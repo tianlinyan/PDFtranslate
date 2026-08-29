@@ -35,17 +35,17 @@ from .worker import OUTPUT_TYPES, TranslateWorker
 #: (display label, language name sent to the model)
 #: Supported target languages — limited by design to Chinese + the five core
 #: Latin-script European languages (character sets all handled by the extractor
-#: and the CJK renderer).
+#: and the CJK renderer).  The parentheses show the Chinese name of each language.
 LANGUAGES = [
-    ("简体中文 (Simplified Chinese)", "Simplified Chinese"),
-    ("English (英语)", "English"),
-    ("Español (Spanish)", "Spanish"),
-    ("Français (French)", "French"),
-    ("Deutsch (German)", "German"),
-    ("Italiano (Italian)", "Italian"),
+    ("简体中文（中文）", "Simplified Chinese"),
+    ("English（英语）", "English"),
+    ("Español（西班牙语）", "Spanish"),
+    ("Français（法语）", "French"),
+    ("Deutsch（德语）", "German"),
+    ("Italiano（意大利语）", "Italian"),
 ]
 
-_DEFAULT_LANG = "简体中文 (Simplified Chinese)"
+_DEFAULT_LANG = "简体中文（中文）"
 _FILE_FILTER = "PDF 文件 (*.pdf);;所有文件 (*.*)"
 
 
