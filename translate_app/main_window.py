@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from . import __app_name__
+from . import __app_name__, __version__
 from .settings import ModelConfig, load_models, load_prefs, save_prefs
 from .translator import clear_translation_cache
 from .worker import OUTPUT_TYPES, TranslateWorker
@@ -61,7 +61,7 @@ class MainWindow(QWidget):
         self._closing = False
         self._models_error = ""
 
-        self.setWindowTitle(f"{__app_name__} — AI 翻译")
+        self.setWindowTitle(f"{__app_name__} — AI 翻译 v{__version__}")
         self.resize(620, 560)
         self.setAcceptDrops(True)
 
