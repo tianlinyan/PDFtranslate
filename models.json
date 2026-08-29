@@ -1,0 +1,23 @@
+{
+  "models": [
+    {
+      "id": "qwen3.8",
+      "name": "qwen3.8",
+      "type": "llama-server",
+      "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
+      "model": "qwen3.8",
+      "reasoning_effort": "low",
+      "concurrency": 2,
+      "batch_size": 12000
+    },
+    {
+      "id": "ds4-pro",
+      "name": "DS4",
+      "type": "deepseek",
+      "endpoint": "https://api.deepseek.com/v1/chat/completions",
+      "model": "deepseek-v4-flash",
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "tools_choice": "auto"
+    }
+  ]
+}

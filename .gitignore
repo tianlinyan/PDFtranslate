@@ -1,0 +1,30 @@
+# Python 缓存与构建产物
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.exe
+*.dll
+*.so
+
+# PyQt6/Qt 构建产物
+PyQt6/
+Qt6/
+*_internal/
+
+# 测试运行时生成的输出目录
+tests/_out/
+
+# 大体积示例 / 生成的译文 PDF（测试运行时会自行生成样本，无需入库）
+*.pdf
+
+# IDE 与系统
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
