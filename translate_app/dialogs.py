@@ -1,4 +1,4 @@
-"""Reusable dialogs: settings/glossary editor and an export preview.
+"""Reusable dialogs: settings/glossary editor and an About dialog.
 
 Kept separate from :mod:`.main_window` so the pure logic (glossary load/save via
 :mod:`.settings`) stays simple and testable; these are thin Qt wrappers.
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -21,10 +21,10 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QTextBrowser,
     QVBoxLayout,
 )
 
+from . import __app_name__, __developer__, __version__
 from .settings import DEFAULT_GLOSSARY_PATH, load_glossary, save_glossary
 
 
@@ -148,39 +148,45 @@ class SettingsDialog(QDialog):
         return self._ocr.isChecked()
 
 
-class PreviewDialog(QDialog):
-    """Bilingual preview of the translation, page by page, before export."""
+class AboutDialog(QDialog):
+    """Shows application information: name, version, developer and purpose."""
 
-    def __init__(self, parent=None, per_page_translated=None, per_page_source=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("译文预览")
-        self.resize(680, 640)
+        self.setWindowTitle("关于")
+        self.setMinimumSize(400, 300)
 
-        browser = QTextBrowser()
-        browser.setOpenExternalLinks(False)
-        browser.setFont(QFont("Microsoft YaHei", 10))
-        browser.setHtml(self._build_html(per_page_translated or [], per_page_source or []))
+        name = QLabel(__app_name__)
+        name.setStyleSheet("font-size: 18pt; font-weight: bold;")
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        version = QLabel(f"版本：v{__version__}")
+        version.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        developer = QLabel(f"开发者：{__developer__}")
+        developer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        email = QLabel("Email：tly001@vip.sina.com")
+        email.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        summary = QLabel(
+            "Windows 桌面 PDF AI 翻译工具。\n"
+            "从 PDF 提取文本，通过 OpenAI 兼容模型翻译，\n"
+            "导出为双语 PDF、原位翻译 PDF、Markdown 或纯文本。"
+        )
+        summary.setWordWrap(True)
+        summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
 
         root = QVBoxLayout(self)
-        root.addWidget(browser)
+        root.addStretch()
+        root.addWidget(name)
+        root.addWidget(version)
+        root.addWidget(developer)
+        root.addWidget(email)
+        root.addSpacing(16)
+        root.addWidget(summary)
+        root.addStretch()
         root.addWidget(buttons)
-
-    @staticmethod
-    def _build_html(per_page_translated, per_page_source) -> str:
-        parts = ["<style>body{font-family:'Segoe UI',sans-serif}"
-                 "details{margin:4px 0}summary{color:#666;cursor:pointer}</style>"]
-        n = max(len(per_page_translated), len(per_page_source))
-        for i in range(n):
-            trans = per_page_translated[i] if i < len(per_page_translated) else []
-            src = per_page_source[i] if i < len(per_page_source) else []
-            parts.append(f"<h3>第 {i + 1} 页</h3>")
-            for block in trans:
-                if block:
-                    parts.append(f"<p>{block}</p>")
-            src_lines = "".join(f"<p>{b}</p>" for b in src if b)
-            if src_lines:
-                parts.append(f"<details><summary>原文</summary>{src_lines}</details>")
-        return "<html><body>" + "".join(parts) + "</body></html>"
