@@ -18,6 +18,10 @@ from typing import Any
 #: Path to the models.json located next to the package.
 DEFAULT_MODELS_PATH = Path(__file__).resolve().parent.parent / "models.json"
 
+#: Path to the default glossary (``glossary.json``) located next to the package.
+#: A model may point at its own glossary file via the ``glossary`` config key.
+DEFAULT_GLOSSARY_PATH = Path(__file__).resolve().parent.parent / "glossary.json"
+
 #: Path to the user preferences file.
 APP_PREFS_PATH = Path.home() / ".pdftranslate" / "prefs.json"
 
@@ -40,6 +44,7 @@ class ModelConfig:
     max_tokens: int | None = None      # per-request max completion tokens (None → server default)
     concurrency: int = 1               # parallel batch requests per translation run
     batch_size: int = 4000             # source-character budget per batch request
+    glossary: str | None = None        # path to a per-model glossary file
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -63,6 +68,7 @@ class ModelConfig:
             ),
             concurrency=int(item.get("concurrency") or 1),
             batch_size=int(item.get("batch_size") or 4000),
+            glossary=(item.get("glossary") or None),
             extra={k: v for k, v in item.items() if k not in cls._KNOWN_FIELDS},
         )
 
@@ -80,6 +86,7 @@ class ModelConfig:
         "max_tokens",
         "concurrency",
         "batch_size",
+        "glossary",
     }
 
     def request_params(self) -> dict[str, Any]:
@@ -170,6 +177,39 @@ def default_model_id() -> str:
     except Exception:
         return ""
     return models[0].id if models else ""
+
+
+def load_glossary(path: Path | str | None = None) -> dict[str, str]:
+    """Load a glossary of ``source -> target`` term mappings.
+
+    ``path`` defaults to ``DEFAULT_GLOSSARY_PATH``; a missing/unreadable file
+    yields an empty glossary (never an error, so a file-less install still
+    works unchanged).  Three JSON shapes are accepted:
+
+    * ``{"transformer": "变换器", "key": "密钥"}``
+    * ``{"terms": {"transformer": "变换器"}}``
+    * ``[["transformer", "变换器"], ["key", "密钥"]]``
+
+    The returned mappings are injected into every batch prompt so the model
+    translates the same domain term identically across all chunks.
+    """
+    try:
+        p = Path(path) if path else DEFAULT_GLOSSARY_PATH
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            if isinstance(data.get("terms"), dict):
+                data = data["terms"]
+            return {str(k): str(v) for k, v in data.items()}
+        if isinstance(data, list):
+            out: dict[str, str] = {}
+            for item in data:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    out[str(item[0])] = str(item[1])
+            return out
+    except Exception:
+        pass
+    return {}
 
 
 # ---------------------------------------------------------------------------

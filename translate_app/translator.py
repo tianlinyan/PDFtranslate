@@ -38,7 +38,7 @@ from openai import (
     PermissionDeniedError,
 )
 
-from .settings import ModelConfig
+from .settings import DEFAULT_GLOSSARY_PATH, ModelConfig, load_glossary
 
 #: Matches one ``[n]`` block in a model reply.  The block content may span
 #: several lines (some models wrap long translations); everything up to the
@@ -54,7 +54,19 @@ _CHAR_BUDGET = 4000
 
 #: Cache format version — bump when the prompt or response format changes so
 #: stale translations from an older run are never reused.
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
+
+#: How many newly translated blocks are kept in memory before one batched write
+#: to the on-disk journal.  A WINDOW of up to this many blocks may be lost on a
+#: hard crash (a clean cancel flushes the buffer, so it is not lost); pick a
+#: larger value to write less often (kinder to an SSD), a smaller one to lose
+#: less work if the app crashes mid-run.
+_FLUSH_ENTRIES = 200
+
+#: Rewrite the whole cache as a single snapshot (and drop the journal) once the
+#: journal has grown past this many lines.  Keeps the journal from growing
+#: unbounded without rewriting the snapshot on every run.
+_COMPACT_ENTRIES = 5000
 
 #: Delay between batch attempts (seconds); injectable so tests don't sleep.
 _TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
@@ -103,9 +115,29 @@ def _cache_dir() -> Path:
     return Path.home() / ".pdftranslate" / "cache"
 
 
-def _cache_key(doc_path: Path, target_lang: str, model_id: str) -> str:
+def _glossary_fingerprint(glossary: dict[str, str] | None) -> str:
+    """A short hash of a glossary, so a glossary change never reuses old cache."""
+    if not glossary:
+        return ""
+    import json
+
+    return hashlib.sha1(
+        json.dumps(glossary, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:8]
+
+
+def _cache_key(
+    doc_path: Path,
+    target_lang: str,
+    model_id: str,
+    glossary: dict[str, str] | None = None,
+) -> str:
+    # The glossary is part of the key: switching or editing it must not serve
+    # translations produced under the previous term mapping.
     h = hashlib.sha1(
-        f"{doc_path.resolve()}|{target_lang}|{model_id}".encode("utf-8")
+        f"{doc_path.resolve()}|{target_lang}|{model_id}|{_glossary_fingerprint(glossary)}".encode(
+            "utf-8"
+        )
     ).hexdigest()[:16]
     return f"trans_v{_CACHE_VERSION}_{h}.json"
 
@@ -130,26 +162,52 @@ def _sleep_interruptible(seconds: float, cancel: CancelFn) -> None:
         time.sleep(min(0.2, deadline - time.monotonic()))
 
 
-def load_translation_cache(doc_path: Path, target_lang: str, model_id: str) -> dict[str, str]:
-    """Load the on-disk translation cache for a doc/lang/model (empty if none)."""
-    cache_path = _cache_dir() / _cache_key(doc_path, target_lang, model_id)
-    if cache_path.exists():
-        try:
-            import json
+def load_translation_cache(
+    doc_path: Path,
+    target_lang: str,
+    model_id: str,
+    glossary: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Load the on-disk translation cache for a doc/lang/model (empty if none).
 
-            return json.loads(cache_path.read_text("utf-8"))
+    The cache is stored as a base ``.json`` snapshot plus an append-only
+    ``.jsonl`` journal of newer entries; both are merged on load.  A batch's
+    translations land in the journal instantly (so a cancel/crash never loses
+    completed work), while the bulk snapshot is only rewritten on compaction.
+    """
+    import json
+
+    cache_path = _cache_dir() / _cache_key(doc_path, target_lang, model_id, glossary)
+    data: dict[str, str] = {}
+    for file in (cache_path, _cache_journal_path(cache_path)):
+        if not file.exists():
+            continue
+        try:
+            if file.suffix == ".json":
+                data.update(json.loads(file.read_text("utf-8")))
+            else:
+                for line in file.read_text("utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data.update(json.loads(line))
+                    except Exception:
+                        # A torn line from a crash is skipped, not fatal.
+                        continue
         except Exception:
             pass
-    return {}
+    return data
 
 
 def clear_translation_cache() -> int:
     """Delete all cached translation files; returns the number of files removed."""
     removed = 0
-    for path in _cache_dir().glob("trans_*.json"):
+    for path in _cache_dir().glob("trans_*"):
         try:
-            path.unlink()
-            removed += 1
+            if path.is_file():
+                path.unlink()
+                removed += 1
         except Exception:
             pass
     return removed
@@ -158,11 +216,17 @@ def clear_translation_cache() -> int:
 class TranslationEngine:
     """Wraps one AI model and translates a list of text blocks."""
 
-    def __init__(self, model: ModelConfig):
+    def __init__(self, model: ModelConfig, glossary: dict[str, str] | None = None):
         self.model = model
         self.client = OpenAI(**model.client_kwargs())
         # Guards the shared translation cache while batches complete concurrently.
         self._cache_lock = threading.Lock()
+        # Glossary of ``source -> target`` terms injected into every batch's
+        # prompt so the same domain term stays identical across all chunks.
+        # Fall back to the model's own glossary file, then the project default.
+        if glossary is None:
+            glossary = load_glossary(model.glossary or DEFAULT_GLOSSARY_PATH)
+        self._glossary = glossary or {}
 
     @staticmethod
     def _build_prompt(blocks: Sequence[str], indices: Sequence[int]) -> str:
@@ -174,9 +238,29 @@ class TranslationEngine:
             lines.append(f"[{pos + 1}]\n{blocks[i]}")
         return "\n\n".join(lines)
 
+    def _batch_glossary(
+        self, indices: Sequence[int], blocks: Sequence[str]
+    ) -> dict[str, str]:
+        """The glossary terms that actually appear in this batch's source blocks.
+
+        Only terms present here are injected into the batch's prompt, so a large
+        glossary is never re-sent verbatim to every chunk (which would burn
+        tokens on terms that cannot occur).  Consistency is unaffected — a term
+        that appears in a chunk is always constrained there, and a term absent
+        from a chunk needs no constraint.
+        """
+        if not self._glossary:
+            return {}
+        text = "\n".join(blocks[i] for i in indices)
+        return {
+            src: tgt
+            for src, tgt in self._glossary.items()
+            if src and src in text
+        }
+
     @staticmethod
-    def _system_prompt(language: str) -> str:
-        return (
+    def _system_prompt(language: str, glossary: dict[str, str] | None = None) -> str:
+        prompt = (
             "You are a professional document translator. Translate every numbered "
             f"block below into {language}.\n"
             "Rules:\n"
@@ -192,8 +276,20 @@ class TranslationEngine:
             "block, in the same order.\n"
             "- Do not merge or split blocks, and do not add explanations, notes or "
             "any preamble.\n"
-            "- Output ONLY the numbered translations, nothing else.\n\n"
-            "Example:\n"
+            "- Output ONLY the numbered translations, nothing else.\n"
+        )
+        if glossary:
+            lines = [
+                "Glossary — translate the following terms exactly as given. Never "
+                "rephrase or paraphrase them, and use the same term throughout the "
+                "whole document so the terminology stays consistent:"
+            ]
+            for src, tgt in glossary.items():
+                lines.append(f"- {src} => {tgt}")
+            prompt += "\n".join(lines) + "\n"
+        return (
+            prompt
+            + "\nExample:\n"
             "Input:\n"
             "[1]\n"
             "Press OK to continue.\n"
@@ -300,7 +396,7 @@ class TranslationEngine:
         cache, or a transient outage would poison it permanently.
         """
         prompt = self._build_prompt(blocks, indices)
-        system = self._system_prompt(language)
+        system = self._system_prompt(language, self._batch_glossary(indices, blocks))
         attempts = len(retry_delays) + 1
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
@@ -350,6 +446,9 @@ class TranslationEngine:
         cancel = cancel or (lambda: False)
         progress = on_progress or (lambda _d, _t: None)
 
+        if self._glossary:
+            log(f"已应用术语表（{len(self._glossary)} 条），保证专用词汇跨分块一致")
+
         n = len(blocks)
         result = TranslationResult(blocks=list(blocks), translated=list(blocks))
 
@@ -361,8 +460,10 @@ class TranslationEngine:
         cache: dict[str, str] = {}
         cache_path: Path | None = None
         if resume and doc_path is not None:
-            cache = load_translation_cache(doc_path, target_language, self.model.id)
-            cache_path = _cache_dir() / _cache_key(doc_path, target_language, self.model.id)
+            cache = load_translation_cache(doc_path, target_language, self.model.id, self._glossary)
+            cache_path = _cache_dir() / _cache_key(
+                doc_path, target_language, self.model.id, self._glossary
+            )
 
         # Progress starts at the count already present in the cache plus the
         # blocks skipped outright, so the bar reflects genuinely *done* work.
@@ -373,6 +474,20 @@ class TranslationEngine:
             return i not in skip and _block_hash(blocks[i]) not in cache
 
         chunks = self._make_chunks(blocks, index_filter=_needs_request)
+        # Translations are buffered in memory and written to disk in large
+        # batches (not per batch), so a long document performs only a handful of
+        # writes — sparing the SSD while still bounding crash loss.
+        pending: dict[str, str] = {}
+        flushed_since_compact = 0
+
+        def _flush_pending() -> None:
+            nonlocal flushed_since_compact
+            if cache_path is None or not pending:
+                return
+            _append_cache_journal(_cache_journal_path(cache_path), pending)
+            flushed_since_compact += len(pending)
+            pending.clear()
+
         if chunks:
             max_workers = max(1, int(self.model.concurrency or 1))
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -393,6 +508,8 @@ class TranslationEngine:
                     try:
                         translated, ok = fut.result()
                     except TranslationCancelled:
+                        # Keep the work completed so far durable before bailing.
+                        _flush_pending()
                         raise
                     except Exception as exc:  # noqa: BLE001 — defensive; the
                         # batch already swallows errors, this catches the rest
@@ -401,25 +518,28 @@ class TranslationEngine:
                     if ok:
                         with self._cache_lock:
                             for i, text in zip(chunk, translated):
-                                cache[_block_hash(blocks[i])] = text
-                            # Persist after every batch so a cancel/crash keeps
-                            # the work completed so far (resume reuses it).
-                            if cache_path is not None:
-                                _write_cache(cache_path, cache)
+                                key = _block_hash(blocks[i])
+                                cache[key] = text
+                                pending[key] = text
+                        if len(pending) >= _FLUSH_ENTRIES:
+                            _flush_pending()
                     else:
                         for i in chunk:
                             result.errors.append(f"块 {i + 1} 翻译失败，保留原文")
                     done += len(chunk)
                     progress(done, n)
 
-        # Fill the output from the (now fully populated) cache.
+        # Merge the in-memory cache back into the output, then flush whatever is
+        # buffered and compact only when the journal has grown large — so a
+        # fully-cached re-run performs no disk writes at all.
         for i, b in enumerate(blocks):
             key = _block_hash(b)
             if key in cache:
                 result.translated[i] = cache[key]
 
-        if cache_path is not None:
-            _write_cache(cache_path, cache)
+        _flush_pending()
+        if cache_path is not None and flushed_since_compact >= _COMPACT_ENTRIES:
+            _compact_cache(cache_path, _cache_journal_path(cache_path), cache)
 
         progress(n, n)
         return result
@@ -450,11 +570,34 @@ class TranslationEngine:
         return chunks
 
 
-def _write_cache(path: Path, cache: dict[str, str]) -> None:
-    """Best-effort persist of the translation cache."""
+def _cache_journal_path(cache_path: Path) -> Path:
+    """The append-only ``.jsonl`` sibling of a cache snapshot file."""
+    return cache_path.with_suffix(".jsonl")
+
+
+def _append_cache_journal(journal_path: Path, entries: dict[str, str]) -> None:
+    """Append new entries as JSON lines; one small write per batch, no rewrite."""
+    if not entries:
+        return
     try:
         import json
 
-        path.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+        with journal_path.open("a", encoding="utf-8") as fh:
+            for key, value in entries.items():
+                fh.write(json.dumps({key: value}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _compact_cache(
+    cache_path: Path, journal_path: Path, cache: dict[str, str]
+) -> None:
+    """Write the merged cache as a single snapshot and drop the journal."""
+    try:
+        import json
+
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+        if journal_path.exists():
+            journal_path.unlink()
     except Exception:
         pass

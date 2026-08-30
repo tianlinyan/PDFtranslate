@@ -5,7 +5,13 @@ import uuid
 from pathlib import Path
 
 from translate_app.settings import ModelConfig
-from translate_app.translator import TranslationEngine, _cache_dir, _cache_key
+from translate_app.translator import (
+    TranslationCancelled,
+    TranslationEngine,
+    _cache_dir,
+    _cache_key,
+    load_translation_cache,
+)
 
 from tests._helpers import MockServer
 
@@ -112,10 +118,8 @@ class TranslatorTest(unittest.TestCase):
             self.assertTrue(res.errors)
             # ... and the failed batch must NOT be written into the cache,
             # otherwise a transient outage would poison future resume runs.
-            cache_path = _cache_dir() / _cache_key(
-                Path("_fake.pdf"), "Chinese", model.id
-            )
-            self.assertEqual(json.loads(cache_path.read_text("utf-8")), {})
+            cache = load_translation_cache(Path("_fake.pdf"), "Chinese", model.id)
+            self.assertEqual(cache, {})
 
     def test_multiline_response_is_parsed(self):
         # A model may wrap a long translation across several lines; everything
@@ -226,6 +230,112 @@ class TranslatorTest(unittest.TestCase):
             engine.translate_blocks(["Hello."], "Chinese", doc_path=Path("_fake.pdf"))
             self.assertEqual(server.last_body["temperature"], 0.2)
             self.assertNotIn("max_tokens", server.last_body)
+
+
+    def test_cancel_flushes_buffered_translations(self):
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-cf-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model", batch_size=10,
+            )
+            engine = TranslationEngine(model)
+            # batch_size=10 makes each block its own chunk (serial, in order).
+            blocks = ["A block one.", "B block two.", "C block three."]
+            calls = [0]
+
+            def cancel():
+                calls[0] += 1
+                return calls[0] > 1  # let the first batch finish, then cancel
+
+            with self.assertRaises(TranslationCancelled):
+                engine.translate_blocks(
+                    blocks, "Chinese", doc_path=Path("_fake.pdf"),
+                    cancel=cancel, retry_delays=(0.0, 0.0),
+                )
+            # The completed first batch was held in memory; the cancel must have
+            # flushed it, so a resume run reuses rather than re-translates it.
+            cache = load_translation_cache(Path("_fake.pdf"), "Chinese", model.id)
+            self.assertEqual(set(cache.values()), {"MOCK:A block one."})
+
+    def test_glossary_injected_and_alignment_kept(self):
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-gl-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            # A glossary passed straight to the engine is injected into the batch
+            # prompt for the terms that appear, so concurrent chunks agree on
+            # domain terms — while keeping the block numbering aligned.
+            blocks = [
+                "The key must be kept secret.",
+                "The protocol is standard here.",
+                "A paragraph without glossary terms.",
+            ]
+            engine = TranslationEngine(model, glossary={"key": "密钥", "protocol": "协议"})
+            res = engine.translate_blocks(blocks, "Chinese", doc_path=Path("_fake.pdf"))
+            self.assertEqual(len(res.translated), len(blocks))
+            for src, tr in zip(blocks, res.translated):
+                self.assertTrue(tr.startswith("MOCK:" + src), tr)
+            # The system message (messages[0]) carries the term mapping.
+            system = server.last_body["messages"][0]["content"]
+            self.assertIn("Glossary", system)
+            self.assertIn("key => 密钥", system)
+            self.assertIn("protocol => 协议", system)
+
+    def test_glossary_only_injects_terms_present_in_batch(self):
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-gf-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            blocks = ["The key is here.", "No glossary term."]
+            engine = TranslationEngine(model, glossary={"key": "密钥", "zebra": "斑马"})
+            engine.translate_blocks(blocks, "Chinese", doc_path=Path("_fake.pdf"))
+            system = server.last_body["messages"][0]["content"]
+            self.assertIn("key => 密钥", system)
+            # ``zebra`` does not appear anywhere in this batch: it must not be
+            # injected, so a large glossary is not re-sent verbatim to every chunk.
+            self.assertNotIn("zebra", system)
+
+    def test_cache_journal_is_merged(self):
+        import json
+
+        p = Path("_fake.pdf")
+        model_id = f"mock-j-{uuid.uuid4().hex[:8]}"
+        base = _cache_dir() / _cache_key(p, "Chinese", model_id)
+        journal = base.with_suffix(".jsonl")
+        try:
+            base.write_text(json.dumps({"a": "A"}), "utf-8")
+            journal.write_text(
+                json.dumps({"b": "B"}, ensure_ascii=False) + "\n"
+                + json.dumps({"c": "C"}, ensure_ascii=False) + "\n",
+                "utf-8",
+            )
+            # The snapshot and the append-only journal are both read back, so a
+            # cancel (which skips the final snapshot) still resumes correctly.
+            cache = load_translation_cache(p, "Chinese", model_id)
+            self.assertEqual(cache, {"a": "A", "b": "B", "c": "C"})
+            # A torn trailing line must be skipped, not reject the whole file.
+            journal.write_text(json.dumps({"d": "D"}, ensure_ascii=False) + "\n" + "{broken", "utf-8")
+            self.assertEqual(
+                load_translation_cache(p, "Chinese", model_id),
+                {"a": "A", "d": "D"},
+            )
+        finally:
+            base.unlink(missing_ok=True)
+            journal.unlink(missing_ok=True)
+
+    def test_glossary_changes_cache_namespace(self):
+        p = Path("_fake.pdf")
+        base = _cache_key(p, "Chinese", "m")
+        self.assertEqual(base, _cache_key(p, "Chinese", "m", None))
+        self.assertEqual(base, _cache_key(p, "Chinese", "m", {}))
+        # A different glossary (or a changed mapping) must not reuse the cache.
+        self.assertNotEqual(base, _cache_key(p, "Chinese", "m", {"key": "密钥"}))
+        self.assertNotEqual(
+            _cache_key(p, "Chinese", "m", {"key": "密钥"}),
+            _cache_key(p, "Chinese", "m", {"key": "password"}),
+        )
 
 
 if __name__ == "__main__":

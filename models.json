@@ -6,14 +6,14 @@
       "type": "llama-server",
       "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
       "model": "qwen3.8",
-      "reasoning_effort": "low",
+      "reasoning_effort": "none",
       "concurrency": 2,
       "temperature":0.1,
       "batch_size": 12000
     },
     {
-      "id": "ds4-pro",
-      "name": "DS4",
+      "id": "deepseek-v4-flash",
+      "name": "DS4F",
       "type": "deepseek",
       "endpoint": "https://api.deepseek.com/v1/chat/completions",
       "model": "deepseek-v4-flash",

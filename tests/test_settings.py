@@ -2,7 +2,7 @@
 import os
 import unittest
 
-from translate_app.settings import ModelConfig, substitute_env
+from translate_app.settings import ModelConfig, load_glossary, substitute_env
 
 
 class SettingsTest(unittest.TestCase):
@@ -87,6 +87,48 @@ class SettingsTest(unittest.TestCase):
         m = ModelConfig(id="m", name="m", type="openai",
                         endpoint="http://x/v1", model="mod")
         self.assertEqual(m.client_kwargs()["timeout"], 300.0)
+
+    def test_glossary_field_parsed(self):
+        m = ModelConfig.from_dict(
+            {"id": "m", "endpoint": "http://x/v1", "model": "mod",
+             "glossary": "glossary.json"}
+        )
+        self.assertEqual(m.glossary, "glossary.json")
+        # ``glossary`` is a known key and must not leak into ``extra``.
+        self.assertNotIn("glossary", m.extra)
+        # Defaults to None when absent.
+        m2 = ModelConfig.from_dict({"id": "m", "endpoint": "http://x/v1", "model": "mod"})
+        self.assertIsNone(m2.glossary)
+
+    def test_load_glossary_formats(self):
+        import json
+        import os
+        import tempfile
+
+        def _write(obj):
+            fd, path = tempfile.mkstemp(suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(obj, fh, ensure_ascii=False)
+            return path
+
+        try:
+            # Flat map.
+            p1 = _write({"transformer": "变换器", "key": "密钥"})
+            self.assertEqual(load_glossary(p1),
+                             {"transformer": "变换器", "key": "密钥"})
+            # Wrapped under a ``terms`` key.
+            p2 = _write({"terms": {"protocol": "协议"}})
+            self.assertEqual(load_glossary(p2), {"protocol": "协议"})
+            # List of [source, target] pairs.
+            p3 = _write([["signature", "签名"], ["key", "密钥"]])
+            self.assertEqual(load_glossary(p3),
+                             {"signature": "签名", "key": "密钥"})
+            # Missing / unreadable file yields an empty glossary, never an error.
+            self.assertEqual(load_glossary("does_not_exist_xyz_123.json"), {})
+        finally:
+            for p in (p1, p2, p3):
+                if os.path.exists(p):
+                    os.unlink(p)
 
 
 if __name__ == "__main__":

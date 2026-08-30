@@ -1,0 +1,10 @@
+{
+  "_comment": "术语表示例：复制为项目根目录的 glossary.json 即可自动加载；或在 models.json 的某个模型条目里用 \"glossary\": \"路径.json\" 指定单独术语表。三条规则照抄也可用。术语表会注入每个分块的提示词，保证同一专有名词在全篇翻译一致。",
+  "terms": {
+    "transformer": "变换器",
+    "key": "密钥",
+    "signature": "签名",
+    "protocol": "协议",
+    "decode": "解码"
+  }
+}
