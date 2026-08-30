@@ -21,6 +21,10 @@ tests/_out/
 # 大体积示例 / 生成的译文 PDF（测试运行时会自行生成样本，无需入库）
 *.pdf
 
+# 发布用压缩包与发布说明（作为 release 资产上传，不入库）
+PDFTranslate-v*.zip
+RELEASE_NOTES_v*.md
+
 # IDE 与系统
 .idea/
 .vscode/
