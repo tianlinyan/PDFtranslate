@@ -171,8 +171,9 @@ class AboutDialog(QDialog):
 
         summary = QLabel(
             "Windows 桌面 PDF AI 翻译工具。\n"
-            "从 PDF 提取文本，通过 OpenAI 兼容模型翻译，\n"
-            "导出为双语 PDF、原位翻译 PDF、Markdown 或纯文本。"
+            "从 PDF 提取文本，通过本地模型或云端模型翻译，\n"
+            "导出为双语 PDF、仅译文 PDF、Markdown 或纯文本。\n"
+            "详见《AI配置手册》。"
         )
         summary.setWordWrap(True)
         summary.setAlignment(Qt.AlignmentFlag.AlignCenter)

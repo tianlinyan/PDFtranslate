@@ -7,12 +7,14 @@ Build (from the project root):
 Output goes to ``dist/PDFTranslate/``:
     PDFTranslate.exe      <- the executable
     _internal/            <- bundled Python runtime + dependencies
-    models.json           <- copied next to the executable by ``copy_models.py``
+    models.json           <- copied next to the executable by ``build.bat``
                             (edit this file to declare your AI models)
+    AI配置手册.md          <- copied next to the executable by ``build.bat``
+                            (AI model configuration guide)
 
 The app resolves ``models.json`` / ``glossary.json`` next to the executable when
 frozen (see ``translate_app/settings.py`` -> ``resource_dir``), so the user can
-edit them without rebuilding.
+edit them without rebuilding. ``build.bat`` performs the post-build copies.
 """
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
