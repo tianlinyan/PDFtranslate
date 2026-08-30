@@ -8,8 +8,10 @@ from translate_app.settings import ModelConfig
 from translate_app.translator import (
     TranslationCancelled,
     TranslationEngine,
+    _OUTPUT_HEADROOM,
     _cache_dir,
     _cache_key,
+    _estimate_tokens,
     load_translation_cache,
 )
 
@@ -207,6 +209,31 @@ class TranslatorTest(unittest.TestCase):
             self.assertEqual(len(chunks), len(BLOCKS))
             for chunk in chunks:
                 self.assertEqual(len(chunk), 1)
+
+    def test_token_aware_batching_respects_max_tokens(self):
+        # A tiny ``max_tokens`` must carve batches so a chunk's estimated output
+        # stays under the reserved headroom — otherwise the reply is truncated
+        # and the engine retries a (wasted) request.
+        model = ModelConfig(
+            id="m", name="m", type="openai", endpoint="http://x/v1", model="mod",
+            batch_size=1_000_000, max_tokens=40,
+        )
+        engine = TranslationEngine(model)
+        blocks = [f"Block {i} text" + ("a" * 20) for i in range(10)]
+        chunks = engine._make_chunks(blocks, index_filter=lambda _i: True)
+        self.assertGreater(len(chunks), 1)
+        cap = int(40 * _OUTPUT_HEADROOM)
+        for chunk in chunks:
+            est = sum(_estimate_tokens(blocks[i]) + 4 for i in chunk)
+            self.assertLessEqual(est, cap)
+        # Without ``max_tokens`` the token cap is ignored (char budget only).
+        model_plain = ModelConfig(
+            id="m2", name="m2", type="openai", endpoint="http://x/v1", model="mod",
+            batch_size=1_000_000, max_tokens=None,
+        )
+        engine_plain = TranslationEngine(model_plain)
+        chunks_plain = engine_plain._make_chunks(blocks, index_filter=lambda _i: True)
+        self.assertEqual(len(chunks_plain), 1)
 
     def test_temperature_and_max_tokens_sent(self):
         with MockServer() as server:

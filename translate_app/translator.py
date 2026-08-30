@@ -68,6 +68,13 @@ _FLUSH_ENTRIES = 200
 #: unbounded without rewriting the snapshot on every run.
 _COMPACT_ENTRIES = 5000
 
+#: Fraction of ``max_tokens`` reserved for a batch's *output*.  A batch whose
+#: estimated output approaches the model's completion cap is likely to be
+#: truncated mid-reply, which the engine treats as a malformed response and
+#: retries (wasting a request).  Keeping each batch's output under this many
+#: tokens avoids those retries.
+_OUTPUT_HEADROOM = 0.8
+
 #: Delay between batch attempts (seconds); injectable so tests don't sleep.
 _TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
 
@@ -149,6 +156,19 @@ def _block_hash(text: str) -> str:
 def _needs_translation(text: str) -> bool:
     """Return True if ``text`` contains letters and thus needs translation."""
     return bool(_LETTERS_RE.search(text))
+
+
+def _estimate_tokens(text: str) -> int:
+    """A rough token estimate for batching purposes.
+
+    CJK and other wide scripts are near one token per character; Latin-script
+    text is more like four characters per token.  Used only to keep a batch's
+    expected output under the model's ``max_tokens`` so replies are not
+    truncated into a wasteful retry, so a heuristic is plenty.
+    """
+    cjk = sum(1 for ch in text if ord(ch) > 0x2E80)
+    latin = len(text) - cjk
+    return cjk + latin // 4 + (1 if latin % 4 else 0)
 
 
 def _sleep_interruptible(seconds: float, cancel: CancelFn) -> None:
@@ -549,22 +569,44 @@ class TranslationEngine:
         blocks: Sequence[str],
         index_filter: Callable[[int], bool] | None = None,
     ) -> list[list[int]]:
-        """Split indices into chunks that fit the model's character budget."""
+        """Split indices into chunks that fit the model's character budget.
+
+        Besides the character budget, when the model declares a ``max_tokens``
+        the chunks are also bounded so a batch's *estimated output* stays under
+        a safe fraction of that cap.  A batch whose output would be truncated is
+        treated as a malformed reply and retried, costing a request; keeping
+        each batch comfortably under the cap avoids that waste.
+        """
         index_filter = index_filter or (lambda _i: True)
         budget = max(1, int(self.model.batch_size or _CHAR_BUDGET))
+        max_out = (
+            int(self.model.max_tokens * _OUTPUT_HEADROOM)
+            if self.model.max_tokens
+            else None
+        )
         chunks: list[list[int]] = []
         current: list[int] = []
         current_chars = 0
+        current_tokens = 0
         for i, block in enumerate(blocks):
             if not index_filter(i):
                 continue
             size = len(block) + len(str(i)) + 6
-            if current and (current_chars + size > budget):
+            toks = _estimate_tokens(block) + 4  # + label/number overhead
+            over_char = current and current_chars + size > budget
+            over_token = (
+                current
+                and max_out is not None
+                and current_tokens + toks > max_out
+            )
+            if over_char or over_token:
                 chunks.append(current)
                 current = []
                 current_chars = 0
+                current_tokens = 0
             current.append(i)
             current_chars += size
+            current_tokens += toks
         if current:
             chunks.append(current)
         return chunks
