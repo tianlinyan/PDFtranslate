@@ -1,3 +1,4 @@
 PyQt6>=6.6
 PyMuPDF>=1.24
 openai>=1.40
+rapidocr_onnxruntime>=1.2

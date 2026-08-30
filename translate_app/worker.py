@@ -39,6 +39,7 @@ class TranslateWorker(QObject):
         target_language: str,
         output_type: str,
         output_path: str,
+        ocr: bool = True,
     ):
         super().__init__()
         self._source = source_path
@@ -46,6 +47,7 @@ class TranslateWorker(QObject):
         self._lang = target_language
         self._output_type = output_type
         self._output_path = output_path
+        self._ocr = ocr
         self._cancelled = False
 
     @pyqtSlot()
@@ -56,13 +58,17 @@ class TranslateWorker(QObject):
 
             self.log.emit(f"正在提取文本：{self._source}")
             self.progress.emit(0, 0, "提取文本…")
-            doc = pdfio.extract_document_text(self._source)
+            doc = pdfio.extract_document_text(self._source, ocr=self._ocr)
 
             if not doc.blocks:
                 self.error.emit("未从该 PDF 中提取到任何文本，无法翻译。")
                 return
 
             self.log.emit(f"共提取 {len(doc.blocks)} 个文本块，{doc.page_count} 页。")
+            if doc.ocr_count:
+                self.log.emit(
+                    f"有 {doc.ocr_count} 个页面无文本层，已通过 OCR 提取（RapidOCR）。"
+                )
 
             engine = TranslationEngine(self._model)
             self.log.emit(f"模型：{self._model.name} ({self._model.model})")

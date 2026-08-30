@@ -15,9 +15,12 @@ into Chinese / Japanese / Korean display correctly in the exported PDF.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import tempfile
+import threading
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import pymupdf as fitz
 
@@ -58,22 +61,40 @@ class DocumentText:
     blocks: list[str] = field(default_factory=list)     # flat, reading order
     block_pages: list[int] = field(default_factory=list)  # page index per block
     title: str = ""
+    ocr_count: int = 0          # pages whose text came from OCR (was scanned)
 
     @property
     def page_count(self) -> int:
         return len(self.pages)
 
 
-def extract_document_text(path: str | Path, title: str | None = None) -> DocumentText:
+def extract_document_text(
+    path: str | Path,
+    title: str | None = None,
+    ocr: bool = True,
+    ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
+) -> DocumentText:
     """Extract text blocks from ``path`` in reading order.
 
     Column layouts are read column by column (left column top to bottom, then
     the next).  Span-level layout hints (font size, bold, alignment, line
     count) are captured per block so the exporters can redraw translations at
     the original positions without re-parsing the page.
+
+    Pages with **no text layer** (scanned / image-only) are OCR'd when ``ocr``
+    is true (and RapidOCR is available), producing ``Block`` objects with real
+    bounding boxes so the translation still honours the original layout.
+    ``ocr_fn`` is an injectable OCR callback ``(page_index, page) -> [(box, text)]``
+    used by tests to avoid running real OCR.
     """
     doc = fitz.open(str(path))
     result = DocumentText(title=title or Path(path).stem)
+    # OCR results are cached per document so a re-run does not redo slow OCR.
+    ocr_cache: dict[int, list[dict]] = {}
+    ocr_cache_path: Path | None = None
+    if ocr and ocr_fn is None:
+        ocr_cache_path = _ocr_cache_path(path)
+        ocr_cache = _load_ocr_cache(ocr_cache_path)
     try:
         for page_index in range(doc.page_count):
             page = doc[page_index]
@@ -85,6 +106,20 @@ def extract_document_text(path: str | Path, title: str | None = None) -> Documen
                 if b[6] == 0 and str(b[4]).strip()
             ]
             if not text_blocks:
+                if ocr and (ocr_fn is not None or _looks_scanned(page)):
+                    if page_index in ocr_cache:
+                        ocr_blocks = [_block_from_dict(d) for d in ocr_cache[page_index]]
+                    else:
+                        ocr_blocks = _ocr_page_blocks(page_index, page, ocr_fn)
+                        if ocr_blocks:
+                            ocr_cache[page_index] = [_block_to_dict(b) for b in ocr_blocks]
+                    if ocr_blocks:
+                        result.pages.append(ocr_blocks)
+                        for block in ocr_blocks:
+                            result.blocks.append(block.text)
+                            result.block_pages.append(page_index)
+                        result.ocr_count += 1
+                        continue
                 result.pages.append([])
                 continue
 
@@ -109,9 +144,187 @@ def extract_document_text(path: str | Path, title: str | None = None) -> Documen
                 result.blocks.append(cleaned)
                 result.block_pages.append(page_index)
             result.pages.append(page_blocks)
+
+        if ocr_cache_path is not None and ocr_cache:
+            _save_ocr_cache(ocr_cache_path, ocr_cache)
     finally:
         doc.close()
     return result
+
+
+# ---------------------------------------------------------------------------
+# OCR for scanned / image-only pages (RapidOCR, lazily loaded)
+# ---------------------------------------------------------------------------
+
+#: Lazily-created RapidOCR engine (``None`` = not yet loaded, ``False`` = failed).
+_OCR_ENGINE: object | None = None
+_OCR_FAILED = False
+_OCR_LOCK = threading.Lock()
+
+#: Render pages at this DPI for OCR — high enough for readable text, not so high
+#: the model it cranks on huge images (RapidOCR upsamples internally anyway).
+_OCR_DPI = 300.0
+
+
+def _ocr_cache_dir() -> Path:
+    """A writable dir for OCR results (model output is usually slow to redo)."""
+    for base in (
+        Path.home() / ".pdftranslate" / "ocr_cache",
+        Path(tempfile.gettempdir()) / "pdftranslate_ocr_cache",
+    ):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            return base
+        except Exception:
+            continue
+    return Path.home() / ".pdftranslate" / "ocr_cache"
+
+
+def _ocr_cache_path(doc_path: str | Path) -> Path:
+    h = hashlib.sha1(str(Path(doc_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    return _ocr_cache_dir() / f"ocr_{h}.json"
+
+
+def _load_ocr_cache(cache_path: Path) -> dict[int, list[dict]]:
+    """Load per-page OCR block dicts (``{page_index: [block_dict]}``)."""
+    if not cache_path.exists():
+        return {}
+    try:
+        import json
+
+        raw = json.loads(cache_path.read_text("utf-8"))
+        return {int(k): v for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _save_ocr_cache(cache_path: Path, data: dict[int, list[dict]]) -> None:
+    """Best-effort persist of OCR results (OCR is slow — reuse on re-run)."""
+    try:
+        import json
+
+        cache_path.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+    except Exception:
+        pass
+
+
+def _ocr_engine():
+    """Return a shared RapidOCR engine, or ``None`` if unavailable."""
+    global _OCR_ENGINE, _OCR_FAILED
+    if _OCR_FAILED:
+        return None
+    if _OCR_ENGINE is None:
+        with _OCR_LOCK:
+            if _OCR_ENGINE is None and not _OCR_FAILED:
+                try:
+                    from rapidocr_onnxruntime import RapidOCR
+
+                    _OCR_ENGINE = RapidOCR()
+                except Exception:
+                    _OCR_FAILED = True
+                    return None
+    return _OCR_ENGINE if _OCR_ENGINE is not False else None
+
+
+def _page_to_array(page: "fitz.Page") -> tuple[object, float]:
+    """Render a page to a BGR numpy array plus the pixel-per-point zoom."""
+    import numpy as np
+
+    zoom = _OCR_DPI / 72.0
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB
+    )
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+        pix.height, pix.width, pix.n
+    )
+    if pix.n >= 3:
+        img = img[:, :, :3][:, :, ::-1]  # RGB -> BGR
+    return img, zoom
+
+
+def _block_to_dict(b: Block) -> dict:
+    return asdict(b)
+
+
+def _block_from_dict(data: dict) -> Block:
+    allowed = {f.name for f in fields(Block)}
+    return Block(**{k: v for k, v in data.items() if k in allowed})
+
+
+def _synthesize_ocr_blocks(
+    results: Sequence[tuple[list, str]], page_index: int
+) -> list[Block]:
+    """Turn ``[(box, text), ...]`` (box already in PDF points) into blocks.
+
+    Text is deduped/cleaned, ordered with the same column-aware reading order
+    as native text, and given a font size estimated from the box height.
+    """
+    items: list[tuple] = []
+    for box, text in results:
+        cleaned = " ".join(str(text).split())
+        if not cleaned:
+            continue
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
+        items.append((min(ys), min(xs), max(xs), max(ys), cleaned))
+    blocks: list[Block] = []
+    for y0, x0, x1, y1, text in _order_blocks(items):
+        size = min(24.0, max(5.0, (y1 - y0) / 1.2))
+        blocks.append(
+            Block(
+                text=text, page=page_index, x0=x0, y0=y0, x1=x1, y1=y1,
+                size=round(size, 2), align="left", bold=False, single_line=True,
+            )
+        )
+    return blocks
+
+
+def _looks_scanned(page: "fitz.Page") -> bool:
+    """True for a page with no text layer that does carry an image (a scan)."""
+    try:
+        return bool(page.get_images(full=True))
+    except Exception:
+        return False
+
+
+def _ocr_page_blocks(
+    page_index: int,
+    page: "fitz.Page",
+    ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None,
+) -> list[Block]:
+    """OCR one page and return its blocks (empty if OCR is unavailable/failed).
+
+    ``ocr_fn`` is injected by tests (returns ``[(box, text)]`` in PDF points);
+    production falls back to the shared RapidOCR engine.
+    """
+    if ocr_fn is not None:
+        try:
+            return _synthesize_ocr_blocks(list(ocr_fn(page_index, page)), page_index)
+        except Exception:
+            return []
+    engine = _ocr_engine()
+    if engine is None:
+        return []
+    try:
+        img, zoom = _page_to_array(page)
+        out = engine(img)
+        results: list[tuple[list, str]] = []
+        # RapidOCR returns (list of [box, text, score] or None, timings).
+        items = out[0] if isinstance(out, tuple) else out
+        if not items:
+            return []
+        for item in items:
+            if not item or len(item) < 2:
+                continue
+            box = item[0]
+            text = item[1]
+            if not text:
+                continue
+            pdf_box = [[float(px) / zoom, float(py) / zoom] for px, py in box]
+            results.append((pdf_box, text))
+        return _synthesize_ocr_blocks(results, page_index)
+    except Exception:
+        return []
 
 
 def _collect_spans(page: fitz.Page) -> list[tuple[fitz.Rect, float, bool]]:

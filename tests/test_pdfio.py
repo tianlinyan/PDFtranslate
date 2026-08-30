@@ -26,6 +26,16 @@ def _text_lines(page):
     return out
 
 
+def _no_text_pdf(path, pages=1):
+    """A PDF whose pages carry no text layer (as if they were blank scans)."""
+    doc = fitz.open()
+    for _ in range(pages):
+        doc.new_page(width=595, height=842)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
 def setUpModule():  # noqa: N802
     _OUT.mkdir(exist_ok=True)
 
@@ -216,6 +226,79 @@ class PdfioTest(unittest.TestCase):
             for l in b["lines"] for s in l["spans"]
         }
         self.assertEqual(fonts, {"Droid Sans Fallback Regular"})
+
+    def test_ocr_populates_scanned_page_blocks(self):
+        src = _OUT / "scanned_ocr.pdf"
+        _no_text_pdf(src)
+
+        def fake_ocr(_page_index, _page):
+            return [
+                ([[50, 70], [200, 70], [200, 90], [50, 90]], "HELLO"),
+                ([[50, 110], [300, 110], [300, 130], [50, 130]], "WORLD 123"),
+            ]
+
+        doc = pdfio.extract_document_text(src, ocr=True, ocr_fn=fake_ocr)
+        self.assertEqual(doc.blocks, ["HELLO", "WORLD 123"])
+        self.assertEqual(doc.ocr_count, 1)
+        self.assertEqual(doc.block_pages, [0, 0])
+        # OCR blocks carry real bboxes so in-place/bilingual export can place them.
+        b0 = doc.pages[0][0]
+        self.assertEqual((b0.x0, b0.y0, b0.x1, b0.y1), (50, 70, 200, 90))
+        self.assertGreater(b0.size, 0)
+
+    def test_ocr_blocks_ordered_by_columns(self):
+        src = _OUT / "scanned_cols.pdf"
+        _no_text_pdf(src)
+
+        def fake_ocr(_page_index, _page):
+            # Right column reported first; reading order must still be column-major.
+            return [
+                ([[300, 70], [400, 70], [400, 90], [300, 90]], "RIGHT"),
+                ([[50, 70], [150, 70], [150, 90], [50, 90]], "LEFT"),
+            ]
+
+        doc = pdfio.extract_document_text(src, ocr=True, ocr_fn=fake_ocr)
+        self.assertEqual(doc.blocks, ["LEFT", "RIGHT"])
+
+    def test_ocr_only_on_pages_without_text_and_when_enabled(self):
+        calls = []
+
+        def fake_ocr(page_index, _page):
+            calls.append(page_index)
+            return []
+
+        # A normal text page is never OCR'd.
+        src = _OUT / "text_ocr.pdf"
+        build_sample_pdf(src, pages=1)
+        doc = pdfio.extract_document_text(src, ocr=True, ocr_fn=fake_ocr)
+        self.assertEqual(doc.ocr_count, 0)
+        self.assertEqual(calls, [])
+
+        # ocr=False must not OCR a text-less page.
+        src2 = _OUT / "blank_off.pdf"
+        _no_text_pdf(src2)
+        doc2 = pdfio.extract_document_text(src2, ocr=False, ocr_fn=fake_ocr)
+        self.assertEqual(doc2.blocks, [])
+        self.assertEqual(calls, [])
+
+        # ocr=True on a text-less page runs OCR (even if it finds nothing).
+        src3 = _OUT / "blank_on.pdf"
+        _no_text_pdf(src3)
+        doc3 = pdfio.extract_document_text(src3, ocr=True, ocr_fn=fake_ocr)
+        self.assertEqual(doc3.blocks, [])
+        self.assertEqual(calls, [0])
+
+    def test_ocr_cache_roundtrip(self):
+        p = _OUT / "ocr_cache_unit.json"
+        p.unlink(missing_ok=True)
+        block = pdfio.Block(text="X", page=0, x0=1, y0=2, x1=3, y1=4,
+                            size=12.0, align="left", bold=False, single_line=True)
+        pdfio._save_ocr_cache(p, {0: [pdfio._block_to_dict(block)]})
+        data = pdfio._load_ocr_cache(p)
+        self.assertEqual(set(data.keys()), {0})
+        rebuilt = pdfio._block_from_dict(data[0][0])
+        self.assertEqual((rebuilt.text, rebuilt.x0, rebuilt.x1), ("X", 1.0, 3.0))
+        p.unlink(missing_ok=True)
 
 
 class WrapTest(unittest.TestCase):
