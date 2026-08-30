@@ -11,16 +11,33 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-#: Path to the models.json located next to the package.
-DEFAULT_MODELS_PATH = Path(__file__).resolve().parent.parent / "models.json"
 
-#: Path to the default glossary (``glossary.json``) located next to the package.
-#: A model may point at its own glossary file via the ``glossary`` config key.
-DEFAULT_GLOSSARY_PATH = Path(__file__).resolve().parent.parent / "glossary.json"
+def resource_dir() -> Path:
+    """Base directory for external config files (``models.json``, ``glossary.json``).
+
+    When the app is frozen by PyInstaller it may be moved anywhere, so config
+    files are looked up **next to the executable** (the directory that holds the
+    ``.exe``).  When running from source, the package's parent directory (the
+    project root) is used, matching the developer layout.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+#: Path to the models.json located next to the executable (or project root when
+#: running from source) — the user can edit this file to declare their models.
+DEFAULT_MODELS_PATH = resource_dir() / "models.json"
+
+#: Path to the default glossary (``glossary.json``) located next to the
+#: executable.  A model may point at its own glossary file via the ``glossary``
+#: config key.
+DEFAULT_GLOSSARY_PATH = resource_dir() / "glossary.json"
 
 #: Path to the user preferences file.
 APP_PREFS_PATH = Path.home() / ".pdftranslate" / "prefs.json"
