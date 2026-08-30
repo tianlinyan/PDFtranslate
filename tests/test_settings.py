@@ -2,7 +2,12 @@
 import os
 import unittest
 
-from translate_app.settings import ModelConfig, load_glossary, substitute_env
+from translate_app.settings import (
+    ModelConfig,
+    load_glossary,
+    save_glossary,
+    substitute_env,
+)
 
 
 class SettingsTest(unittest.TestCase):
@@ -129,6 +134,21 @@ class SettingsTest(unittest.TestCase):
             for p in (p1, p2, p3):
                 if os.path.exists(p):
                     os.unlink(p)
+
+    def test_save_glossary_roundtrip(self):
+        import os
+        import tempfile
+
+        fd, p = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            save_glossary(p, {"key": "密钥", "protocol": "协议"})
+            self.assertEqual(
+                load_glossary(p), {"key": "密钥", "protocol": "协议"}
+            )
+        finally:
+            if os.path.exists(p):
+                os.unlink(p)
 
 
 if __name__ == "__main__":

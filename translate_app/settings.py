@@ -212,6 +212,17 @@ def load_glossary(path: Path | str | None = None) -> dict[str, str]:
     return {}
 
 
+def save_glossary(path: Path | str, glossary: dict[str, str]) -> None:
+    """Write ``{"terms": {source: target}}`` to ``path`` (best effort)."""
+    try:
+        Path(path).write_text(
+            json.dumps({"terms": glossary}, ensure_ascii=False, indent=2),
+            "utf-8",
+        )
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # User preferences
 # ---------------------------------------------------------------------------

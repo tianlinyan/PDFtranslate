@@ -31,6 +31,7 @@ class TranslateWorker(QObject):
     log = pyqtSignal(str)
     finished = pyqtSignal(str)             # output path
     error = pyqtSignal(str)
+    preview_ready = pyqtSignal(list, list)  # translated per page, source per page
 
     def __init__(
         self,
@@ -88,6 +89,10 @@ class TranslateWorker(QObject):
             per_page = pdfio.group_by_page(
                 doc.block_pages, result.translated, doc.page_count
             )
+            # Hand the bilingual content to the main thread so the user can
+            # preview before (or after) the file is written.
+            source_per_page = pdfio.group_by_page(doc.block_pages, doc.blocks, doc.page_count)
+            self.preview_ready.emit(per_page, source_per_page)
             self.log.emit("正在生成输出文件…")
             self.progress.emit(len(doc.blocks), len(doc.blocks), "导出…")
 

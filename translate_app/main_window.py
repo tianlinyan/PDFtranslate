@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from . import __app_name__, __version__
+from .dialogs import PreviewDialog, SettingsDialog
 from .settings import ModelConfig, load_models, load_prefs, save_prefs
 from .translator import clear_translation_cache
 from .worker import OUTPUT_TYPES, TranslateWorker
@@ -60,12 +61,14 @@ class MainWindow(QWidget):
         self._last_output: str | None = None
         self._closing = False
         self._models_error = ""
+        self._preview: tuple[list[list[str]], list[list[str]]] | None = None
 
         self.setWindowTitle(f"{__app_name__} — AI 翻译 v{__version__}")
         self.resize(620, 560)
         self.setAcceptDrops(True)
 
         prefs = self._load_prefs()
+        self._ocr = bool(prefs.get("ocr", True))
 
         # --- Source file ---
         self._src_edit = QLineEdit()
@@ -144,15 +147,22 @@ class MainWindow(QWidget):
         self._open_btn = QPushButton("打开输出")
         self._open_btn.setEnabled(False)
         self._open_btn.clicked.connect(self._open_output)
+        self._preview_btn = QPushButton("预览译文")
+        self._preview_btn.setEnabled(False)
+        self._preview_btn.clicked.connect(self._open_preview)
         self._clear_cache_btn = QPushButton("清除缓存")
         self._clear_cache_btn.clicked.connect(self._clear_cache)
+        self._settings_btn = QPushButton("设置")
+        self._settings_btn.clicked.connect(self._open_settings)
 
         btn_row = QHBoxLayout()
+        btn_row.addWidget(self._settings_btn)
         btn_row.addWidget(self._clear_cache_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._start_btn)
         btn_row.addWidget(self._cancel_btn)
         btn_row.addStretch()
+        btn_row.addWidget(self._preview_btn)
         btn_row.addWidget(self._open_btn)
 
         root = QVBoxLayout(self)
@@ -255,15 +265,18 @@ class MainWindow(QWidget):
         self._start_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._open_btn.setEnabled(False)
+        self._preview_btn.setEnabled(False)
+        self._preview = None
 
         self._thread = QThread(self)
         self._worker = TranslateWorker(
-            self._source, model, str(lang), key, out_path
+            self._source, model, str(lang), key, out_path, ocr=self._ocr
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
         self._worker.log.connect(self._append_log)
+        self._worker.preview_ready.connect(self._on_preview)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._thread.quit)
@@ -350,6 +363,28 @@ class MainWindow(QWidget):
             QMessageBox.information(
                 self, "输出文件", f"文件已保存到：\n{self._last_output}"
             )
+
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(self, ocr_enabled=self._ocr)
+        if dialog.exec():
+            self._ocr = dialog.use_ocr()
+            try:
+                prefs = load_prefs()
+                prefs["ocr"] = self._ocr
+                save_prefs(prefs)
+            except Exception:
+                pass
+            self._append_log(f"已保存设置（扫描页 OCR：{'开' if self._ocr else '关'}）")
+
+    def _on_preview(self, per_page: list[list[str]], source_per_page: list[list[str]]) -> None:
+        self._preview = (per_page, source_per_page)
+        self._preview_btn.setEnabled(True)
+
+    def _open_preview(self) -> None:
+        if not self._preview:
+            return
+        PreviewDialog(self, per_page_translated=self._preview[0],
+                      per_page_source=self._preview[1]).exec()
 
     def _cleanup(self) -> None:
         if self._worker is not None:
