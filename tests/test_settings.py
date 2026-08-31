@@ -1,10 +1,16 @@
 """Tests for model configuration parsing and validation."""
+import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
+from translate_app import settings
 from translate_app.settings import (
     ModelConfig,
     load_glossary,
+    load_models,
     save_glossary,
     substitute_env,
 )
@@ -149,6 +155,76 @@ class SettingsTest(unittest.TestCase):
         finally:
             if os.path.exists(p):
                 os.unlink(p)
+
+
+class RobustConfigTest(unittest.TestCase):
+    """One hand-edit typo must not break the whole configuration."""
+
+    def test_from_dict_degrades_bad_numbers(self):
+        # Bad values degrade to defaults with a warning; parsing never raises,
+        # and the problems are non-blocking (warnings, not validate()).
+        m = ModelConfig.from_dict(
+            {"id": "m", "endpoint": "http://x/v1", "model": "mod",
+             "temperature": "0,2", "max_tokens": "many",
+             "concurrency": "x", "batch_size": "y"}
+        )
+        self.assertIsNone(m.temperature)
+        self.assertIsNone(m.max_tokens)
+        self.assertEqual(m.concurrency, 1)
+        self.assertEqual(m.batch_size, 4000)
+        self.assertEqual(m.validate(), [])  # still usable
+        warns = "\n".join(m.warnings())
+        for key in ("temperature", "max_tokens", "concurrency", "batch_size"):
+            self.assertIn(key, warns)
+
+    def test_unknown_extra_ignored_and_flagged(self):
+        # An unknown key (typo) must NOT reach OpenAI(**kwargs) (it would
+        # raise TypeError mid-run); whitelisted keys still pass through.
+        m = ModelConfig.from_dict(
+            {"id": "m", "endpoint": "http://x/v1", "model": "mod",
+             "time_out": 5, "timeout": 30}
+        )
+        kwargs = m.client_kwargs()
+        self.assertEqual(kwargs["timeout"], 30)
+        self.assertNotIn("time_out", kwargs)
+        self.assertIn("time_out", "\n".join(m.warnings()))
+        self.assertEqual(m.validate(), [])
+
+    def test_load_models_survives_bad_entry(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"models": [
+                    {"id": "bad", "endpoint": "http://x/v1", "model": "m",
+                     "temperature": "hot"},
+                    {"id": "ok", "endpoint": "http://y/v1", "model": "m2"},
+                ]}, fh)
+            models = load_models(path)
+            self.assertEqual([m.id for m in models], ["bad", "ok"])
+            self.assertIn("temperature", "\n".join(models[0].warnings()))
+            self.assertEqual(models[1].validate(), [])
+            self.assertEqual(models[1].warnings(), [])
+        finally:
+            os.unlink(path)
+
+    def test_glossary_relative_path_uses_resource_dir(self):
+        # A relative glossary path resolves against resource_dir (next to the
+        # exe / project root), never the current working directory.
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "g.json").write_text(
+                json.dumps({"key": "密钥"}), "utf-8"
+            )
+            cwd = os.getcwd()
+            other = tempfile.mkdtemp()  # a CWD that does NOT hold g.json
+            try:
+                os.chdir(other)
+                with mock.patch.object(
+                    settings, "resource_dir", return_value=Path(td)
+                ):
+                    self.assertEqual(load_glossary("g.json"), {"key": "密钥"})
+            finally:
+                os.chdir(cwd)
+                os.rmdir(other)
 
 
 if __name__ == "__main__":

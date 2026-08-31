@@ -20,6 +20,8 @@ Key behaviours
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import re
 import tempfile
 import threading
@@ -39,6 +41,8 @@ from openai import (
 )
 
 from .settings import DEFAULT_GLOSSARY_PATH, ModelConfig, load_glossary
+
+_logger = logging.getLogger(__name__)
 
 #: Matches one ``[n]`` block in a model reply.  The block content may span
 #: several lines (some models wrap long translations); everything up to the
@@ -64,8 +68,9 @@ _CACHE_VERSION = 3
 _FLUSH_ENTRIES = 200
 
 #: Rewrite the whole cache as a single snapshot (and drop the journal) once the
-#: journal has grown past this many lines.  Keeps the journal from growing
-#: unbounded without rewriting the snapshot on every run.
+#: journal — including entries from earlier runs — plus this run's writes
+#: exceeds this many lines.  Keeps the journal from growing unbounded without
+#: rewriting the snapshot on every run.
 _COMPACT_ENTRIES = 5000
 
 #: Fraction of ``max_tokens`` reserved for a batch's *output*.  A batch whose
@@ -109,7 +114,20 @@ class TranslationResult:
 
 
 def _cache_dir() -> Path:
-    """Return a writable cache directory, falling back to the system temp dir."""
+    """Return a writable cache directory, falling back to the system temp dir.
+
+    ``PDFTRANSLATE_CACHE_DIR`` overrides the location (useful for tests and for
+    users who want the cache somewhere specific); the default is the user's
+    ``~/.pdftranslate/cache``.
+    """
+    override = os.environ.get("PDFTRANSLATE_CACHE_DIR")
+    if override:
+        try:
+            p = Path(override)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("无法使用自定义缓存目录 %s: %s", override, exc)
     for path in (
         Path.home() / ".pdftranslate" / "cache",
         Path(tempfile.gettempdir()) / "pdftranslate_cache",
@@ -117,7 +135,8 @@ def _cache_dir() -> Path:
         try:
             path.mkdir(parents=True, exist_ok=True)
             return path
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("缓存目录不可用 %s: %s", path, exc)
             continue
     return Path.home() / ".pdftranslate" / "cache"
 
@@ -212,11 +231,11 @@ def load_translation_cache(
                         continue
                     try:
                         data.update(json.loads(line))
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         # A torn line from a crash is skipped, not fatal.
                         continue
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _logger.debug("读取缓存文件失败 %s: %s", file, exc)
     return data
 
 
@@ -228,8 +247,8 @@ def clear_translation_cache() -> int:
             if path.is_file():
                 path.unlink()
                 removed += 1
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _logger.debug("删除缓存文件失败 %s: %s", path, exc)
     return removed
 
 
@@ -353,11 +372,23 @@ class TranslationEngine:
 
         Each ``[n]`` block may span several lines; internal line breaks are
         folded into spaces so one reply block becomes one translated block.
+        A reply without any ``[n]`` marker falls back to positional line
+        matching, but only when it carries **exactly** one line per block — an
+        exact match is the only prefix-free way to be sure the model did not add
+        a preamble or drop a block (one extra leading line would silently shift
+        every subsequent translation).  A mismatched reply raises instead of
+        padding with the source text (which would be cached as if translated).
         """
-        result: list[str] = []
         matched: dict[int, str] = {}
         for m in _MULTI_BLOCK_RE.finditer(text):
             pos = int(m.group(1)) - 1
+            if pos in matched:
+                # A duplicate ``[n]`` means the model echoed the same block
+                # twice; treat it like any other malformed reply (the caller
+                # retries rather than silently dropping one of the copies).
+                raise ValueError(
+                    f"模型回复重复回显块 [{m.group(1)}]，无法对齐"
+                )
             matched[pos] = " ".join(m.group(2).split())
         if matched:
             # Every requested block must have been echoed (once each).  A partial
@@ -376,14 +407,24 @@ class TranslationEngine:
             result = [matched[p] for p in range(len(indices))]
             return result
 
-        # Fallback: assume output lines correspond in order.
+        # Fallback: the model ignored the ``[n]`` protocol; assume its output
+        # lines correspond to the requested blocks in order.  This is only
+        # trustworthy when the reply carries EXACTLY one line per block — a
+        # count above the block count usually means the model prepended an
+        # intro or dropped a block, and shifting everything by one line would
+        # silently misalign every subsequent translation.  Padding missing
+        # blocks with the *source* text would look like a successful
+        # translation to the caller (ok=True) and write untranslated text
+        # into the cache, permanently poisoning resume runs.  Raise so the
+        # batch is retried and, after retries are exhausted, the source is
+        # preserved WITHOUT being cached.
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        for n, i in enumerate(indices):
-            if n < len(lines):
-                result.append(lines[n])
-            else:
-                result.append(blocks[i])
-        return result
+        if len(lines) != len(indices):
+            raise ValueError(
+                "模型未按编号回复且行数不匹配"
+                f"（期望 {len(indices)} 行，实际 {len(lines)} 行），无法对齐"
+            )
+        return lines
 
     @staticmethod
     def _is_transient(exc: Exception) -> bool:
@@ -479,11 +520,17 @@ class TranslationEngine:
         # Load the on-disk cache so repeated runs are cheap.
         cache: dict[str, str] = {}
         cache_path: Path | None = None
+        journal_lines = 0
         if resume and doc_path is not None:
             cache = load_translation_cache(doc_path, target_language, self.model.id, self._glossary)
             cache_path = _cache_dir() / _cache_key(
                 doc_path, target_language, self.model.id, self._glossary
             )
+            # Count what the journal already holds: compaction must trigger on
+            # the journal's *total* size, not just this run's additions (a run
+            # that translates a few new blocks each time would otherwise grow
+            # the journal across runs without ever compacting).
+            journal_lines = _journal_entry_count(_cache_journal_path(cache_path))
 
         # Progress starts at the count already present in the cache plus the
         # blocks skipped outright, so the bar reflects genuinely *done* work.
@@ -499,18 +546,36 @@ class TranslationEngine:
         # writes — sparing the SSD while still bounding crash loss.
         pending: dict[str, str] = {}
         flushed_since_compact = 0
+        write_warned = False
 
         def _flush_pending() -> None:
-            nonlocal flushed_since_compact
+            nonlocal flushed_since_compact, write_warned
             if cache_path is None or not pending:
                 return
-            _append_cache_journal(_cache_journal_path(cache_path), pending)
-            flushed_since_compact += len(pending)
-            pending.clear()
+            # ``pending`` is only ever touched from this (consumer) thread —
+            # the batch worker threads never mutate it, so the snapshot here is
+            # single-threaded in practice.  The lock is kept defensively so the
+            # invariant stays explicit and safe to rely on: a flush can be
+            # triggered mid-loop between completions, and iterating a dict
+            # while another thread could mutate it would raise "dictionary
+            # changed size during iteration" — or, worse, clear() would
+            # silently drop entries a batch just finished.
+            with self._cache_lock:
+                entries = dict(pending)
+                pending.clear()
+            ok = _append_cache_journal(_cache_journal_path(cache_path), entries)
+            if ok:
+                flushed_since_compact += len(entries)
+            elif not write_warned:
+                # A silently failing cache is worse than no cache: every run
+                # would restart from zero with no hint why.  Tell the user once.
+                write_warned = True
+                log("警告：翻译缓存写入磁盘失败，本次译文将无法断点续翻（请检查磁盘空间与权限）")
 
         if chunks:
             max_workers = max(1, int(self.model.concurrency or 1))
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            pool = ThreadPoolExecutor(max_workers=max_workers)
+            try:
                 futures = {
                     pool.submit(
                         self._translate_batch,
@@ -548,6 +613,13 @@ class TranslationEngine:
                             result.errors.append(f"块 {i + 1} 翻译失败，保留原文")
                     done += len(chunk)
                     progress(done, n)
+            finally:
+                # Never block on queued work: on cancel the not-yet-started
+                # batches are dropped outright instead of each starting up
+                # only to check cancel and raise.  In-flight HTTP requests
+                # still finish on their own (httpx gives no way to interrupt
+                # them), but this thread no longer waits for them.
+                pool.shutdown(wait=False, cancel_futures=True)
 
         # Merge the in-memory cache back into the output, then flush whatever is
         # buffered and compact only when the journal has grown large — so a
@@ -558,7 +630,10 @@ class TranslationEngine:
                 result.translated[i] = cache[key]
 
         _flush_pending()
-        if cache_path is not None and flushed_since_compact >= _COMPACT_ENTRIES:
+        if (
+            cache_path is not None
+            and journal_lines + flushed_since_compact >= _COMPACT_ENTRIES
+        ):
             _compact_cache(cache_path, _cache_journal_path(cache_path), cache)
 
         progress(n, n)
@@ -617,29 +692,57 @@ def _cache_journal_path(cache_path: Path) -> Path:
     return cache_path.with_suffix(".jsonl")
 
 
-def _append_cache_journal(journal_path: Path, entries: dict[str, str]) -> None:
-    """Append new entries as JSON lines; one small write per batch, no rewrite."""
+def _journal_entry_count(journal_path: Path) -> int:
+    """How many entries the journal currently holds (0 if it does not exist).
+
+    Used to decide compaction on the journal's *total* size, so runs that each
+    add only a few entries still compact eventually instead of growing the
+    journal forever across runs.
+    """
+    try:
+        with journal_path.open("r", encoding="utf-8") as fh:
+            return sum(1 for line in fh if line.strip())
+    except OSError:
+        return 0
+
+
+def _append_cache_journal(journal_path: Path, entries: dict[str, str]) -> bool:
+    """Append new entries as JSON lines; one small write per batch, no rewrite.
+
+    Returns ``True`` on success; ``False`` means the entries were not made
+    durable (the caller surfaces this to the user once per run).
+    """
     if not entries:
-        return
+        return True
     try:
         import json
 
         with journal_path.open("a", encoding="utf-8") as fh:
             for key, value in entries.items():
                 fh.write(json.dumps({key: value}, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("写入缓存日志失败: %s", exc)
+        return False
 
 
 def _compact_cache(
     cache_path: Path, journal_path: Path, cache: dict[str, str]
 ) -> None:
-    """Write the merged cache as a single snapshot and drop the journal."""
+    """Write the merged cache as a single snapshot and drop the journal.
+
+    The snapshot goes to a temp file first and is ``os.replace``d into place:
+    a crash mid-write must never corrupt the existing snapshot, because load
+    skips an unreadable snapshot and the journal it just replaced would be
+    gone — silently discarding every older translation.
+    """
     try:
         import json
 
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+        tmp = cache_path.with_name(cache_path.name + ".tmp")
+        tmp.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+        os.replace(tmp, cache_path)
         if journal_path.exists():
             journal_path.unlink()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("合并缓存快照失败: %s", exc)

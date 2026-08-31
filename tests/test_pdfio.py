@@ -73,9 +73,13 @@ class PdfioTest(unittest.TestCase):
         doc = pdfio.extract_document_text(src)
         per_page = pdfio.group_by_page(doc.block_pages, doc.blocks, doc.page_count)
         out = _OUT / "bilingual.pdf"
-        pdfio.save_interleaved_pdf(src, per_page, out, "Chinese")
+        pdfio.save_interleaved_pdf(src, per_page, out, "Chinese", doc.pages)
         d = fitz.open(str(out))
         self.assertGreaterEqual(d.page_count, 4)  # 2 original + 2 translation pages
+        # Translation pages must actually carry text (not just the empty-page
+        # note): per_page here is the source text, so it must be mirrored.
+        trans_text = d[1].get_text() + d[3].get_text()
+        self.assertIn("This is a sample", trans_text)
         d.close()
 
     def test_translated_pdf_removes_original_text(self):
@@ -159,6 +163,48 @@ class PdfioTest(unittest.TestCase):
         self.assertEqual(footer.text, "Page 1 of 9")
         self.assertEqual(footer.align, "right")
 
+    def test_dense_bullet_list_splits_into_lines(self):
+        # A tightly-packed bullet list is returned by PyMuPDF as ONE block; the
+        # extractor must split it back into per-line blocks so the translation
+        # keeps the original one-bullet-per-line layout.  A bilingual page then
+        # mirrors the list instead of collapsing it into a flowing paragraph.
+        src = _OUT / "dense_list.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        font = fitz.Font("cjk")
+        items = [
+            "Highly Detailed 3D Model with 4K HD Textures",
+            "Accurate Flight Model with Custom Ground Handling Simulation",
+            "2 Hand-Crafted Liveries in collaboration with Mike Patey and his Team",
+            "Custom PT6A-140 WWISE Sound Pack with optional Headphone Simulation",
+        ]
+        y = 40
+        for item in items:
+            tw = fitz.TextWriter(page.rect)
+            tw.append(fitz.Point(40, y), "\u2726 " + item, font=font, fontsize=9)
+            tw.write_text(page)
+            y += 12
+        doc.save(str(src))
+        doc.close()
+
+        d = pdfio.extract_document_text(src)
+        # The whole list was a single block before; now one block per line.
+        self.assertEqual(len(d.pages[0]), len(items))
+        for b in d.pages[0]:
+            self.assertTrue(b.single_line)
+
+        # Each line moves to its own translation page row.
+        trans = [[f"\u7ffb\u8bd1{i}" for i in range(len(items))]]
+        out = _OUT / "dense_list_bi.pdf"
+        pdfio.save_interleaved_pdf(src, trans, out, "Chinese", d.pages)
+        dd = fitz.open(str(out))
+        lines = _text_lines(dd[1])
+        self.assertEqual(len(lines), len(items))
+        for block, (rect, _t) in zip(d.pages[0], lines):
+            self.assertGreaterEqual(rect.y0, block.y0 - 2.0)
+            self.assertLessEqual(rect.y0, block.y1 + 2.0)
+        dd.close()
+
     def test_bilingual_pdf_mirrors_block_positions(self):
         src = _OUT / "sample_m.pdf"
         build_sample_pdf(src, pages=1)
@@ -176,6 +222,28 @@ class PdfioTest(unittest.TestCase):
             self.assertGreaterEqual(rect.y0, block.y0 - 2.0)
             self.assertLessEqual(rect.y0, block.y1 + 2.0)
         d.close()
+
+    def test_group_by_page_rejects_length_mismatch(self):
+        # block_pages and values must align; a mismatch must be refused loudly
+        # (zip would otherwise silently drop the extra translation).
+        with self.assertRaises(ValueError):
+            pdfio.group_by_page([0, 1], ["a", "b", "c"], 2)
+
+    def test_group_by_page_rejects_out_of_range_page(self):
+        with self.assertRaises(ValueError):
+            pdfio.group_by_page([0, 5], ["a", "b"], 2)
+
+    def test_bilingual_pdf_refuses_block_count_mismatch(self):
+        src = _OUT / "mismatch_bi.pdf"
+        build_sample_pdf(src, pages=1)
+        doc = pdfio.extract_document_text(src)
+        per_page = pdfio.group_by_page(doc.block_pages, doc.blocks, doc.page_count)
+        # One fewer translation than layout blocks: must raise, not drop a block.
+        bad = [[t for t in pg[:-1]] for pg in per_page]
+        with self.assertRaises(ValueError):
+            pdfio.save_interleaved_pdf(
+                src, bad, _OUT / "mismatch_bi_out.pdf", "Chinese", doc.pages
+            )
 
     def test_single_line_block_vertically_centered(self):
         doc = fitz.open()
@@ -218,14 +286,15 @@ class PdfioTest(unittest.TestCase):
         pdfio._draw_translated_block(page, font, block, "粗体标题")
         (rect, text), = _text_lines(page)
         self.assertEqual(text, "粗体标题")
-        # Bold must NOT pull in a second font: every rendered span uses the
-        # standard cjk font (a mixed Heiti/Droid look was a visible defect).
+        # Bold must NOT pull in a second font: every rendered span uses a single
+        # font family (a mixed Heiti/Droid look was a visible defect).  The exact
+        # family name is not hard-coded — it may differ across PyMuPDF versions.
         fonts = {
             s["font"]
             for b in page.get_text("dict")["blocks"] if b.get("type") == 0
             for l in b["lines"] for s in l["spans"]
         }
-        self.assertEqual(fonts, {"Droid Sans Fallback Regular"})
+        self.assertEqual(len(fonts), 1, fonts)
 
     def test_ocr_populates_scanned_page_blocks(self):
         src = _OUT / "scanned_ocr.pdf"
@@ -299,6 +368,16 @@ class PdfioTest(unittest.TestCase):
         rebuilt = pdfio._block_from_dict(data[0][0])
         self.assertEqual((rebuilt.text, rebuilt.x0, rebuilt.x1), ("X", 1.0, 3.0))
         p.unlink(missing_ok=True)
+
+    def test_ocr_cache_path_invalidated_by_content_change(self):
+        # The OCR cache key carries mtime+size: a replaced/edited PDF must not
+        # reuse the old page's OCR results.
+        f = _OUT / "ocr_stamp.pdf"
+        f.write_bytes(b"%PDF-1.4 original content")
+        first = pdfio._ocr_cache_path(f)
+        self.assertEqual(first, pdfio._ocr_cache_path(f))  # stable for one file
+        f.write_bytes(b"%PDF-1.4 a totally different document, larger")
+        self.assertNotEqual(first, pdfio._ocr_cache_path(f))
 
 
 class WrapTest(unittest.TestCase):

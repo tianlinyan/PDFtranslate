@@ -1,14 +1,20 @@
 """Tests for the translation engine (batching, alignment, progress, cache)."""
 import json
+import os
+import shutil
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
+from translate_app import translator as translator_mod
 from translate_app.settings import ModelConfig
 from translate_app.translator import (
     TranslationCancelled,
     TranslationEngine,
     _OUTPUT_HEADROOM,
+    _block_hash,
     _cache_dir,
     _cache_key,
     _estimate_tokens,
@@ -25,6 +31,25 @@ BLOCKS = [
     "Fifth paragraph to translate.",
     "Sixth paragraph to translate.",
 ]
+
+#: Temp dir the tests redirect the on-disk translation cache to; created in
+#: ``setUpModule`` so the suite never touches (or is blocked by) the real user
+#: cache and cleans up after itself.
+_TEST_CACHE_DIR: str | None = None
+
+
+def setUpModule():
+    global _TEST_CACHE_DIR
+    _TEST_CACHE_DIR = tempfile.mkdtemp(prefix="pdftranslate_test_cache")
+    os.environ["PDFTRANSLATE_CACHE_DIR"] = _TEST_CACHE_DIR
+
+
+def tearDownModule():
+    global _TEST_CACHE_DIR
+    if _TEST_CACHE_DIR:
+        shutil.rmtree(_TEST_CACHE_DIR, ignore_errors=True)
+        _TEST_CACHE_DIR = None
+    os.environ.pop("PDFTRANSLATE_CACHE_DIR", None)
 
 
 class TranslatorTest(unittest.TestCase):
@@ -363,6 +388,127 @@ class TranslatorTest(unittest.TestCase):
             _cache_key(p, "Chinese", "m", {"key": "密钥"}),
             _cache_key(p, "Chinese", "m", {"key": "password"}),
         )
+
+    def test_unnumbered_line_fallback_maps_in_order(self):
+        # A model that ignores the ``[n]`` protocol entirely still works via
+        # positional line matching when it returns one line per block.
+        parsed = TranslationEngine._parse_response(
+            "译文一\n译文二", ["a", "b"], [0, 1]
+        )
+        self.assertEqual(parsed, ["译文一", "译文二"])
+
+    def test_unnumbered_short_reply_is_rejected(self):
+        # Without ``[n]`` markers AND with fewer lines than blocks, the reply
+        # must be rejected — padding the missing blocks with the source text
+        # would cache untranslated text and poison resume.
+        with self.assertRaises(ValueError):
+            TranslationEngine._parse_response("only line", ["a", "b", "c"], [0, 1, 2])
+
+    def test_unnumbered_extra_line_is_rejected(self):
+        # A model that ignores the ``[n]`` protocol and prepends an intro line
+        # would shift every translation by one if we blindly took the first N
+        # lines; any count ABOVE the block count must be rejected and retried
+        # (never silently misaligned into the cache).
+        with self.assertRaises(ValueError):
+            TranslationEngine._parse_response(
+                "译者前言\n译文一\n译文二\n译文三", ["a", "b", "c"], [0, 1, 2]
+            )
+
+    def test_unnumbered_short_reply_is_not_cached(self):
+        # End-to-end: a persistently short unnumbered reply is retried, then
+        # the source is preserved, the failure recorded, and NOTHING is
+        # written to the cache (otherwise a resume would skip these blocks
+        # forever, treating the source as translated).
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-nm-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            engine._request_locked = lambda _p, _s: "only one line"  # type: ignore[method-assign]
+            blocks = ["First block.", "Second block."]
+            res = engine.translate_blocks(
+                blocks, "Chinese", doc_path=Path("_fake.pdf"),
+                retry_delays=(0.0, 0.0),
+            )
+            self.assertEqual(res.translated, blocks)
+            self.assertTrue(res.errors)
+            cache = load_translation_cache(Path("_fake.pdf"), "Chinese", model.id)
+            self.assertEqual(cache, {})
+
+    def test_compact_triggers_on_journal_total_size(self):
+        # A fully-cached run adds nothing new, but the journal ALREADY holds
+        # (patched) threshold-many entries from earlier runs: it must still be
+        # compacted into the snapshot, so the journal cannot grow unbounded
+        # across small incremental runs.
+        p = Path("_compact_test.pdf")
+        model_id = f"mock-cp-{uuid.uuid4().hex[:8]}"
+        base = _cache_dir() / _cache_key(p, "Chinese", model_id)
+        journal = base.with_suffix(".jsonl")
+        try:
+            blocks = ["Compact me one.", "Compact me two."]
+            with journal.open("w", encoding="utf-8") as fh:
+                for b in blocks:
+                    fh.write(
+                        json.dumps({_block_hash(b): "MOCK:" + b}, ensure_ascii=False)
+                        + "\n"
+                    )
+            model = ModelConfig(
+                id=model_id, name="mock", type="openai",
+                endpoint="http://x/v1", model="m",
+            )
+            engine = TranslationEngine(model)
+            with mock.patch.object(translator_mod, "_COMPACT_ENTRIES", 2):
+                res = engine.translate_blocks(blocks, "Chinese", doc_path=p)
+            # Served from the journal, then the journal compacted away.
+            self.assertEqual(
+                res.translated, ["MOCK:Compact me one.", "MOCK:Compact me two."]
+            )
+            self.assertFalse(journal.exists())
+            snap = json.loads(base.read_text("utf-8"))
+            self.assertEqual(snap[_block_hash(blocks[0])], "MOCK:Compact me one.")
+            self.assertEqual(snap[_block_hash(blocks[1])], "MOCK:Compact me two.")
+            # The atomic-write temp file must not linger.
+            self.assertFalse(base.with_name(base.name + ".tmp").exists())
+        finally:
+            base.unlink(missing_ok=True)
+            journal.unlink(missing_ok=True)
+
+    def test_compact_cache_roundtrip(self):
+        base = _cache_dir() / _cache_key(Path("_compact_unit.pdf"), "Chinese", "unit-c")
+        journal = base.with_suffix(".jsonl")
+        try:
+            journal.write_text('{"k1": "v1"}\n', "utf-8")
+            translator_mod._compact_cache(base, journal, {"k1": "v1", "k2": "v2"})
+            self.assertEqual(
+                json.loads(base.read_text("utf-8")), {"k1": "v1", "k2": "v2"}
+            )
+            self.assertFalse(journal.exists())
+            self.assertFalse(base.with_name(base.name + ".tmp").exists())
+        finally:
+            base.unlink(missing_ok=True)
+            journal.unlink(missing_ok=True)
+
+    def test_cache_write_failure_is_logged(self):
+        # A silently failing cache is worse than no cache at all (every run
+        # restarts from zero with no hint why): the user must see one warning.
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-wf-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            messages: list[str] = []
+            with mock.patch.object(
+                translator_mod, "_append_cache_journal", return_value=False
+            ):
+                res = engine.translate_blocks(
+                    ["Write failure."], "Chinese",
+                    doc_path=Path("_fake.pdf"), log=messages.append,
+                )
+            # Translation itself still succeeds; only durability was lost.
+            self.assertEqual(res.translated, ["MOCK:Write failure."])
+            self.assertTrue(any("缓存" in m and "失败" in m for m in messages))
 
 
 if __name__ == "__main__":

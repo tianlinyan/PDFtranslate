@@ -9,12 +9,15 @@ environment so secrets never have to be stored in the file.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 
 def resource_dir() -> Path:
@@ -63,9 +66,31 @@ class ModelConfig:
     batch_size: int = 4000             # source-character budget per batch request
     glossary: str | None = None        # path to a per-model glossary file
     extra: dict[str, Any] = field(default_factory=dict)
+    #: Human-readable problems found while parsing ``models.json`` (bad values
+    #: are degraded to defaults instead of failing the whole file, and reported
+    #: here so :meth:`validate` can surface them).
+    parse_issues: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, item: dict[str, Any]) -> "ModelConfig":
+        label = str(item.get("id") or item.get("name") or "?")
+        issues: list[str] = []
+
+        def _num(key: str, cast: Any) -> Any:
+            """Parse a numeric field; a bad hand-edited value degrades to the
+            default (with a validation issue) instead of raising — one typo
+            must not leave *every* model in models.json unusable."""
+            raw = item.get(key)
+            if raw in (None, ""):
+                return None
+            try:
+                return cast(raw)
+            except (TypeError, ValueError):
+                issues.append(f"模型 {label} 的 {key} 值无效：{raw!r}（已改用默认值）")
+                return None
+
+        concurrency = _num("concurrency", int)
+        batch_size = _num("batch_size", int)
         return cls(
             id=str(item.get("id", "")),
             name=str(item.get("name", item.get("id", ""))),
@@ -75,18 +100,13 @@ class ModelConfig:
             api_key=substitute_env(item.get("api_key")) if item.get("api_key") else None,
             tools_choice=item.get("tools_choice"),
             reasoning_effort=(item.get("reasoning_effort") or None),
-            temperature=(
-                float(item["temperature"])
-                if item.get("temperature") not in (None, "")
-                else None
-            ),
-            max_tokens=(
-                int(item["max_tokens"]) if item.get("max_tokens") not in (None, "") else None
-            ),
-            concurrency=int(item.get("concurrency") or 1),
-            batch_size=int(item.get("batch_size") or 4000),
+            temperature=_num("temperature", float),
+            max_tokens=_num("max_tokens", int),
+            concurrency=concurrency if concurrency and concurrency >= 1 else 1,
+            batch_size=batch_size if batch_size and batch_size >= 1 else 4000,
             glossary=(item.get("glossary") or None),
             extra={k: v for k, v in item.items() if k not in cls._KNOWN_FIELDS},
+            parse_issues=issues,
         )
 
     #: Keys consumed explicitly by :meth:`from_dict`.
@@ -104,6 +124,20 @@ class ModelConfig:
         "concurrency",
         "batch_size",
         "glossary",
+    }
+
+    #: Keys from ``models.json`` that may be forwarded verbatim to the OpenAI
+    #: client constructor.  Anything else in ``extra`` is a typo (or a request
+    #: body param, which belongs in ``reasoning_effort`` etc.) and would make
+    #: ``OpenAI(**kwargs)`` raise ``TypeError`` mid-run; ignore it and report it
+    #: from :meth:`validate` instead.
+    _CLIENT_KEYS = {
+        "organization",
+        "timeout",
+        "max_retries",
+        "default_headers",
+        "default_query",
+        "http_client",
     }
 
     def request_params(self) -> dict[str, Any]:
@@ -146,12 +180,12 @@ class ModelConfig:
         # llama-server / local endpoints typically do not require a key.
         kwargs["api_key"] = key if key else "not-needed"
         for k, v in self.extra.items():
-            if k not in ("base_url", "api_key", "model", "endpoint"):
+            if k in self._CLIENT_KEYS:
                 kwargs[k] = v
         return kwargs
 
     def validate(self) -> list[str]:
-        """Return a list of configuration problems (empty if the model is usable)."""
+        """Blocking problems: the model cannot be used at all until fixed."""
         issues: list[str] = []
         label = self.id or self.name or "?"
         if not self.endpoint:
@@ -162,6 +196,20 @@ class ModelConfig:
             resolved = substitute_env(self.api_key)
             if not resolved or "${" in resolved:
                 issues.append(f"模型 {label} 的 api_key 环境变量未设置")
+        return issues
+
+    def warnings(self) -> list[str]:
+        """Non-blocking configuration problems (the model still works):
+        hand-edit typos that were degraded to defaults, and unknown keys that
+        are ignored rather than forwarded to the OpenAI client."""
+        label = self.id or self.name or "?"
+        issues: list[str] = list(self.parse_issues)
+        for key in self.extra:
+            if key not in self._CLIENT_KEYS:
+                issues.append(
+                    f"模型 {label} 含未识别的配置键 {key!r}，已忽略"
+                    "（请检查拼写；按请求参数如 reasoning_effort 直接写在条目顶层）"
+                )
         return issues
 
 
@@ -186,12 +234,12 @@ def load_models(path: Path | str = DEFAULT_MODELS_PATH) -> list[ModelConfig]:
     entries = data.get("models", [])
     return [ModelConfig.from_dict(e) for e in entries]
 
-
 def default_model_id() -> str:
     """Return the id of the first declared model, or an empty string."""
     try:
         models = load_models()
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("读取默认模型失败: %s", exc)
         return ""
     return models[0].id if models else ""
 
@@ -199,9 +247,12 @@ def default_model_id() -> str:
 def load_glossary(path: Path | str | None = None) -> dict[str, str]:
     """Load a glossary of ``source -> target`` term mappings.
 
-    ``path`` defaults to ``DEFAULT_GLOSSARY_PATH``; a missing/unreadable file
-    yields an empty glossary (never an error, so a file-less install still
-    works unchanged).  Three JSON shapes are accepted:
+    ``path`` defaults to ``DEFAULT_GLOSSARY_PATH``; a relative path resolves
+    against :func:`resource_dir` (next to the executable / project root), never
+    the current working directory, so a frozen app launched from elsewhere
+    still finds its file.  A missing/unreadable file yields an empty glossary
+    (never an error, so a file-less install still works unchanged).
+    Three JSON shapes are accepted:
 
     * ``{"transformer": "变换器", "key": "密钥"}``
     * ``{"terms": {"transformer": "变换器"}}``
@@ -212,6 +263,8 @@ def load_glossary(path: Path | str | None = None) -> dict[str, str]:
     """
     try:
         p = Path(path) if path else DEFAULT_GLOSSARY_PATH
+        if not p.is_absolute():
+            p = resource_dir() / p
         with p.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict):
@@ -224,8 +277,8 @@ def load_glossary(path: Path | str | None = None) -> dict[str, str]:
                 if isinstance(item, (list, tuple)) and len(item) >= 2:
                     out[str(item[0])] = str(item[1])
             return out
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — a missing/unreadable glossary is not fatal
+        _logger.debug("读取术语表失败（按空返回）: %s", exc)
     return {}
 
 
@@ -236,8 +289,8 @@ def save_glossary(path: Path | str, glossary: dict[str, str]) -> None:
             json.dumps({"terms": glossary}, ensure_ascii=False, indent=2),
             "utf-8",
         )
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("保存术语表失败: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +303,8 @@ def load_prefs() -> dict[str, Any]:
         if APP_PREFS_PATH.exists():
             with APP_PREFS_PATH.open("r", encoding="utf-8") as fh:
                 return dict(json.load(fh))
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _logger.debug("读取用户偏好失败（按空返回）: %s", exc)
     return {}
 
 
@@ -261,5 +314,5 @@ def save_prefs(prefs: dict[str, Any]) -> None:
         APP_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with APP_PREFS_PATH.open("w", encoding="utf-8") as fh:
             json.dump(prefs, fh, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("保存用户偏好失败: %s", exc)

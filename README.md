@@ -1,6 +1,6 @@
 # PDFtranslate
 
-> 当前版本：**v0.1.3**（版本号定义于 `translate_app/__init__.py` 的 `__version__`）
+> 当前版本：**v0.1.4**（版本号定义于 `translate_app/__init__.py` 的 `__version__`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
 即可把文档翻译成指定语言并保存为双语 PDF、原位翻译 PDF、Markdown 或纯文本。
@@ -55,18 +55,19 @@ python main.py "C:\path\to\doc.pdf"
 {
   "models": [
     {
-      "id": "qwen3.8",
-      "name": "qwen3.8",
+      "id": "LocalModel",
+      "name": "LocalModel",
       "type": "llama-server",
       "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
       "model": "qwen3.8",
       "reasoning_effort": "low",
       "concurrency": 2,
+      "temperature": 0.1,
       "batch_size": 12000
     },
     {
-      "id": "ds4-pro",
-      "name": "DS4",
+      "id": "deepseek-v4-flash",
+      "name": "DS4F",
       "type": "deepseek",
       "endpoint": "https://api.deepseek.com/v1/chat/completions",
       "model": "deepseek-v4-flash",
@@ -94,7 +95,10 @@ python main.py "C:\path\to\doc.pdf"
   80%，避免回复被截断而触发无谓的重试（无 `max_tokens` 时仅按字符预算分批）。
 * `glossary`（可选）：该模型使用的术语表文件路径；缺省读取项目根的
   `glossary.json`。见下文「术语表」。
-* 其余未识别键透传给 OpenAI client 构造参数（如 `timeout`，默认 300 秒）。
+* 其余配置键：仅客户端级白名单键会透传给 OpenAI client 构造参数（如 `timeout`，默认 300 秒、
+  `organization`、`max_retries`、`default_headers`、`default_query`、`http_client`）。未知键
+  会被忽略并在日志中提示（校验拼写），不会导致程序崩溃；数值字段（`temperature`、
+  `max_tokens`、`concurrency`、`batch_size`）填错时降级为默认值并在日志提示。
 
 ## 术语表（跨分块保持不变）
 

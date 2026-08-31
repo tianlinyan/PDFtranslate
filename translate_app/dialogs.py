@@ -166,8 +166,13 @@ class AboutDialog(QDialog):
         developer = QLabel(f"开发者：{__developer__}")
         developer.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        email = QLabel("Email：tly001@vip.sina.com")
-        email.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        link = QLabel(
+            '<a href="https://github.com/tianlinyan/PDFtranslate">'
+            "https://github.com/tianlinyan/PDFtranslate</a>"
+        )
+        link.setTextFormat(Qt.TextFormat.RichText)
+        link.setOpenExternalLinks(True)
+        link.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         summary = QLabel(
             "Windows 桌面 PDF AI 翻译工具。\n"
@@ -186,7 +191,7 @@ class AboutDialog(QDialog):
         root.addWidget(name)
         root.addWidget(version)
         root.addWidget(developer)
-        root.addWidget(email)
+        root.addWidget(link)
         root.addSpacing(16)
         root.addWidget(summary)
         root.addStretch()

@@ -16,6 +16,8 @@ into Chinese / Japanese / Korean display correctly in the exported PDF.
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
 import tempfile
 import threading
 from dataclasses import asdict, dataclass, field, fields
@@ -23,6 +25,8 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 import pymupdf as fitz
+
+_logger = logging.getLogger(__name__)
 
 #: Font used for rendered text (covers CJK plus Latin).
 try:
@@ -123,7 +127,7 @@ def extract_document_text(
                 result.pages.append([])
                 continue
 
-            spans = _collect_spans(page)
+            spans, page_lines = _collect_page_struct(page)
             # Horizontal extents of the page's text, used for right-align
             # detection of single-line blocks (page numbers, signatures).
             page_x0 = min(b[1] for b in text_blocks)
@@ -133,16 +137,36 @@ def extract_document_text(
                 cleaned = " ".join(str(text).split())
                 if not cleaned:
                     continue
-                meta = _block_meta(
-                    fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1
-                )
-                block = Block(
-                    text=cleaned, page=page_index, x0=x0, y0=y0, x1=x1, y1=y1,
-                    **meta,
-                )
-                page_blocks.append(block)
-                result.blocks.append(cleaned)
-                result.block_pages.append(page_index)
+                rect = fitz.Rect(x0, y0, x1, y1)
+                pieces = _split_list_lines(rect, cleaned, page_lines)
+                if len(pieces) == 1:
+                    # A normal paragraph / single line: keep it as one block.
+                    meta = _block_meta(rect, spans, page_x0, page_x1)
+                    block = Block(
+                        text=cleaned, page=page_index,
+                        x0=x0, y0=y0, x1=x1, y1=y1,
+                        **meta,
+                    )
+                    page_blocks.append(block)
+                    result.blocks.append(cleaned)
+                    result.block_pages.append(page_index)
+                else:
+                    # A block PyMuPDF merged from several visually separate
+                    # lines (e.g. a bullet list).  Emit one block per line so
+                    # each line translates and redraws on its own — otherwise a
+                    # list becomes a single flowing paragraph that no longer
+                    # matches the original layout.
+                    for line_rect, line_text in pieces:
+                        meta = _block_meta(line_rect, spans, page_x0, page_x1)
+                        block = Block(
+                            text=line_text, page=page_index,
+                            x0=line_rect.x0, y0=line_rect.y0,
+                            x1=line_rect.x1, y1=line_rect.y1,
+                            **meta,
+                        )
+                        page_blocks.append(block)
+                        result.blocks.append(line_text)
+                        result.block_pages.append(page_index)
             result.pages.append(page_blocks)
 
         if ocr_cache_path is not None and ocr_cache:
@@ -167,7 +191,19 @@ _OCR_DPI = 300.0
 
 
 def _ocr_cache_dir() -> Path:
-    """A writable dir for OCR results (model output is usually slow to redo)."""
+    """A writable dir for OCR results (model output is usually slow to redo).
+
+    ``PDFTRANSLATE_OCR_CACHE_DIR`` overrides the location; the default is the
+    user's ``~/.pdftranslate/ocr_cache``.
+    """
+    override = os.environ.get("PDFTRANSLATE_OCR_CACHE_DIR")
+    if override:
+        try:
+            p = Path(override)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("无法使用自定义 OCR 缓存目录 %s: %s", override, exc)
     for base in (
         Path.home() / ".pdftranslate" / "ocr_cache",
         Path(tempfile.gettempdir()) / "pdftranslate_ocr_cache",
@@ -175,13 +211,27 @@ def _ocr_cache_dir() -> Path:
         try:
             base.mkdir(parents=True, exist_ok=True)
             return base
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("OCR 缓存目录不可用 %s: %s", base, exc)
             continue
     return Path.home() / ".pdftranslate" / "ocr_cache"
 
 
 def _ocr_cache_path(doc_path: str | Path) -> Path:
-    h = hashlib.sha1(str(Path(doc_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    """Cache file for a document's OCR results.
+
+    The key includes the file's mtime and size, not just its path: reusing
+    OCR results from a *replaced or edited* PDF would silently translate the
+    old content.  (The translation cache needs no such stamp because it looks
+    blocks up by content hash.)
+    """
+    p = Path(doc_path)
+    try:
+        st = p.stat()
+        stamp = f"|{int(st.st_mtime)}|{st.st_size}"
+    except OSError:
+        stamp = ""
+    h = hashlib.sha1(f"{p.resolve()}{stamp}".encode("utf-8")).hexdigest()[:16]
     return _ocr_cache_dir() / f"ocr_{h}.json"
 
 
@@ -194,7 +244,8 @@ def _load_ocr_cache(cache_path: Path) -> dict[int, list[dict]]:
 
         raw = json.loads(cache_path.read_text("utf-8"))
         return {int(k): v for k, v in raw.items()}
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        _logger.debug("读取 OCR 缓存失败 %s: %s", cache_path, exc)
         return {}
 
 
@@ -204,8 +255,8 @@ def _save_ocr_cache(cache_path: Path, data: dict[int, list[dict]]) -> None:
         import json
 
         cache_path.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("保存 OCR 缓存失败: %s", exc)
 
 
 def _ocr_engine():
@@ -220,8 +271,9 @@ def _ocr_engine():
                     from rapidocr_onnxruntime import RapidOCR
 
                     _OCR_ENGINE = RapidOCR()
-                except Exception:
+                except Exception:  # noqa: BLE001
                     _OCR_FAILED = True
+                    _logger.warning("无法加载 RapidOCR（扫描页将无法识别）")
                     return None
     return _OCR_ENGINE if _OCR_ENGINE is not False else None
 
@@ -327,13 +379,25 @@ def _ocr_page_blocks(
         return []
 
 
-def _collect_spans(page: fitz.Page) -> list[tuple[fitz.Rect, float, bool]]:
-    """Return ``(bbox, size, bold)`` for every text span on the page."""
+def _collect_page_struct(
+    page: fitz.Page,
+) -> tuple[list[tuple[fitz.Rect, float, bool]], list[tuple[fitz.Rect, str]]]:
+    """Return ``(spans, lines)`` for a page.
+
+    ``spans`` is ``(bbox, size, bold)`` for every span; ``lines`` is
+    ``(bbox, text)`` for every non-empty visual line (the smallest unit the
+    original PDF renders).  Line data lets the extractor split a block that
+    PyMuPDF merged from several visually separate lines (e.g. a bullet list)
+    back into per-line blocks so a translation can honour the original layout.
+    """
     spans: list[tuple[fitz.Rect, float, bool]] = []
+    lines: list[tuple[fitz.Rect, str]] = []
     for b in page.get_text("dict").get("blocks", []):
         if b.get("type") != 0:
             continue
         for line in b.get("lines", []):
+            line_rect = fitz.Rect(line["bbox"])
+            parts: list[str] = []
             for s in line.get("spans", []):
                 rect = fitz.Rect(s["bbox"])
                 size = float(s.get("size", 10.0))
@@ -341,7 +405,11 @@ def _collect_spans(page: fitz.Page) -> list[tuple[fitz.Rect, float, bool]]:
                 font = str(s.get("font", ""))
                 bold = bool(flags & 16) or "bold" in font.lower()
                 spans.append((rect, size, bold))
-    return spans
+                parts.append(s.get("text", ""))
+            text = " ".join("".join(parts).split())
+            if text:
+                lines.append((line_rect, text))
+    return spans, lines
 
 
 def _order_blocks(text_blocks: Sequence[tuple]) -> list[tuple]:
@@ -374,6 +442,45 @@ def _order_blocks(text_blocks: Sequence[tuple]) -> list[tuple]:
     for col in columns:
         out.extend(rows(col))
     return out
+
+
+def _split_list_lines(
+    block_rect: fitz.Rect,
+    block_text: str,
+    page_lines: Sequence[tuple[fitz.Rect, str]],
+) -> list[tuple[fitz.Rect, str]]:
+    """Return the per-line pieces of a block.
+
+    A block PyMuPDF merged from several short, left-aligned lines (a bullet or
+    numbered list) is split back into one ``(rect, text)`` per line so each
+    line is translated and drawn separately.  Wrapped-paragraph blocks (whose
+    lines fill the block width) are returned unchanged as a single ``(rect,
+    text)``.
+    """
+    matching = [
+        (lr, lt) for lr, lt in page_lines if lr.intersects(block_rect)
+    ]
+    matching.sort(key=lambda rt: (round(rt[0].y0, 1), rt[0].x0))
+    if len(matching) >= 2 and _looks_like_list(block_rect, matching):
+        return matching
+    return [(block_rect, block_text)]
+
+
+def _looks_like_list(
+    block_rect: fitz.Rect, lines: Sequence[tuple[fitz.Rect, str]]
+) -> bool:
+    """True when most of a block's lines are short (list items).
+
+    A wrapped paragraph's lines each reach close to the block's right edge,
+    whereas a list's items end well before it.  If most lines leave a clear
+    right margin the block is a list, not a paragraph.
+    """
+    if len(lines) < 2:
+        return False
+    min_height = min(lr.y1 - lr.y0 for lr, _t in lines)
+    short = sum(1 for lr, _t in lines if block_rect.x1 - lr.x1 > 4.0)
+    # Require a clear majority of short lines; a wrapped paragraph has few.
+    return short >= max(2, int(len(lines) * 0.6)) and min_height > 0
 
 
 def _block_meta(
@@ -434,9 +541,22 @@ def _block_meta(
 
 
 def group_by_page(block_pages: Sequence[int], values: Sequence[str], page_count: int) -> list[list[str]]:
-    """Regroup a flat ``values`` list back into per-page lists."""
+    """Regroup a flat ``values`` list back into per-page lists.
+
+    ``block_pages`` and ``values`` must be the same length (they both derive
+    from one document's blocks).  A mismatch is a bug in the caller and would
+    otherwise be silently truncated by ``zip`` — refuse loudly instead, so a
+    translation is never dropped without a trace.
+    """
+    if len(block_pages) != len(values):
+        raise ValueError(
+            "分页对齐失败：块页码数 "
+            f"{len(block_pages)} 与译文数 {len(values)} 不一致"
+        )
     per_page: list[list[str]] = [[] for _ in range(page_count)]
     for page, value in zip(block_pages, values):
+        if page < 0 or page >= page_count:
+            raise ValueError(f"块页码 {page} 超出页面范围 [0, {page_count})")
         per_page[page].append(value)
     return per_page
 
@@ -625,11 +745,17 @@ def save_interleaved_pdf(
     per_page: Sequence[Sequence[str]],
     out_path: str | Path,
     lang: str,
-    pages: Sequence[Sequence[Block]] | None = None,
+    pages: Sequence[Sequence[Block]],
 ) -> None:
     """Create a bilingual PDF: each original page followed by a translation
     page that mirrors the original layout (every translated block sits at its
-    source block's position)."""
+    source block's position).
+
+    ``pages`` (the layout blocks from :func:`extract_document_text`) is
+    required: translation text is drawn at its source block's position, so
+    without it there is nothing to mirror — silently dropping every
+    translation would be worse than refusing the call.
+    """
     src = fitz.open(str(src_path))
     new_doc = fitz.open()
     try:
@@ -638,13 +764,17 @@ def save_interleaved_pdf(
             new_doc.insert_pdf(src, from_page=i, to_page=i)
             page_rect = src[i].rect
             tpage = new_doc.new_page(width=page_rect.width, height=page_rect.height)
-            blocks = pages[i] if pages is not None and i < len(pages) else []
+            blocks = pages[i] if i < len(pages) else []
             trans = per_page[i] if i < len(per_page) else []
-            m = min(len(blocks), len(trans))
-            if m == 0:
+            if len(blocks) != len(trans):
+                raise ValueError(
+                    f"第 {i + 1} 页布局块数 {len(blocks)} 与译文块数 "
+                    f"{len(trans)} 不一致，已放弃导出（避免静默丢弃译文）"
+                )
+            if not blocks:
                 _render_note(tpage, font, lang)
                 continue
-            for j in range(m):
+            for j in range(len(blocks)):
                 _draw_translated_block(tpage, font, blocks[j], trans[j])
         new_doc.set_metadata({"title": "Bilingual translation", "creator": "PDFtranslate"})
         new_doc.save(str(out_path), garbage=4, deflate=True)
@@ -677,12 +807,16 @@ def save_translated_pdf(
             page = out_doc[-1]
             blocks = pages[i] if i < len(pages) else []
             trans = per_page[i]
-            m = min(len(blocks), len(trans))
-            if m == 0:
+            if len(blocks) != len(trans):
+                raise ValueError(
+                    f"第 {i + 1} 页布局块数 {len(blocks)} 与译文块数 "
+                    f"{len(trans)} 不一致，已放弃导出（避免静默丢弃译文）"
+                )
+            if not blocks:
                 continue
 
             # Remove the original text (keep images and line art/graphics).
-            for j in range(m):
+            for j in range(len(blocks)):
                 b = blocks[j]
                 page.add_redact_annot(fitz.Rect(b.x0, b.y0, b.x1, b.y1))
             page.apply_redactions(
@@ -692,7 +826,7 @@ def save_translated_pdf(
 
             # Draw the translation at the original positions / alignment /
             # font size (see ``_draw_translated_block`` for the fitting rules).
-            for j in range(m):
+            for j in range(len(blocks)):
                 _draw_translated_block(page, font, blocks[j], trans[j])
 
         out_doc.set_metadata({"title": "Translated text", "creator": "PDFtranslate"})

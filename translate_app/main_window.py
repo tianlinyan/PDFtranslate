@@ -8,6 +8,7 @@ PDF / Markdown / plain text) and can be opened from the window.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread
@@ -104,9 +105,19 @@ class MainWindow(QWidget):
         self._type_combo = QComboBox()
         for key, (label, _ext) in OUTPUT_TYPES.items():
             self._type_combo.addItem(label, key)
-        saved_type = prefs.get("output_type", 0)
-        if isinstance(saved_type, int) and 0 <= saved_type < self._type_combo.count():
-            self._type_combo.setCurrentIndex(saved_type)
+        # Default to 「仅译文 PDF」(translated_pdf).  ``output_type`` is persisted
+        # as a string key (older prefs may hold an int index), so resolve it by
+        # matching the combo item's data rather than assuming an int.
+        _default_key = "translated_pdf"
+        saved_type = prefs.get("output_type", _default_key)
+        _idx = self._type_combo.findData(saved_type)
+        if _idx < 0:
+            if isinstance(saved_type, int) and 0 <= saved_type < self._type_combo.count():
+                _idx = saved_type
+            else:
+                _idx = self._type_combo.findData(_default_key)
+        if _idx >= 0:
+            self._type_combo.setCurrentIndex(_idx)
 
         # --- Output path ---
         self._path_edit = QLineEdit()
@@ -169,6 +180,8 @@ class MainWindow(QWidget):
         root.addWidget(self._progress)
         root.addWidget(self._log, 1)
         root.addLayout(btn_row)
+
+        self._append_log("提示：如果文档包含机密或隐私信息，请选择本地AI模型（LocalModel）。")
 
         if self._models_error:
             QMessageBox.warning(
@@ -258,6 +271,10 @@ class MainWindow(QWidget):
         self._save_prefs(model.id, self._lang_combo.currentText(), key)
 
         self._log.clear()
+        # Non-blocking config problems (typos degraded to defaults, ignored
+        # unknown keys): surface them in the log instead of blocking the run.
+        for warning in model.warnings():
+            self._append_log(f"配置提示：{warning}")
         self._stage.setText("准备…")
         self._progress.setValue(0)
         self._start_btn.setEnabled(False)
@@ -276,6 +293,8 @@ class MainWindow(QWidget):
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._thread.quit)
         self._worker.error.connect(self._thread.quit)
+        self._worker.cancelled.connect(self._on_cancelled)
+        self._worker.cancelled.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup)
         # Must be connected after ``_cleanup`` so it sees the thread as None.
         self._thread.finished.connect(self._finish_close)
@@ -345,13 +364,19 @@ class MainWindow(QWidget):
     def _on_error(self, msg: str) -> None:
         self._stage.setText("发生错误")
         self._log.appendPlainText(msg)
-        QMessageBox.critical(self, "翻译失败", msg.splitlines()[0])
+        QMessageBox.critical(self, "翻译失败", msg.splitlines()[0] if msg else "未知错误")
+
+    def _on_cancelled(self) -> None:
+        """Reset the progress UI after a user cancel (thread quits via
+        ``cancelled -> thread.quit``; ``_cleanup`` re-enables the buttons)."""
+        self._stage.setText("已取消")
+        self._progress.setRange(0, 100)
+        self._progress.setFormat("完成 0%")
+        self._progress.setValue(0)
 
     def _open_output(self) -> None:
         if not self._last_output:
             return
-        import os
-
         try:
             os.startfile(self._last_output)  # type: ignore[attr-defined]
         except Exception:
@@ -410,13 +435,16 @@ class MainWindow(QWidget):
         if not running:
             event.accept()
             return
-        # A translation is in progress: wait for it instead of letting Qt abort
-        # on a still-running QThread.
+        # A translation is in progress: ask once, then force-stop the worker
+        # thread so the window closes immediately instead of waiting for an
+        # in-flight HTTP/OCR call to finish on its own (which previously kept
+        # the window open for up to the full request timeout).
         if not self._closing:
             resp = QMessageBox.question(
                 self,
                 "正在翻译",
-                "翻译仍在进行。确定要取消并退出吗？\n（将等待当前请求完成后退出。）",
+                "翻译仍在进行。确定要强制退出吗？\n"
+                "（将强制终止后台线程并立即退出，正在进行的请求可能未完成。）",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if resp != QMessageBox.StandardButton.Yes:
@@ -425,4 +453,32 @@ class MainWindow(QWidget):
             self._closing = True
             if self._worker is not None:
                 self._worker.cancel()
-        event.ignore()   # keep the window until the thread finishes
+        self._force_quit_thread()
+        event.accept()
+        # Hard-exit the process: leftover thread-pool workers (in-flight HTTP
+        # requests) are non-daemon and their atexit hook would keep the process
+        # alive for up to the request timeout, so kill every thread at once.
+        os._exit(0)
+
+    def _force_quit_thread(self) -> None:
+        """Stop the worker thread so the window can close without waiting.
+
+        Gives the worker a short grace period to stop on its own (a cancel
+        caught between batches flushes the cache journal cleanly); if it is
+        blocked in an in-flight HTTP or OCR call it cannot honour the cancel,
+        so the caller hard-exits the process right after this returns.
+        """
+        thread = self._thread
+        worker = self._worker
+        self._thread = None
+        self._worker = None
+        self._closing = False
+        if thread is not None and thread.isRunning():
+            # Best-effort graceful stop; never wait for a long request timeout.
+            thread.wait(3000)
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
+        self._start_btn.setEnabled(True)
+        self._cancel_btn.setEnabled(False)

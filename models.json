@@ -1,12 +1,12 @@
 {
   "models": [
     {
-      "id": "qwen3.8",
-      "name": "qwen3.8",
+      "id": "LocalModel",
+      "name": "LocalModel",
       "type": "llama-server",
       "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
       "model": "qwen3.8",
-      "reasoning_effort": "none",
+      "reasoning_effort": "low",
       "concurrency": 2,
       "temperature":0.1,
       "batch_size": 12000
@@ -17,8 +17,7 @@
       "type": "deepseek",
       "endpoint": "https://api.deepseek.com/v1/chat/completions",
       "model": "deepseek-v4-flash",
-      "api_key": "${DEEPSEEK_API_KEY}",
-      "tools_choice": "auto"
+      "api_key": "${DEEPSEEK_API_KEY}"
     }
   ]
 }

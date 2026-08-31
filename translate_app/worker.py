@@ -31,6 +31,7 @@ class TranslateWorker(QObject):
     log = pyqtSignal(str)
     finished = pyqtSignal(str)             # output path
     error = pyqtSignal(str)
+    cancelled = pyqtSignal()               # user cancelled (thread must quit)
 
     def __init__(
         self,
@@ -73,11 +74,21 @@ class TranslateWorker(QObject):
             engine = TranslationEngine(self._model)
             self.log.emit(f"模型：{self._model.name} ({self._model.model})")
 
+            def _log(msg: str) -> None:
+                # After a cancel, a batch thread may still be finishing its
+                # HTTP request while the GUI already deleted this worker;
+                # emitting on a deleted QObject would raise inside that
+                # thread, so swallow it there.
+                try:
+                    self.log.emit(msg)
+                except RuntimeError:
+                    pass
+
             result = engine.translate_blocks(
                 doc.blocks,
                 self._lang,
                 on_progress=lambda d, t: self.progress.emit(d, t, "翻译中…"),
-                log=lambda m: self.log.emit(m),
+                log=_log,
                 cancel=lambda: self._cancelled,
                 doc_path=Path(self._source),
             )
@@ -97,6 +108,11 @@ class TranslateWorker(QObject):
             self.finished.emit(out_path)
         except TranslationCancelled:
             self.log.emit("已取消。")
+            # The GUI connects this to ``thread.quit``: without it the worker
+            # thread would keep its event loop running forever after a cancel
+            # (no finished/error is emitted), leaving the window unable to
+            # start another run or even close.
+            self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001
             import traceback
 
