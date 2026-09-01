@@ -7,6 +7,7 @@ to the main thread through Qt signals.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
@@ -22,6 +23,20 @@ OUTPUT_TYPES = {
     "markdown": ("Markdown 文档", ".md"),
     "plain_text": ("纯文本", ".txt"),
 }
+
+
+def format_duration(seconds: float) -> str:
+    """把秒数格式化成中文可读时长，例如 ``12.3 秒`` / ``1 分 05 秒``。"""
+    if seconds < 0:
+        seconds = 0.0
+    if seconds < 60:
+        return f"{seconds:.1f} 秒"
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours} 小时 {minutes:02d} 分 {secs:02d} 秒"
+    return f"{minutes} 分 {secs:02d} 秒"
 
 
 class TranslateWorker(QObject):
@@ -50,13 +65,16 @@ class TranslateWorker(QObject):
 
     @pyqtSlot()
     def run(self) -> None:
+        started = time.monotonic()
         try:
             if self._cancelled:
                 raise TranslationCancelled()
 
+            self.log.emit(f"开始时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
             self.log.emit(f"正在提取文本：{self._source}")
             self.progress.emit(0, 0, "提取文本…")
             doc = pdfio.extract_document_text(self._source)
+            extract_elapsed = time.monotonic() - started
 
             if not doc.blocks:
                 self.error.emit("未从该 PDF 中提取到任何文本，无法翻译。")
@@ -67,6 +85,7 @@ class TranslateWorker(QObject):
             engine = TranslationEngine(self._model)
             self.log.emit(f"模型：{self._model.name} ({self._model.model})")
 
+            translate_started = time.monotonic()
             result = engine.translate_blocks(
                 doc.blocks,
                 self._lang,
@@ -75,6 +94,7 @@ class TranslateWorker(QObject):
                 cancel=lambda: self._cancelled,
                 doc_path=Path(self._source),
             )
+            translate_elapsed = time.monotonic() - translate_started
 
             if self._cancelled:
                 raise TranslationCancelled()
@@ -85,16 +105,29 @@ class TranslateWorker(QObject):
             self.log.emit("正在生成输出文件…")
             self.progress.emit(len(doc.blocks), len(doc.blocks), "导出…")
 
+            export_started = time.monotonic()
             out_path = self._export(doc, per_page)
+            export_elapsed = time.monotonic() - export_started
 
+            total_elapsed = time.monotonic() - started
             self.log.emit(f"完成：{out_path}")
+            self.log.emit(
+                f"总用时：{format_duration(total_elapsed)}"
+                f"（提取 {format_duration(extract_elapsed)}，"
+                f"翻译 {format_duration(translate_elapsed)}，"
+                f"导出 {format_duration(export_elapsed)}）"
+            )
             self.finished.emit(out_path)
         except TranslationCancelled:
-            self.log.emit("已取消。")
+            self.log.emit(f"已取消。用时 {format_duration(time.monotonic() - started)}")
         except Exception as exc:  # noqa: BLE001
             import traceback
 
-            self.error.emit(f"翻译失败：{exc}\n\n{traceback.format_exc()}")
+            self.error.emit(
+                f"翻译失败：{exc}"
+                f"（用时 {format_duration(time.monotonic() - started)}）"
+                f"\n\n{traceback.format_exc()}"
+            )
 
     def cancel(self) -> None:
         """Request cancellation (safe to call from the GUI thread)."""
