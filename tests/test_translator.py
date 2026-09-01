@@ -1,9 +1,12 @@
 """Tests for the translation engine (batching, alignment, progress, cache)."""
 import json
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
+from translate_app import translator
 from translate_app.settings import ModelConfig
 from translate_app.translator import TranslationEngine, _cache_dir, _cache_key
 
@@ -116,6 +119,46 @@ class TranslatorTest(unittest.TestCase):
                 Path("_fake.pdf"), "Chinese", model.id
             )
             self.assertEqual(json.loads(cache_path.read_text("utf-8")), {})
+
+    def test_unwritable_cache_dir_falls_back_to_temp(self):
+        # ``mkdir(exist_ok=True)`` succeeds on an existing directory even when
+        # writing into it is denied (read-only home, sandbox).  Only a real
+        # probe write catches that, so the fallback must still kick in.
+        home_cache = Path.home() / ".pdftranslate" / "cache"
+        real_write_text = Path.write_text
+
+        def fake_write_text(self, *args, **kwargs):
+            if self.name.startswith(".write_probe_") and home_cache in self.parents:
+                raise PermissionError("denied by test")
+            return real_write_text(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", fake_write_text):
+            resolved = _cache_dir()
+        self.assertEqual(resolved, Path(tempfile.gettempdir()) / "pdftranslate_cache")
+
+    def test_cache_write_failure_is_logged_once(self):
+        # An unwritable cache must not break the translation, but it must be
+        # reported — otherwise every re-run silently re-translates everything.
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            logs: list[str] = []
+            with mock.patch.object(
+                translator, "_write_cache", return_value="PermissionError: denied"
+            ):
+                res = engine.translate_blocks(
+                    BLOCKS, "Chinese", doc_path=Path("_fake.pdf"), log=logs.append
+                )
+            # Translation still succeeds ...
+            for src, tr in zip(BLOCKS, res.translated):
+                self.assertTrue(tr.startswith("MOCK:" + src), tr)
+            # ... and the failure is reported exactly once, even though the
+            # cache is persisted per batch *and* once at the end.
+            warnings = [m for m in logs if "缓存写入失败" in m]
+            self.assertEqual(len(warnings), 1, logs)
 
     def test_multiline_response_is_parsed(self):
         # A model may wrap a long translation across several lines; everything

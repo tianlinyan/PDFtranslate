@@ -42,7 +42,8 @@ main.py → MainWindow (PyQt6)
 - 按字符预算分批（`_CHAR_BUDGET` 默认 4000，可按模型 `batch_size` 覆盖，`_make_chunks` 读取）；纯数字/符号块（`_needs_translation` 判空）不发送、原样保留。
 - 批次在 `ThreadPoolExecutor` 中并发请求（`model.concurrency` 个 worker）；结果按完成序回收，输出仍按输入块序对齐。缓存字典更新加 `_cache_lock`。
 - 瞬时故障（网络错误、429/5xx、解析不匹配）重试 3 次并带退避（`retry_delays`，测试注入 `(0,0)`）；4xx 认证/参数错误直接失败。重试耗尽后该批次**保留原文**（绝不丢内容）且**不写入缓存**（防污染 resume），失败原因记入 `result.errors`。
-- 磁盘缓存位于 `~/.pdftranslate/cache`：文件名 = `trans_v2_` + sha1(文档路径 | 目标语言 | 模型 id)，内容 = JSON 映射 md5(块文本) → 译文。每批完成即落盘。进度从已缓存块数+跳过块数起始。测试用唯一模型 id + 唯一文档路径避开热缓存。
+- 磁盘缓存位于 `~/.pdftranslate/cache`（该目录不可写时回退到系统临时目录下的 `pdftranslate_cache`；`_cache_dir` 会实写探针文件验证可写性，仅 `mkdir` 成功不算数）：文件名 = `trans_v{_CACHE_VERSION}_` + sha1(文档路径 | 目标语言 | 模型 id) 前 16 位，内容 = JSON 映射 md5(块文本) → 译文。改动缓存语义时**递增 `_CACHE_VERSION`**（当前为 3）令旧缓存自动失效。每批完成即落盘。进度从已缓存块数+跳过块数起始。测试用唯一模型 id + 唯一文档路径避开热缓存。
+- 缓存写入是尽力而为：失败**不中断翻译**，但会经 `log` 回调告警（每次运行只警告一次）。若不告警，只读 home / 沙箱等场景下会表现为「每次重跑都全量重译」而无任何线索。
 - 取消抛出 `TranslationCancelled`（重试退避的 sleep 分片检查），worker 捕获后仅输出“已取消”日志（不算错误）。
 
 ### translate_app/pdfio.py

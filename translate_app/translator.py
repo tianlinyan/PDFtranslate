@@ -20,6 +20,7 @@ Key behaviours
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import tempfile
 import threading
@@ -90,13 +91,23 @@ class TranslationResult:
 
 
 def _cache_dir() -> Path:
-    """Return a writable cache directory, falling back to the system temp dir."""
+    """Return a writable cache directory, falling back to the system temp dir.
+
+    Creating the directory is not enough to prove it is usable: an existing
+    directory under a read-only / sandboxed ``$HOME`` lets ``mkdir`` succeed
+    (``exist_ok=True`` is a no-op) while every later write is denied.  That
+    silently disables resume, so each candidate is verified with a real probe
+    write before it is accepted.
+    """
     for path in (
         Path.home() / ".pdftranslate" / "cache",
         Path(tempfile.gettempdir()) / "pdftranslate_cache",
     ):
         try:
             path.mkdir(parents=True, exist_ok=True)
+            probe = path / f".write_probe_{os.getpid()}"
+            probe.write_text("", "utf-8")
+            probe.unlink()
             return path
         except Exception:
             continue
@@ -369,6 +380,23 @@ class TranslationEngine:
         done = sum(1 for b in blocks if _block_hash(b) in cache) + len(skip)
         progress(done, n)
 
+        # A cache write may fail (read-only home, sandbox, full disk).  That
+        # must not abort a translation, but staying silent is worse: the run
+        # looks fine and every re-run re-translates everything.  Warn once.
+        cache_warned = False
+
+        def _persist_cache() -> None:
+            nonlocal cache_warned
+            if cache_path is None:
+                return
+            reason = _write_cache(cache_path, cache)
+            if reason and not cache_warned:
+                cache_warned = True
+                log(
+                    f"  警告：翻译缓存写入失败（{reason}），"
+                    f"本次结果不会被缓存，重跑将重新翻译：{cache_path}"
+                )
+
         def _needs_request(i: int) -> bool:
             return i not in skip and _block_hash(blocks[i]) not in cache
 
@@ -404,8 +432,7 @@ class TranslationEngine:
                                 cache[_block_hash(blocks[i])] = text
                             # Persist after every batch so a cancel/crash keeps
                             # the work completed so far (resume reuses it).
-                            if cache_path is not None:
-                                _write_cache(cache_path, cache)
+                            _persist_cache()
                     else:
                         for i in chunk:
                             result.errors.append(f"块 {i + 1} 翻译失败，保留原文")
@@ -419,7 +446,7 @@ class TranslationEngine:
                 result.translated[i] = cache[key]
 
         if cache_path is not None:
-            _write_cache(cache_path, cache)
+            _persist_cache()
 
         progress(n, n)
         return result
@@ -450,11 +477,18 @@ class TranslationEngine:
         return chunks
 
 
-def _write_cache(path: Path, cache: dict[str, str]) -> None:
-    """Best-effort persist of the translation cache."""
+def _write_cache(path: Path, cache: dict[str, str]) -> str | None:
+    """Best-effort persist of the translation cache.
+
+    Returns ``None`` on success, or a short human readable reason on failure.
+    A cache write must never abort a translation that already succeeded, but
+    the caller should surface the reason once — a silently unwritable cache
+    looks exactly like a working one until the next (fully re-translated) run.
+    """
     try:
         import json
 
         path.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
-    except Exception:
-        pass
+        return None
+    except Exception as exc:  # noqa: BLE001 — the cache is optional by design
+        return f"{type(exc).__name__}: {exc}"
