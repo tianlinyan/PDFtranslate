@@ -16,12 +16,20 @@ into Chinese / Japanese / Korean display correctly in the exported PDF.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+import hashlib
+import os
 import re
-from typing import Sequence
+import tempfile
+import threading
+from typing import Callable, Sequence
 
 import pymupdf as fitz
+
+#: Cancellation signal raised by the extractor (OCR) so the worker can treat a
+#: cancelled OCR pass exactly like a cancelled translation.
+from .translator import TranslationCancelled
 
 #: Font used for rendered text (covers CJK plus Latin).
 try:
@@ -50,6 +58,10 @@ class Block:
     align: str = "left"          # left / center / right
     bold: bool = False
     single_line: bool = True
+    #: True when this block was recovered by OCR from a scan.  Such blocks sit
+    #: on top of a raster image rather than a text layer, so the in-place
+    #: exporter must first cover the original pixels instead of redacting text.
+    ocr: bool = False
 
 
 @dataclass
@@ -60,13 +72,21 @@ class DocumentText:
     blocks: list[str] = field(default_factory=list)     # flat, reading order
     block_pages: list[int] = field(default_factory=list)  # page index per block
     title: str = ""
+    ocr_count: int = 0          # pages whose text came from OCR (was scanned)
 
     @property
     def page_count(self) -> int:
         return len(self.pages)
 
 
-def extract_document_text(path: str | Path, title: str | None = None) -> DocumentText:
+def extract_document_text(
+    path: str | Path,
+    title: str | None = None,
+    ocr: bool = False,
+    ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
+    cancel: Callable[[], bool] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> DocumentText:
     """Extract text blocks from ``path`` in reading order.
 
     Column layouts are read column by column (left column top to bottom, then
@@ -82,14 +102,60 @@ def extract_document_text(path: str | Path, title: str | None = None) -> Documen
     ``Label:`` style) or that change style (size / bold / colour) start a new
     block, so tables, bullet and numbered lists keep one entry per line, while
     lines of a flowing paragraph stay merged and translate as a whole.
+
+    When ``ocr`` is enabled, pages that carry no embedded text layer (scans) are
+    recognised with RapidOCR (its default model auto-detects Chinese + English,
+    i.e. it follows the original text's language) and injected into the same
+    block pipeline, so the extracted ``blocks`` / ``block_pages`` / ``pages``
+    keep the exact layout the exporters expect.  ``ocr_fn`` is an injectable
+    OCR callback ``(page_index, page) -> [(box, text)]`` (box already in PDF
+    points) used by tests to avoid running real OCR; when it is ``None`` the
+    shared RapidOCR engine is used and per-page results are cached per document
+    (keyed by file mtime + size, so an edited PDF is re-OCR'd).  ``cancel`` is
+    polled per page (raising :class:`TranslateCancelled`), and ``log`` receives
+    per-page OCR progress.
     """
     doc = fitz.open(str(path))
     result = DocumentText(title=title or Path(path).stem)
+    ocr_cache: dict[int, list[dict]] = {}
+    ocr_cache_path: Path | None = None
+    if ocr and ocr_fn is None:
+        ocr_cache_path = _ocr_cache_path(path)
+        ocr_cache = _load_ocr_cache(ocr_cache_path)
     try:
         for page_index in range(doc.page_count):
             page = doc[page_index]
             lines = _collect_lines(page)
             if not lines:
+                page_blocks: list[Block] = []
+                if ocr and (ocr_fn is not None or _needs_ocr(page)):
+                    if page_index in ocr_cache:
+                        page_blocks = [_block_from_dict(d) for d in ocr_cache[page_index]]
+                    else:
+                        if log:
+                            log(f"  OCR 第 {page_index + 1}/{doc.page_count} 页…")
+                        if ocr_fn is None and _get_ocr_engine() is None:
+                            if not _OCR_WARNED:
+                                _OCR_WARNED = True
+                                if log:
+                                    log(
+                                        "  OCR 引擎不可用：未安装 rapidocr_onnxruntime，"
+                                        "扫描页将不识别。"
+                                    )
+                            page_blocks = []
+                        else:
+                            page_blocks = _ocr_page_blocks(page_index, page, ocr_fn, cancel)
+                            if page_blocks:
+                                ocr_cache[page_index] = [
+                                    _block_to_dict(b) for b in page_blocks
+                                ]
+                if page_blocks:
+                    for b in page_blocks:
+                        result.blocks.append(b.text)
+                        result.block_pages.append(page_index)
+                    result.pages.append(page_blocks)
+                    result.ocr_count += 1
+                    continue
                 result.pages.append([])
                 continue
 
@@ -116,9 +182,240 @@ def extract_document_text(path: str | Path, title: str | None = None) -> Documen
                 result.blocks.append(block.text)
                 result.block_pages.append(page_index)
             result.pages.append(page_blocks)
+
+        if ocr_cache_path is not None and ocr_cache:
+            _save_ocr_cache(ocr_cache_path, ocr_cache)
     finally:
         doc.close()
     return result
+
+
+# ---------------------------------------------------------------------------
+# OCR for scanned / image-only pages (RapidOCR, lazily loaded)
+# ---------------------------------------------------------------------------
+
+#: Lazily-created RapidOCR engine (``None`` = not yet loaded, ``False`` = failed).
+_OCR_ENGINE: object | None = None
+_OCR_FAILED = False
+_OCR_WARNED = False
+_OCR_LOCK = threading.Lock()
+
+#: Render DPI for OCR — high enough for readable text, not so high the model
+#: works on huge images (RapidOCR upsamples internally anyway).
+_OCR_DPI = 300.0
+
+#: Control characters (C0/C1 + DEL) leaked by bad font encodings.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _clean_text(text: str) -> str:
+    """Map control characters to spaces and collapse whitespace."""
+    return " ".join(_CTRL_RE.sub(" ", str(text)).split())
+
+
+def _get_ocr_engine():
+    """Return a shared RapidOCR engine, or ``None`` if unavailable (degrade).
+
+    Loading is guarded by a lock; a failure is cached (``_OCR_FAILED``) so the
+    import is not retried on every page.  The caller may warn once (via its
+    ``log`` callback) when this returns ``None``.
+    """
+    global _OCR_ENGINE, _OCR_FAILED
+    if _OCR_FAILED:
+        return None
+    if _OCR_ENGINE is None:
+        with _OCR_LOCK:
+            if _OCR_ENGINE is None and not _OCR_FAILED:
+                try:
+                    from rapidocr_onnxruntime import RapidOCR
+
+                    _OCR_ENGINE = RapidOCR()
+                except Exception:
+                    _OCR_FAILED = True
+                    return None
+    return _OCR_ENGINE
+
+
+def _ocr_cache_dir() -> Path:
+    """A writable dir for OCR results (OCR output is slow — reuse on re-run).
+
+    ``PDFTRANSLATE_OCR_CACHE_DIR`` overrides the location; the default is the
+    user's ``~/.pdftranslate/ocr_cache``.
+    """
+    override = os.environ.get("PDFTRANSLATE_OCR_CACHE_DIR")
+    if override:
+        try:
+            p = Path(override)
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
+    for base in (
+        Path.home() / ".pdftranslate" / "ocr_cache",
+        Path(tempfile.gettempdir()) / "pdftranslate_ocr_cache",
+    ):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            return base
+        except Exception:
+            continue
+    return Path.home() / ".pdftranslate" / "ocr_cache"
+
+
+def _ocr_cache_path(doc_path: str | Path) -> Path:
+    """Cache file for a document's OCR results.
+
+    The key includes the file's mtime and size, not just its path: reusing OCR
+    results from a *replaced or edited* PDF would silently translate stale
+    content.  (The translation cache needs no such stamp — it looks blocks up
+    by content hash.)
+    """
+    p = Path(doc_path)
+    try:
+        st = p.stat()
+        stamp = f"|{int(st.st_mtime)}|{st.st_size}"
+    except OSError:
+        stamp = ""
+    h = hashlib.sha1(f"{p.resolve()}{stamp}".encode("utf-8")).hexdigest()[:16]
+    return _ocr_cache_dir() / f"ocr_{h}.json"
+
+
+def _load_ocr_cache(cache_path: Path) -> dict[int, list[dict]]:
+    """Load per-page OCR block dicts (``{page_index: [block_dict]}``)."""
+    if not cache_path.exists():
+        return {}
+    try:
+        import json
+
+        raw = json.loads(cache_path.read_text("utf-8"))
+        return {int(k): v for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def _save_ocr_cache(cache_path: Path, data: dict[int, list[dict]]) -> None:
+    """Best-effort persist of OCR results (OCR is slow — reuse on re-run)."""
+    try:
+        import json
+
+        cache_path.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+    except Exception:
+        pass
+
+
+def _page_to_array(page) -> tuple[object, float]:
+    """Render a page to a BGR numpy array plus the pixel-per-point zoom."""
+    import numpy as np
+
+    zoom = _OCR_DPI / 72.0
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB
+    )
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n >= 3:
+        img = img[:, :, :3][:, :, ::-1]  # RGB -> BGR (RapidOCR / OpenCV convention)
+    return img, zoom
+
+
+def _block_to_dict(b: Block) -> dict:
+    return asdict(b)
+
+
+def _block_from_dict(data: dict) -> Block:
+    allowed = {f.name for f in fields(Block)}
+    return Block(**{k: v for k, v in data.items() if k in allowed})
+
+
+def _synthesize_ocr_blocks(
+    results: Sequence[tuple[list, str]], page_index: int
+) -> list[Block]:
+    """Turn ``[(box, text), ...]`` (box already in PDF points) into blocks.
+
+    Text is cleaned, ordered with the same column-aware reading order as native
+    text, and given a font size estimated from the box height.
+    """
+    items: list[tuple] = []
+    for box, text in results:
+        cleaned = _clean_text(text)
+        if not cleaned:
+            continue
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
+        items.append((min(ys), min(xs), max(xs), max(ys), cleaned))
+    blocks: list[Block] = []
+    for y0, x0, x1, y1, text in _order_blocks(items):
+        size = min(_MAX_FONT, max(5.0, (y1 - y0) / 1.2))
+        blocks.append(
+            Block(
+                text=text, page=page_index, x0=x0, y0=y0, x1=x1, y1=y1,
+                size=round(size, 2), align="left", bold=False, single_line=True,
+                ocr=True,
+            )
+        )
+    return blocks
+
+
+def _needs_ocr(page) -> bool:
+    """True when a page has no embedded text but is clearly not blank.
+
+    A page that already exposes a text layer keeps using it.  A truly blank page
+    (no images, no drawings) is skipped so the renderer is not wasted.  Scanned
+    pages reach us as a full-page image, which ``get_images`` detects.
+    """
+    try:
+        if page.get_images(full=True):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(page.get_drawings())
+    except Exception:
+        return False
+
+
+def _ocr_page_blocks(
+    page_index: int,
+    page,
+    ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None,
+    cancel: Callable[[], bool] | None,
+) -> list[Block]:
+    """OCR one page and return its blocks (empty if OCR is unavailable/failed).
+
+    ``ocr_fn`` is injected by tests (returns ``[(box, text)]`` in PDF points);
+    production falls back to the shared RapidOCR engine.  ``cancel`` is polled
+    before the (potentially slow) render so a cancelled run does not start a
+    page it will never use.
+    """
+    if cancel is not None and cancel():
+        raise TranslationCancelled()
+    if ocr_fn is not None:
+        try:
+            return _synthesize_ocr_blocks(list(ocr_fn(page_index, page)), page_index)
+        except Exception:
+            return []
+    engine = _get_ocr_engine()
+    if engine is None:
+        return []
+    try:
+        img, zoom = _page_to_array(page)
+        out = engine(img)
+        # RapidOCR returns (list of [box, text, score] or None, timings).
+        items = out[0] if isinstance(out, tuple) else out
+        if not items:
+            return []
+        results: list[tuple[list, str]] = []
+        for item in items:
+            if not item or len(item) < 2:
+                continue
+            box = item[0]
+            text = item[1]
+            if not text:
+                continue
+            pdf_box = [[float(px) / zoom, float(py) / zoom] for px, py in box]
+            results.append((pdf_box, text))
+        return _synthesize_ocr_blocks(results, page_index)
+    except Exception:
+        return []
 
 
 #: Characters treated as a leading bullet (e.g. ``❖``, ``•``, ``▪``).
@@ -604,9 +901,12 @@ def save_translated_pdf(
                 continue
 
             # Remove the original text (keep images and line art/graphics).
+            # OCR blocks sit on a raster image rather than a text layer, so
+            # nothing is redacted for them — they are covered below instead.
             for j in range(m):
                 b = blocks[j]
-                page.add_redact_annot(fitz.Rect(b.x0, b.y0, b.x1, b.y1))
+                if not b.ocr:
+                    page.add_redact_annot(fitz.Rect(b.x0, b.y0, b.x1, b.y1))
             page.apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_NONE,
                 graphics=fitz.PDF_REDACT_LINE_ART_NONE,
@@ -615,7 +915,16 @@ def save_translated_pdf(
             # Draw the translation at the original positions / alignment /
             # font size (see ``_draw_translated_block`` for the fitting rules).
             for j in range(m):
-                _draw_translated_block(page, font, blocks[j], trans[j])
+                b = blocks[j]
+                if b.ocr:
+                    # Cover the underlying scan pixels so the translation does
+                    # not overprint the original (raster) text.
+                    page.draw_rect(
+                        fitz.Rect(b.x0 - 0.5, b.y0 - 0.5, b.x1 + 0.5, b.y1 + 0.5),
+                        color=None,
+                        fill=(1, 1, 1),
+                    )
+                _draw_translated_block(page, font, b, trans[j])
 
         out_doc.set_metadata({"title": "Translated text", "creator": "PDFtranslate"})
         out_doc.save(str(out_path), garbage=4, deflate=True)

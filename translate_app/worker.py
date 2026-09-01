@@ -54,6 +54,7 @@ class TranslateWorker(QObject):
         target_language: str,
         output_type: str,
         output_path: str,
+        ocr: bool = False,
     ):
         super().__init__()
         self._source = source_path
@@ -61,6 +62,7 @@ class TranslateWorker(QObject):
         self._lang = target_language
         self._output_type = output_type
         self._output_path = output_path
+        self._ocr = ocr
         self._cancelled = False
 
     @pyqtSlot()
@@ -72,8 +74,17 @@ class TranslateWorker(QObject):
 
             self.log.emit(f"开始时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
             self.log.emit(f"正在提取文本：{self._source}")
+            if self._ocr:
+                self.log.emit("已启用 OCR（自动识别原文语言），将识别无文本层的扫描页。")
             self.progress.emit(0, 0, "提取文本…")
-            doc = pdfio.extract_document_text(self._source)
+            doc = pdfio.extract_document_text(
+                self._source,
+                ocr=self._ocr,
+                cancel=lambda: self._cancelled,
+                log=lambda m: self.log.emit(m),
+            )
+            if doc.ocr_count:
+                self.log.emit(f"有 {doc.ocr_count} 个页面无文本层，已通过 OCR 提取。")
             extract_elapsed = time.monotonic() - started
 
             if not doc.blocks:

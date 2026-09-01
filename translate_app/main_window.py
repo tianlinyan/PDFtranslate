@@ -13,6 +13,7 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QThread
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -133,6 +134,15 @@ class MainWindow(QWidget):
         form.addRow("目标语言", self._lang_combo)
         form.addRow("输出格式", self._type_combo)
         form.addRow("保存到", path_row)
+
+        # --- OCR (scanned pages) ---
+        # OCR 语言自动跟随原文（RapidOCR 内置中英文自动识别模型），无需手动选择。
+        self._ocr_check = QCheckBox("启用 OCR（识别扫描 PDF 中的文本）")
+        self._ocr_check.setChecked(bool(prefs.get("ocr", True)))
+        ocr_row = QHBoxLayout()
+        ocr_row.addWidget(self._ocr_check)
+        ocr_row.addStretch()
+        form.addRow("识别扫描页", ocr_row)
 
         # --- Progress + log ---
         self._progress = QProgressBar()
@@ -272,7 +282,12 @@ class MainWindow(QWidget):
 
         self._thread = QThread(self)
         self._worker = TranslateWorker(
-            self._source, model, str(lang), key, out_path
+            self._source,
+            model,
+            str(lang),
+            key,
+            out_path,
+            ocr=self._ocr_check.isChecked(),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -293,6 +308,7 @@ class MainWindow(QWidget):
                     "model_id": model_id,
                     "language": language,
                     "output_type": output_key,
+                    "ocr": self._ocr_check.isChecked(),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )

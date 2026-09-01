@@ -50,11 +50,13 @@ main.py → MainWindow (PyQt6)
 - `extract_document_text` 使用 `page.get_text("blocks")`，仅保留文本块（type 0）；`_order_blocks` 按 x 重叠聚类分栏，多栏页按列（左列自上而下，再右列）阅读，单栏保持 y 取整后按 x。另用 `page.get_text("dict")` 一次提取 span，为每个 `Block` 填充 `size`（span 字号中位数）、`bold`、`align`（left/center/right）与 `single_line`。`DocumentText` 同时携带 `pages`（带布局元数据的 `Block`）和扁平的 `blocks`/`block_pages`。
 - CJK 文本用 PyMuPDF 内置的 `fitz.Font("cjk")` 渲染（回退 helv）。所有块（含粗体）统一用同一款字体——曾尝试用 `insert_text("china-s", render_mode=2)` 描边模拟粗体，但会混入第二种字体（Heiti），造成版面字体不一致，已移除；`Block.bold` 字段保留但暂不改变渲染。
 - `_draw_translated_block`（原位与双语共用的绘制助手）：字形框（ascender+行+descender）锚定块 bbox 顶部，字号从原块字号起（上限 `_MAX_FONT` 24pt）以 0.9 因子缩减直到装进框内（下限 3pt 保证不溢出）；单行块在框内垂直居中，多行块贴顶；支持左/中/右对齐。
-- `save_translated_pdf`（仅译文/原位）：原样插入每页原文，涂盖原文文本矩形但保留图片与线条（`PDF_REDACT_IMAGE_NONE` / `PDF_REDACT_LINE_ART_NONE`），再按块调用 `_draw_translated_block`。
+- `save_translated_pdf`（仅译文/原位）：原样插入每页原文，涂盖原文文本矩形但保留图片与线条（`PDF_REDACT_IMAGE_NONE` / `PDF_REDACT_LINE_ART_NONE`），再按块调用 `_draw_translated_block`。对 `Block.ocr` 为真的块（其文字是位图、无文本层可红action）**不红action**，而是先在该块 bbox 画一个不透明白色矩形盖住扫描字，再画译文，避免叠字。
 - `save_interleaved_pdf`（双语）：原文页之后新建空白译文页，译文块按原文块的 bbox 位置绘制（镜像版式）；无文本页写提示文案。worker 传 `doc.pages` 供其使用。
+- OCR（扫描页）：`extract_document_text(...)` 接受 `ocr` / `ocr_fn` / `cancel` / `log`。当页无文本层且 `_needs_ocr(page)`（有图片或图形）为真时，用 RapidOCR（`rapidocr_onnxruntime`，内置中英文 PP-OCRv3 模型、离线）识别。生产路径：`_page_to_array` 按 `_OCR_DPI` 渲染并做 **RGB→BGR**（RapidOCR/OpenCV 约定），`engine(img)` 输出经防御式解析（兼容 `(list, timings)` 或裸 list），像素框 `/zoom` 转成 PDF 点，再经 `_synthesize_ocr_blocks`（`_clean_text` 清控制字符 → `_order_blocks` 按列阅读序 → 字号 `(y1-y0)/1.2` 截断 `[5, _MAX_FONT]`）还原成 `Block`（`ocr=True`、`single_line=True`）。**OCR 结果按文档缓存**（`~/.pdftranslate/ocr_cache/ocr_<sha1>.json`，key 含文件 mtime+size；`PDFTRANSLATE_OCR_CACHE_DIR` 可覆盖目录），`DocumentText.ocr_count` 记录 OCR 页数供 worker 日志。`_get_ocr_engine` 惰性单例（`_OCR_LOCK` + `_OCR_FAILED` 缓存，失败返回 `None` 并**降级跳过**而非抛异常）；`ocr_fn(page_index, page)->[(box,text)]`（box 为 PDF 点）是测试注入缝；`cancel()` 每页触发抛 `TranslationCancelled`。**OCR 语言自动跟随原文**（RapidOCR 默认中英文自动识别模型，无独立选择项）。
 - `_wrap` 必须按字符断开无空格的 CJK「词」（`_break_word` 中二分查找）且不丢字——由 `WrapTest` 覆盖。
 
 ### translate_app/main_window.py
 - `LANGUAGES` 将界面显示名映射为发送给模型的语言名。
 - 线程生命周期：每次运行创建 `QThread` + worker；关闭窗口即「六亲不认」地强行退出——不弹任何确认框，直接 `thread.terminate()` + `thread.wait()` 强制结束 worker 线程，再用 `os._exit(0)` 硬退整个进程，以绕过 `concurrent.futures` 在解释器退出时对非 daemon HTTP 线程的 join 阻塞（因此绝不等待当前请求完成）。
+- OCR 开关：表单中以「识别扫描页」行提供 `QCheckBox`（默认勾选；OCR 语言自动跟随原文，无独立下拉），随 `_save_prefs` 持久化到 `prefs.json`（`ocr`），`_start` 时传给 `TranslateWorker(ocr=...)`。
 - PDF 可拖放到窗口设置源文件；命令行传入的 PDF 路径效果相同。
