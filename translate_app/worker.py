@@ -14,7 +14,7 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from . import pdfio
 from .settings import ModelConfig
-from .translator import TranslationCancelled, TranslationEngine
+from .translator import TranslationAborted, TranslationCancelled, TranslationEngine
 
 #: Output formats offered by the translation dialog.
 OUTPUT_TYPES = {
@@ -46,6 +46,12 @@ class TranslateWorker(QObject):
     log = pyqtSignal(str)
     finished = pyqtSignal(str)             # output path
     error = pyqtSignal(str)
+    #: Emitted on *every* exit path (success, error, cancellation).  The GUI
+    #: connects it to ``QThread.quit``: a cancelled run emits neither
+    #: ``finished`` nor ``error``, so without this signal the worker thread's
+    #: event loop would keep running forever and the window could never start
+    #: another translation.
+    stopped = pyqtSignal()
 
     def __init__(
         self,
@@ -110,6 +116,15 @@ class TranslateWorker(QObject):
             if self._cancelled:
                 raise TranslationCancelled()
 
+            # Batches that failed every retry kept their source text.  Say so:
+            # otherwise the run reports "完成" and the user has to notice on
+            # their own that parts of the document were never translated.
+            if result.errors:
+                self.log.emit(
+                    f"警告：{len(result.errors)} 个文本块翻译失败，已保留原文。"
+                    "可稍后重新运行，已成功的部分会直接从缓存恢复。"
+                )
+
             per_page = pdfio.group_by_page(
                 doc.block_pages, result.translated, doc.page_count
             )
@@ -131,6 +146,13 @@ class TranslateWorker(QObject):
             self.finished.emit(out_path)
         except TranslationCancelled:
             self.log.emit(f"已取消。用时 {format_duration(time.monotonic() - started)}")
+        except TranslationAborted as exc:
+            # A configuration error (bad key / unknown model): report it as a
+            # failure instead of exporting a document that is just the source.
+            self.error.emit(
+                f"翻译已中止：{exc}"
+                f"（用时 {format_duration(time.monotonic() - started)}）"
+            )
         except Exception as exc:  # noqa: BLE001
             import traceback
 
@@ -139,6 +161,9 @@ class TranslateWorker(QObject):
                 f"（用时 {format_duration(time.monotonic() - started)}）"
                 f"\n\n{traceback.format_exc()}"
             )
+        finally:
+            # Always release the thread, whatever happened above.
+            self.stopped.emit()
 
     def cancel(self) -> None:
         """Request cancellation (safe to call from the GUI thread)."""

@@ -51,6 +51,27 @@ _DEFAULT_LANG = "简体中文（中文）"
 _FILE_FILTER = "PDF 文件 (*.pdf);;所有文件 (*.*)"
 
 
+def resolve_language(text: str) -> str:
+    """Map the language combo's *text* to the language name sent to the model.
+
+    The combo is editable, so the user may type a language that is not in
+    :data:`LANGUAGES`.  ``QComboBox.currentData()`` must not be used to read it:
+    when the typed text matches no item, Qt leaves ``currentIndex`` — and thus
+    the item data — pointing at the previously selected entry.  Typing
+    "Português" therefore translated the document into whatever was selected
+    before, and even named the output file after it, with nothing on screen to
+    suggest the input had been ignored.
+    """
+    typed = (text or "").strip()
+    for label, code in LANGUAGES:
+        if typed == label or typed.casefold() == code.casefold():
+            return code
+    # An unknown value is passed through: the model can translate into far more
+    # languages than the six listed here.
+    return typed or LANGUAGES[0][1]
+
+
+
 class MainWindow(QWidget):
     """The translation tool's main window."""
 
@@ -235,9 +256,13 @@ class MainWindow(QWidget):
         if path:
             self._path_edit.setText(path)
 
+    def _target_language(self) -> str:
+        """The language name sent to the model (typed values win, see above)."""
+        return resolve_language(self._lang_combo.currentText())
+
     def _default_output_path(self) -> str:
         source = Path(self._source or "document.pdf")
-        lang = (self._lang_combo.currentData() or self._lang_combo.currentText())
+        lang = self._target_language()
         lang_slug = "".join(ch for ch in str(lang) if ch.isalnum())[:24] or "translated"
         key = self._type_combo.currentData()
         _label, ext = OUTPUT_TYPES[key]
@@ -267,7 +292,7 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "模型配置", "\n".join(problems))
             return
 
-        lang = self._lang_combo.currentData() or self._lang_combo.currentText()
+        lang = self._target_language()
         key = self._type_combo.currentData()
         out_path = self._path_edit.text().strip() or self._default_output_path()
 
@@ -295,8 +320,11 @@ class MainWindow(QWidget):
         self._worker.log.connect(self._append_log)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.error.connect(self._thread.quit)
+        # ``stopped`` fires on every exit path — including a cancellation, which
+        # emits neither ``finished`` nor ``error``.  Quitting the thread from it
+        # (instead of from those two) guarantees ``_cleanup`` always runs and the
+        # "开始翻译" button comes back.
+        self._worker.stopped.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup)
         self._thread.start()
 
@@ -368,7 +396,9 @@ class MainWindow(QWidget):
     def _on_error(self, msg: str) -> None:
         self._stage.setText("发生错误")
         self._log.appendPlainText(msg)
-        QMessageBox.critical(self, "翻译失败", msg.splitlines()[0])
+        # Show only the headline in the dialog (the log keeps the full detail).
+        headline = next((ln for ln in msg.splitlines() if ln.strip()), "翻译失败")
+        QMessageBox.critical(self, "翻译失败", headline)
 
     def _open_output(self) -> None:
         if not self._last_output:

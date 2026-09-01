@@ -19,6 +19,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -110,16 +111,17 @@ def extract_document_text(
     keep the exact layout the exporters expect.  ``ocr_fn`` is an injectable
     OCR callback ``(page_index, page) -> [(box, text)]`` (box already in PDF
     points) used by tests to avoid running real OCR; when it is ``None`` the
-    shared RapidOCR engine is used and per-page results are cached per document
-    (keyed by file mtime + size, so an edited PDF is re-OCR'd).  ``cancel`` is
-    polled per page (raising :class:`TranslateCancelled`), and ``log`` receives
-    per-page OCR progress.
+    shared RapidOCR engine is used.  Recognised pages are cached per document
+    (keyed by file mtime + size, so an edited PDF is re-OCR'd) and the cache is
+    written after every page, so a cancelled run keeps what it already did.
+    ``cancel`` is polled per page (raising :class:`TranslationCancelled`), and
+    ``log`` receives per-page OCR progress.
     """
     doc = fitz.open(str(path))
     result = DocumentText(title=title or Path(path).stem)
     ocr_cache: dict[int, list[dict]] = {}
     ocr_cache_path: Path | None = None
-    if ocr and ocr_fn is None:
+    if ocr:
         ocr_cache_path = _ocr_cache_path(path)
         ocr_cache = _load_ocr_cache(ocr_cache_path)
     try:
@@ -135,20 +137,21 @@ def extract_document_text(
                         if log:
                             log(f"  OCR 第 {page_index + 1}/{doc.page_count} 页…")
                         if ocr_fn is None and _get_ocr_engine() is None:
-                            if not _OCR_WARNED:
-                                _OCR_WARNED = True
-                                if log:
-                                    log(
-                                        "  OCR 引擎不可用：未安装 rapidocr_onnxruntime，"
-                                        "扫描页将不识别。"
-                                    )
+                            _warn_ocr_unavailable(log)
                             page_blocks = []
                         else:
-                            page_blocks = _ocr_page_blocks(page_index, page, ocr_fn, cancel)
+                            page_blocks = _ocr_page_blocks(
+                                page_index, page, ocr_fn, cancel, log
+                            )
                             if page_blocks:
                                 ocr_cache[page_index] = [
                                     _block_to_dict(b) for b in page_blocks
                                 ]
+                                # Persist after *every* page: OCR is by far the
+                                # slowest stage, so a cancel or a crash must not
+                                # throw away the pages already recognised.
+                                if ocr_cache_path is not None:
+                                    _save_ocr_cache(ocr_cache_path, ocr_cache)
                 if page_blocks:
                     for b in page_blocks:
                         result.blocks.append(b.text)
@@ -182,9 +185,6 @@ def extract_document_text(
                 result.blocks.append(block.text)
                 result.block_pages.append(page_index)
             result.pages.append(page_blocks)
-
-        if ocr_cache_path is not None and ocr_cache:
-            _save_ocr_cache(ocr_cache_path, ocr_cache)
     finally:
         doc.close()
     return result
@@ -236,6 +236,24 @@ def _get_ocr_engine():
     return _OCR_ENGINE
 
 
+def _warn_ocr_unavailable(log: Callable[[str], None] | None) -> None:
+    """Warn (once per process) that the OCR engine could not be loaded.
+
+    The "warned already?" flag is module-level mutable state, so it is rebound
+    *here* — inside a function that declares ``global`` — rather than inside the
+    extraction loop.  Assigning it there without the declaration made Python
+    treat the name as a local for the whole function, so merely reading it
+    raised ``UnboundLocalError`` and the intended "degrade and skip" path
+    crashed the entire run instead.
+    """
+    global _OCR_WARNED
+    if _OCR_WARNED:
+        return
+    _OCR_WARNED = True
+    if log:
+        log("  OCR 引擎不可用：未安装 rapidocr_onnxruntime，扫描页将不识别。")
+
+
 def _ocr_cache_dir() -> Path:
     """A writable dir for OCR results (OCR output is slow — reuse on re-run).
 
@@ -285,22 +303,31 @@ def _load_ocr_cache(cache_path: Path) -> dict[int, list[dict]]:
     if not cache_path.exists():
         return {}
     try:
-        import json
-
         raw = json.loads(cache_path.read_text("utf-8"))
+        if not isinstance(raw, dict):
+            return {}
         return {int(k): v for k, v in raw.items()}
     except Exception:
         return {}
 
 
 def _save_ocr_cache(cache_path: Path, data: dict[int, list[dict]]) -> None:
-    """Best-effort persist of OCR results (OCR is slow — reuse on re-run)."""
-    try:
-        import json
+    """Best-effort *atomic* persist of OCR results (OCR is slow — reuse it).
 
-        cache_path.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+    Written through a temp file + :func:`os.replace` because this is now called
+    after every OCR'd page: a cancel (or the GUI's hard ``os._exit``) landing
+    mid-write would otherwise leave truncated JSON, which reads back as "no
+    cache" and re-runs the whole slow OCR pass next time.
+    """
+    tmp = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+        os.replace(tmp, cache_path)
     except Exception:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _page_to_array(page) -> tuple[object, float]:
@@ -378,6 +405,7 @@ def _ocr_page_blocks(
     page,
     ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None,
     cancel: Callable[[], bool] | None,
+    log: Callable[[str], None] | None = None,
 ) -> list[Block]:
     """OCR one page and return its blocks (empty if OCR is unavailable/failed).
 
@@ -385,13 +413,24 @@ def _ocr_page_blocks(
     production falls back to the shared RapidOCR engine.  ``cancel`` is polled
     before the (potentially slow) render so a cancelled run does not start a
     page it will never use.
+
+    A recognition failure degrades to "no text on this page" — one bad page
+    must not kill the run — but the reason is reported through ``log`` instead
+    of being swallowed: a silent ``except`` here looks exactly like a scan that
+    contains no text, which is impossible to diagnose from the outside.
+    :class:`TranslationCancelled` is deliberately re-raised: it is a control
+    signal, not a page-level failure.
     """
     if cancel is not None and cancel():
         raise TranslationCancelled()
     if ocr_fn is not None:
         try:
             return _synthesize_ocr_blocks(list(ocr_fn(page_index, page)), page_index)
-        except Exception:
+        except TranslationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — one bad page must not abort
+            if log:
+                log(f"  第 {page_index + 1} 页 OCR 失败：{type(exc).__name__}: {exc}")
             return []
     engine = _get_ocr_engine()
     if engine is None:
@@ -414,7 +453,11 @@ def _ocr_page_blocks(
             pdf_box = [[float(px) / zoom, float(py) / zoom] for px, py in box]
             results.append((pdf_box, text))
         return _synthesize_ocr_blocks(results, page_index)
-    except Exception:
+    except TranslationCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001 — one bad page must not abort
+        if log:
+            log(f"  第 {page_index + 1} 页 OCR 失败：{type(exc).__name__}: {exc}")
         return []
 
 

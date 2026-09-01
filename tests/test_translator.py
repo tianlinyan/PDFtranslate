@@ -1,14 +1,23 @@
 """Tests for the translation engine (batching, alignment, progress, cache)."""
 import json
+import os
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
 
+import httpx
+from openai import AuthenticationError, BadRequestError
+
 from translate_app import translator
 from translate_app.settings import ModelConfig
-from translate_app.translator import TranslationEngine, _cache_dir, _cache_key
+from translate_app.translator import (
+    TranslationAborted,
+    TranslationEngine,
+    _cache_dir,
+    _cache_key,
+)
 
 from tests._helpers import MockServer
 
@@ -23,6 +32,18 @@ BLOCKS = [
 
 
 class TranslatorTest(unittest.TestCase):
+    def setUp(self):
+        # Keep the cache out of the developer's real ``~/.pdftranslate/cache``:
+        # every run used to leave files there forever.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cache_dir = Path(tmp.name)
+        patcher = mock.patch.dict(
+            os.environ, {"PDFTRANSLATE_CACHE_DIR": str(self.cache_dir)}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _engine(self, server: MockServer) -> TranslationEngine:
         model = ModelConfig(
             id="mock", name="mock", type="openai",
@@ -132,9 +153,60 @@ class TranslatorTest(unittest.TestCase):
                 raise PermissionError("denied by test")
             return real_write_text(self, *args, **kwargs)
 
-        with mock.patch.object(Path, "write_text", fake_write_text):
-            resolved = _cache_dir()
+        # This test is about the home -> temp fallback, so the explicit
+        # ``PDFTRANSLATE_CACHE_DIR`` override set in setUp must be out of the way.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PDFTRANSLATE_CACHE_DIR", None)
+            with mock.patch.object(Path, "write_text", fake_write_text):
+                resolved = _cache_dir()
         self.assertEqual(resolved, Path(tempfile.gettempdir()) / "pdftranslate_cache")
+
+    def test_cache_dir_env_override_is_used(self):
+        self.assertEqual(self.cache_dir, _cache_dir())
+
+    def test_cache_write_is_atomic(self):
+        # The GUI hard-exits the process on close, so a plain overwrite could
+        # leave truncated JSON behind — which reads back as "no cache" and
+        # silently re-translates the whole document next time.
+        path = self.cache_dir / "trans_v9_atomic.json"
+        path.write_text('{"old": "value"}', "utf-8")
+
+        real_replace = os.replace
+        seen: list[str] = []
+
+        def failing_replace(src, dst):
+            seen.append(str(src))
+            raise OSError("disk full")
+
+        with mock.patch.object(os, "replace", failing_replace):
+            reason = translator._write_cache(path, {"new": "value"})
+        self.assertIsNotNone(reason)
+        # The previous cache is untouched, and no temp file is left behind.
+        self.assertEqual({"old": "value"}, json.loads(path.read_text("utf-8")))
+        self.assertEqual([], list(self.cache_dir.glob("*.tmp")))
+        self.assertTrue(seen)
+
+        # And the successful path really swaps the new content in.
+        self.assertIsNone(translator._write_cache(path, {"new": "value"}))
+        self.assertEqual({"new": "value"}, json.loads(path.read_text("utf-8")))
+        self.assertEqual([], list(self.cache_dir.glob("*.tmp")))
+        self.assertIs(os.replace, real_replace)
+
+    def test_corrupted_cache_file_is_ignored(self):
+        doc_path = Path("_corrupt.pdf")
+        cache_path = _cache_dir() / _cache_key(doc_path, "Chinese", "mock-corrupt")
+        cache_path.write_text('["not", "a", "mapping"]', "utf-8")
+        self.assertEqual({}, translator.load_translation_cache(
+            doc_path, "Chinese", "mock-corrupt"
+        ))
+
+    def test_clear_cache_also_removes_temp_leftovers(self):
+        (self.cache_dir / "trans_v3_abc.json").write_text("{}", "utf-8")
+        (self.cache_dir / "trans_v3_abc.json.123.tmp").write_text("{", "utf-8")
+        removed = translator.clear_translation_cache()
+        self.assertEqual(2, removed)
+        self.assertEqual([], list(self.cache_dir.glob("trans_*")))
+
 
     def test_cache_write_failure_is_logged_once(self):
         # An unwritable cache must not break the translation, but it must be
@@ -167,7 +239,7 @@ class TranslatorTest(unittest.TestCase):
             "[1]\nFirst line.\nsecond line continued.\n"
             "[2]\nSecond block."
         )
-        parsed = TranslationEngine._parse_response(raw, ["a", "b"], [0, 1])
+        parsed = TranslationEngine._parse_response(raw, [0, 1])
         self.assertEqual(
             parsed, ["First line. second line continued.", "Second block."]
         )
@@ -178,11 +250,55 @@ class TranslatorTest(unittest.TestCase):
         # retry) instead of silently filling the gaps with the original text.
         raw = "[1]\nFirst block.\n[2]\nSecond block."  # third block missing
         with self.assertRaises(ValueError):
-            TranslationEngine._parse_response(raw, ["a", "b", "c"], [0, 1, 2])
+            TranslationEngine._parse_response(raw, [0, 1, 2])
 
         # Out-of-range marker (echoes [4] for a 3-block batch) is also rejected.
         with self.assertRaises(ValueError):
-            TranslationEngine._parse_response("[1]\na\n[4]\nd", ["a", "b", "c"], [0, 1, 2])
+            TranslationEngine._parse_response("[1]\na\n[4]\nd", [0, 1, 2])
+
+    def test_unnumbered_reply_must_match_the_block_count(self):
+        # Regression: with no [n] markers at all the parser used to map reply
+        # lines onto blocks positionally and pad the rest with the source text.
+        # A one-line refusal therefore became block 1's "translation" — and,
+        # counting as success, was written to the cache and reused forever.
+        with self.assertRaises(ValueError):
+            TranslationEngine._parse_response(
+                "Sorry, I cannot translate this.", [0, 1, 2]
+            )
+        # A chatty preamble ahead of the translations is rejected too.
+        with self.assertRaises(ValueError):
+            TranslationEngine._parse_response(
+                "Sure! Here you go:\nFirst.\nSecond.", [0, 1]
+            )
+
+    def test_unnumbered_reply_with_one_line_per_block_is_accepted(self):
+        parsed = TranslationEngine._parse_response("First.\nSecond.", [0, 1])
+        self.assertEqual(["First.", "Second."], parsed)
+
+    def test_unnumbered_single_block_reply_is_folded(self):
+        # A single requested block owns the whole reply, however it is wrapped.
+        parsed = TranslationEngine._parse_response("A long\nwrapped reply.", [7])
+        self.assertEqual(["A long wrapped reply."], parsed)
+
+    def test_unparseable_reply_keeps_source_and_skips_cache(self):
+        # End-to-end: a model that answers without markers and with the wrong
+        # line count must leave the document untranslated *and* uncached.
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            engine._request_locked = lambda _p, _s: "Sorry, I cannot translate this."
+            doc_path = Path("_unparseable.pdf")
+            res = engine.translate_blocks(
+                BLOCKS, "Chinese", doc_path=doc_path, retry_delays=(0.0, 0.0),
+            )
+            self.assertEqual(BLOCKS, res.translated)
+            self.assertTrue(res.errors)
+            cache_path = _cache_dir() / _cache_key(doc_path, "Chinese", model.id)
+            self.assertEqual({}, json.loads(cache_path.read_text("utf-8")))
+
 
     def test_symbol_only_blocks_are_skipped(self):
         with MockServer() as server:
@@ -271,5 +387,88 @@ class TranslatorTest(unittest.TestCase):
             self.assertNotIn("max_tokens", server.last_body)
 
 
+class FatalErrorTest(unittest.TestCase):
+    """A wrong key / model must stop the run, not "translate" into the source."""
+
+    def _auth_error(self) -> AuthenticationError:
+        request = httpx.Request("POST", "http://x/v1/chat/completions")
+        return AuthenticationError(
+            "invalid api key", response=httpx.Response(401, request=request), body=None
+        )
+
+    def _engine(self, endpoint: str) -> TranslationEngine:
+        return TranslationEngine(
+            ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=endpoint, model="mock-model",
+            )
+        )
+
+    def test_auth_error_aborts_the_whole_run(self):
+        with MockServer() as server:
+            engine = self._engine(server.endpoint)
+            err = self._auth_error()
+
+            def boom(_prompt, _system):
+                raise err
+
+            engine._request_locked = boom  # type: ignore[method-assign]
+            with self.assertRaises(TranslationAborted) as ctx:
+                engine.translate_blocks(
+                    BLOCKS, "Chinese", doc_path=Path("_fatal.pdf"),
+                    retry_delays=(0.0, 0.0),
+                )
+        # The message must point at the actual cause (the API key).
+        self.assertIn("api_key", str(ctx.exception))
+
+    def test_fatal_error_does_not_retry_or_run_further_batches(self):
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model", batch_size=30,
+            )
+            engine = TranslationEngine(model)
+            calls: list[str] = []
+            err = self._auth_error()
+
+            def boom(prompt, _system):
+                calls.append(prompt)
+                raise err
+
+            engine._request_locked = boom  # type: ignore[method-assign]
+            # A 30-char budget puts every block in its own batch ...
+            with self.assertRaises(TranslationAborted):
+                engine.translate_blocks(
+                    BLOCKS, "Chinese", doc_path=Path("_fatal2.pdf"),
+                    retry_delays=(0.0, 0.0),
+                )
+            # ... yet exactly one doomed request is issued: no retries for a
+            # fatal error, and the batches queued behind it bail out.
+            self.assertEqual(1, len(calls), calls)
+
+    def test_bad_request_is_not_fatal(self):
+        # 400 is usually data-dependent (one oversized batch), so the other
+        # batches must still get their chance: keep the source, carry on.
+        with MockServer() as server:
+            engine = self._engine(server.endpoint)
+            request = httpx.Request("POST", "http://x/v1/chat/completions")
+            err = BadRequestError(
+                "context length exceeded",
+                response=httpx.Response(400, request=request), body=None,
+            )
+
+            def boom(_prompt, _system):
+                raise err
+
+            engine._request_locked = boom  # type: ignore[method-assign]
+            res = engine.translate_blocks(
+                BLOCKS, "Chinese", doc_path=Path("_badreq.pdf"),
+                retry_delays=(0.0, 0.0),
+            )
+        self.assertEqual(BLOCKS, res.translated)
+        self.assertTrue(res.errors)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -15,11 +15,14 @@ Key behaviours
 * Transient failures are retried with backoff; a block that cannot be
   translated is left as the original text rather than silently dropped, and
   failed batches are never written into the cache.
+* A fatal configuration error (wrong API key, unknown model) aborts the run
+  instead of quietly handing back the untranslated source as a "result".
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -54,8 +57,11 @@ _MULTI_BLOCK_RE = re.compile(r"(?ms)^\s*\[(\d+)\]\s*(.*?)(?=^\s*\[\d+\]\s*|\Z)")
 _CHAR_BUDGET = 4000
 
 #: Cache format version — bump when the prompt or response format changes so
-#: stale translations from an older run are never reused.
-_CACHE_VERSION = 3
+#: stale translations from an older run are never reused.  Bumped to 4 when the
+#: unnumbered-reply fallback was tightened: caches written before that could
+#: contain a model's refusal / preamble line stored as block 1's "translation",
+#: and such an entry would otherwise be reused forever.
+_CACHE_VERSION = 4
 
 #: Delay between batch attempts (seconds); injectable so tests don't sleep.
 _TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
@@ -78,6 +84,16 @@ class TranslationCancelled(Exception):
     """Raised when a user cancels an in-flight translation."""
 
 
+class TranslationAborted(Exception):
+    """Raised when a fatal configuration error stops the whole run.
+
+    Unlike a per-batch failure (which keeps the source text and carries on),
+    a bad API key or a misspelled model name fails identically for every batch.
+    Carrying on would produce a "finished" document that is really just the
+    untranslated source, so the run stops and the GUI reports the reason.
+    """
+
+
 @dataclass
 class TranslationResult:
     """Result of translating a single document."""
@@ -93,16 +109,24 @@ class TranslationResult:
 def _cache_dir() -> Path:
     """Return a writable cache directory, falling back to the system temp dir.
 
+    ``PDFTRANSLATE_CACHE_DIR`` overrides the location (mirroring
+    ``PDFTRANSLATE_OCR_CACHE_DIR`` on the OCR side) so tests — and users with a
+    read-only home — can point the cache somewhere else.
+
     Creating the directory is not enough to prove it is usable: an existing
     directory under a read-only / sandboxed ``$HOME`` lets ``mkdir`` succeed
     (``exist_ok=True`` is a no-op) while every later write is denied.  That
     silently disables resume, so each candidate is verified with a real probe
     write before it is accepted.
     """
-    for path in (
+    candidates = [
         Path.home() / ".pdftranslate" / "cache",
         Path(tempfile.gettempdir()) / "pdftranslate_cache",
-    ):
+    ]
+    override = os.environ.get("PDFTRANSLATE_CACHE_DIR")
+    if override:
+        candidates.insert(0, Path(override))
+    for path in candidates:
         try:
             path.mkdir(parents=True, exist_ok=True)
             probe = path / f".write_probe_{os.getpid()}"
@@ -146,9 +170,11 @@ def load_translation_cache(doc_path: Path, target_lang: str, model_id: str) -> d
     cache_path = _cache_dir() / _cache_key(doc_path, target_lang, model_id)
     if cache_path.exists():
         try:
-            import json
-
-            return json.loads(cache_path.read_text("utf-8"))
+            data = json.loads(cache_path.read_text("utf-8"))
+            # Anything but a JSON object is a foreign / corrupted file: ignore
+            # it rather than letting ``cache[key] = ...`` blow up mid-run.
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
         except Exception:
             pass
     return {}
@@ -157,7 +183,9 @@ def load_translation_cache(doc_path: Path, target_lang: str, model_id: str) -> d
 def clear_translation_cache() -> int:
     """Delete all cached translation files; returns the number of files removed."""
     removed = 0
-    for path in _cache_dir().glob("trans_*.json"):
+    # ``trans_*`` (not ``trans_*.json``) also sweeps up any ``.tmp`` file left
+    # behind by an interrupted atomic write.
+    for path in _cache_dir().glob("trans_*"):
         try:
             path.unlink()
             removed += 1
@@ -241,15 +269,15 @@ class TranslationEngine:
         return (choice.message.content or "").strip()
 
     @staticmethod
-    def _parse_response(
-        text: str, blocks: Sequence[str], indices: Sequence[int]
-    ) -> list[str]:
+    def _parse_response(text: str, indices: Sequence[int]) -> list[str]:
         """Map a model response back onto the requested blocks.
 
         Each ``[n]`` block may span several lines; internal line breaks are
         folded into spaces so one reply block becomes one translated block.
+        A reply that cannot be aligned with certainty raises ``ValueError`` —
+        the source text is never mixed into a "successful" result, because such
+        a result would be cached and reused forever.
         """
-        result: list[str] = []
         matched: dict[int, str] = {}
         for m in _MULTI_BLOCK_RE.finditer(text):
             pos = int(m.group(1)) - 1
@@ -268,17 +296,28 @@ class TranslationEngine:
                     "模型回复的块编号不完整（期望 "
                     f"{len(indices)} 块，回显 [{got}]），无法对齐"
                 )
-            result = [matched[p] for p in range(len(indices))]
-            return result
+            return [matched[p] for p in range(len(indices))]
 
-        # Fallback: assume output lines correspond in order.
+
+        # Fallback: the reply carries no ``[n]`` marker at all.  Mapping lines
+        # onto blocks by position is only defensible when the reply really does
+        # have one line per requested block.  Accepting anything else let a
+        # single-line refusal ("Sorry, I cannot translate this.") become block
+        # 1's translation while the rest silently kept the source text — and
+        # because that counts as success, the garbage was written to the cache
+        # and reused forever.  Reject instead: the caller retries and, once the
+        # retries are exhausted, preserves the source text without caching it.
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        for n, i in enumerate(indices):
-            if n < len(lines):
-                result.append(lines[n])
-            else:
-                result.append(blocks[i])
-        return result
+        if len(indices) == 1:
+            # One requested block: the whole reply belongs to it (models often
+            # wrap a long translation over several lines).
+            return [" ".join(text.split())]
+        if len(lines) != len(indices):
+            raise ValueError(
+                "模型回复既无 [n] 编号，行数也与块数不符"
+                f"（期望 {len(indices)} 行，实际 {len(lines)} 行），无法对齐"
+            )
+        return list(lines)
 
     @staticmethod
     def _is_transient(exc: Exception) -> bool:
@@ -295,6 +334,33 @@ class TranslationEngine:
             return exc.status_code == 429 or exc.status_code >= 500
         return True
 
+    @staticmethod
+    def _is_fatal(exc: Exception | None) -> bool:
+        """True for configuration errors that doom *every* batch equally.
+
+        A wrong API key, a revoked key or a misspelled model / endpoint fails
+        the same way for every request in the run.  Continuing would burn one
+        doomed request per batch and then hand back a document in which every
+        block "kept the original text" — a file that looks like a finished
+        translation but is just the source.  Such a run must stop loudly.
+
+        ``BadRequestError`` (400) is deliberately NOT fatal: it is usually
+        data-dependent (one oversized batch), so the other batches may succeed.
+        """
+        return isinstance(
+            exc, (AuthenticationError, PermissionDeniedError, NotFoundError)
+        )
+
+    @staticmethod
+    def _fatal_message(exc: Exception) -> str:
+        if isinstance(exc, AuthenticationError):
+            return f"API 认证失败，请检查 models.json 中的 api_key：{exc}"
+        if isinstance(exc, PermissionDeniedError):
+            return f"API 拒绝访问，密钥无权调用该模型：{exc}"
+        if isinstance(exc, NotFoundError):
+            return f"接口或模型不存在，请检查 endpoint 与 model：{exc}"
+        return str(exc)
+
     def _translate_batch(
         self,
         indices: Sequence[int],
@@ -303,12 +369,17 @@ class TranslationEngine:
         log: LogFn,
         cancel: CancelFn,
         retry_delays: Sequence[float] = _TRANSIENT_RETRY_DELAYS,
+        abort: threading.Event | None = None,
     ) -> tuple[list[str], bool]:
         """Translate one batch; returns ``(translations, ok)``.
 
         ``ok`` is False when every attempt failed — the source text is then
         preserved (content is never dropped) but must NOT be written to the
         cache, or a transient outage would poison it permanently.
+
+        A fatal configuration error raises :class:`TranslationAborted` and sets
+        ``abort`` so the batches still queued behind it return immediately
+        instead of repeating the same doomed request.
         """
         prompt = self._build_prompt(blocks, indices)
         system = self._system_prompt(language)
@@ -317,19 +388,21 @@ class TranslationEngine:
         for attempt in range(1, attempts + 1):
             if cancel():
                 raise TranslationCancelled()
+            if abort is not None and abort.is_set():
+                # Another batch already hit a fatal error; this run is over.
+                return [blocks[i] for i in indices], False
             try:
                 raw = self._request_locked(prompt, system)
-                parsed = self._parse_response(raw, blocks, indices)
-                if len(parsed) == len(indices):
-                    return parsed, True
-                last_error = RuntimeError(
-                    f"model returned {len(parsed)} results for "
-                    f"{len(indices)} blocks"
-                )
+                # Either returns exactly ``len(indices)`` translations or raises.
+                return self._parse_response(raw, indices), True
             except TranslationCancelled:
                 raise
             except Exception as exc:  # noqa: BLE001 — network / API errors
                 last_error = exc
+            if self._is_fatal(last_error):
+                if abort is not None:
+                    abort.set()
+                raise TranslationAborted(self._fatal_message(last_error))
             if not self._is_transient(last_error):
                 break
             if attempt < attempts:
@@ -339,6 +412,7 @@ class TranslationEngine:
             log(f"  批次失败，保留原文: {last_error}")
         # Preserve the source text for every block in the failed batch.
         return [blocks[i] for i in indices], False
+
 
     def translate_blocks(
         self,
@@ -403,6 +477,9 @@ class TranslationEngine:
         chunks = self._make_chunks(blocks, index_filter=_needs_request)
         if chunks:
             max_workers = max(1, int(self.model.concurrency or 1))
+            # Set as soon as one batch hits a fatal configuration error, so the
+            # batches queued behind it give up instead of repeating it.
+            abort = threading.Event()
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {
                     pool.submit(
@@ -413,6 +490,7 @@ class TranslationEngine:
                         log,
                         cancel,
                         retry_delays,
+                        abort,
                     ): chunk
                     for chunk in chunks
                 }
@@ -420,7 +498,7 @@ class TranslationEngine:
                     chunk = futures[fut]
                     try:
                         translated, ok = fut.result()
-                    except TranslationCancelled:
+                    except (TranslationCancelled, TranslationAborted):
                         raise
                     except Exception as exc:  # noqa: BLE001 — defensive; the
                         # batch already swallows errors, this catches the rest
@@ -478,17 +556,27 @@ class TranslationEngine:
 
 
 def _write_cache(path: Path, cache: dict[str, str]) -> str | None:
-    """Best-effort persist of the translation cache.
+    """Best-effort *atomic* persist of the translation cache.
 
     Returns ``None`` on success, or a short human readable reason on failure.
     A cache write must never abort a translation that already succeeded, but
     the caller should surface the reason once — a silently unwritable cache
     looks exactly like a working one until the next (fully re-translated) run.
-    """
-    try:
-        import json
 
-        path.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+    The write goes to a temp file and is swapped in with :func:`os.replace`:
+    the cache is rewritten after every batch while the GUI may hard-exit the
+    process at any moment (``os._exit`` on window close), and a half-written
+    JSON file is unreadable — which looks like "no cache at all" and quietly
+    re-translates the entire document on the next run.
+    """
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+        os.replace(tmp, path)
         return None
     except Exception as exc:  # noqa: BLE001 — the cache is optional by design
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         return f"{type(exc).__name__}: {exc}"
