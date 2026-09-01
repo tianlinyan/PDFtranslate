@@ -54,7 +54,7 @@ _CHAR_BUDGET = 4000
 
 #: Cache format version — bump when the prompt or response format changes so
 #: stale translations from an older run are never reused.
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 
 #: Delay between batch attempts (seconds); injectable so tests don't sleep.
 _TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)

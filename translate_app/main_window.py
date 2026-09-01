@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from . import __app_name__, __version__
+from .about_dialog import AboutDialog
 from .settings import ModelConfig, load_models, load_prefs, save_prefs
 from .translator import clear_translation_cache
 from .worker import OUTPUT_TYPES, TranslateWorker
@@ -100,11 +101,22 @@ class MainWindow(QWidget):
 
         # --- Output type ---
         self._type_combo = QComboBox()
+        type_keys = list(OUTPUT_TYPES)
         for key, (label, _ext) in OUTPUT_TYPES.items():
             self._type_combo.addItem(label, key)
-        saved_type = prefs.get("output_type", 0)
-        if isinstance(saved_type, int) and 0 <= saved_type < self._type_combo.count():
-            self._type_combo.setCurrentIndex(saved_type)
+        # 默认输出格式为「仅译文 PDF」（原位翻译）。
+        default_type_idx = type_keys.index("translated_pdf")
+        idx = default_type_idx
+        saved_type = prefs.get("output_type")
+        if isinstance(saved_type, int):
+            # legacy: saved as combo index
+            if 0 <= saved_type < self._type_combo.count():
+                idx = saved_type
+        elif isinstance(saved_type, str):
+            # saved as the output key (e.g. "translated_pdf")
+            if saved_type in type_keys:
+                idx = type_keys.index(saved_type)
+        self._type_combo.setCurrentIndex(idx)
 
         # --- Output path ---
         self._path_edit = QLineEdit()
@@ -146,14 +158,17 @@ class MainWindow(QWidget):
         self._open_btn.clicked.connect(self._open_output)
         self._clear_cache_btn = QPushButton("清除缓存")
         self._clear_cache_btn.clicked.connect(self._clear_cache)
+        self._about_btn = QPushButton("关于")
+        self._about_btn.clicked.connect(self._show_about)
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(self._clear_cache_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._start_btn)
         btn_row.addWidget(self._cancel_btn)
-        btn_row.addStretch()
         btn_row.addWidget(self._open_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self._about_btn)
 
         root = QVBoxLayout(self)
         root.addLayout(form)
@@ -321,6 +336,9 @@ class MainWindow(QWidget):
             self._append_log(f"已清除 {removed} 个缓存文件。")
         except Exception as exc:
             self._append_log(f"清除缓存失败：{exc}")
+
+    def _show_about(self) -> None:
+        AboutDialog(self).exec()
 
     def _append_log(self, msg: str) -> None:
         self._log.appendPlainText(msg)

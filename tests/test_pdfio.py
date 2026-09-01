@@ -8,7 +8,7 @@ import pymupdf as fitz
 
 from translate_app import pdfio
 
-from tests._helpers import build_sample_pdf, build_two_column_pdf
+from tests._helpers import build_sample_pdf, build_two_column_pdf, build_list_table_pdf
 
 _OUT = Path(__file__).resolve().parent / "_out"
 
@@ -148,6 +148,28 @@ class PdfioTest(unittest.TestCase):
         footer = doc.pages[0][-1]
         self.assertEqual(footer.text, "Page 1 of 9")
         self.assertEqual(footer.align, "right")
+
+    def test_list_and_table_entries_are_not_collapsed(self):
+        # Regression: PyMuPDF merges a close-spaced list / table into one block,
+        # which used to collapse the whole thing into a single run-on paragraph.
+        # The line-aware extractor must keep every numbered / ``Label:`` entry as
+        # its own single-line block.
+        src = _OUT / "list_table.pdf"
+        build_list_table_pdf(src)
+        doc = pdfio.extract_document_text(src)
+        blocks = doc.pages[0]
+        item_texts = [b.text for b in blocks]
+        # Each numbered item is a distinct block, not merged with its neighbours.
+        for txt in ("1. First item", "2. Second item", "3. Third item"):
+            self.assertIn(txt, item_texts)
+        # Label/table rows stay on their own lines (single-line blocks).
+        rows = [b for b in blocks if b.text.startswith(
+            ("Powerplant:", "Brand:", "Model:"))]
+        self.assertEqual(len(rows), 3)
+        for b in rows:
+            self.assertTrue(b.single_line, f"table row collapsed: {b.text!r}")
+            self.assertIn(b.text, ("Powerplant:", "Brand: Pratt & Whitney",
+                                   "Model: PT6A-140"))
 
     def test_bilingual_pdf_mirrors_block_positions(self):
         src = _OUT / "sample_m.pdf"

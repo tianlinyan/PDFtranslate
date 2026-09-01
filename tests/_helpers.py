@@ -109,3 +109,28 @@ def build_two_column_pdf(path: str | Path) -> Path:
     doc.save(str(path))
     doc.close()
     return path
+
+
+def build_list_table_pdf(path: str | Path) -> Path:
+    """Create a PDF with a close-spaced numbered list and ``Label:`` table rows.
+
+    The items are placed so close together that a block-level extraction would
+    merge them all into one run-on block; the line-aware extraction must keep
+    every item / table row as its own single-line block.
+    """
+    path = Path(path)
+    doc = fitz.open()
+    page = doc.new_page()
+    # Numbered list, 15 pt apart (well inside a single block's bbox span).
+    for i, text in enumerate(
+        ["1. First item", "2. Second item", "3. Third item"], start=0
+    ):
+        page.insert_text((60, 80 + i * 15), text, fontsize=12)
+    # Label: table rows.
+    labels = [("Powerplant:", 140), ("Brand: Pratt & Whitney", 155),
+              ("Model: PT6A-140", 170)]
+    for text, y in labels:
+        page.insert_text((60, y), text, fontsize=12)
+    doc.save(str(path))
+    doc.close()
+    return path

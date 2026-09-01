@@ -15,8 +15,10 @@ into Chinese / Japanese / Korean display correctly in the exported PDF.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Sequence
 
 import pymupdf as fitz
@@ -71,47 +73,180 @@ def extract_document_text(path: str | Path, title: str | None = None) -> Documen
     the next).  Span-level layout hints (font size, bold, alignment, line
     count) are captured per block so the exporters can redraw translations at
     the original positions without re-parsing the page.
+
+    Blocks are rebuilt from individual visual lines rather than from PyMuPDF's
+    own ``blocks`` output, because PyMuPDF merges several sibling lines (list
+    items, table rows, section titles) into a single block; a translation drawn
+    over such a merged block collapses the original line structure into one
+    run-on paragraph.  Lines that begin a list / table entry (bullet, number or
+    ``Label:`` style) or that change style (size / bold / colour) start a new
+    block, so tables, bullet and numbered lists keep one entry per line, while
+    lines of a flowing paragraph stay merged and translate as a whole.
     """
     doc = fitz.open(str(path))
     result = DocumentText(title=title or Path(path).stem)
     try:
         for page_index in range(doc.page_count):
             page = doc[page_index]
-            raw = page.get_text("blocks")
-            # Keep text blocks (type 0).
-            text_blocks = [
-                (b[1], b[0], b[2], b[3], b[4])  # y0, x0, x1, y1, text
-                for b in raw
-                if b[6] == 0 and str(b[4]).strip()
-            ]
-            if not text_blocks:
+            lines = _collect_lines(page)
+            if not lines:
                 result.pages.append([])
                 continue
 
             spans = _collect_spans(page)
-            # Horizontal extents of the page's text, used for right-align
-            # detection of single-line blocks (page numbers, signatures).
-            page_x0 = min(b[1] for b in text_blocks)
-            page_x1 = max(b[2] for b in text_blocks)
+            page_x0 = min(ln["x0"] for ln in lines)
+            page_x1 = max(ln["x1"] for ln in lines)
             page_blocks: list[Block] = []
-            for y0, x0, x1, y1, text in _order_blocks(text_blocks):
-                cleaned = " ".join(str(text).split())
-                if not cleaned:
+            for group in _group_lines(_order_lines(lines)):
+                if not group:
                     continue
-                meta = _block_meta(
-                    fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1
-                )
+                x0 = min(ln["x0"] for ln in group)
+                y0 = min(ln["y0"] for ln in group)
+                x1 = max(ln["x1"] for ln in group)
+                y1 = max(ln["y1"] for ln in group)
+                text = " ".join(ln["text"] for ln in group)
+                if not text.strip():
+                    continue
+                meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1)
                 block = Block(
-                    text=cleaned, page=page_index, x0=x0, y0=y0, x1=x1, y1=y1,
+                    text=text, page=page_index, x0=x0, y0=y0, x1=x1, y1=y1,
                     **meta,
                 )
                 page_blocks.append(block)
-                result.blocks.append(cleaned)
+                result.blocks.append(block.text)
                 result.block_pages.append(page_index)
             result.pages.append(page_blocks)
     finally:
         doc.close()
     return result
+
+
+#: Characters treated as a leading bullet (e.g. ``❖``, ``•``, ``▪``).
+_BULLET_CHARS = (
+    "\u2022\u25aa\u25cf\u25a0\u25c6\u25c7\u2726\u2727\u2756\u2764\u27a1"
+    "\u2192\u2190\u25b8\u25b6\u00bb\u2023\u2043\u2219\u00b7\u275a\u25d8\u25cb"
+)
+_BULLET_RE = re.compile(r"^\s*[" + re.escape(_BULLET_CHARS) + r"]\s*")
+#: A dash/asterisk used as a bullet only when followed by whitespace (so a
+#: leading hyphenated word is not mistaken for a list marker).
+_DASH_BULLET_RE = re.compile(r"^\s*(?:\*\s+|-\s+|\u2013\s+|\u2014\s+)")
+#: Leading number of a numbered-list item, e.g. ``1.``, ``27)``.
+_NUM_RE = re.compile(r"^\s*\d{1,3}[.)]\s*")
+#: A short ``Label:`` row / heading that begins a table entry.
+_LABEL_RE = re.compile(r"^\s*[A-Za-z\u4e00-\u9fff\u4e00-\u9fa5][^:\n]{0,40}:\s")
+
+
+def _is_entry(text: str) -> bool:
+    """True when ``text`` begins a new list / table entry (bullet, number, ``Label:``)."""
+    t = text.strip()
+    if not t:
+        return False
+    return bool(
+        _BULLET_RE.match(t) or _DASH_BULLET_RE.match(t) or _NUM_RE.match(t) or _LABEL_RE.match(t)
+    )
+
+
+def _collect_lines(page) -> list[dict]:
+    """Return one record per visual line (a PyMuPDF ``line``), with bbox and
+    style hints used to decide paragraph vs. entry grouping."""
+    out: list[dict] = []
+    for b in page.get_text("dict").get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        for line in b.get("lines", []):
+            spans = line.get("spans", [])
+            if not spans:
+                continue
+            text = " ".join("".join(s["text"] for s in spans).split())
+            if not text:
+                continue
+            sizes = sorted(float(s.get("size", 10.0)) for s in spans)
+            size = sizes[len(sizes) // 2]
+            bold = any(
+                bool(int(s.get("flags", 0)) & 16) or "bold" in str(s.get("font", "")).lower()
+                for s in spans
+            )
+            colors = [int(s.get("color", 0)) for s in spans]
+            color = Counter(colors).most_common(1)[0][0]
+            out.append(
+                {
+                    "x0": min(s["bbox"][0] for s in spans),
+                    "y0": min(s["bbox"][1] for s in spans),
+                    "x1": max(s["bbox"][2] for s in spans),
+                    "y1": max(s["bbox"][3] for s in spans),
+                    "size": size,
+                    "bold": bold,
+                    "color": color,
+                    "text": text,
+                }
+            )
+    return out
+
+
+def _order_lines(lines: Sequence[dict]) -> list[dict]:
+    """Order visual lines into reading order (column by column)."""
+    xsorted = sorted(lines, key=lambda ln: ln["x0"])
+    columns: list[list[dict]] = []
+    col_max_x1: list[float] = []
+    for ln in xsorted:
+        for c in range(len(columns)):
+            if ln["x0"] < col_max_x1[c] - 2.0:
+                columns[c].append(ln)
+                col_max_x1[c] = max(col_max_x1[c], ln["x1"])
+                break
+        else:
+            columns.append([ln])
+            col_max_x1.append(ln["x1"])
+
+    def rows(col: Sequence[dict]) -> list[dict]:
+        return sorted(col, key=lambda ln: (round(ln["y0"], 1), ln["x0"]))
+
+    if len(columns) == 1:
+        return rows(lines)
+    ordered: list[dict] = []
+    for col in columns:
+        ordered.extend(rows(col))
+    return ordered
+
+
+def _group_lines(ordered: Sequence[dict]) -> list[list[dict]]:
+    """Group ordered lines into blocks: split at entries / style changes /
+    paragraph gaps, but keep the lines of a flowing paragraph together."""
+    groups: list[list[dict]] = []
+    i = 0
+    n = len(ordered)
+    while i < n:
+        group = [ordered[i]]
+        base = ordered[i]
+        i += 1
+        while i < n and not _break_between(base, group[-1], ordered[i]):
+            group.append(ordered[i])
+            i += 1
+        groups.append(group)
+    return groups
+
+
+def _break_between(base: dict, prev: dict, cur: dict) -> bool:
+    """True when ``cur`` starts a new block rather than joining the running one."""
+    # Moving back up (e.g. the last line of one column followed by the first
+    # line of the next column) is always a hard break.
+    if cur["y0"] < prev["y0"] - 1.0:
+        return True
+    # Style jump (different size / bold / colour) starts a new entry: catches
+    # section headings (e.g. gold sub-titles) and emphasis changes.
+    if (
+        abs(cur["size"] - base["size"]) > 0.6
+        or cur["bold"] != base["bold"]
+        or cur["color"] != base["color"]
+    ):
+        return True
+    # A line that begins a list / table entry stands alone.
+    if _is_entry(cur["text"]):
+        return True
+    # A vertical gap larger than half a line marks a paragraph / entry break.
+    if cur["y0"] - prev["y1"] > 0.5 * base["size"]:
+        return True
+    return False
 
 
 def _collect_spans(page: fitz.Page) -> list[tuple[fitz.Rect, float, bool]]:

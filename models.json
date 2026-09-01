@@ -7,9 +7,9 @@
       "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
       "model": "qwen3.8",
       "reasoning_effort": "low",
-      "concurrency": 2,
+      "concurrency": 1,
       "temperature":0.1,
-      "batch_size": 12000
+      "batch_size": 8000
     },
     {
       "id": "ds4-pro",
