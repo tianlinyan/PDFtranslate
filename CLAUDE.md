@@ -56,5 +56,5 @@ main.py → MainWindow (PyQt6)
 
 ### translate_app/main_window.py
 - `LANGUAGES` 将界面显示名映射为发送给模型的语言名。
-- 线程生命周期：每次运行创建 `QThread` + worker；翻译进行中关闭窗口会弹确认框，置 `_closing`，取消 worker，等线程结束后才真正关闭。信号连接顺序有讲究：`finished → _cleanup` 必须先于 `finished → _finish_close` 连接。
+- 线程生命周期：每次运行创建 `QThread` + worker；关闭窗口即「六亲不认」地强行退出——不弹任何确认框，直接 `thread.terminate()` + `thread.wait()` 强制结束 worker 线程，再用 `os._exit(0)` 硬退整个进程，以绕过 `concurrent.futures` 在解释器退出时对非 daemon HTTP 线程的 join 阻塞（因此绝不等待当前请求完成）。
 - PDF 可拖放到窗口设置源文件；命令行传入的 PDF 路径效果相同。

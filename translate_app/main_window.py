@@ -59,7 +59,6 @@ class MainWindow(QWidget):
         self._thread: QThread | None = None
         self._worker: TranslateWorker | None = None
         self._last_output: str | None = None
-        self._closing = False
         self._models_error = ""
 
         self.setWindowTitle(f"{__app_name__} — AI 翻译 v{__version__}")
@@ -284,8 +283,6 @@ class MainWindow(QWidget):
         self._worker.finished.connect(self._thread.quit)
         self._worker.error.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup)
-        # Must be connected after ``_cleanup`` so it sees the thread as None.
-        self._thread.finished.connect(self._finish_close)
         self._thread.start()
 
     def _save_prefs(self, model_id: str, language: str, output_key: str) -> None:
@@ -379,12 +376,6 @@ class MainWindow(QWidget):
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
 
-    def _finish_close(self) -> None:
-        """Finish a pending close once the worker thread has actually stopped."""
-        if self._closing:
-            self._closing = False
-            self.close()
-
     # ------------------------------------------------------------------
     # Drag & drop a PDF to set the source
     # ------------------------------------------------------------------
@@ -401,23 +392,18 @@ class MainWindow(QWidget):
             event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        running = self._thread is not None and self._thread.isRunning()
-        if not running:
-            event.accept()
-            return
-        # A translation is in progress: wait for it instead of letting Qt abort
-        # on a still-running QThread.
-        if not self._closing:
-            resp = QMessageBox.question(
-                self,
-                "正在翻译",
-                "翻译仍在进行。确定要取消并退出吗？\n（将等待当前请求完成后退出。）",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if resp != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-            self._closing = True
+        # 六亲不认的强行退出：关闭窗口即刻强制结束工作线程，并直接硬退出整个
+        # 进程——不弹任何确认框、不等待当前请求完成、不理会任何后台线程。
+        if self._thread is not None and self._thread.isRunning():
             if self._worker is not None:
                 self._worker.cancel()
-        event.ignore()   # keep the window until the thread finishes
+            # Force-kill the background worker thread, then reap it from the OS.
+            self._thread.terminate()
+            self._thread.wait(5000)
+        # ``terminate`` only kills the Qt worker thread.  The translation
+        # pipeline may have left non-daemon ``ThreadPoolExecutor`` / HTTP
+        # threads running; a normal close would hang the interpreter joining
+        # them at exit.  Hard-exit the process so the program really quits now.
+        import os
+
+        os._exit(0)
