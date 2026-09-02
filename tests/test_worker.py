@@ -222,5 +222,61 @@ class KeepOriginalDirectionTest(_WorkerTestBase):
         self.assertTrue(any("罗马化" in m for m in logs), logs)
 
 
+class ChartNodeDirectionTest(_WorkerTestBase):
+    """Org-chart / architecture-diagram node labels are never translated.
+
+    Unlike a ``姓名`` name cell (kept only for a CJK target), a diagram's box
+    label is structural: it must survive a language switch, so the worker feeds
+    it into ``keep_original`` for both a CJK and a Latin target.
+    """
+
+    def _run_capture(self, lang: str) -> tuple[dict, list[str]]:
+        chart_block = pdfio.Block(
+            text="党群工作部", page=0, x0=50, y0=50, x1=57.4, y1=79.5,
+            size=24.0, align="center", bold=False, is_chart=True,
+        )
+        doc = pdfio.DocumentText(
+            pages=[[chart_block, pdfio.Block(text="标题", page=0, x0=60, y0=20, x1=150, y1=35, size=12.0)]],
+            blocks=["党群工作部", "标题"],
+            block_pages=[0, 0],
+            title="chart",
+        )
+        captured: dict = {}
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                captured["keep"] = kwargs.get("keep_original")
+                return TranslationResult(
+                    blocks=list(blocks),
+                    translated=[f"MOCK:{b}" for b in blocks],
+                )
+
+        logs: list[str] = []
+        worker = TranslateWorker(
+            str(self.tmp / "chart.pdf"),
+            self._model("http://127.0.0.1:9/v1"), lang,
+            "plain_text", str(self.tmp / f"out_{lang}.txt"),
+        )
+        worker.log.connect(logs.append)
+        with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
+            with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
+                self._run(worker)
+        return captured, logs
+
+    def test_chart_nodes_kept_for_cjk_target(self):
+        captured, _logs = self._run_capture("简体中文")
+        self.assertEqual({0}, captured["keep"])
+
+    def test_chart_nodes_kept_for_latin_target(self):
+        # A Western target still keeps the diagram's Chinese node labels — they
+        # are structural, not prose, so they must not be romanized.
+        captured, logs = self._run_capture("English")
+        self.assertEqual({0}, captured["keep"])
+        self.assertTrue(any("组织结构图/架构图节点" in m for m in logs), logs)
+
+
 if __name__ == "__main__":
     unittest.main()

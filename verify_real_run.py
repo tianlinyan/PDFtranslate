@@ -90,7 +90,10 @@ def main():
                 continue
             n_in_table += 1
             lines, fs = pdfio._fit_block(b, font, t)
-            h = pdfio._wrapped_height(font, lines, fs)
+            h = pdfio._wrapped_height(
+                font, lines, fs,
+                pdfio._line_leading(font, in_table=True, n_lines=len(lines)),
+            )
             if fs < 4:
                 buckets["<4"] += 1
                 worst += 1

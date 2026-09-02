@@ -68,6 +68,12 @@ class Block:
     #: a personal-name cell in a "姓名 / Name" table column.  Such blocks are
     #: never sent to the model and always export as the original text.
     keep_original: bool = False
+    #: True when this block is a node label of an org chart / architecture
+    #: diagram (usually a narrow-tall box whose text reads vertically).  Such
+    #: labels are structural, not prose — translating them mangles the diagram —
+    #: so they are kept verbatim regardless of target language (unlike
+    #: ``keep_original``, which for a Western target re-romanizes the name).
+    is_chart: bool = False
     #: True when this block was recovered by OCR from a scan.  Such blocks sit
     #: on top of a raster image rather than a text layer, so the in-place
     #: exporter must first cover the original pixels instead of redacting text.
@@ -220,6 +226,7 @@ def extract_document_text(
                                         f"重跑将重新 OCR：{ocr_cache_path}"
                                     )
                 if page_blocks:
+                    _flag_chart_nodes(page_blocks)
                     for b in page_blocks:
                         result.blocks.append(b.text)
                         result.block_pages.append(page_index)
@@ -268,6 +275,7 @@ def extract_document_text(
             for block in page_blocks:
                 result.blocks.append(block.text)
                 result.block_pages.append(page_index)
+            _flag_chart_nodes(page_blocks)
             result.pages.append(page_blocks)
     finally:
         doc.close()
@@ -1199,6 +1207,20 @@ def _collect_lines(page_dict: dict) -> list[dict]:
             )
             colors = [int(s.get("color", 0)) for s in spans]
             color = Counter(colors).most_common(1)[0][0]
+            # Per-span records (``x0, y0, x1, y1, text``) let the table block
+            # builder split one visual line across the cells it actually spans
+            # (a ``Capacity: | value`` row is a single line in the text layer but
+            # two table cells) instead of pinning the whole line to one cell.
+            span_records = [
+                (
+                    float(s["bbox"][0]),
+                    float(s["bbox"][1]),
+                    float(s["bbox"][2]),
+                    float(s["bbox"][3]),
+                    "".join(s["text"]).strip(),
+                )
+                for s in spans
+            ]
             out.append(
                 {
                     "x0": min(s["bbox"][0] for s in spans),
@@ -1209,6 +1231,7 @@ def _collect_lines(page_dict: dict) -> list[dict]:
                     "bold": bold,
                     "color": color,
                     "text": text,
+                    "spans": span_records,
                 }
             )
     return out
@@ -1552,6 +1575,81 @@ def _mark_name_column(blocks: list[Block]) -> None:
 #: column.
 _TABLE_CELL_PAD = 2.0
 
+#: A ruled-table cell narrower than this is padding between real columns (e.g.
+#: the few-point gutter ``find_tables`` reports next to the page edge, or between
+#: a label column and its value column), not a content cell.  Content must never
+#: be fitted into one: a long row whose whole-line centre lands in such a gutter
+#: (long labels like ``Max Gross Weight:``) was pinning the translation into a
+#: ~1.4pt box and rendering it as an unreadable vertical stack.
+_TABLE_CELL_MIN_WIDTH = 6.0
+
+
+def _cell_for_span(rect: fitz.Rect, cell_rects: Sequence[fitz.Rect]) -> fitz.Rect | None:
+    """Return the real content cell containing ``rect``'s centre (x and y), or
+    ``None``.
+
+    Only cells at least :data:`_TABLE_CELL_MIN_WIDTH` wide are considered, so a
+    span is never assigned to a padding gutter.  Cells never overlap in 2-D, so
+    checking both the x and the y centre pins the span to exactly one cell — a
+    row's label span (its centre ends in the label column) and its value span
+    (its centre is in the value column) split cleanly, and a full-width section
+    header keeps its own spanning cell rather than being squeezed into a narrow
+    label cell two rows down.
+    """
+    cx = (rect.x0 + rect.x1) / 2.0
+    cy = (rect.y0 + rect.y1) / 2.0
+    for r in cell_rects:
+        if r.width < _TABLE_CELL_MIN_WIDTH:
+            continue
+        if r.x0 <= cx <= r.x1 and r.y0 <= cy <= r.y1:
+            return fitz.Rect(r)
+    return None
+
+
+def _line_cell_groups(
+    ln: dict, cell_rects: Sequence[fitz.Rect]
+) -> list[tuple[fitz.Rect | None, str, fitz.Rect]] | None:
+    """Split one merged table line into per-cell ``(cell, text, extent)`` groups.
+
+    Returns ``None`` when the line carries no per-span data (a caller-constructed
+    line in a test), so the caller keeps the whole-line behaviour.  Groups are
+    returned left to right by the first span that lands in each cell; a cell with
+    no span produces no group.  A span whose centre is not in any real content
+    cell yields a ``(None, ...)`` group drawn from its own extent (kept
+    ``in_table=False`` so it falls back to paragraph fitting).
+    """
+    span_records = ln.get("spans")
+    if not span_records:
+        return None
+    assigns: list[tuple[float, fitz.Rect | None, fitz.Rect, str]] = []
+    for rec in span_records:
+        x0, y0, x1, y1, t = rec
+        if not (t and t.strip()):
+            continue
+        srect = fitz.Rect(float(x0), float(y0), float(x1), float(y1))
+        assigns.append((srect.x0, _cell_for_span(srect, cell_rects), srect, t.strip()))
+    if not assigns:
+        return None
+    assigns.sort(key=lambda a: a[0])
+    groups: list[list] = []  # [key, texts, union]
+    index: dict = {}
+    for _, cell, srect, t in assigns:
+        key = (cell.x0, cell.y0, cell.x1, cell.y1) if cell is not None else None
+        if key in index:
+            group = groups[index[key]]
+            group[1].append(t)
+            group[2] = group[2] | srect
+        else:
+            index[key] = len(groups)
+            groups.append([key, [t], fitz.Rect(srect)])
+    out: list[tuple[fitz.Rect | None, str, fitz.Rect]] = []
+    for key, texts, union in groups:
+        cell = None if key is None else fitz.Rect(*key)
+        joined = " ".join(p for p in texts if p).strip()
+        if joined:
+            out.append((cell, joined, fitz.Rect(union)))
+    return out or None
+
 
 def _build_table_blocks(
     table_lines: Sequence[dict],
@@ -1563,6 +1661,15 @@ def _build_table_blocks(
 ) -> list[Block]:
     """Turn a table's per-cell lines into row-major per-cell blocks.
 
+    A visual line can hold two cells on the same baseline (a label column and a
+    value column, e.g. ``Capacity: | Pilot + Copilot + Two Passengers``): the
+    text layer reports them as one line but ``find_tables`` sees two cells.  The
+    line is split per cell so each cell becomes its own block (label stays in the
+    label column, value in the value column) instead of the whole line being
+    pinned to whichever cell its centre happens to land in — which dropped the
+    label column entirely, and pinned long labels to the narrow gutter cell
+    (a vertical stack).
+
     Each cell's block is widened to the full ruled-table cell (not the source
     text's own extent) and flagged ``in_table``, so the exporter can lay out the
     (usually longer) translation on one line within the whole column instead of
@@ -1570,7 +1677,8 @@ def _build_table_blocks(
     figures hug the column's right edge (as in the ``股份类型`` share table),
     everything else is centred (as the source ``前十名股东`` table centres its
     cells).  The cell is inset by :data:`_TABLE_CELL_PAD` on each side so the
-    one-line text does not touch the borders.
+    one-line text does not touch the borders.  A line with no per-span data (a
+    caller-constructed line) keeps the whole-line behaviour.
     """
     blocks: list[Block] = []
     cell_rects = list(cell_rects)
@@ -1578,19 +1686,45 @@ def _build_table_blocks(
         if not ln["text"].strip() or _is_pure_symbol(ln["text"]):
             continue
         x0, y0, x1, y1 = ln["x0"], ln["y0"], ln["x1"], ln["y1"]
-        meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1)
-        cell = _cell_for_line(ln, cell_rects)
-        if cell is not None:
-            x0, x1 = cell.x0 + _TABLE_CELL_PAD, cell.x1 - _TABLE_CELL_PAD
-            # Re-derive alignment for the widened cell: numeric columns right-align
-            # (figures share a flush right edge), other cells centre.
-            meta["align"] = "right" if _is_numeric_cell(ln["text"]) else "center"
-        blocks.append(
-            Block(
-                text=ln["text"], page=page_index, x0=x0, y0=y0, x1=x1, y1=y1,
-                color=ln["color"], in_table=cell is not None, **meta,
+        groups = _line_cell_groups(ln, cell_rects)
+        if groups is None:
+            # No per-span info (test-constructed line): keep the single-block,
+            # whole-line behaviour so a whole row is one cell.
+            meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1)
+            cell = _cell_for_line(ln, cell_rects)
+            if cell is not None:
+                x0, x1 = cell.x0 + _TABLE_CELL_PAD, cell.x1 - _TABLE_CELL_PAD
+                # Re-derive alignment for the widened cell: numeric columns
+                # right-align (figures share a flush right edge), others centre.
+                meta["align"] = "right" if _is_numeric_cell(ln["text"]) else "center"
+            blocks.append(
+                Block(
+                    text=ln["text"], page=page_index, x0=x0, y0=y0, x1=x1, y1=y1,
+                    color=ln["color"], in_table=cell is not None, **meta,
+                )
             )
-        )
+            continue
+        for cell, text, extent in groups:
+            if cell is not None:
+                cx0, cx1 = cell.x0 + _TABLE_CELL_PAD, cell.x1 - _TABLE_CELL_PAD
+                meta = _block_meta(cell, spans, page_x0, page_x1)
+                meta["align"] = "right" if _is_numeric_cell(text) else "center"
+                blocks.append(
+                    Block(
+                        text=text, page=page_index, x0=cx0, y0=y0, x1=cx1, y1=y1,
+                        color=ln["color"], in_table=True, **meta,
+                    )
+                )
+            else:
+                # A span that sits outside any content cell: paragraph-style block.
+                meta = _block_meta(extent, spans, page_x0, page_x1)
+                blocks.append(
+                    Block(
+                        text=text, page=page_index, x0=extent.x0, y0=extent.y0,
+                        x1=extent.x1, y1=extent.y1, color=ln["color"],
+                        in_table=False, **meta,
+                    )
+                )
     _mark_name_column(blocks)
     return blocks
 
@@ -1842,10 +1976,42 @@ def _split_line_half(line: str) -> tuple[str, str] | None:
     return a, b
 
 
-def _wrapped_height(font, lines: Sequence[str], fs: float) -> float:
-    """Vertical extent of ``lines`` at ``fs`` (same metric ``_fit_block`` uses)."""
+#: Loose leading (baseline-to-baseline) for paragraph blocks and single-line
+#: cells: 1.35× the font size, keeping the source layout's airy look.
+_LOOSE_LEADING = 1.35
+
+#: Leading (baseline-to-baseline) for a *multi-line* table cell: 1.0× the font
+#: size — the tightest spacing that keeps a run of lines readable while staying
+#: compact, so a long translation in a narrow column fits the row band without
+#: growing the row.  (Below this, characters start to overlap; 1.0 is the
+#: requested minimum.)
+_TABLE_CELL_LEADING = 1.0
+
+
+def _line_leading(font, *, in_table: bool, n_lines: int) -> float:
+    """Baseline-to-baseline multiplier for a block's wrapped lines.
+
+    A *multi-line* table cell uses the tight ``_TABLE_CELL_LEADING`` (1.0× font
+    size) instead of the loose 1.35× leading that paragraphs and single-line
+    cells keep: a long translation in a narrow column must stay compact so the
+    wrap fits the row band without growing the row or pushing the rows beneath
+    it down.  A single line has no inter-line gap, so its leading never matters.
+    """
+    if in_table and n_lines > 1:
+        return _TABLE_CELL_LEADING
+    return _LOOSE_LEADING
+
+
+def _wrapped_height(font, lines: Sequence[str], fs: float,
+                    leading: float = _LOOSE_LEADING) -> float:
+    """Vertical extent of ``lines`` at ``fs`` (same metric ``_fit_block`` uses).
+
+    ``leading`` is the baseline-to-baseline multiplier; pass
+    :func:`_line_leading`'s value for a table cell so this measurement agrees
+    with the drawing pass (which decides the multiplier the same way).
+    """
     return (
-        fs * font.ascender + (len(lines) - 1) * fs * 1.35 - fs * font.descender
+        fs * font.ascender + (len(lines) - 1) * fs * leading - fs * font.descender
     )
 
 
@@ -1862,8 +2028,12 @@ def _fit_band(
     (smaller sizes pack more lines) until the wrapped height fits the band.
     ``_MIN_TABLE_FLOOR`` only bounds the descent.
     """
+    # A scanned cell's wrap always yields at least two lines, so its leading is
+    # the tight ``_TABLE_CELL_LEADING`` (see ``_line_leading``).  Using it here
+    # keeps the band check in agreement with the drawing pass.
+    leading = _TABLE_CELL_LEADING
     lines = _wrap(font, text, max_width, _MIN_TABLE_READABLE)
-    if _wrapped_height(font, lines, _MIN_TABLE_READABLE) <= band:
+    if _wrapped_height(font, lines, _MIN_TABLE_READABLE, leading) <= band:
         return lines, _MIN_TABLE_READABLE
     # Search the 0.01 grid explicitly (a plain float bisection then rounded to
     # 2dp could land 0.02pt over the band — the whole point is staying inside).
@@ -1871,7 +2041,7 @@ def _fit_band(
     while lo < hi:
         mid = (lo + hi + 1) // 2
         fsm = mid / 100
-        if _wrapped_height(font, _wrap(font, text, max_width, fsm), fsm) <= band:
+        if _wrapped_height(font, _wrap(font, text, max_width, fsm), fsm, leading) <= band:
             lo = mid
         else:
             hi = mid - 1
@@ -1932,7 +2102,8 @@ def _fit_block(block: Block, font, text: str) -> tuple[list[str], float]:
     lines = _wrap(font, text, max_width, fs)
 
     def height() -> float:
-        return fs * font.ascender + (len(lines) - 1) * fs * 1.35 - fs * font.descender
+        return (fs * font.ascender + (len(lines) - 1) * fs * _LOOSE_LEADING
+                - fs * font.descender)
 
     # Trim the font so the translation's height no longer exceeds the box it
     # replaces (a smaller font also wraps to fewer lines).
@@ -1965,6 +2136,91 @@ def _is_vertical_label(block: Block) -> bool:
     w = block.x1 - block.x0
     h = block.y1 - block.y0
     return h >= 2.0 * w and w <= 30.0 and h >= 22.0
+
+
+#: Strong (narrow-tall) node boxes a page must hold before it is treated as an
+#: org chart / architecture diagram.  A lone narrow box is a rotated side note,
+#: not a diagram; a handful clustered together is a chart.  The narrow-tall box
+#: is the *unambiguous* diagram signature; the weaker square nodes only join the
+#: flagging once a page already shows this signature.
+_CHART_STRONG_MIN = 3
+#: Minimum total node boxes (strong + square) on a page for it to be a diagram.
+#: With at least one strong box, a page whose remaining nodes are compact
+#: squares is still a chart.
+_CHART_NODE_MIN = 3
+#: A compact square node is a short single-line label in a small box — it must
+#: be neither a full-width text line nor a multi-line paragraph.
+_CHART_SQUARE_MAX_W = 150.0
+_CHART_SQUARE_MAX_H = 50.0
+#: Node labels are short (a few characters); anything that long is prose.
+_CHART_NODE_MAX_CHARS = 12
+
+
+def _is_narrow_tall_box(block: Block) -> bool:
+    """True for a narrow-tall vertical-label box (a strong diagram signature).
+
+    Only the box shape is checked, not ``single_line``: a rotated run reports a
+    tall bbox in the text layer (so ``single_line`` is false) while a label
+    stacked into a narrow column reports a bbox across several lines — both are
+    nodes, and both extraction paths present a narrow-tall bbox.
+    """
+    if block.in_table or "\n" in block.text:
+        return False
+    w = block.x1 - block.x0
+    h = block.y1 - block.y0
+    return h >= 2.0 * w and w <= 30.0 and h >= 22.0
+
+
+def _is_chart_node(block: Block) -> bool:
+    """True for an org-chart / architecture-diagram *node label* box.
+
+    A node is either a narrow-tall vertical box (the strong, unambiguous
+    signature) or a compact roughly-square box holding a short single-line
+    label — an architecture diagram also draws its nodes as small square boxes.
+    Table cells are excluded (a ruled cell can be narrow too, but it is a value,
+    not a diagram node).  The square variant is deliberately stricter (single
+    line, short text, small box) so a normal page's headings/list items are not
+    mistaken for nodes on their own; on a chart page the cluster confirms them.
+    """
+    if _is_narrow_tall_box(block):
+        return True
+    if block.in_table or "\n" in block.text or not block.single_line:
+        return False
+    w = block.x1 - block.x0
+    h = block.y1 - block.y0
+    return (
+        len(block.text.strip()) <= _CHART_NODE_MAX_CHARS
+        and w <= _CHART_SQUARE_MAX_W and h <= _CHART_SQUARE_MAX_H
+    )
+
+
+def _is_org_chart_page(blocks: Sequence[Block]) -> bool:
+    """True when ``blocks`` form an org chart / architecture diagram.
+
+    A page is a diagram when it shows at least one narrow-tall box (the strong
+    chart signature) together with a cluster of node boxes — which may be the
+    remaining narrow-tall boxes or compact square nodes.  A lone narrow box is
+    a rotated side note, not a diagram.  Only the node labels of a diagram are
+    structural — translating them mangles the diagram — so their text is kept
+    verbatim (``is_chart``) while surrounding prose/headings still translate.
+    """
+    strong = sum(1 for b in blocks if _is_narrow_tall_box(b))
+    total = sum(1 for b in blocks if _is_chart_node(b))
+    return strong >= 1 and total >= _CHART_NODE_MIN
+
+
+def _flag_chart_nodes(blocks: Sequence[Block]) -> None:
+    """Mark the node labels of an org chart / architecture diagram ``is_chart``.
+
+    Called per page after its blocks are collected: when the page is a diagram,
+    every node box (narrow-tall *or* compact square) is flagged so it is never
+    translated and exports as the source text.  A non-diagram page is untouched.
+    """
+    if not _is_org_chart_page(blocks):
+        return
+    for b in blocks:
+        if _is_chart_node(b):
+            b.is_chart = True
 
 
 def _draw_vertical_label(page: fitz.Page, font, block: Block, text: str) -> None:
@@ -2040,9 +2296,10 @@ def _draw_translated_block(page: fitz.Page, font, block: Block, text: str) -> No
     lines, fs = _fit_block(block, font, text)
     ascent = fs * font.ascender
     descent = -fs * font.descender
+    leading = _line_leading(font, in_table=block.in_table, n_lines=len(lines))
 
     def height() -> float:
-        return ascent + (len(lines) - 1) * fs * 1.35 + descent
+        return ascent + (len(lines) - 1) * fs * leading + descent
 
     y = r.y0 + ascent
     if block.single_line:
@@ -2060,7 +2317,7 @@ def _draw_translated_block(page: fitz.Page, font, block: Block, text: str) -> No
             lw = font.text_length(line, fontsize=fs)
             x = max(r.x0, r.x1 - lw)
         tw.append(fitz.Point(x, y), line, font=font, fontsize=fs)
-        y += fs * 1.35
+        y += fs * leading
     tw.write_text(page, color=_color_tuple(block.color) if block.color else None)
 
 
@@ -2348,7 +2605,8 @@ def _map_blocks_to_table_cells(blocks, tables) -> dict[int, tuple[int, int]]:
 def _measure_block_height(block: Block, font, text: str) -> float:
     """Height the translated ``text`` would occupy in ``block`` (via ``_fit_block``)."""
     lines, fs = _fit_block(block, font, text)
-    return fs * font.ascender + (len(lines) - 1) * fs * 1.35 - fs * font.descender
+    leading = _line_leading(font, in_table=block.in_table, n_lines=len(lines))
+    return fs * font.ascender + (len(lines) - 1) * fs * leading - fs * font.descender
 
 
 def _compute_table_layout(tables, mapping, blocks, trans, font):
@@ -2491,9 +2749,12 @@ def save_translated_pdf(
             # Remove the original text (keep images and other line art/graphics).
             # OCR blocks sit on a raster image rather than a text layer, so
             # nothing is redacted for them — they are covered below instead.
+            # ``is_chart`` node labels are left entirely untouched: the source
+            # diagram's label is the "translation", so neither the original nor
+            # a redraw is needed (redrawing a vertical label would mangle it).
             for j in range(m):
                 b = blocks[j]
-                if not b.ocr:
+                if not b.ocr and not b.is_chart:
                     page.add_redact_annot(fitz.Rect(b.x0, b.y0, b.x1, b.y1))
             # A detected table's grid lines must go too, or they stay at the old
             # row positions while the (now taller) translations are drawn lower.
@@ -2512,6 +2773,11 @@ def save_translated_pdf(
             # font size (see ``_draw_translated_block`` for the fitting rules).
             for j in range(m):
                 b = blocks[j]
+                if b.is_chart:
+                    # A diagram node label keeps its source: the original is
+                    # already on the page (nothing was redacted/covered above),
+                    # so there is nothing to draw.
+                    continue
                 draw_b = b
                 if j in shifts and shifts[j]:
                     dy = shifts[j]

@@ -111,33 +111,41 @@ class TranslateWorker(QObject):
             # original text — but only for a CJK target: when the output is
             # Latin-script, leaving the Chinese names in place would produce a
             # mixed-language document, so they are translated instead (the
-            # prompt rule romanizes them with consistent pinyin).  The flat
-            # block order in ``doc.blocks`` matches ``doc.pages``, so walk the
-            # pages to collect those indices.
+            # prompt rule romanizes them with consistent pinyin).
+            #
+            # Org-chart / architecture-diagram node labels are the opposite:
+            # they are structural, not prose, so they are never translated
+            # regardless of the target language (a diagram's box labels survive
+            # a language switch; transcribing them would mangle the diagram).
+            # The flat block order in ``doc.blocks`` matches ``doc.pages``, so
+            # walk the pages to collect those indices.
             target_is_cjk = any("一" <= c <= "鿿" for c in self._lang)
             keep_original: set[int] = set()
-            if target_is_cjk:
-                flat = 0
-                for page_blocks in doc.pages:
-                    for b in page_blocks:
-                        if b.keep_original:
+            n_chart = 0
+            n_names = 0
+            flat = 0
+            for page_blocks in doc.pages:
+                for b in page_blocks:
+                    if b.is_chart:
+                        keep_original.add(flat)
+                        n_chart += 1
+                    elif b.keep_original:
+                        n_names += 1
+                        if target_is_cjk:
                             keep_original.add(flat)
-                        flat += 1
-                if keep_original:
-                    self.log.emit(
-                        f"已识别 {len(keep_original)} 个姓名块，将保留原文不做翻译。"
-                    )
-            else:
-                n_names = sum(
-                    1
-                    for page_blocks in doc.pages
-                    for b in page_blocks
-                    if b.keep_original
+                    flat += 1
+            if n_chart:
+                self.log.emit(
+                    f"已识别 {n_chart} 个组织结构图/架构图节点，将保留原文不做翻译。"
                 )
-                if n_names:
-                    self.log.emit(
-                        f"目标语言为西文，{n_names} 个姓名块将按规则罗马化（不保留中文原文）。"
-                    )
+            if n_names and target_is_cjk:
+                self.log.emit(
+                    f"已识别 {n_names} 个姓名块，将保留原文不做翻译。"
+                )
+            elif n_names:
+                self.log.emit(
+                    f"目标语言为西文，{n_names} 个姓名块将按规则罗马化（不保留中文原文）。"
+                )
 
             translate_started = time.monotonic()
             result = engine.translate_blocks(

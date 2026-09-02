@@ -442,6 +442,69 @@ class TableCellFitTest(unittest.TestCase):
         self.assertEqual(name.align, "center")
         self.assertEqual(num.align, "right")
 
+    def _line_with_spans(self, x0, x1, y0, y1, text, spans):
+        d = self._line(x0, x1, y0, y1, text)
+        d["spans"] = spans
+        return d
+
+    def test_build_table_blocks_splits_label_and_value_cells(self):
+        # A source row that reports label+value on ONE visual line is really two
+        # table cells (a label column and a value column).  It must come out as
+        # two blocks, each pinned to its own cell — not the whole line stuffed
+        # into whichever cell its centre happens to land in (which merged the
+        # two columns and dropped the label column).
+        cell_rects = [
+            fitz.Rect(100, 100, 200, 120),   # label column
+            fitz.Rect(200, 100, 400, 120),   # value column
+        ]
+        line = self._line_with_spans(
+            150, 300, 105, 115,
+            "Capacity: Pilot + Copilot + Two Passengers",
+            [
+                (150.0, 105.0, 195.0, 115.0, "Capacity:"),
+                (210.0, 105.0, 300.0, 115.0, "Pilot + Copilot + Two Passengers"),
+            ],
+        )
+        blocks = pdfio._build_table_blocks([line], [], 0, 600, 0, cell_rects)
+        self.assertEqual(len(blocks), 2)
+        by_text = {b.text: b for b in blocks}
+        label = by_text["Capacity:"]
+        value = by_text["Pilot + Copilot + Two Passengers"]
+        self.assertTrue(label.in_table)
+        self.assertTrue(value.in_table)
+        # Each block is widened to its own cell, not to the merged line's extent.
+        self.assertAlmostEqual(label.x0, 100 + pdfio._TABLE_CELL_PAD, delta=0.01)
+        self.assertAlmostEqual(label.x1, 200 - pdfio._TABLE_CELL_PAD, delta=0.01)
+        self.assertAlmostEqual(value.x0, 200 + pdfio._TABLE_CELL_PAD, delta=0.01)
+        self.assertAlmostEqual(value.x1, 400 - pdfio._TABLE_CELL_PAD, delta=0.01)
+
+    def test_build_table_blocks_ignores_narrow_gutter_cell(self):
+        # A thin gutter between the label and value columns must never become a
+        # cell a long label is fitted into.  The pre-fix code pinned a long
+        # label row (whose whole-line centre lands in the gutter) to the ~1pt
+        # gutter and rendered the translation as a vertical stack.
+        cell_rects = [
+            fitz.Rect(100, 100, 200, 120),   # label column
+            fitz.Rect(200, 100, 205, 120),   # narrow gutter (sliver, < MIN_WIDTH)
+            fitz.Rect(205, 100, 400, 120),   # value column
+        ]
+        line = self._line_with_spans(
+            150, 300, 105, 115,
+            "Max Gross Weight: 4,000 lbs / 1,814 kg",
+            [
+                (170.0, 105.0, 199.0, 115.0, "Max Gross Weight:"),
+                (240.0, 105.0, 300.0, 115.0, "4,000 lbs / 1,814 kg"),
+            ],
+        )
+        blocks = pdfio._build_table_blocks([line], [], 0, 600, 0, cell_rects)
+        self.assertEqual(len(blocks), 2)
+        by_text = {b.text: b for b in blocks}
+        label = by_text["Max Gross Weight:"]
+        value = by_text["4,000 lbs / 1,814 kg"]
+        # Neither is crushed into the ~5pt gutter.
+        self.assertGreater(label.x1 - label.x0, 50.0)
+        self.assertGreater(value.x1 - value.x0, 50.0)
+
     def test_fit_block_puts_table_cell_on_one_line(self):
         # A long English translation used to wrap inside the narrow cell and push
         # the rows below it down.  An in_table cell shrinks the font instead.
@@ -489,7 +552,12 @@ class TableCellFitTest(unittest.TestCase):
         lines, fs = pdfio._fit_block(block, font, long_name)
         self.assertGreater(len(lines), 1)
         self.assertEqual(fs, pdfio._MIN_TABLE_READABLE)
-        self.assertLessEqual(pdfio._wrapped_height(font, lines, fs), 40.0)
+        self.assertLessEqual(
+            pdfio._wrapped_height(
+                font, lines, fs, pdfio._line_leading(font, in_table=True, n_lines=len(lines))
+            ),
+            40.0,
+        )
         self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
 
     def test_fit_block_band_descends_when_the_band_is_tight(self):
@@ -506,7 +574,12 @@ class TableCellFitTest(unittest.TestCase):
         long_name = "Wenling Municipal State-owned Assets Management Co., Ltd."
         lines, fs = pdfio._fit_block(block, font, long_name)
         self.assertGreater(len(lines), 1)
-        self.assertLessEqual(round(pdfio._wrapped_height(font, lines, fs), 2), 17.5)
+        self.assertLessEqual(
+            round(pdfio._wrapped_height(
+                font, lines, fs, pdfio._line_leading(font, in_table=True, n_lines=len(lines))
+            ), 2),
+            17.5,
+        )
         self.assertGreaterEqual(fs, pdfio._MIN_TABLE_FLOOR)
         self.assertLess(fs, pdfio._MIN_TABLE_READABLE)
         self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
@@ -558,6 +631,40 @@ class TableCellFitTest(unittest.TestCase):
         self.assertEqual("".join(lines).replace(" ", ""), text.replace(" ", ""))
         self.assertLess(fs, pdfio._MIN_TABLE_READABLE)
         self.assertGreaterEqual(fs, pdfio._MIN_TABLE_FLOOR)
+
+    def test_multiline_table_cell_uses_min_line_leading(self):
+        # A cell whose translation wraps to more than one line renders with the
+        # *minimum* line spacing — ``_TABLE_CELL_LEADING`` (1.0× the font size)
+        # — instead of the loose 1.35× leading that paragraphs keep.  A long
+        # translation in a narrow column must stay compact so the wrap fits the
+        # row band without growing the row or pushing the rows below it down.
+        font = fitz.Font("cjk")
+        tight = pdfio._TABLE_CELL_LEADING
+        self.assertLess(tight, pdfio._LOOSE_LEADING)
+        # Multi-line table cell -> the tight leading.
+        self.assertEqual(pdfio._line_leading(font, in_table=True, n_lines=2), tight)
+        self.assertEqual(pdfio._line_leading(font, in_table=True, n_lines=3), tight)
+        # A single line has no inter-line gap, so it keeps the loose value.
+        self.assertEqual(pdfio._line_leading(font, in_table=True, n_lines=1),
+                         pdfio._LOOSE_LEADING)
+        # Paragraph (non-table) blocks keep the loose leading.
+        self.assertEqual(pdfio._line_leading(font, in_table=False, n_lines=3),
+                         pdfio._LOOSE_LEADING)
+        # A wrapped cell measured through ``_fit_block`` is also measured tight,
+        # so the row-height re-layout agrees with the drawing pass.
+        cell = pdfio.Block(
+            text="净亏损\n小计", page=0, x0=100, y0=100, x1=180, y1=140,
+            size=9.0, align="left", bold=False, single_line=False, in_table=True,
+        )
+        wrapped = ("Net loss per share attributable to the shareholders of the "
+                   "Company after taking into account the discontinued operations")
+        lines, fs = pdfio._fit_block(cell, font, wrapped)
+        self.assertGreater(len(lines), 1)
+        # The tight leading packs the lines tighter than the loose default.
+        self.assertLess(
+            pdfio._measure_block_height(cell, font, wrapped),
+            pdfio._wrapped_height(font, lines, fs),
+        )
 
 
 class OcrGridTest(unittest.TestCase):
@@ -831,6 +938,157 @@ class VerticalLabelTest(unittest.TestCase):
         self.assertTrue(
             long_label.replace(" ", "") in text.replace(" ", ""), text
         )
+
+    def test_is_org_chart_page_requires_a_cluster(self):
+        # A page is an org chart / architecture diagram only when it holds a
+        # *cluster* of node boxes with at least one narrow-tall anchor: a lone
+        # narrow box (or a set of undifferentiated squares) is not a diagram.
+        self.assertFalse(
+            pdfio._is_org_chart_page([self._block()])  # one box
+        )
+        self.assertFalse(
+            pdfio._is_org_chart_page([self._block(), self._block(y0=100, y1=129.5)])
+            # two boxes
+        )
+        cluster = [
+            self._block(y0=50, y1=79.5),
+            self._block(y0=100, y1=129.5),
+            self._block(y0=150, y1=179.5),
+        ]
+        self.assertTrue(pdfio._is_org_chart_page(cluster))
+        # Two vertical boxes plus a wide box / prose block is not a cluster
+        # (only two nodes total, and the wide box is not a node).
+        mixed = [
+            self._block(y0=50, y1=79.5), self._block(y0=100, y1=129.5),
+            self._block(x1=300.0, y0=150, y1=179.5),  # a wide (non-node) block
+            pdfio.Block(text="正文文字", page=0, x0=40, y0=190, x1=300, y1=205,
+                        size=11.0, single_line=True),
+        ]
+        self.assertFalse(pdfio._is_org_chart_page(mixed))
+        # Squares join the cluster only with a narrow-tall anchor: three plain
+        # squares alone are not a diagram (they could be headings/list items).
+        squares = [
+            self._square(x0=200, y0=50), self._square(x0=260, y0=50),
+            self._square(x0=320, y0=50),
+        ]
+        self.assertFalse(pdfio._is_org_chart_page(squares))
+
+    def _square(self, x0=200.0, y0=50.0, **kw):
+        """A compact roughly-square node box: a short single-line label."""
+        return pdfio.Block(
+            text="系统架构", page=0, x0=x0, y0=y0, x1=x0 + 55.0, y1=y0 + 18.0,
+            size=12.0, align="center", single_line=True, **kw
+        )
+
+    def test_is_chart_node_recognizes_compact_square_boxes(self):
+        # A node is either a narrow-tall box or a compact square box; a
+        # full-width text line, long prose, or a table cell are not nodes.
+        self.assertTrue(pdfio._is_chart_node(self._block()))   # narrow-tall
+        self.assertTrue(pdfio._is_chart_node(self._square()))  # compact square
+        # Full-width single line (a heading): not a node.
+        wide = pdfio.Block(text="合并资产负债表", page=0, x0=40, y0=50, x1=400,
+                           y1=68, size=12.0, single_line=True)
+        self.assertFalse(pdfio._is_chart_node(wide))
+        # Long single-line label: prose, not a node.
+        longlbl = pdfio.Block(text="自然资源管理信息系统与数据交换平台", page=0,
+                              x0=200, y0=50, x1=255, y1=68, size=12.0,
+                              single_line=True)
+        self.assertFalse(pdfio._is_chart_node(longlbl))
+        # A square box that is a table cell (a ruled column value): not a node.
+        cell = pdfio.Block(text="系统架构", page=0, x0=200, y0=50, x1=255, y1=68,
+                           size=12.0, single_line=True, in_table=True)
+        self.assertFalse(pdfio._is_chart_node(cell))
+
+    def test_is_org_chart_page_accepts_mixed_narrow_and_square(self):
+        # A narrow-tall anchor plus compact square nodes together form a chart.
+        anchor = [self._block(y0=50, y1=79.5)]
+        squares = [self._square(x0=200, y0=50), self._square(x0=260, y0=50)]
+        self.assertTrue(pdfio._is_org_chart_page(anchor + squares))
+        self.assertTrue(pdfio._is_org_chart_page(
+            [self._block(y0=50, y1=79.5)] * pdfio._CHART_NODE_MIN
+        ))
+
+    def test_flag_chart_nodes_marks_only_node_boxes(self):
+        # On a diagram page the node labels (narrow-tall *and* square) are
+        # flagged; headings / prose on the same page still translate.
+        intro = pdfio.Block(text="组织机构图", page=0, x0=40, y0=20, x1=300, y1=35,
+                            size=14.0, single_line=True)
+        nodes = [
+            self._block(y0=50, y1=79.5),
+            self._block(y0=100, y1=129.5),
+            self._square(x0=200, y0=50),
+        ]
+        page_blocks = [intro] + nodes
+        pdfio._flag_chart_nodes(page_blocks)
+        self.assertTrue(all(b.is_chart for b in nodes))
+        self.assertFalse(intro.is_chart)
+        # A non-diagram page leaves every block untouched.
+        plain = [self._block(), intro]  # only one node — not a cluster
+        pdfio._flag_chart_nodes(plain)
+        self.assertTrue(all(not b.is_chart for b in plain))
+
+
+class ChartPageDetectionIntegrationTest(unittest.TestCase):
+    """``extract_document_text`` flags org-chart / architecture node labels.
+
+    End to end: a page whose text layer is a cluster of narrow-tall stacked
+    labels (a Chinese org chart) comes back with every node box marked
+    ``is_chart``, while a normal page is untouched.
+    """
+
+    def _chart_pdf(self) -> Path:
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=600)
+        font = fitz.Font("cjk")
+        # Three narrow-tall node boxes, each built by stacking its label into a
+        # narrow column — the shape of a vertical org-chart label.
+        for x, word in ((60, "党群工作部"), (110, "综合管理部"), (160, "财务部")):
+            tw = fitz.TextWriter(page.rect)
+            for i, ch in enumerate(word):
+                tw.append(fitz.Point(x, 60 + i * 20), ch, font=font, fontsize=22)
+            tw.write_text(page)
+        path = _OUT / "org_chart.pdf"
+        doc.save(str(path))
+        doc.close()
+        return path
+
+    def test_chart_page_nodes_are_flagged_is_chart(self):
+        dt = pdfio.extract_document_text(self._chart_pdf())
+        self.assertEqual(1, dt.page_count)
+        nodes = dt.pages[0]
+        self.assertGreaterEqual(len(nodes), pdfio._CHART_NODE_MIN)
+        self.assertTrue(pdfio._is_org_chart_page(nodes))
+        # Every node label is kept verbatim; a rotated run that extraction
+        # reports with a tall bbox (single_line=False) is still a node.
+        self.assertTrue(all(b.is_chart for b in nodes))
+
+    def test_normal_page_has_no_chart_nodes(self):
+        src = _OUT / "plain.pdf"
+        build_sample_pdf(src, pages=1)
+        dt = pdfio.extract_document_text(src)
+        for page_blocks in dt.pages:
+            for b in page_blocks:
+                self.assertFalse(b.is_chart)
+
+    def test_inplace_export_keeps_chart_labels_verbatim(self):
+        # The in-place exporter never touches an ``is_chart`` node label: it
+        # neither redacts nor redraws it (a fed-in "translation" is ignored),
+        # so the original diagram label survives the export exactly as-is.
+        src = self._chart_pdf()
+        dt = pdfio.extract_document_text(src)
+        per_page = [["TRANSLATED ONE"] * len(dt.pages[0])]
+        out = _OUT / "org_chart_out.pdf"
+        pdfio.save_translated_pdf(src, dt.pages, per_page, out, "English")
+        doc = fitz.open(str(out))
+        text = "".join(
+            s["text"]
+            for b in doc[0].get_text("dict")["blocks"] if b.get("type") == 0
+            for l in b["lines"] for s in l["spans"]
+        )
+        doc.close()
+        self.assertIn("党", text)
+        self.assertIn("群", text)
+        self.assertNotIn("TRANSLATED", text)
 
 
 class OcrTableNoExpansionTest(unittest.TestCase):

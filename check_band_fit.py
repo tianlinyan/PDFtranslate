@@ -73,7 +73,10 @@ def main():
             if trans is None:
                 continue
             lines, fs = pdfio._fit_block(b, font, trans)
-            h = pdfio._wrapped_height(font, lines, fs)
+            h = pdfio._wrapped_height(
+                font, lines, fs,
+                pdfio._line_leading(font, in_table=True, n_lines=len(lines)),
+            )
             if fs < 3:
                 buckets["<3"] += 1
             elif fs < 4:
