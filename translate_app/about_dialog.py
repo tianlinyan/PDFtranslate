@@ -77,8 +77,10 @@ class AboutDialog(QDialog):
         if close_btn is not None:
             close_btn.setText("关闭")
             close_btn.setDefault(True)
+        # The box only carries a Close (RejectRole) button, so ``rejected`` is
+        # the only signal it can emit; there is no Accept button to fire
+        # ``accepted``.
         buttons.rejected.connect(self.reject)
-        buttons.accepted.connect(self.accept)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 16)

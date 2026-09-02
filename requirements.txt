@@ -3,4 +3,6 @@ PyMuPDF>=1.24
 openai>=1.40
 # OCR for scanned PDFs (bundled ch+en PP-OCRv3 models, offline).
 rapidocr_onnxruntime>=1.3
-numpy>=1.24
+# numpy 2.x has had compatibility issues across the onnxruntime/opencv stack
+# that rapidocr pulls in; pin to the 1.x line until that chain is verified.
+numpy>=1.24,<2

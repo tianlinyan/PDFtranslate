@@ -33,7 +33,9 @@ class ModelConfig:
     type: str
     endpoint: str
     model: str
-    api_key: str | None = None
+    # ``repr=False``: the dataclass's default ``repr`` would print the raw key
+    # (``api_key='sk-...'``) if the config were ever logged or asserted on.
+    api_key: str | None = field(default=None, repr=False)
     tools_choice: str | None = None
     reasoning_effort: str | None = None
     temperature: float | None = None   # sampling temperature (None → engine default)
@@ -50,7 +52,11 @@ class ModelConfig:
             type=str(item.get("type", "openai")),
             endpoint=str(item.get("endpoint", "")),
             model=str(item.get("model", "")),
-            api_key=substitute_env(item.get("api_key")) if item.get("api_key") else None,
+            # Store the raw value; ``${ENV_VAR}`` substitution happens lazily in
+            # ``_resolved_api_key`` / ``validate`` (substituting here *and*
+            # there again gave inconsistent results — e.g. an env var set to ""
+            # silently became "not-needed" with no validation warning).
+            api_key=(str(item["api_key"]) if item.get("api_key") else None),
             tools_choice=item.get("tools_choice"),
             reasoning_effort=(item.get("reasoning_effort") or None),
             temperature=(
@@ -163,15 +169,6 @@ def load_models(path: Path | str = DEFAULT_MODELS_PATH) -> list[ModelConfig]:
     return [ModelConfig.from_dict(e) for e in entries]
 
 
-def default_model_id() -> str:
-    """Return the id of the first declared model, or an empty string."""
-    try:
-        models = load_models()
-    except Exception:
-        return ""
-    return models[0].id if models else ""
-
-
 # ---------------------------------------------------------------------------
 # User preferences
 # ---------------------------------------------------------------------------
@@ -187,11 +184,24 @@ def load_prefs() -> dict[str, Any]:
     return {}
 
 
-def save_prefs(prefs: dict[str, Any]) -> None:
-    """Persist user preferences to disk."""
+def save_prefs(prefs: dict[str, Any]) -> str | None:
+    """Persist user preferences to disk.
+
+    Returns ``None`` on success, or a short reason on failure (the caller
+    should surface it — a silently lost preference is invisible until the next
+    launch).  The write is atomic (temp file + ``os.replace``), matching the
+    translation/OCR caches: the GUI hard-exits on window close, and a plain
+    overwrite could leave a truncated ``prefs.json``.
+    """
+    tmp = APP_PREFS_PATH.with_name(f"{APP_PREFS_PATH.name}.{os.getpid()}.tmp")
     try:
         APP_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with APP_PREFS_PATH.open("w", encoding="utf-8") as fh:
-            json.dump(prefs, fh, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        tmp.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), "utf-8")
+        os.replace(tmp, APP_PREFS_PATH)
+        return None
+    except Exception as exc:  # noqa: BLE001 — prefs are best-effort
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return f"{type(exc).__name__}: {exc}"

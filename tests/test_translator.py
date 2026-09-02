@@ -2,18 +2,25 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
 from unittest import mock
 
 import httpx
-from openai import AuthenticationError, BadRequestError
+from openai import (
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    PermissionDeniedError,
+)
 
 from translate_app import translator
 from translate_app.settings import ModelConfig
 from translate_app.translator import (
     TranslationAborted,
+    TranslationCancelled,
     TranslationEngine,
     _cache_dir,
     _cache_key,
@@ -58,6 +65,20 @@ class TranslatorTest(unittest.TestCase):
             self.assertEqual(len(res.translated), len(BLOCKS))
             for src, tr in zip(BLOCKS, res.translated):
                 self.assertTrue(tr.startswith("MOCK:" + src), tr)
+
+    def test_keep_original_blocks_stay_source(self):
+        # Blocks flagged keep-original (e.g. a personal-name column) are never sent
+        # to the model and always export as the source text — even if a previous
+        # run cached a transliteration of the name.
+        blocks = ["Normal text.", "汪建法", "Another paragraph."]
+        with MockServer() as server:
+            engine = self._engine(server)
+            res = engine.translate_blocks(
+                blocks, "English", doc_path=Path("_fake.pdf"), keep_original={1}
+            )
+            self.assertEqual(res.translated[0], "MOCK:Normal text.")
+            self.assertEqual(res.translated[1], "汪建法")  # untouched
+            self.assertEqual(res.translated[2], "MOCK:Another paragraph.")
 
     def test_progress_starts_at_cached_count(self):
         with MockServer() as server:
@@ -256,6 +277,70 @@ class TranslatorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             TranslationEngine._parse_response("[1]\na\n[4]\nd", [0, 1, 2])
 
+    def test_duplicate_numbered_output_is_rejected(self):
+        # Regression: the set-comparison used to treat ``[1]a\n[1]b\n[2]c`` as a
+        # valid 2-block reply, silently returning ``["b", "c"]`` — dropping block
+        # 1's first translation and caching the loss forever.  A duplicated ``[n]``
+        # must be rejected the same way a missing one is.
+        raw = "[1]\nFirst.\n[1]\nFirst again.\n[2]\nSecond."
+        with self.assertRaises(ValueError):
+            TranslationEngine._parse_response(raw, [0, 1])
+
+    def test_empty_numbered_translation_is_rejected(self):
+        # Regression: an *empty* translation (``[1]`` with no content) used to
+        # parse as "" and count as success — blanking the block in the export
+        # and writing "" to the cache, where it was reused forever.
+        raw = "[1]\n\n[2]\nSecond block."
+        with self.assertRaises(ValueError):
+            TranslationEngine._parse_response(raw, [0, 1])
+
+        # Whitespace-only content is empty too.
+        raw = "[1]\n   \n[2]\nSecond block."
+        with self.assertRaises(ValueError):
+            TranslationEngine._parse_response(raw, [0, 1])
+
+    def test_empty_single_block_reply_is_rejected(self):
+        # A single requested block owns the whole reply — but an all-blank
+        # reply folds to "" and must be rejected, not cached as an empty
+        # translation.
+        with self.assertRaises(ValueError):
+            TranslationEngine._parse_response("   \n  ", [7])
+
+    def test_empty_translation_keeps_source_and_skips_cache(self):
+        # End-to-end: a model that answers with an empty numbered block must
+        # leave the document untranslated *and* uncached once retries are
+        # exhausted.
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            engine._request_locked = (
+                lambda _p, _s: "[1]\n\n[2]\nMOCK:Second paragraph with more words here."
+            )
+            blocks = list(BLOCKS[:2])
+            doc_path = Path("_empty_reply.pdf")
+            res = engine.translate_blocks(
+                blocks, "Chinese", doc_path=doc_path, retry_delays=(0.0, 0.0),
+            )
+            self.assertEqual(blocks, res.translated)
+            self.assertTrue(res.errors)
+            cache_path = _cache_dir() / _cache_key(doc_path, "Chinese", model.id)
+            self.assertEqual({}, json.loads(cache_path.read_text("utf-8")))
+
+    def test_poisoned_empty_cache_entries_are_dropped_on_load(self):
+        # Caches written before the empty-reply check may hold a "" entry that
+        # would blank the block in every export.  Loading must treat such an
+        # entry as "not cached" so the block is re-translated.
+        doc_path = Path("_poisoned.pdf")
+        cache_path = _cache_dir() / _cache_key(doc_path, "Chinese", "mock-poisoned")
+        cache_path.write_text(
+            json.dumps({"goodhash": "译文", "badhash": "   "}), "utf-8"
+        )
+        loaded = translator.load_translation_cache(doc_path, "Chinese", "mock-poisoned")
+        self.assertEqual({"goodhash": "译文"}, loaded)
+
     def test_unnumbered_reply_must_match_the_block_count(self):
         # Regression: with no [n] markers at all the parser used to map reply
         # lines onto blocks positionally and pad the rest with the source text.
@@ -299,6 +384,40 @@ class TranslatorTest(unittest.TestCase):
             cache_path = _cache_dir() / _cache_key(doc_path, "Chinese", model.id)
             self.assertEqual({}, json.loads(cache_path.read_text("utf-8")))
 
+
+    def test_408_is_retried_as_transient(self):
+        # A server-side 408 (request timeout) is transient: once the SDK's own
+        # retries are exhausted it surfaces as a plain ``APIStatusError(408)``
+        # and must be retried here, not given up on (which would have kept the
+        # source text and logged a needless failure).
+        from openai import APIStatusError
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            request = httpx.Request("POST", "http://x/v1/chat/completions")
+            err = APIStatusError(
+                "gateway timeout",
+                response=httpx.Response(408, request=request),
+                body=None,
+            )
+            calls = {"n": 0}
+
+            def flaky(_prompt, _system):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise err
+                return "[1] MOCK:Hello."
+
+            engine._request_locked = flaky  # type: ignore[method-assign]
+            res = engine.translate_blocks(
+                ["Hello."], "Chinese", doc_path=Path("_408.pdf"),
+                retry_delays=(0.0, 0.0),
+            )
+            self.assertEqual(["MOCK:Hello."], res.translated)
+            self.assertEqual(2, calls["n"])  # retried once after the 408
 
     def test_symbol_only_blocks_are_skipped(self):
         with MockServer() as server:
@@ -349,6 +468,56 @@ class TranslatorTest(unittest.TestCase):
                 self.assertTrue(tr.startswith("MOCK:" + src), tr)
             self.assertEqual(progress[-1], (len(blocks), len(blocks)))
 
+    def test_cancel_interrupts_an_in_flight_request(self):
+        # Regression: 取消 used to be polled only *between* attempts, so a single
+        # in-flight request (up to the 300s client timeout) blocked the worker
+        # until it returned.  The watchdog now closes the HTTP client on cancel,
+        # which aborts the in-flight request so the run stops promptly.
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            started = threading.Event()
+            closed = threading.Event()
+
+            def slow_request(_prompt, _system):
+                started.set()
+                # Blocks until the watchdog closes the client (simulating a long
+                # in-flight request that must be aborted on cancel).
+                closed.wait(timeout=10)
+                raise RuntimeError("client closed mid-request")
+
+            engine._request_locked = slow_request
+            # The watchdog calls ``client.close()`` on cancel; wire that to release
+            # the blocked request so the test never waits on a real HTTP call.
+            engine.client.close = closed.set  # type: ignore[method-assign]
+
+            cancel_flag = [False]
+            outcome: dict[str, bool] = {}
+
+            def run() -> None:
+                try:
+                    engine.translate_blocks(
+                        ["First paragraph.", "Second paragraph."],
+                        "Chinese",
+                        doc_path=Path("_cancel.pdf"),
+                        cancel=lambda: cancel_flag[0],
+                        retry_delays=(0.0, 0.0),
+                    )
+                    outcome["completed"] = True
+                except TranslationCancelled:
+                    outcome["cancelled"] = True
+
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            self.assertTrue(started.wait(timeout=5), "the request never started")
+            cancel_flag[0] = True  # the user hits 取消 while the request is in flight
+            t.join(timeout=5)
+            self.assertFalse(t.is_alive(), "取消 did not interrupt the in-flight request")
+            self.assertTrue(outcome.get("cancelled"), outcome)
+
     def test_batch_size_config_controls_chunking(self):
         with MockServer() as server:
             model = ModelConfig(
@@ -396,6 +565,18 @@ class FatalErrorTest(unittest.TestCase):
             "invalid api key", response=httpx.Response(401, request=request), body=None
         )
 
+    def _permission_error(self) -> PermissionDeniedError:
+        request = httpx.Request("POST", "http://x/v1/chat/completions")
+        return PermissionDeniedError(
+            "forbidden", response=httpx.Response(403, request=request), body=None
+        )
+
+    def _not_found_error(self) -> NotFoundError:
+        request = httpx.Request("POST", "http://x/v1/chat/completions")
+        return NotFoundError(
+            "model not found", response=httpx.Response(404, request=request), body=None
+        )
+
     def _engine(self, endpoint: str) -> TranslationEngine:
         return TranslationEngine(
             ModelConfig(
@@ -420,6 +601,42 @@ class FatalErrorTest(unittest.TestCase):
                 )
         # The message must point at the actual cause (the API key).
         self.assertIn("api_key", str(ctx.exception))
+
+    def test_permission_error_aborts_with_key_message(self):
+        # 403 (key lacks permission for the model) is fatal like 401 and must
+        # point at the key, not "translate" the source.
+        with MockServer() as server:
+            engine = self._engine(server.endpoint)
+            err = self._permission_error()
+
+            def boom(_prompt, _system):
+                raise err
+
+            engine._request_locked = boom  # type: ignore[method-assign]
+            with self.assertRaises(TranslationAborted) as ctx:
+                engine.translate_blocks(
+                    BLOCKS, "Chinese", doc_path=Path("_fatal403.pdf"),
+                    retry_delays=(0.0, 0.0),
+                )
+        self.assertIn("拒绝访问", str(ctx.exception))
+
+    def test_not_found_error_aborts_with_endpoint_message(self):
+        # 404 (unknown model / endpoint) is fatal and must point at the
+        # endpoint/model, not "translate" the source.
+        with MockServer() as server:
+            engine = self._engine(server.endpoint)
+            err = self._not_found_error()
+
+            def boom(_prompt, _system):
+                raise err
+
+            engine._request_locked = boom  # type: ignore[method-assign]
+            with self.assertRaises(TranslationAborted) as ctx:
+                engine.translate_blocks(
+                    BLOCKS, "Chinese", doc_path=Path("_fatal404.pdf"),
+                    retry_delays=(0.0, 0.0),
+                )
+        self.assertIn("不存在", str(ctx.exception))
 
     def test_fatal_error_does_not_retry_or_run_further_batches(self):
         with MockServer() as server:
@@ -467,6 +684,96 @@ class FatalErrorTest(unittest.TestCase):
             )
         self.assertEqual(BLOCKS, res.translated)
         self.assertTrue(res.errors)
+
+
+class GlossaryTest(unittest.TestCase):
+    """``glossary.json`` next to the document pins terminology and the cache."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        patcher = mock.patch.dict(
+            os.environ, {"PDFTRANSLATE_CACHE_DIR": str(self.tmp / "cache")}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Loading only needs the document's directory, not the file itself.
+        self.doc = self.tmp / "report.pdf"
+        self.doc.write_text("fake", "utf-8")
+
+    def _engine(self, server: MockServer) -> TranslationEngine:
+        model = ModelConfig(
+            id="mock", name="mock", type="openai",
+            endpoint=server.endpoint, model="mock-model",
+        )
+        return TranslationEngine(model)
+
+    def test_prompt_carries_rules_and_glossary(self):
+        p = TranslationEngine._system_prompt("English", {"总资产": "total assets"})
+        self.assertIn("Romanize Chinese personal names", p)
+        # Names are written given name first, family name last (王晓东 -> Xiaodong Wang).
+        self.assertIn("Xiaodong Wang", p)
+        self.assertNotIn("surname first", p)
+        self.assertIn("总资产: total assets", p)
+        self.assertIn("ten thousand yuan", p)
+        # A CJK target keeps the names as they are: no romanization rule.
+        cjk = TranslationEngine._system_prompt("简体中文")
+        self.assertNotIn("Romanize", cjk)
+        self.assertNotIn("Glossary", cjk)
+
+    def test_glossary_file_from_doc_dir_reaches_the_request(self):
+        with MockServer() as server:
+            (self.tmp / "glossary.json").write_text(
+                json.dumps({"总资产": "total assets"}), "utf-8"
+            )
+            logs: list[str] = []
+            engine = self._engine(server)
+            engine.translate_blocks(
+                ["总资产是多少？"], "English",
+                doc_path=self.doc, log=logs.append,
+            )
+        self.assertTrue(any("已加载 1 条术语表" in m for m in logs), logs)
+        system = server.last_body["messages"][0]["content"]
+        self.assertIn("total assets", system)
+
+    def test_missing_or_malformed_glossary_is_tolerated(self):
+        # A non-object glossary.json warns and is ignored — silently skipping it
+        # would make the user believe their terms apply when they do not.
+        (self.tmp / "glossary.json").write_text("[1, 2, 3]", "utf-8")
+        logs: list[str] = []
+        with MockServer() as server:
+            engine = self._engine(server)
+            res = engine.translate_blocks(
+                ["Hello."], "Chinese", doc_path=self.doc, log=logs.append,
+            )
+        self.assertTrue(res.translated[0].startswith("MOCK:"))
+        self.assertTrue(any("术语表" in m for m in logs), logs)
+
+    def test_cache_key_parts_per_glossary(self):
+        k1 = _cache_key(self.doc, "English", "m", "")
+        k2 = _cache_key(self.doc, "English", "m", "aced")
+        self.assertNotEqual(k1, k2)
+
+    def test_changed_glossary_invalidates_cache(self):
+        """A different glossary must not reuse translations made without it."""
+        progress: list[tuple[int, int]] = []
+        with MockServer() as server:
+            engine = self._engine(server)
+            engine.translate_blocks(
+                ["First block to translate."], "English",
+                doc_path=self.doc, on_progress=lambda d, t: progress.append((d, t)),
+            )
+            self.assertEqual((0, 1), progress[0])
+            progress.clear()
+            (self.tmp / "glossary.json").write_text(
+                json.dumps({"Firm": "Corporation"}), "utf-8"
+            )
+            engine.translate_blocks(
+                ["First block to translate."], "English",
+                doc_path=self.doc, on_progress=lambda d, t: progress.append((d, t)),
+            )
+        self.assertEqual((0, 1), progress[0])  # cold again, not (1, 1)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+from translate_app import pdfio
 from translate_app import worker as worker_module
 from translate_app.settings import ModelConfig
 from translate_app.translator import TranslationAborted, TranslationResult
@@ -157,6 +158,68 @@ class FormatDurationTest(unittest.TestCase):
         self.assertEqual("12.3 秒", format_duration(12.34))
         self.assertEqual("1 分 05 秒", format_duration(65))
         self.assertEqual("1 小时 01 分 01 秒", format_duration(3661))
+
+
+class KeepOriginalDirectionTest(_WorkerTestBase):
+    """Name cells stay source only for a CJK target; Latin targets romanize.
+
+    A ``姓名`` column keeps its original text so Chinese names survive in a
+    Chinese document — but in an English output the kept Chinese names would be
+    mixed-language leftovers, so there they must be handed to the model (whose
+    prompt rule romanizes them with a consistent spelling).  The block flags
+    themselves come from ``pdfio._mark_name_column`` (covered by the pdfio
+    tests); here the worker's direction gate is the unit under test, so the
+    extraction is stubbed with one name block already flagged.
+    """
+
+    def _run_capture(self, lang: str) -> tuple[dict, list[str]]:
+        name_block = pdfio.Block(
+            text="汪建法", page=0, x0=60, y0=120, x1=100, y1=135,
+            size=9.0, keep_original=True,
+        )
+        doc = pdfio.DocumentText(
+            pages=[[pdfio.Block(text="姓名", page=0, x0=60, y0=100, x1=100, y1=115, size=9.0), name_block]],
+            blocks=["姓名", "汪建法", "Body text to translate."],
+            block_pages=[0, 0, 0],
+            title="names",
+        )
+        captured: dict = {}
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                captured["keep"] = kwargs.get("keep_original")
+                captured["lang"] = _target
+                return TranslationResult(
+                    blocks=list(blocks),
+                    translated=[f"MOCK:{b}" for b in blocks],
+                )
+
+        logs: list[str] = []
+        worker = TranslateWorker(
+            str(self.tmp / "names.pdf"),
+            self._model("http://127.0.0.1:9/v1"), lang,
+            "plain_text", str(self.tmp / f"out_{lang}.txt"),
+        )
+        worker.log.connect(logs.append)
+        with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
+            with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
+                self._run(worker)
+        return captured, logs
+
+    def test_name_cells_kept_for_cjk_target(self):
+        captured, logs = self._run_capture("简体中文")
+        self.assertEqual("简体中文", captured["lang"])
+        self.assertEqual({1}, captured["keep"])
+        self.assertTrue(any("保留原文" in m for m in logs), logs)
+
+    def test_name_cells_romanized_for_latin_target(self):
+        captured, logs = self._run_capture("English")
+        self.assertEqual("English", captured["lang"])
+        self.assertEqual(set(), captured["keep"])
+        self.assertTrue(any("罗马化" in m for m in logs), logs)
 
 
 if __name__ == "__main__":

@@ -60,20 +60,38 @@ _CHAR_BUDGET = 4000
 #: stale translations from an older run are never reused.  Bumped to 4 when the
 #: unnumbered-reply fallback was tightened: caches written before that could
 #: contain a model's refusal / preamble line stored as block 1's "translation",
-#: and such an entry would otherwise be reused forever.
-_CACHE_VERSION = 4
+#: and such an entry would otherwise be reused forever.  Bumped to 5 when the
+#: glossary entered the key and the name romanization rule was added; to 6 when
+#: the name-order rule changed to given name first (cached entries made under
+#: the old surname-first rule would otherwise be reused unchanged).
+_CACHE_VERSION = 6
 
 #: Delay between batch attempts (seconds); injectable so tests don't sleep.
 _TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
 
-#: Letters (CJK, kana, hangul, Greek, Cyrillic, Hebrew, Arabic, Latin) that
-#: make a block worth translating.  Blocks without any letters (page numbers,
-#: separators, pure symbols) are kept as-is and never sent to the model.
-_LETTERS_RE = re.compile(
-    r"[぀-ヿㇰ-ㇿ㐀-䶿一-鿿豈-﫿"
-    r"가-힯Ͱ-ϿЀ-ӿ֐-׿؀-ۿ"
-    r"A-Za-z]"
-)
+#: Any Unicode letter makes a block worth translating.  Blocks without any
+#: letters (page numbers, separators, pure symbols) are kept as-is and never
+#: sent to the model.  ``[^\W\d_]`` matches letters of every script — CJK,
+#: kana, hangul, Greek, Cyrillic, Hebrew, Arabic, accented Latin (é/Ü/ñ),
+#: … — instead of a hand-maintained range list that silently skipped
+#: non-ASCII-Latin text.
+_LETTERS_RE = re.compile(r"[^\W\d_]")
+
+#: The few-shot output lines for the prompt's example, keyed by the target
+#: language's lowercase name.  If the language is missing here the prompt falls
+#: back to the example whose output is in Chinese (the default target).  The
+#: *input* lines of the example stay in English for every target — they only
+#: illustrate the numbered pair format, and keeping them fixed avoids nudging a
+#: translation into the input language.
+_EXAMPLE_INPUT = ("Press OK to continue.", "Save the file before exiting.")
+_EXAMPLE_OUTPUTS: dict[str, tuple[str, str]] = {
+    "simplified chinese": ("点击“确定”继续。", "退出前请保存文件。"),
+    "english": ("Click \u201cOK\u201d to continue.", "Save the file before exiting."),
+    "spanish": ("Pulse \u201cAceptar\u201d para continuar.", "Guarde el archivo antes de salir."),
+    "french": ("Cliquez sur \u201cOK\u201d pour continuer.", "Enregistrez le fichier avant de quitter."),
+    "german": ("Klicken Sie auf \u201cOK\u201d, um fortzufahren.", "Speichern Sie die Datei, bevor Sie beenden."),
+    "italian": ("Fare clic su \u201cOK\u201d per continuare.", "Salvare il file prima di uscire."),
+}
 
 ProgressFn = Callable[[int, int], None]
 LogFn = Callable[[str], None]
@@ -138,11 +156,41 @@ def _cache_dir() -> Path:
     return Path.home() / ".pdftranslate" / "cache"
 
 
-def _cache_key(doc_path: Path, target_lang: str, model_id: str) -> str:
+def _cache_key(
+    doc_path: Path, target_lang: str, model_id: str, glossary_hash: str = ""
+) -> str:
+    # ``glossary_hash`` is part of the key: a run with a different glossary must
+    # not reuse translations made without it, or the new rules would silently
+    # never apply to blocks that already hit the cache.
     h = hashlib.sha1(
-        f"{doc_path.resolve()}|{target_lang}|{model_id}".encode("utf-8")
+        f"{doc_path.resolve()}|{target_lang}|{model_id}|{glossary_hash}".encode("utf-8")
     ).hexdigest()[:16]
     return f"trans_v{_CACHE_VERSION}_{h}.json"
+
+
+def _load_glossary(doc_path: Path, log: Callable[[str], None]) -> dict[str, str]:
+    """Load ``glossary.json`` next to the document, if present.
+
+    The file is a flat JSON object ``{"source term": "target term", ...}``.
+    Anything malformed is reported through ``log`` and treated as no glossary
+    (a silent skip would make the user believe their terms apply when they
+    do not).
+    """
+    path = doc_path.parent / "glossary.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except Exception:
+        log(f"  警告：术语表无法解析（跳过）：{path}")
+        return {}
+    if not isinstance(data, dict):
+        log(f"  警告：术语表格式错误（应为 JSON 对象）：{path}")
+        return {}
+    glossary = {str(k): str(v) for k, v in data.items() if str(k).strip()}
+    if not glossary:
+        log(f"  警告：术语表为空：{path}")
+    return glossary
 
 
 def _block_hash(text: str) -> str:
@@ -165,16 +213,27 @@ def _sleep_interruptible(seconds: float, cancel: CancelFn) -> None:
         time.sleep(min(0.2, deadline - time.monotonic()))
 
 
-def load_translation_cache(doc_path: Path, target_lang: str, model_id: str) -> dict[str, str]:
+def load_translation_cache(
+    doc_path: Path,
+    target_lang: str,
+    model_id: str,
+    glossary_hash: str = "",
+) -> dict[str, str]:
     """Load the on-disk translation cache for a doc/lang/model (empty if none)."""
-    cache_path = _cache_dir() / _cache_key(doc_path, target_lang, model_id)
+    cache_path = _cache_dir() / _cache_key(doc_path, target_lang, model_id, glossary_hash)
     if cache_path.exists():
         try:
             data = json.loads(cache_path.read_text("utf-8"))
             # Anything but a JSON object is a foreign / corrupted file: ignore
             # it rather than letting ``cache[key] = ...`` blow up mid-run.
             if isinstance(data, dict):
-                return {str(k): str(v) for k, v in data.items()}
+                # Drop empty / whitespace-only translations: caches written
+                # before the empty-reply check could hold a poisoned "" entry
+                # that would blank the block in every export.  Treating it as
+                # "not cached" re-translates the block and self-heals the file.
+                return {
+                    str(k): str(v) for k, v in data.items() if str(v).strip()
+                }
         except Exception:
             pass
     return {}
@@ -202,6 +261,13 @@ class TranslationEngine:
         self.client = OpenAI(**model.client_kwargs())
         # Guards the shared translation cache while batches complete concurrently.
         self._cache_lock = threading.Lock()
+        # The cache *file* is rewritten by several finishing batches; serialize
+        # the disk I/O separately from the in-memory dict, and drop stale
+        # snapshots (by sequence number) so an old batch persisting late can
+        # never overwrite a newer one.
+        self._persist_lock = threading.Lock()
+        self._cache_seq = 0
+        self._persisted_seq = 0
 
     @staticmethod
     def _build_prompt(blocks: Sequence[str], indices: Sequence[int]) -> str:
@@ -214,36 +280,89 @@ class TranslationEngine:
         return "\n\n".join(lines)
 
     @staticmethod
-    def _system_prompt(language: str) -> str:
-        return (
+    def _system_prompt(language: str, glossary: dict[str, str] | None = None) -> str:
+        # The name / numbering rules only apply to a Latin-script target (an
+        # English translation of a Chinese annual report): for a CJK target the
+        # source names stay as they are and the numbering conventions carry
+        # over directly.
+        latin = not any("一" <= c <= "鿿" for c in language)
+        lc = language.strip().casefold()
+        is_english = latin and lc == "english"
+        prompt = (
             "You are a professional document translator. Translate every numbered "
-            f"block below into {language}.\n"
+            f"block below into {language}. Output the whole translation in "
+            f"{language} only — never in English or any other language.\n"
             "Rules:\n"
             "- Keep the original meaning, tone and paragraph structure.\n"
             "- Keep the translation similar in length to the source and word it "
             "concisely, so it fits the original document layout.\n"
-            "- Keep numbers, units, URLs, code, product names and proper nouns as "
-            "in the source unless a standard translation exists in the target "
-            "language.\n"
+            "- Keep numbers, units, URLs, codes and product names as in the "
+            "source: never reformat thousands separators, decimals or figures. "
+            "Keep the original unit but express its name in the target language "
+            "— for example translate 万元 as \"ten thousand yuan\" in English, or "
+            "\"diez mil yuanes\" in Spanish — so the numeric value itself never "
+            "changes.\n"
+            "- Keep section numbers in the document's own numbering style (e.g. "
+            "1., 1.1, 第4条); do not renumber or invent a different style.\n"
+            "- Keep official statement and report codes as they are: do not "
+            "transliterate a code like a statement number; use the standard "
+        )
+        if is_english:
+            prompt += (
+                "English name (e.g. \"Consolidated Statement of Cash Flows\") with "
+                "its original code.\n"
+            )
+        else:
+            prompt += (
+                "name in the target language (never the English name: render "
+                "\"Consolidated Statement of Cash Flows\" as \"Estado consolidado "
+                "de flujos de efectivo\" in Spanish) with its original code.\n"
+            )
+        if latin:
+            prompt += (
+                "- Romanize Chinese personal names with the standard pinyin "
+                "spelling, given name first and family name last (e.g. 王晓东 "
+                "-> \"Xiaodong Wang\"), and use the same spelling for a person "
+                "throughout the document; a personal-name cell must never stay "
+                "in Chinese.\n"
+            )
+        prompt += (
             "- If a block is already entirely in the target language, output it "
             "unchanged.\n"
             "- Preserve numbering exactly: reply as '[n] translated text' per "
             "block, in the same order.\n"
             "- Do not merge or split blocks, and do not add explanations, notes or "
             "any preamble.\n"
-            "- Output ONLY the numbered translations, nothing else.\n\n"
+            "- Output ONLY the numbered translations, nothing else.\n"
+        )
+        # The example's *output* must be in the target language: the previous
+        # version always showed a Chinese result, which anchored a Spanish or
+        # French target to Chinese (and, for models that translate via English,
+        # to English).  Input lines stay in English for every target — they only
+        # demonstrate the numbered-pair format.
+        out1, out2 = _EXAMPLE_OUTPUTS.get(lc, _EXAMPLE_OUTPUTS["simplified chinese"])
+        inp1, inp2 = _EXAMPLE_INPUT
+        prompt += (
             "Example:\n"
             "Input:\n"
             "[1]\n"
-            "Press OK to continue.\n"
+            f"{inp1}\n"
             "[2]\n"
-            "Save the file before exiting.\n"
+            f"{inp2}\n"
             "Output:\n"
             "[1]\n"
-            "点击“确定”继续。\n"
+            f"{out1}\n"
             "[2]\n"
-            "退出前请保存文件。"
+            f"{out2}\n\n"
+            "Do not write anything except the numbered translations."
         )
+        if glossary:
+            entries = "\n".join(f"- {src}: {dst}" for src, dst in glossary.items())
+            prompt += (
+                f"\n\nGlossary: use these translations without change when the "
+                f"matching source term appears:\n{entries}"
+            )
+        return prompt
 
     def _request_locked(self, prompt: str, system: str) -> str:
         """Issue one chat-completions request and return the assistant text."""
@@ -274,13 +393,25 @@ class TranslationEngine:
 
         Each ``[n]`` block may span several lines; internal line breaks are
         folded into spaces so one reply block becomes one translated block.
-        A reply that cannot be aligned with certainty raises ``ValueError`` —
-        the source text is never mixed into a "successful" result, because such
-        a result would be cached and reused forever.
+        A reply that cannot be aligned with certainty — including one with an
+        empty translation for any block — raises ``ValueError``: the source
+        text is never mixed into a "successful" result, and an empty
+        translation is never accepted, because such a result would be cached
+        and reused forever (blanking the block in every future export).
         """
         matched: dict[int, str] = {}
+        seen: set[int] = set()
         for m in _MULTI_BLOCK_RE.finditer(text):
             pos = int(m.group(1)) - 1
+            # A duplicate ``[n]`` (the same number echoed twice) would silently
+            # overwrite the earlier translation via ``matched[pos] = ...`` below —
+            # and a set comparison could not detect it, so a reply like
+            # ``[1]a\n[1]b\n[2]c`` for a 2-block batch would "succeed" and return
+            # ``["b", "c"]``, dropping block 1's first translation then caching it
+            # forever.  Reject duplicates explicitly instead.
+            if pos in seen:
+                raise ValueError(f"模型回复中编号 [{pos + 1}] 重复出现，无法对齐")
+            seen.add(pos)
             matched[pos] = " ".join(m.group(2).split())
         if matched:
             # Every requested block must have been echoed (once each).  A partial
@@ -290,13 +421,20 @@ class TranslationEngine:
             # Raise so the caller treats it as a transient failure and retries
             # (falling back to the source text only after retries are exhausted).
             expected = set(range(len(indices)))
-            if expected != set(matched):
-                got = ", ".join(str(n + 1) for n in sorted(matched))
+            if expected != seen:
+                got = ", ".join(str(n + 1) for n in sorted(seen))
                 raise ValueError(
                     "模型回复的块编号不完整（期望 "
                     f"{len(indices)} 块，回显 [{got}]），无法对齐"
                 )
-            return [matched[p] for p in range(len(indices))]
+            result = [matched[p] for p in range(len(indices))]
+            # An *empty* translation is as bad as a missing one: accepting it
+            # would blank out the block in the export AND write the empty string
+            # to the cache, where it would be reused forever.  Reject it so the
+            # caller retries (and, once retries are exhausted, keeps the source).
+            if any(not t for t in result):
+                raise ValueError("模型回复中存在空译文块，无法对齐")
+            return result
 
 
         # Fallback: the reply carries no ``[n]`` marker at all.  Mapping lines
@@ -310,8 +448,12 @@ class TranslationEngine:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if len(indices) == 1:
             # One requested block: the whole reply belongs to it (models often
-            # wrap a long translation over several lines).
-            return [" ".join(text.split())]
+            # wrap a long translation over several lines).  An all-whitespace
+            # reply would fold to "" and blank the block, so reject it.
+            folded = " ".join(text.split())
+            if not folded:
+                raise ValueError("模型回复为空，无法对齐")
+            return [folded]
         if len(lines) != len(indices):
             raise ValueError(
                 "模型回复既无 [n] 编号，行数也与块数不符"
@@ -321,9 +463,12 @@ class TranslationEngine:
 
     @staticmethod
     def _is_transient(exc: Exception) -> bool:
-        """True for errors worth retrying (network, 429, 5xx, parse issues).
+        """True for errors worth retrying (network, 408, 429, 5xx, parse issues).
 
         Permanent client errors (400/401/403/404) fail fast without retrying.
+        Note: once the SDK's own internal retries are exhausted, a server-side
+        408 (request timeout) surfaces as a plain ``APIStatusError`` — it is
+        transient by nature and must be retried here, not given up on.
         """
         if isinstance(
             exc,
@@ -331,7 +476,7 @@ class TranslationEngine:
         ):
             return False
         if isinstance(exc, APIStatusError):
-            return exc.status_code == 429 or exc.status_code >= 500
+            return exc.status_code in (408, 429) or exc.status_code >= 500
         return True
 
     @staticmethod
@@ -370,6 +515,7 @@ class TranslationEngine:
         cancel: CancelFn,
         retry_delays: Sequence[float] = _TRANSIENT_RETRY_DELAYS,
         abort: threading.Event | None = None,
+        glossary: dict[str, str] | None = None,
     ) -> tuple[list[str], bool]:
         """Translate one batch; returns ``(translations, ok)``.
 
@@ -382,7 +528,7 @@ class TranslationEngine:
         instead of repeating the same doomed request.
         """
         prompt = self._build_prompt(blocks, indices)
-        system = self._system_prompt(language)
+        system = self._system_prompt(language, glossary)
         attempts = len(retry_delays) + 1
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
@@ -399,6 +545,13 @@ class TranslationEngine:
                 raise
             except Exception as exc:  # noqa: BLE001 — network / API errors
                 last_error = exc
+            # The watchdog may have aborted this request because a cancel (or a
+            # fatal error) fired *mid-flight*.  Treat that as the control signal it
+            # represents, not as a transient glitch worth retrying.
+            if cancel():
+                raise TranslationCancelled()
+            if abort is not None and abort.is_set():
+                return [blocks[i] for i in indices], False
             if self._is_fatal(last_error):
                 if abort is not None:
                     abort.set()
@@ -424,30 +577,54 @@ class TranslationEngine:
         doc_path: Path | None = None,
         resume: bool = True,
         retry_delays: Sequence[float] = _TRANSIENT_RETRY_DELAYS,
+        keep_original: set[int] | None = None,
     ) -> TranslationResult:
         """Translate ``blocks`` into ``target_language``.
 
         Batches are sent concurrently (``model.concurrency`` parallel requests)
         and results folded back in completion order; the output still aligns
-        with the input block order.
+        with the input block order.  ``keep_original`` is a set of block indices
+        that must be left verbatim (e.g. a personal-name column); those blocks
+        are never sent to the model and always export as the source text.
         """
         log = log or (lambda _msg: None)
         cancel = cancel or (lambda: False)
         progress = on_progress or (lambda _d, _t: None)
+        keep = keep_original or set()
 
         n = len(blocks)
         result = TranslationResult(blocks=list(blocks), translated=list(blocks))
 
         # Blocks without any letters (page numbers, separators, pure symbols)
-        # are kept as-is: they need no translation and waste a request.
-        skip = {i for i, b in enumerate(blocks) if not _needs_translation(b)}
+        # and blocks flagged keep-original (names) are kept as-is: they need no
+        # translation and waste a request.
+        skip = {i for i, b in enumerate(blocks) if not _needs_translation(b)} | keep
+
+        # A glossary.json next to the document pins the terminology; its content
+        # takes part in the cache key so adding one always takes effect.
+        glossary = _load_glossary(doc_path, log) if doc_path is not None else {}
+        if glossary:
+            log(f"  已加载 {len(glossary)} 条术语表：{doc_path.parent / 'glossary.json'}")
 
         # Load the on-disk cache so repeated runs are cheap.
         cache: dict[str, str] = {}
         cache_path: Path | None = None
         if resume and doc_path is not None:
-            cache = load_translation_cache(doc_path, target_language, self.model.id)
-            cache_path = _cache_dir() / _cache_key(doc_path, target_language, self.model.id)
+            # An absent glossary keeps the hash empty, so the cache key is the
+            # same as before the glossary feature existed (only the version tag
+            # differs); a glossary's content is part of the key.
+            glossary_hash = (
+                hashlib.sha1(
+                    json.dumps(glossary, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest()[:16]
+                if glossary else ""
+            )
+            cache = load_translation_cache(
+                doc_path, target_language, self.model.id, glossary_hash
+            )
+            cache_path = _cache_dir() / _cache_key(
+                doc_path, target_language, self.model.id, glossary_hash
+            )
 
         # Progress starts at the count already present in the cache plus the
         # blocks skipped outright, so the bar reflects genuinely *done* work.
@@ -459,13 +636,28 @@ class TranslationEngine:
         # looks fine and every re-run re-translates everything.  Warn once.
         cache_warned = False
 
-        def _persist_cache() -> None:
+        def _persist_cache(snapshot: dict[str, str], seq: int) -> None:
             nonlocal cache_warned
             if cache_path is None:
                 return
-            reason = _write_cache(cache_path, cache)
-            if reason and not cache_warned:
-                cache_warned = True
+            # The disk write is serialized by ``_persist_lock`` — *not*
+            # ``_cache_lock`` (which only guards the in-memory dict) — so one
+            # batch's slow write cannot stall every other batch's completion.
+            # A snapshot that is no longer the newest is dropped: a batch that
+            # finished early but persisted late must not overwrite a newer
+            # batch's work.
+            with self._persist_lock:
+                if seq < self._persisted_seq:
+                    return
+                self._persisted_seq = seq
+                reason = _write_cache(cache_path, snapshot)
+            if reason:
+                # Warn at most once per run, even though several batches may
+                # fail to persist concurrently.
+                with self._cache_lock:
+                    if cache_warned:
+                        return
+                    cache_warned = True
                 log(
                     f"  警告：翻译缓存写入失败（{reason}），"
                     f"本次结果不会被缓存，重跑将重新翻译：{cache_path}"
@@ -473,6 +665,11 @@ class TranslationEngine:
 
         def _needs_request(i: int) -> bool:
             return i not in skip and _block_hash(blocks[i]) not in cache
+        # Keep-original blocks must never be pulled from the cache either, or a
+        # run *before* this change (when the name was transliterated) would
+        # quietly hand back the old transliteration.
+        for i in keep:
+            cache.pop(_block_hash(blocks[i]), None)
 
         chunks = self._make_chunks(blocks, index_filter=_needs_request)
         if chunks:
@@ -480,51 +677,97 @@ class TranslationEngine:
             # Set as soon as one batch hits a fatal configuration error, so the
             # batches queued behind it give up instead of repeating it.
             abort = threading.Event()
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {
-                    pool.submit(
-                        self._translate_batch,
-                        chunk,
-                        blocks,
-                        target_language,
-                        log,
-                        cancel,
-                        retry_delays,
-                        abort,
-                    ): chunk
-                    for chunk in chunks
-                }
-                for fut in as_completed(futures):
-                    chunk = futures[fut]
-                    try:
-                        translated, ok = fut.result()
-                    except (TranslationCancelled, TranslationAborted):
-                        raise
-                    except Exception as exc:  # noqa: BLE001 — defensive; the
-                        # batch already swallows errors, this catches the rest
-                        log(f"  批次异常，保留原文: {exc}")
-                        translated, ok = [blocks[i] for i in chunk], False
-                    if ok:
-                        with self._cache_lock:
-                            for i, text in zip(chunk, translated):
-                                cache[_block_hash(blocks[i])] = text
-                            # Persist after every batch so a cancel/crash keeps
-                            # the work completed so far (resume reuses it).
-                            _persist_cache()
-                    else:
-                        for i in chunk:
-                            result.errors.append(f"块 {i + 1} 翻译失败，保留原文")
-                    done += len(chunk)
-                    progress(done, n)
 
-        # Fill the output from the (now fully populated) cache.
+            # A watchdog that closes the underlying HTTP client the moment a
+            # cancel (or a fatal error) fires.  ``client.close()`` aborts any
+            # request still in flight, so 取消 can interrupt a long-running
+            # request instead of letting it run to its timeout — without it the
+            # cancel flag is polled only *between* attempts, and a single
+            # in-flight request (up to the 300s client timeout) blocks the worker.
+            watchdog_stop = threading.Event()
+
+            def _watchdog() -> None:
+                while not watchdog_stop.is_set():
+                    if cancel() or abort.is_set():
+                        try:
+                            self.client.close()
+                        except Exception:  # noqa: BLE001 — best effort
+                            pass
+                        return
+                    time.sleep(0.05)
+
+            watchdog = threading.Thread(target=_watchdog, daemon=True)
+            watchdog.start()
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {
+                        pool.submit(
+                            self._translate_batch,
+                            chunk,
+                            blocks,
+                            target_language,
+                            log,
+                            cancel,
+                            retry_delays,
+                            abort,
+                            glossary,
+                        ): chunk
+                        for chunk in chunks
+                    }
+                    for fut in as_completed(futures):
+                        # Honour a cancel as soon as the next batch resolves,
+                        # rather than draining every queued batch first.
+                        if cancel():
+                            raise TranslationCancelled()
+                        chunk = futures[fut]
+                        try:
+                            translated, ok = fut.result()
+                        except (TranslationCancelled, TranslationAborted):
+                            raise
+                        except Exception as exc:  # noqa: BLE001 — defensive; the
+                            # batch already swallows errors, this catches the rest
+                            log(f"  批次异常，保留原文: {exc}")
+                            translated, ok = [blocks[i] for i in chunk], False
+                        if ok:
+                            with self._cache_lock:
+                                for i, text in zip(chunk, translated):
+                                    cache[_block_hash(blocks[i])] = text
+                                snapshot = dict(cache)
+                                seq = self._cache_seq
+                                self._cache_seq += 1
+                            # Persist after every batch so a cancel/crash keeps
+                            # the work completed so far (resume reuses it).  The
+                            # snapshot is taken under the lock; the disk I/O is
+                            # not, so concurrent batches do not serialize on it.
+                            _persist_cache(snapshot, seq)
+                        else:
+                            for i in chunk:
+                                result.errors.append(f"块 {i + 1} 翻译失败，保留原文")
+                        done += len(chunk)
+                        progress(done, n)
+            finally:
+                watchdog_stop.set()
+                # The watchdog only closes the client on cancel/abort; close it
+                # on the normal path too.  The engine is short-lived (one per
+                # run), so an unclosed client would leak its connection pool
+                # until the process hard-exits.
+                try:
+                    self.client.close()
+                except Exception:  # noqa: BLE001 — best effort
+                    pass
+
+        # Fill the output from the (now fully populated) cache.  Keep-original
+        # blocks stay the source text (their translations were never requested).
         for i, b in enumerate(blocks):
+            if i in keep:
+                continue
             key = _block_hash(b)
             if key in cache:
                 result.translated[i] = cache[key]
 
+        # Final persist (no concurrency left — the pool has exited).
         if cache_path is not None:
-            _persist_cache()
+            _persist_cache(cache, self._cache_seq)
 
         progress(n, n)
         return result

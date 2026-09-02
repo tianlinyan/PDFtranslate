@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import os
 import tempfile
 import unittest
@@ -71,6 +72,107 @@ class _TempOcrCacheMixin:
 
 
 
+class NumberNormalizationTest(unittest.TestCase):
+    """OCR-degraded amounts must be repaired, and only when provably safe.
+
+    Regression for the real report (Mintai 2025, pages 24-27): RapidOCR tore
+    separator groups apart (``65, 334, 085.99``), swapped dots and commas
+    (``3,702.726,474.45``) and dropped decimal points (``11,530,351,55``).
+    These cells bypass the translation model (pure digits), so the repair here
+    is the *last* line of defence before the amount reaches the reader.
+    """
+
+    #: (corrupted as OCR read it, intended amount).
+    REAL_CASES = [
+        ("3,702.726,474.45", "3,702,726,474.45"),
+        ("65, 334, 085.99", "65,334,085.99"),
+        ("8, 677,890, 288.88", "8,677,890,288.88"),
+        ("228, 468, 960.74", "228,468,960.74"),
+        ("766, 777,688.19", "766,777,688.19"),
+        ("72, 848, 047. 80", "72,848,047.80"),
+        ("268,719, 676,841.77", "268,719,676,841.77"),
+        ("11,402.358,739.92", "11,402,358,739.92"),
+        ("189.060,973.80", "189,060,973.80"),
+        ("11.564,079,882.19", "11,564,079,882.19"),
+        ("309,120.175.36", "309,120,175.36"),
+        ("161.708,976.70", "161,708,976.70"),
+        ("24,321.445,868.48", "24,321,445,868.48"),
+        ("1,295,874,138,65", "1,295,874,138.65"),
+        ("1,150,111,164,25", "1,150,111,164.25"),
+        ("11,530,351,55", "11,530,351.55"),
+        ("87,893, 014.86", "87,893,014.86"),
+        ("68, 081,405.42", "68,081,405.42"),
+        ("4, 641,610,929.75", "4,641,610,929.75"),
+        ("33,024,552,.394.27", "33,024,552,394.27"),
+        # A wrapped figure leaves a ``/`` where the line broke.
+        ("231. / 81", "231.81"),
+        ("150.0 / 8", "150.08"),
+        ("1,304,083,150.0 / 8", "1,304,083,150.08"),
+        ("192, / 003,164.72", "192,003,164.72"),
+        ("292,712,933,925.1 / 7", "292,712,933,925.17"),
+    ]
+
+    #: Strings that are *not* regrouped: dates, plain values, prose.
+    UNTOUCHED = [
+        "1960.08",
+        "0.98",
+        "92.5%",
+        "97.05%",
+        "29",
+        "-60,327,958.12",
+        "0",
+        "100.00",
+        "2025年12月31日",
+        "总资产",
+        "1.5亿元",
+        "2025",
+        "10/20",  # no comma and no dot: ratio, not a wrapped figure
+        "3/4",
+        "12,34,56,789",  # cannot form valid 3-groups: leave for human review
+    ]
+
+    def test_real_corrupted_samples_are_repaired(self):
+        for corrupted, expected in self.REAL_CASES:
+            with self.subTest(corrupted=corrupted):
+                self.assertEqual(expected, pdfio._normalize_number(corrupted))
+
+    def test_plain_text_is_never_touched(self):
+        for text in self.UNTOUCHED:
+            with self.subTest(text=text):
+                self.assertEqual(text, pdfio._normalize_number(text))
+
+    def test_digit_sequence_is_never_altered(self):
+        """Repairs are formatting only: the digits are the same, in the same order."""
+        for corrupted, expected in self.REAL_CASES:
+            with self.subTest(corrupted=corrupted):
+                self.assertEqual(
+                    re.sub(r"\D", "", corrupted), re.sub(r"\D", "", expected)
+                )
+
+    def test_synthesize_reports_fixes_through_log(self):
+        logs: list[str] = []
+        blocks = pdfio._synthesize_ocr_blocks(
+            [
+                ([[0.0, 0.0], [30.0, 0.0], [30.0, 10.0], [0.0, 10.0]],
+                 "3,702.726,474.45"),
+                ([[0.0, 12.0], [30.0, 12.0], [30.0, 22.0], [0.0, 22.0]],
+                 "未交货"),  # prose: untouched
+            ],
+            0, log=logs.append,
+        )
+        self.assertEqual("3,702,726,474.45", blocks[0].text)
+        note = [m for m in logs if "数字格式异常已修正 1 处" in m and "3,702.726,474.45" in m]
+        self.assertEqual(1, len(note), logs)
+
+    def test_cannot_repair_is_left_verbatim_and_never_invented(self):
+        # A digit count that cannot form valid 3-groups must not be "fixed":
+        # a made-up amount in a financial statement is worse than a visible error.
+        self.assertEqual("12,34,56,789", pdfio._normalize_number("12,34,56,789"))
+        # Digits only: fold spaces (the sequence is intact, the grouping kind
+        # can't be known) — never invent a separator.
+        self.assertEqual("2025", pdfio._normalize_number("2 0 2 5"))
+
+
 class OcrPlumbingTest(unittest.TestCase):
     """Tests independent of the real OCR engine."""
 
@@ -95,6 +197,36 @@ class OcrPlumbingTest(unittest.TestCase):
             [([[0.0, 0.0], [10.0, 0.0], [10.0, 5.0], [0.0, 5.0]], "a\x00b\x7f c")], 1
         )
         self.assertEqual(["a b c"], [b.text for b in blocks])
+
+    def test_signature_items_are_dropped_and_logged(self):
+        # A handwriting signature (the 法定代表人 row of a scanned statement) is
+        # a tall, name-only OCR box in the page's bottom band.  It must NOT
+        # become a block: the model would romanize it and the white cover rect
+        # would hide the real signature — a signature is identity, not content.
+        # Print rows stay; a tall bottom-band item that has digits is a figure,
+        # not a signature, so it stays too.
+        logs: list[str] = []
+        blocks = pdfio._synthesize_ocr_blocks(
+            [
+                ([[2.0, 100.0], [30.0, 100.0], [30.0, 109.0], [2.0, 109.0]], "项目"),
+                ([[2.0, 120.0], [30.0, 120.0], [30.0, 129.0], [2.0, 129.0]], "资产"),
+                ([[2.0, 140.0], [30.0, 140.0], [30.0, 149.0], [2.0, 149.0]], "利润"),
+                # handwritten 小波: 40pt tall, bottom band of the 800pt page
+                ([[120.0, 700.0], [260.0, 700.0], [260.0, 740.0], [120.0, 740.0]], "小波"),
+                # tall bottom-band item WITH digits: a figure, not a signature
+                ([[300.0, 690.0], [380.0, 690.0], [380.0, 715.0], [300.0, 715.0]],
+                 "V001"),
+            ],
+            0, log=logs.append, page_height=800.0,
+        )
+        texts = [b.text for b in blocks]
+        self.assertIn("项目", texts)
+        self.assertIn("资产", texts)
+        self.assertNotIn("小波", texts)
+        self.assertIn("V001", texts)
+        self.assertEqual(
+            1, len([m for m in logs if "手写体签字" in m]), logs
+        )
 
     def test_needs_ocr_detects_image_and_drawing_pages(self):
         self.assertTrue(pdfio._needs_ocr(_FakePage(images=["x"])))
@@ -142,6 +274,77 @@ class OcrExtractionTest(_TempOcrCacheMixin, unittest.TestCase):
         failures = [m for m in logs if "OCR 失败" in m and "engine exploded" in m]
         self.assertEqual(1, len(failures), logs)
 
+
+
+class OcrProductionPathTest(unittest.TestCase):
+    """The real (non-injected) OCR path: page rendering + engine output parsing.
+
+    Exercises ``_page_to_array`` (RGB->BGR, zoom, contiguity) and the defensive
+    parsing of the RapidOCR engine's output in ``_ocr_page_blocks`` — the part
+    previously only covered indirectly through the ``ocr_fn`` injection seam.
+    """
+
+    def test_page_to_array_is_bgr_zoomed_and_contiguous(self):
+        import numpy as np  # noqa: F401  (ensures numpy is importable)
+
+        doc = fitz.open()
+        page = doc.new_page(width=100, height=100)
+        # Solid red rectangle (RGB 1,0,0).
+        page.draw_rect(fitz.Rect(0, 0, 100, 100), color=None, fill=(1, 0, 0))
+        img, zoom = pdfio._page_to_array(page)
+        doc.close()
+        self.assertAlmostEqual(zoom, 300.0 / 72.0)
+        self.assertEqual(3, img.shape[2])
+        # 100pt * (300/72) = 416.67px.
+        self.assertIn(img.shape[0], (416, 417))
+        # Must be a contiguous array: RapidOCR/OpenCV may reject or silently
+        # copy the negative-stride view the BGR flip would otherwise produce.
+        self.assertTrue(img.flags.c_contiguous)
+        # A red pixel (R=255,G=0,B=0) is stored as [B,G,R]=[0,0,255] in BGR.
+        px = img[img.shape[0] // 2, img.shape[1] // 2]
+        self.assertEqual((int(px[0]), int(px[1]), int(px[2])), (0, 0, 255))
+
+    def test_ocr_engine_output_parsed_and_zoom_converted(self):
+        doc = fitz.open()
+        page = doc.new_page(width=100, height=100)
+        page.draw_rect(fitz.Rect(10, 10, 90, 90), color=(0, 0, 0), fill=(1, 1, 1))
+
+        class FakeEngine:
+            def __call__(self, img):
+                # (list, timings) form, with degenerate items that must be
+                # filtered out (no text / None / empty text).
+                return (
+                    [
+                        [[[0, 0], [40, 0], [40, 40], [0, 40]], "Hello", 0.9],
+                        [[[0, 0], [40, 0], [40, 40], [0, 40]]],  # no text -> skip
+                        None,  # skip
+                        [[[0, 0], [40, 0], [40, 40], [0, 40]], "", 0.5],  # empty -> skip
+                    ],
+                    {"det": 0.1},
+                )
+
+        with mock.patch.object(pdfio, "_get_ocr_engine", return_value=FakeEngine()):
+            blocks = pdfio._ocr_page_blocks(0, page, None, None, lambda m: None)
+        doc.close()
+        self.assertEqual(["Hello"], [b.text for b in blocks])
+        # The pixel box was converted to PDF points (divided by zoom).
+        zoom = 300.0 / 72.0
+        self.assertAlmostEqual(40.0 / zoom, blocks[0].x1, places=3)
+
+    def test_ocr_engine_bare_list_output_is_accepted(self):
+        # Some RapidOCR versions return a bare list (no timings tuple); the
+        # parser must handle both shapes.
+        doc = fitz.open()
+        page = doc.new_page(width=100, height=100)
+
+        class FakeEngine:
+            def __call__(self, img):
+                return [[[[0, 0], [20, 0], [20, 20], [0, 20]], "World", 0.8]]
+
+        with mock.patch.object(pdfio, "_get_ocr_engine", return_value=FakeEngine()):
+            blocks = pdfio._ocr_page_blocks(0, page, None, None, lambda m: None)
+        doc.close()
+        self.assertEqual(["World"], [b.text for b in blocks])
 
 
 class OcrEngineUnavailableTest(_TempOcrCacheMixin, unittest.TestCase):
@@ -229,11 +432,80 @@ class OcrCacheTest(_TempOcrCacheMixin, unittest.TestCase):
         pdfio.extract_document_text(path, ocr=True, ocr_fn=_ocr_fn)
         self.assertEqual([], list(self.ocr_cache_dir.glob("*.tmp")))
 
+    def test_cache_filename_embeds_the_version(self):
+        # Bumping _OCR_CACHE_VERSION must actually change the file name — a
+        # cached build of blocks from an older synthesis (no fit_width, labels
+        # widened onto the note band, fragments unmerged) is reused verbatim and
+        # silently defeats the grid fixes otherwise.
+        path = self._build_vector_page(pages=1)
+        cache = pdfio._ocr_cache_path(path)
+        self.assertIn(f"ocr_v{pdfio._OCR_CACHE_VERSION}_", cache.name)
+
+    def test_ocr_cache_dir_probes_writability(self):
+        # mkdir(exist_ok=True) succeeds on an existing directory even when
+        # writing into it is denied (read-only home, sandbox).  Only a real probe
+        # write catches that, so an unwritable override must fall back to temp.
+        override = self.ocr_cache_dir
+        home_cache = Path.home() / ".pdftranslate" / "ocr_cache"
+        real_write_text = Path.write_text
+
+        def fake_write_text(self, *args, **kwargs):
+            if self.name.startswith(".ocr_write_probe_"):
+                if override in self.parents or home_cache in self.parents:
+                    raise PermissionError("denied by test")
+            return real_write_text(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", fake_write_text):
+            resolved = pdfio._ocr_cache_dir()
+        self.assertEqual(resolved, Path(tempfile.gettempdir()) / "pdftranslate_ocr_cache")
+
+    def test_ocr_cache_write_failure_is_logged_once(self):
+        # A failed OCR cache write must not abort the run, but it must be
+        # reported — once — otherwise a read-only cache silently re-OCRs the
+        # whole document on every run.
+        path = self._build_vector_page(pages=1)
+        logs: list[str] = []
+        with mock.patch.object(
+            pdfio, "_save_ocr_cache", return_value="PermissionError: denied"
+        ):
+            doc = pdfio.extract_document_text(
+                path, ocr=True, ocr_fn=_ocr_fn, log=logs.append
+            )
+        # OCR itself still succeeds ...
+        self.assertEqual(["Hello", "World"], doc.blocks)
+        # ... and the failure is reported exactly once, not per page or per block.
+        warnings = [m for m in logs if "OCR 缓存写入失败" in m]
+        self.assertEqual(1, len(warnings), logs)
+
     def test_corrupted_cache_is_ignored(self):
         path = self._build_vector_page(pages=1)
         # A half-written file (what a non-atomic write used to leave behind).
         pdfio._ocr_cache_path(path).write_text('{"0": [truncated', "utf-8")
         doc = pdfio.extract_document_text(path, ocr=True, ocr_fn=_ocr_fn)
         self.assertEqual(["Hello", "World"], doc.blocks)
+
+    def test_stale_cache_is_renormalized_on_load(self):
+        """A cache written before number normalization must not keep the
+        garbled figures: renormalize on load instead of requiring the user to
+        wipe ``~/.pdftranslate/ocr_cache`` (which means re-OCRing everything)."""
+        path = self._build_vector_page(pages=1)
+        stale = pdfio.Block(
+            text="3,702.726,474.45", page=0, x0=50.0, y0=50.0, x1=200.0, y1=70.0,
+            ocr=True,
+        )
+        pdfio._save_ocr_cache(
+            pdfio._ocr_cache_path(path), {0: [pdfio._block_to_dict(stale)]}
+        )
+
+        def must_not_call(*_args):
+            raise AssertionError("cache hit must not call the OCR function")
+
+        logs: list[str] = []
+        doc = pdfio.extract_document_text(
+            path, ocr=True, ocr_fn=must_not_call, log=logs.append
+        )
+        self.assertEqual(["3,702,726,474.45"], doc.blocks)
+        note = [m for m in logs if "数字格式异常已修正 1 处" in m and "→ 3,702,726,474.45" in m]
+        self.assertEqual(1, len(note), logs)
 
 

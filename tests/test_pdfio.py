@@ -8,7 +8,12 @@ import pymupdf as fitz
 
 from translate_app import pdfio
 
-from tests._helpers import build_sample_pdf, build_two_column_pdf, build_list_table_pdf
+from tests._helpers import (
+    build_sample_pdf,
+    build_two_column_pdf,
+    build_two_column_pdf_with_heading,
+    build_list_table_pdf,
+)
 
 _OUT = Path(__file__).resolve().parent / "_out"
 
@@ -86,9 +91,58 @@ class PdfioTest(unittest.TestCase):
         self.assertIn("TRANSLATED-", all_text)
         d.close()
 
-    def test_translated_pdf_trims_font_to_fit_box(self):
-        # A translation that is much taller than its box must be font-trimmed so
-        # it stays inside the box instead of overlapping what is below it.
+    def test_translated_pdf_covers_ocr_block_with_white(self):
+        # An OCR block sits on a raster image, not a text layer, so the
+        # in-place exporter must cover the original (scanned) pixels with a
+        # white rectangle instead of redacting text — otherwise the
+        # translation overprints the original.
+        src = _OUT / "scan_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        # A dark pixmap standing in for a scanned region containing text.
+        pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 300, 70), 0)
+        pix.set_rect(fitz.IRect(0, 0, 300, 70), (30,))  # dark gray "scan"
+        page.insert_image(fitz.Rect(50, 50, 350, 120), pixmap=pix)
+        doc.save(str(src))
+        doc.close()
+
+        ocr_block = pdfio.Block(
+            text="scanned text", page=0, x0=50, y0=50, x1=350, y1=120,
+            size=12.0, align="left", bold=False, single_line=False, ocr=True,
+        )
+        out = _OUT / "translated_ocr.pdf"
+        pdfio.save_translated_pdf(src, [[ocr_block]], [["translated text"]], out, "Chinese")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        # The translation must be present.
+        self.assertIn("translated text", page.get_text())
+        # A white-filled rectangle must cover the OCR block's bbox (the block
+        # rect expanded by 0.5 on each side).
+        found_white = False
+        for dr in page.get_drawings():
+            fill = dr.get("fill")
+            if fill is None:
+                continue
+            r = dr["rect"]
+            if (
+                all(abs(c - 1.0) < 0.01 for c in fill)
+                and abs(r.x0 - 49.5) < 1.0
+                and abs(r.y0 - 49.5) < 1.0
+                and abs(r.x1 - 350.5) < 1.0
+                and abs(r.y1 - 120.5) < 1.0
+            ):
+                found_white = True
+        d.close()
+        self.assertTrue(found_white, "expected a white cover rectangle over the OCR block")
+
+    def test_translated_pdf_keeps_readable_font(self):
+        # A translation far longer than its box used to be font-trimmed down to
+        # an illegible ~4pt sliver so it would stay inside the box.  The
+        # readability floor now wins: the rendered size never drops below
+        # ``_MIN_READABLE`` (the text may extend a little past the source box,
+        # which is redacted, rather than become unreadable), and it must not
+        # overflow the page width.
         src = _OUT / "sample_over.pdf"
         build_sample_pdf(src, pages=1)
         doc = pdfio.extract_document_text(src)
@@ -105,23 +159,22 @@ class PdfioTest(unittest.TestCase):
         d = fitz.open(str(out))
         page = d[0]
         info = page.get_text("dict")
-        rects = []
+        rects, sizes = [], []
         for b in info.get("blocks", []):
             if b.get("type") != 0:
                 continue
             for l in b.get("lines", []):
                 t = "".join(s["text"] for s in l["spans"]).strip()
                 if t:
-                    rects.append((fitz.Rect(l["bbox"]), t))
+                    rects.append(fitz.Rect(l["bbox"]))
+                    sizes.extend(s["size"] for s in l["spans"])
         self.assertTrue(rects, "expected rendered translation text")
-        box = fitz.Rect(doc.pages[0][0].x0, doc.pages[0][0].y0,
-                        doc.pages[0][0].x1, doc.pages[0][0].y1)
-        # Text must not spill below the original box (allow a small tolerance).
-        bottom = max(r.y1 for r, _t in rects)
-        self.assertLessEqual(bottom, box.y1 + 1.0)
-        # And every line must fit within the box width (no page overflow).
-        for r, _t in rects:
-            self.assertLessEqual(r.x1, box.x1 + 1.0)
+        # Readability floor: no rendered span is smaller than _MIN_READABLE.
+        self.assertTrue(sizes)
+        self.assertGreaterEqual(min(sizes), pdfio._MIN_READABLE)
+        # And no line spills past the page width.
+        for r in rects:
+            self.assertLessEqual(r.x1, page.rect.x1 + 1.0)
         d.close()
 
 
@@ -148,6 +201,38 @@ class PdfioTest(unittest.TestCase):
         footer = doc.pages[0][-1]
         self.assertEqual(footer.text, "Page 1 of 9")
         self.assertEqual(footer.align, "right")
+
+    def test_full_width_heading_does_not_merge_columns(self):
+        # Regression: a heading spanning both columns used to become a
+        # "column" whose right edge was the page width, so every line of both
+        # real columns "overlapped" it and the two columns were merged into
+        # one — left and right lines interleaved by y into single blocks.
+        # The heading must read first, then the whole left column, then the
+        # whole right column.
+        src = _OUT / "two_col_heading.pdf"
+        build_two_column_pdf_with_heading(src)
+        doc = pdfio.extract_document_text(src)
+        texts = doc.blocks
+        self.assertEqual(
+            texts[0], "FULL WIDTH HEADING ACROSS BOTH COLUMNS OF THE PAGE"
+        )
+        left_idx = [i for i, t in enumerate(texts) if t.startswith("Left column")]
+        right_idx = [i for i, t in enumerate(texts) if t.startswith("Right column")]
+        self.assertTrue(left_idx and right_idx)
+        # The whole left column still precedes the whole right column.
+        self.assertLess(max(left_idx), min(right_idx))
+        self.assertEqual(
+            [texts[i] for i in left_idx],
+            [
+                "Left column first line.",
+                "Left column second line.",
+                "Left column third line.",
+            ],
+        )
+        self.assertEqual(
+            [texts[i] for i in right_idx],
+            ["Right column first line.", "Right column second line."],
+        )
 
     def test_list_and_table_entries_are_not_collapsed(self):
         # Regression: PyMuPDF merges a close-spaced list / table into one block,
@@ -238,6 +323,589 @@ class PdfioTest(unittest.TestCase):
             for l in b["lines"] for s in l["spans"]
         }
         self.assertEqual(fonts, {"Droid Sans Fallback Regular"})
+
+    def test_color_restores_original_color(self):
+        # Regression: the exporter flattened every heading to black.  A block's
+        # captured source colour must be reproduced (same single CJK font).
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="", page=0, x0=50, y0=100, x1=300, y1=130,
+            size=12.0, align="left", bold=False, single_line=True, color=0xCC0000,
+        )
+        pdfio._draw_translated_block(page, font, block, "红色标题")
+        span = page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]
+        self.assertEqual(span["color"], 0xCC0000)
+        # Still the one consistent CJK font (no Heiti creep).
+        fonts = {
+            s["font"] for b in page.get_text("dict")["blocks"] if b.get("type") == 0
+            for l in b["lines"] for s in l["spans"]
+        }
+        self.assertEqual(fonts, {"Droid Sans Fallback Regular"})
+        doc.close()
+
+    def test_name_column_keeps_original(self):
+        # A "姓名 / Name"-headed table column must be flagged keep-original so the
+        # names are not transliterated; the header and other columns are not.
+        blocks = [
+            pdfio.Block(text="姓名", page=0, x0=60, y0=100, x1=100, y1=115, size=9),
+            pdfio.Block(text="汪建法", page=0, x0=60, y0=120, x1=100, y1=135, size=9),
+            pdfio.Block(text="钱水土", page=0, x0=60, y0=140, x1=100, y1=155, size=9),
+            pdfio.Block(text="职务", page=0, x0=160, y0=100, x1=200, y1=115, size=9),
+            pdfio.Block(text="董事长", page=0, x0=160, y0=120, x1=200, y1=135, size=9),
+        ]
+        pdfio._mark_name_column(blocks)
+        flagged = {b.text for b in blocks if b.keep_original}
+        self.assertEqual(flagged, {"汪建法", "钱水土"})
+        # The header cell and the other (non-name) column are left untouched.
+        self.assertIn("姓名", {b.text for b in blocks if not b.keep_original})
+        self.assertIn("董事长", {b.text for b in blocks if not b.keep_original})
+
+    def test_table_row_expansion_shifts_rows_down(self):
+        # Regression: a translated table row that no longer fits its cell used to
+        # overlap the row beneath it.  Rows must be pushed down (and their height
+        # enlarged) so they stay separate.
+        font = fitz.Font("cjk")
+        rows = []
+        cells = []
+        for r in range(3):
+            row = [fitz.Rect(x, 200 + r * 20, x + 90, 220 + r * 20) for x in (60, 160)]
+            rows.append(row)
+            cells.extend(row)
+        tables = [{"bbox": fitz.Rect(60, 200, 250, 260), "rows": rows,
+                   "col_edges": [60, 150, 250]}]
+        blocks, trans = [], []
+        for r in range(3):
+            for c in range(2):
+                cell = rows[r][c]
+                blocks.append(pdfio.Block(
+                    text="t", page=0, x0=cell.x0, y0=cell.y0, x1=cell.x1, y1=cell.y1,
+                    size=9.0, single_line=True,
+                ))
+                # The middle row gets a translation that needs several lines.
+                trans.append(
+                    "A considerably longer translated string that wraps across "
+                    "many lines and therefore needs extra row height."
+                    if r == 1 else "Short"
+                )
+        mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
+        self.assertEqual(len(mapping), len(blocks))
+        shifts, new_bottoms, grid, bboxes = pdfio._compute_table_layout(
+            tables, mapping, blocks, trans, font
+        )
+        row0 = next(bi for bi, (_ti, r) in mapping.items() if r == 0)
+        row1 = next(bi for bi, (_ti, r) in mapping.items() if r == 1)
+        row2 = next(bi for bi, (_ti, r) in mapping.items() if r == 2)
+        # Top row is undisturbed; the lower rows move down because row 1 grows.
+        self.assertEqual(shifts[row0], 0.0)
+        self.assertGreaterEqual(shifts[row1], 0.0)
+        self.assertGreater(shifts[row2], 0.0)
+        # The grown row 1's new bottom must not cross row 2's shifted top.
+        self.assertLessEqual(new_bottoms[row1], 240.0 + shifts[row2] + 0.5)
+        # A redrawn grid (horizontal + vertical rules) is produced.
+        self.assertTrue(any(g[0] == "h" for g in grid))
+        self.assertTrue(any(g[0] == "v" for g in grid))
+        # The whole original table is flagged for removal (stale grid lines).
+        self.assertEqual(len(bboxes), 1)
+
+
+class TableCellFitTest(unittest.TestCase):
+    """A table cell's translation shrinks onto ONE line (instead of wrapping and
+    growing the row) when it fits the widened cell; a cell that cannot fit at
+    the readability floor falls back to wrapping, and non-table blocks still
+    wrap as before."""
+
+    def _line(self, x0, x1, y0, y1, text):
+        return {"x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                "size": 9.0, "bold": False, "color": 0, "text": text}
+
+    def test_build_table_blocks_widens_cells_and_sets_in_table(self):
+        # Native ruled-table cells are flagged in_table and widened to the whole
+        # cell (minus a small gutter) so a longer translation can use the column.
+        cell_rects = [fitz.Rect(100, 100, 300, 120)]
+        lines = [
+            self._line(150, 210, 105, 115, "名称"),
+            self._line(150, 250, 105, 115, "1,234,567"),
+        ]
+        blocks = pdfio._build_table_blocks(lines, [], 0, 600, 0, cell_rects)
+        self.assertEqual(len(blocks), 2)
+        by_text = {b.text: b for b in blocks}
+        name = by_text["名称"]
+        num = by_text["1,234,567"]
+        self.assertTrue(name.in_table)
+        self.assertTrue(num.in_table)
+        # Widened to the cell width (with the small gutter), not the text extent.
+        self.assertAlmostEqual(name.x0, 100 + pdfio._TABLE_CELL_PAD, delta=0.01)
+        self.assertAlmostEqual(name.x1, 300 - pdfio._TABLE_CELL_PAD, delta=0.01)
+        # Text cells centre; figure cells right-align.
+        self.assertEqual(name.align, "center")
+        self.assertEqual(num.align, "right")
+
+    def test_fit_block_puts_table_cell_on_one_line(self):
+        # A long English translation used to wrap inside the narrow cell and push
+        # the rows below it down.  An in_table cell shrinks the font instead.
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="", page=0, x0=100, y0=100, x1=300, y1=120,
+            size=9.0, align="left", bold=False, single_line=True, in_table=True,
+        )
+        long_name = "Wenling Municipal State-owned Assets Management Co., Ltd."
+        lines, fs = pdfio._fit_block(block, font, long_name)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines, [long_name])
+        # The font shrank (never below the table floor) to fit the cell width.
+        self.assertLess(fs, 9.0)
+        self.assertGreaterEqual(fs, pdfio._MIN_TABLE_READABLE)
+        self.assertLessEqual(font.text_length(long_name, fontsize=fs), 200.0)
+
+    def test_fit_block_too_narrow_table_cell_wraps_at_readable_floor(self):
+        # A cell so narrow that even the readability floor cannot hold a single
+        # line used to stay ONE line at the 3pt floor — the slug-cell soft spot
+        # (44 cells < 5pt on the scan, 5 at 3.0).  The cell now wraps at the
+        # readability floor instead of collapsing to an illegible single line.
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="", page=0, x0=100, y0=100, x1=160, y1=120,
+            size=9.0, align="left", bold=False, single_line=True, in_table=True,
+        )
+        long_name = "Wenling Municipal State-owned Assets Management Co., Ltd."
+        lines, fs = pdfio._fit_block(block, font, long_name)
+        self.assertGreater(len(lines), 1)
+        self.assertEqual(fs, pdfio._MIN_TABLE_READABLE)
+        self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
+
+    def test_fit_block_band_wraps_at_readable_floor_when_band_is_plenty(self):
+        # A scanned grid cell carries a fit_height band down to the row below
+        # (the raster table lines cannot move, so the wrap must stay inside it).
+        # A wide-enough band means 2-3 lines at the full readability floor.
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="", page=0, x0=100, y0=100, x1=160, y1=120,
+            size=9.0, align="left", bold=False, single_line=True, in_table=True,
+            fit_height=40.0,
+        )
+        long_name = "Wenling Municipal State-owned Assets Management Co., Ltd."
+        lines, fs = pdfio._fit_block(block, font, long_name)
+        self.assertGreater(len(lines), 1)
+        self.assertEqual(fs, pdfio._MIN_TABLE_READABLE)
+        self.assertLessEqual(pdfio._wrapped_height(font, lines, fs), 40.0)
+        self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
+
+    def test_fit_block_band_descends_when_the_band_is_tight(self):
+        # A hole as tight as the scan's real row pitch (~18pt) holds only 2
+        # lines at 6pt: the fit downsizes until the wrapped height fits the
+        # band (but never below the absolute floor) rather than crossing the
+        # grid line to keep a bigger font.
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="", page=0, x0=100, y0=100, x1=160, y1=120,
+            size=9.0, align="left", bold=False, single_line=True, in_table=True,
+            fit_height=17.5,
+        )
+        long_name = "Wenling Municipal State-owned Assets Management Co., Ltd."
+        lines, fs = pdfio._fit_block(block, font, long_name)
+        self.assertGreater(len(lines), 1)
+        self.assertLessEqual(round(pdfio._wrapped_height(font, lines, fs), 2), 17.5)
+        self.assertGreaterEqual(fs, pdfio._MIN_TABLE_FLOOR)
+        self.assertLess(fs, pdfio._MIN_TABLE_READABLE)
+        self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
+
+    def test_non_table_block_still_wraps(self):
+        # A flowing paragraph (not a table cell) is unaffected: it wraps and keeps
+        # its own box rather than being forced onto one line.
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="", page=0, x0=50, y0=100, x1=300, y1=140,
+            size=11.0, align="left", bold=False, single_line=False, in_table=False,
+        )
+        text = ("本飞机专为单飞行员操作而开发，并经过相应调整以更好地模拟真实环境。"
+                "其制作综合了多个真实世界的数据点。")
+        lines, _fs = pdfio._fit_block(block, font, text)
+        self.assertGreater(len(lines), 1)
+        self.assertEqual("".join(lines), text)
+
+    def test_fit_block_preserves_two_line_source_count(self):
+        # A cell whose source spans exactly TWO lines keeps exactly two lines:
+        # the fitter splits and rebalances so the count matches the source (and
+        # the model's output is not re-wrapped into a different line count).
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="长期投资\n合计", page=0, x0=100, y0=100, x1=300, y1=140,
+            size=9.0, align="left", bold=False, single_line=False, in_table=True,
+        )
+        text = ("Wenling Municipal State-owned Assets Management Co., Ltd. "
+                "Total long-term investments")
+        lines, fs = pdfio._fit_block(block, font, text)
+        self.assertEqual(len(lines), 2)
+        # No character was lost or fabricated across the two lines.
+        self.assertEqual("".join(lines).replace(" ", ""), text.replace(" ", ""))
+        self.assertGreaterEqual(fs, pdfio._MIN_TABLE_READABLE)
+
+    def test_fit_block_two_lines_shrink_below_readable_floor_if_needed(self):
+        # Line count wins over the readability floor: a 2-line source stays two
+        # lines even in a too-narrow cell (the exact-n rebalance keeps the count
+        # and lets the font drop to the absolute floor).
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="净亏损\n小计", page=0, x0=100, y0=100, x1=180, y1=140,
+            size=9.0, align="left", bold=False, single_line=False, in_table=True,
+        )
+        text = ("Net loss per share attributable to the shareholders of the "
+                "Company after taking into account the discontinued operations")
+        lines, fs = pdfio._fit_block(block, font, text)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual("".join(lines).replace(" ", ""), text.replace(" ", ""))
+        self.assertLess(fs, pdfio._MIN_TABLE_READABLE)
+        self.assertGreaterEqual(fs, pdfio._MIN_TABLE_FLOOR)
+
+
+class OcrGridTest(unittest.TestCase):
+    """Scanned financial tables (OCR blocks, no text layer / vector rules) must
+    be rebuilt into a grid instead of collapsing into a jumble."""
+
+    def _items(self):
+        # A miniature balance sheet: a label column, a "行次" number column and
+        # two numeric columns (合并 / 母公司).  Item tuple is (y0, x0, x1, y1, text).
+        return [
+            # header row
+            (100, 78, 180, 112, "项目"), (100, 190, 212, 112, "行次"),
+            (100, 240, 292, 112, "合并"), (100, 320, 372, 112, "母公司"),
+            # data row 1 — label + two figures
+            (130, 84, 164, 148, "现金及存放中央银行款项"),
+            (130, 226, 290, 148, "17,485,938,749.91"),
+            (130, 306, 370, 148, "14,944,565,492.79"),
+            # data row 2
+            (165, 84, 128, 180, "存放同业款项"),
+            (165, 230, 289, 180, "3,702,726,474.45"),
+            (165, 310, 369, 180, "1,386,040,370.31"),
+            # data row 3 — a label, a line number, one figure
+            (200, 84, 141, 212, "发放贷款和垫款"),
+            (200, 190, 212, 212, "8"),
+            (200, 222, 289, 212, "224,464,860,917.53"),
+        ]
+
+    def test_is_numeric_cell(self):
+        self.assertTrue(pdfio._is_numeric_cell("17,485,938,749.91"))
+        # OCR mis-reads can inject spaces inside a figure; still numeric.
+        self.assertTrue(pdfio._is_numeric_cell("65, 334, 085.99"))
+        self.assertTrue(pdfio._is_numeric_cell("(1,234.56)"))
+        self.assertTrue(pdfio._is_numeric_cell("-789,702,296.83"))
+        self.assertTrue(pdfio._is_numeric_cell("5.6"))
+        # Labels / ordinals are not numeric.
+        self.assertFalse(pdfio._is_numeric_cell("营业收入"))
+        self.assertFalse(pdfio._is_numeric_cell("(四)"))
+        self.assertFalse(pdfio._is_numeric_cell("现金及存放中央银行款项"))
+
+    def test_reconstruct_ocr_grid_is_row_major_and_right_aligns_numbers(self):
+        blocks, tables = pdfio._reconstruct_ocr_grid(self._items())
+        self.assertTrue(blocks)
+        self.assertEqual(len(tables), 1)
+        texts = [b.text for b in blocks]
+        # Row-major: the label column is not all emitted before the figures.
+        self.assertLess(texts.index("现金及存放中央银行款项"), texts.index("17,485,938,749.91"))
+        # Numeric cells are right-aligned; labels stay left.
+        by_text = {b.text: b for b in blocks}
+        self.assertEqual(by_text["17,485,938,749.91"].align, "right")
+        self.assertEqual(by_text["14,944,565,492.79"].align, "right")
+        self.assertEqual(by_text["现金及存放中央银行款项"].align, "left")
+        # The numeric cell keeps its own right edge (aligned within its column),
+        # while the label keeps its own glyph box as the bbox (the cover/redact
+        # step erases exactly the printed label pixels — never a neighbouring
+        # cell) and carries the whole column as draw room in ``fit_width``.
+        self.assertAlmostEqual(by_text["17,485,938,749.91"].x1, 290.0, delta=1.0)
+        self.assertAlmostEqual(by_text["现金及存放中央银行款项"].x1, 164.0, delta=1.0)
+        self.assertGreater(
+            by_text["现金及存放中央银行款项"].fit_width,
+            by_text["现金及存放中央银行款项"].x1 - by_text["现金及存放中央银行款项"].x0,
+        )
+
+    def test_reconstruct_ocr_tables_maps_all_cells(self):
+        blocks, _ = pdfio._reconstruct_ocr_grid(self._items())
+        tables = pdfio._reconstruct_ocr_tables(blocks)
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(len(tables[0]["rows"]), 4)  # header + 3 data rows
+        mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
+        self.assertEqual(len(mapping), len(blocks))
+
+    def test_grid_subcolumn_header_gets_row_gap_as_fit_width(self):
+        # The "合并"/"母公司" header cells live inside a figure sub-column whose
+        # own OCR box only encloses the two printed characters; the translation
+        # ("Consolidated") must be able to use the empty gap up to the next cell
+        # in the row, or it is crushed to the 3pt floor.
+        blocks, _ = pdfio._reconstruct_ocr_grid(self._items())
+        by_text = {b.text: b for b in blocks}
+        header = by_text["合并"]
+        self.assertGreater(header.fit_width, header.x1 - header.x0)
+        self.assertAlmostEqual(header.fit_width, 320.0 - 2.0 - 240.0, delta=1.0)
+
+    def test_grid_cells_get_row_pitch_as_fit_height(self):
+        # Each cell of a grid row may draw down to the *next* row's top (minus a
+        # margin for the raster line): a translation too long for a readable
+        # single line wraps into the row gap instead of crossing the table line
+        # below (scan raster lines cannot move).  The last row has no band.
+        blocks, _ = pdfio._reconstruct_ocr_grid(self._items())
+        by_text = {b.text: b for b in blocks}
+        cell = by_text["现金及存放中央银行款项"]     # row top 130, next row top 165
+        self.assertAlmostEqual(cell.fit_height, 165.0 - 130.0 - 1.5, delta=0.01)
+        self.assertGreater(cell.fit_height, cell.y1 - cell.y0)
+        self.assertEqual(by_text["发放贷款和垫款"].fit_height, 0.0)  # last row
+
+    def test_grid_label_fit_width_stops_before_the_note_marker(self):
+        # A row with the 附注 "(二)" band inside the label column: the label
+        # keeps its own glyph box as bbox, its draw room stops 2pt before the
+        # note (a long translation must not slide under "(二)" and have its tail
+        # sliced by the note's white cover), and the note keeps its own box,
+        # centred where the source printed it.
+        items = self._items() + [
+            (140, 84, 141, 152, "拆出资金"),
+            (140, 170, 188, 152, "(二)"),
+            (140, 230, 289, 152, "3,702,726,474.45"),
+        ]
+        blocks, _ = pdfio._reconstruct_ocr_grid(items)
+        by_text = {b.text: b for b in blocks}
+        label, note = by_text["拆出资金"], by_text["(二)"]
+        self.assertAlmostEqual(label.x1, 141.0, delta=1.0)
+        self.assertAlmostEqual(label.fit_width, 170.0 - 2.0 - 84.0, delta=1.0)
+        self.assertEqual(label.align, "left")
+        self.assertAlmostEqual(note.x1, 188.0, delta=1.0)
+        self.assertEqual(note.align, "center")
+
+    def test_grid_merges_split_label_fragments(self):
+        # RapidOCR splits one printed label (营业利润（亏损以"一"号填列）) into two
+        # close items; the fragments must become ONE cell so the model receives
+        # the whole label and the fitter sees the whole run — while a "(十六)"
+        # note marker stays its own cell.
+        items = [
+            (100, 78, 180, 112, "项目"), (100, 320, 372, 112, "母公司"),
+            (130, 84, 131, 148, "营业利润（亏损以"),
+            (130, 148, 168, 148, "号填列）"),
+            (130, 230, 289, 148, "207,098,342.00"),
+            (165, 84, 128, 180, "利息净收入"),
+            (165, 170, 188, 180, "（十六）"),
+            (165, 230, 289, 180, "84,528,349.88"),
+        ]
+        blocks, _ = pdfio._reconstruct_ocr_grid(items)
+        texts = [x.text for x in blocks]
+        self.assertIn("营业利润（亏损以号填列）", texts)
+        self.assertNotIn("号填列）", texts)
+        self.assertIn("利息净收入", texts)
+        self.assertIn("（十六）", texts)
+        merged = next(b for b in blocks if b.text == "营业利润（亏损以号填列）")
+        # The merged run's box spans both fragments, so the fit sees the run.
+        self.assertAlmostEqual(merged.x1, 168.0, delta=1.0)
+
+    def test_grid_does_not_merge_a_note_marker_into_the_label(self):
+        # The marker guard is symmetric enough that 拆出资金 + (二) never merge,
+        # even though "(二)" sits 30pt from the label (a 40pt+ marker would too).
+        items = [
+            (100, 78, 180, 112, "项目"), (100, 320, 372, 112, "母公司"),
+            (130, 84, 128, 148, "拆出资金"),
+            (130, 170, 188, 148, "(二)"),
+            (130, 230, 289, 148, "97,923,282.04"),
+        ]
+        blocks, _ = pdfio._reconstruct_ocr_grid(items)
+        texts = [x.text for x in blocks]
+        self.assertIn("拆出资金", texts)
+        self.assertIn("(二)", texts)
+        self.assertNotEqual(texts.index("拆出资金"), texts.index("(二)"))
+
+
+class NumberAtomicityTest(unittest.TestCase):
+    """Figures are never split mid-number by the wrap machinery.
+
+    Regression: on the statement pages the value 292,712,933,925.17 was drawn
+    as ``292,712,933,925.1`` on one line and ``7`` on the next — a reader sees
+    a decimal point that grew or lost a digit, and an amount that is wrong.
+    """
+
+    def test_number_in_narrow_box_stays_whole(self):
+        font = fitz.Font("cjk")
+        text = "292,712,933,925.17"
+        lines = pdfio._wrap(font, text, 25.0, 11.0)  # far narrower than the text
+        self.assertEqual([text], lines)
+
+    def test_number_inside_prose_wraps_at_word_boundaries(self):
+        font = fitz.Font("cjk")
+        text = "总资产达 292,712,933,925.17 元，较上年末增长。"
+        lines = pdfio._wrap(font, text, 40.0, 11.0)
+        # No character was lost (the wrap drops inter-word spaces at line
+        # breaks, so compare content digit-for-digit), no line holds a
+        # *partial* amount, and the whole figure sits on one line.
+        self.assertEqual(text.replace(" ", ""), "".join(lines))
+        self.assertTrue(any("292,712,933,925.17" in line for line in lines))
+        for line in lines:
+            with self.subTest(line=line):
+                if "292,712,933,925.17" not in line:
+                    self.assertNotIn("292,712", line)
+
+    def test_stray_spaces_around_separators_are_merged(self):
+        # ``65, 334, 085.99`` was one amount OCR padded; splitting it at the
+        # spaces would turn the value back into three numbers.
+        font = fitz.Font("cjk")
+        lines = pdfio._wrap(font, "65, 334, 085.99", 25.0, 11.0)
+        self.assertEqual(["65,334,085.99"], lines)
+
+    def test_space_thousand_separator_not_merged(self):
+        # ``10 000`` uses a space as the group separator: it must survive as-is.
+        font = fitz.Font("cjk")
+        lines = pdfio._wrap(font, "10 000", 585.0, 11.0)
+        self.assertEqual(["10 000"], lines)
+
+    def test_break_latin_word_minimum_two_char_pieces(self):
+        # The org chart shards (``P- ar- ty a- n- d ...``) came from one-char
+        # pieces; a piece must carry at least two characters or the rest is
+        # kept whole (a dangling ``a-`` would suggest the word continues).
+        font = fitz.Font("cjk")
+        lines: list[str] = []
+        rest = pdfio._break_latin_word(font, "Innovative", 12.0, 11.0, lines)
+        pieces = lines + [rest]
+        self.assertEqual("".join(p.rstrip("-") for p in pieces), "Innovative")
+        for piece in pieces:
+            self.assertGreaterEqual(len(piece.rstrip("-")), 2, piece)
+
+
+class VerticalLabelTest(unittest.TestCase):
+    """Narrow-tall boxes (org-chart labels) get a rotated 90° translation."""
+
+    def _block(self, x0=50.0, y0=50.0, x1=57.4, y1=79.5, **kw):
+        # 7.4 x 29.5pt: the shape of the real 党群工作部 box on page 5.
+        return pdfio.Block(
+            text="", page=0, x0=x0, y0=y0, x1=x1, y1=y1,
+            size=24.0, align="center", bold=False, **kw
+        )
+
+    def test_detection_only_for_narrow_tall_single_line(self):
+        block = self._block()
+        self.assertTrue(pdfio._is_vertical_label(block))
+        # Wide box, squat box, table cell and multi-line: not vertical labels.
+        self.assertFalse(pdfio._is_vertical_label(self._block(x1=150.0)))
+        self.assertFalse(pdfio._is_vertical_label(self._block(y1=60.0)))
+        self.assertFalse(pdfio._is_vertical_label(self._block(in_table=True)))
+        self.assertFalse(
+            pdfio._is_vertical_label(self._block(single_line=False))
+        )
+
+    def test_rotation_keeps_label_inside_the_box(self):
+        font = fitz.Font("cjk")
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=300)
+        # An 8 x 120pt vertical label box (multi-char column): the phrase fits
+        # along the height when rotated, which the horizontal draw cannot do.
+        block = pdfio.Block(
+            text="", page=0, x0=50.0, y0=50.0, x1=58.0, y1=170.0,
+            size=24.0, align="center", bold=False,
+        )
+        pdfio._draw_translated_block(page, font, block, "Party and Mass Work")
+        # Extract while the document is still open.
+        spans = [s for s in page.get_text("dict")["blocks"] if s.get("type") == 0]
+        text = "".join(sp["text"] for s in spans for l in s["lines"] for sp in l["spans"])
+        doc.close()
+        # The line must be whole (no hyphenated shards) and the glyph column
+        # centred inside the box (wider boxes than the source keep the word).
+        self.assertNotIn("-", text)
+        self.assertTrue("PartyandMassWork" in text.replace(" ", ""))
+        bbox = fitz.Rect(0, 0, 0, 0)
+        for s in spans:
+            for l in s["lines"]:
+                bbox |= fitz.Rect(l["bbox"])
+        self.assertAlmostEqual((bbox.x0 + bbox.x1) / 2, (block.x0 + block.x1) / 2, delta=2.0)
+        self.assertGreater(bbox.y0, block.y0 - 2.0)
+        self.assertLess(bbox.y1, block.y1 + 2.0)
+
+    def test_label_longer_than_box_height_is_still_whole(self):
+        # A label that cannot fit the box at any readable size is drawn rotated
+        # at the column size (extending beyond the box, centred on it) — the
+        # alternative, horizontal one-char shards, never reads at all.
+        font = fitz.Font("cjk")
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=300)
+        block = self._block()  # 7.4 x 29.5pt
+        long_label = "The Party Committee and Administrative Department"
+        pdfio._draw_vertical_label(page, font, block, long_label)
+        # Extract while the document is still open.
+        spans = [s for s in page.get_text("dict")["blocks"] if s.get("type") == 0]
+        text = "".join(sp["text"] for s in spans for l in s["lines"] for sp in l["spans"])
+        doc.close()
+        self.assertNotIn("-", text)
+        self.assertTrue(
+            long_label.replace(" ", "") in text.replace(" ", ""), text
+        )
+
+
+class OcrTableNoExpansionTest(unittest.TestCase):
+    """OCR-reconstructed tables keep the scan's own geometry.
+
+    Regression: the row-height expansion measured translated cells against the
+    reconstructed rows and pushed the lower rows hundreds of points down (on
+    the report's statement pages a value moved ~355 pt, several rows below its
+    own cell).  Scan pages must draw at the positions the OCR grid produced.
+    """
+
+    def _scan_source(self, path: Path) -> Path:
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        # A fake scan: a raster band and no text layer, so find_tables finds no
+        # ruled grid and the OCR-table reconstruction path is taken.
+        page.draw_rect(fitz.Rect(40, 40, 555, 300), color=None, fill=(0.9, 0.9, 0.9))
+        doc.save(str(path))
+        doc.close()
+        return path
+
+    def _cells(self):
+        def cell(x0, y0, x1, y1, text):
+            return pdfio.Block(
+                text=text, page=0, x0=x0, y0=y0, x1=x1, y1=y1,
+                size=10.0, align="left", bold=False,
+                single_line=True, ocr=True, in_table=True,
+            )
+
+        return cell
+
+    def test_ocr_grid_in_place_keeps_rows_below_the_wrapping_cell(self):
+        """A scanned table page stays in-place and the rows are not expanded.
+
+        Six cells where the translation of one cell wraps to several lines
+        while the scan row is only 12pt tall: the exporter must keep the scan
+        geometry and NOT push the rows below the wrapping cell down — that is
+        the ~355pt misplacement regression.
+        """
+        src = _OUT / "scan_grid_in_place.pdf"
+        self._scan_source(src)
+        cell = self._cells()
+
+        def row(y0, left, right):
+            return cell(50, y0, 260, y0 + 12, left), cell(300, y0, 520, y0 + 12, right)
+
+        b0, b1 = row(100, "总资产", "总负债")
+        b2, b3 = row(140, "净资产", "现金")
+        b4, b5 = row(180, "净利润", "总成本")
+        blocks = [b0, b1, b2, b3, b4, b5]
+        trans = [
+            "292,712,933,925.17",
+            "The consolidated financial statements of the Group and its "
+            "subsidiaries were prepared under the principles of going concern",
+            "24,321,445,868.48",
+            "268,719,676,841.77",
+            "12,345,678,901.23",
+            "4,567,892,100.00",
+        ]
+        out = _OUT / "ocr_grid_in_place_out.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], out, "English")
+        doc = fitz.open(out)
+        self.assertEqual(doc.page_count, 1)
+        spans = _text_lines(doc[0])
+        doc.close()
+
+        def find(text: str) -> fitz.Rect:
+            matches = [bb for bb, t in spans if text in t]
+            self.assertGreater(len(matches), 0, text)
+            return matches[0]
+
+        for b, t in zip(blocks, trans):
+            rect = find(t[:20])  # the first words of the cell
+            self.assertLess(abs(rect.y0 - b.y0), 8.0, t)
+            self.assertLess(abs(rect.x0 - b.x0), 5.0, t)
 
 
 class WrapTest(unittest.TestCase):

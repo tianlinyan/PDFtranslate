@@ -82,6 +82,10 @@ class MainWindow(QWidget):
         self._worker: TranslateWorker | None = None
         self._last_output: str | None = None
         self._models_error = ""
+        # Run outcome, used by ``_cleanup`` to decide whether to reset the
+        # progress bar / stage (a cancelled run leaves the bar spinning).
+        self._run_ok = False
+        self._cancelled_by_user = False
 
         self.setWindowTitle(f"{__app_name__} — AI 翻译 v{__version__}")
         self.resize(620, 560)
@@ -296,9 +300,12 @@ class MainWindow(QWidget):
         key = self._type_combo.currentData()
         out_path = self._path_edit.text().strip() or self._default_output_path()
 
-        self._save_prefs(model.id, self._lang_combo.currentText(), key)
-
+        self._run_ok = False
+        self._cancelled_by_user = False
+        # Clear the log *before* saving prefs so a prefs-save warning is not
+        # wiped out.
         self._log.clear()
+        self._save_prefs(model.id, self._lang_combo.currentText(), key)
         self._stage.setText("准备…")
         self._progress.setValue(0)
         self._start_btn.setEnabled(False)
@@ -324,6 +331,15 @@ class MainWindow(QWidget):
         # emits neither ``finished`` nor ``error``.  Quitting the thread from it
         # (instead of from those two) guarantees ``_cleanup`` always runs and the
         # "开始翻译" button comes back.
+        #
+        # ``stopped`` is also where the worker C++ object is scheduled for
+        # deletion: at this moment the worker thread's event loop is still
+        # running, so the ``DeferredDelete`` is actually processed and the
+        # object is freed.  Deleting it later, from ``_cleanup`` (which runs
+        # after the thread has finished), would post the ``DeferredDelete`` to
+        # a dead event loop that never processes it, leaking one QObject per
+        # run.
+        self._worker.stopped.connect(self._worker.deleteLater)
         self._worker.stopped.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup)
         self._thread.start()
@@ -340,13 +356,18 @@ class MainWindow(QWidget):
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )
-            save_prefs(prefs)
+            reason = save_prefs(prefs)
+            if reason:
+                # A silently lost preference is invisible until the next launch;
+                # say so (this runs after the log is cleared for the new run).
+                self._append_log(f"  警告：用户偏好保存失败（{reason}），本次设置不会被记住。")
         except Exception:
             pass
 
     def _cancel(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
+            self._cancelled_by_user = True
             self._append_log("正在取消…")
         self._cancel_btn.setEnabled(False)
 
@@ -362,6 +383,18 @@ class MainWindow(QWidget):
             # total unknown yet (e.g. extracting text): show a busy bar
             self._progress.setRange(0, 0)
             self._stage.setText(stage)
+
+    def _settle_progress(self, value: int, stage: str) -> None:
+        """Restore the progress bar from the busy (indeterminate) state.
+
+        A cancelled or failed run can leave the bar spinning
+        (``setRange(0, 0)``) with the stage label stuck on the last phase;
+        settle both so the UI reflects a finished run, not one still working.
+        """
+        self._progress.setRange(0, 100)
+        self._progress.setFormat(f"完成 {value}%")
+        self._progress.setValue(value)
+        self._stage.setText(stage)
 
     def _clear_cache(self) -> None:
         reply = QMessageBox.question(
@@ -385,6 +418,7 @@ class MainWindow(QWidget):
         self._log.appendPlainText(msg)
 
     def _on_finished(self, out_path: str) -> None:
+        self._run_ok = True
         self._last_output = out_path
         self._progress.setRange(0, 100)
         self._progress.setFormat("完成 100%")
@@ -394,8 +428,11 @@ class MainWindow(QWidget):
         self._append_log(f"翻译完成，已保存：{out_path}")
 
     def _on_error(self, msg: str) -> None:
-        self._stage.setText("发生错误")
-        self._log.appendPlainText(msg)
+        # Settle the progress bar (it may be stuck in the busy state) and mark
+        # the run failed so ``_cleanup`` keeps this state instead of resetting
+        # it.
+        self._settle_progress(0, "发生错误")
+        self._append_log(msg)
         # Show only the headline in the dialog (the log keeps the full detail).
         headline = next((ln for ln in msg.splitlines() if ln.strip()), "翻译失败")
         QMessageBox.critical(self, "翻译失败", headline)
@@ -413,12 +450,23 @@ class MainWindow(QWidget):
             )
 
     def _cleanup(self) -> None:
-        if self._worker is not None:
-            self._worker.deleteLater()
-            self._worker = None
+        # The worker C++ object was already deleted via ``stopped ->
+        # deleteLater`` (processed in the worker thread before its loop
+        # exited); just drop the Python reference here.  Calling
+        # ``deleteLater`` again would target an object whose owning thread is
+        # finished, so the event would never be processed.
+        self._worker = None
         if self._thread is not None:
             self._thread.deleteLater()
             self._thread = None
+        # A cancelled run emits neither ``finished`` nor ``error``, so nothing
+        # else settles the progress bar — stop the busy bar and restore a ready
+        # stage.  Successful / failed runs keep the state their slot set.
+        if not self._run_ok and self._progress.maximum() == 0:
+            stage = "已取消" if self._cancelled_by_user else "就绪"
+            self._settle_progress(0, stage)
+        self._run_ok = False
+        self._cancelled_by_user = False
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
 
@@ -426,7 +474,11 @@ class MainWindow(QWidget):
     # Drag & drop a PDF to set the source
     # ------------------------------------------------------------------
     def dragEnterEvent(self, event):  # noqa: N802
-        if event.mimeData().hasUrls():
+        # Only accept a drop we will actually act on: a local PDF file.  (The
+        # old code accepted *any* URL — a directory or a web link was accepted
+        # on hover but silently ignored on drop.)
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile() and urls[0].toLocalFile().lower().endswith(".pdf"):
             event.acceptProposedAction()
 
     def dropEvent(self, event):  # noqa: N802
@@ -435,7 +487,7 @@ class MainWindow(QWidget):
             path = urls[0].toLocalFile()
             if path.lower().endswith(".pdf"):
                 self.set_source_path(path)
-            event.acceptProposedAction()
+                event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         # 六亲不认的强行退出：关闭窗口即刻强制结束工作线程，并直接硬退出整个

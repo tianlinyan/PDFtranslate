@@ -111,6 +111,32 @@ def build_two_column_pdf(path: str | Path) -> Path:
     return path
 
 
+def build_two_column_pdf_with_heading(path: str | Path) -> Path:
+    """Create a PDF with a full-width heading above two text columns.
+
+    Regression fixture for the column clustering: a heading spanning both
+    columns used to become a "column" whose right edge was the page width, so
+    every line of both real columns "overlapped" it and the two columns were
+    merged into one (left and right lines interleaved by y).
+    """
+    path = Path(path)
+    doc = fitz.open()
+    page = doc.new_page()  # A4: 595 x 842
+    # Full-width heading spanning both columns.
+    page.insert_text(
+        (60, 50), "FULL WIDTH HEADING ACROSS BOTH COLUMNS OF THE PAGE", fontsize=14
+    )
+    # Left column (x ~60..200) and right column (x ~315..460).
+    page.insert_text((60, 100), "Left column first line.", fontsize=12)
+    page.insert_text((60, 130), "Left column second line.", fontsize=12)
+    page.insert_text((60, 160), "Left column third line.", fontsize=12)
+    page.insert_text((315, 100), "Right column first line.", fontsize=12)
+    page.insert_text((315, 130), "Right column second line.", fontsize=12)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
 def build_list_table_pdf(path: str | Path) -> Path:
     """Create a PDF with a close-spaced numbered list and ``Label:`` table rows.
 

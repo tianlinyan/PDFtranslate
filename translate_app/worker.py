@@ -7,6 +7,7 @@ to the main thread through Qt signals.
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -69,13 +70,17 @@ class TranslateWorker(QObject):
         self._output_type = output_type
         self._output_path = output_path
         self._ocr = ocr
-        self._cancelled = False
+        # Cancellation flag.  An ``Event`` (not a bare bool) because it is
+        # written from the GUI thread (``cancel``) and read from the worker
+        # thread: the Event gives explicit, memory-model-safe signalling
+        # instead of relying on the CPython GIL to make a bool atomic.
+        self._cancelled = threading.Event()
 
     @pyqtSlot()
     def run(self) -> None:
         started = time.monotonic()
         try:
-            if self._cancelled:
+            if self._cancelled.is_set():
                 raise TranslationCancelled()
 
             self.log.emit(f"开始时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -86,7 +91,7 @@ class TranslateWorker(QObject):
             doc = pdfio.extract_document_text(
                 self._source,
                 ocr=self._ocr,
-                cancel=lambda: self._cancelled,
+                cancel=lambda: self._cancelled.is_set(),
                 log=lambda m: self.log.emit(m),
             )
             if doc.ocr_count:
@@ -102,18 +107,51 @@ class TranslateWorker(QObject):
             engine = TranslationEngine(self._model)
             self.log.emit(f"模型：{self._model.name} ({self._model.model})")
 
+            # Personal-name cells (a "姓名 / Name" table column) keep the
+            # original text — but only for a CJK target: when the output is
+            # Latin-script, leaving the Chinese names in place would produce a
+            # mixed-language document, so they are translated instead (the
+            # prompt rule romanizes them with consistent pinyin).  The flat
+            # block order in ``doc.blocks`` matches ``doc.pages``, so walk the
+            # pages to collect those indices.
+            target_is_cjk = any("一" <= c <= "鿿" for c in self._lang)
+            keep_original: set[int] = set()
+            if target_is_cjk:
+                flat = 0
+                for page_blocks in doc.pages:
+                    for b in page_blocks:
+                        if b.keep_original:
+                            keep_original.add(flat)
+                        flat += 1
+                if keep_original:
+                    self.log.emit(
+                        f"已识别 {len(keep_original)} 个姓名块，将保留原文不做翻译。"
+                    )
+            else:
+                n_names = sum(
+                    1
+                    for page_blocks in doc.pages
+                    for b in page_blocks
+                    if b.keep_original
+                )
+                if n_names:
+                    self.log.emit(
+                        f"目标语言为西文，{n_names} 个姓名块将按规则罗马化（不保留中文原文）。"
+                    )
+
             translate_started = time.monotonic()
             result = engine.translate_blocks(
                 doc.blocks,
                 self._lang,
                 on_progress=lambda d, t: self.progress.emit(d, t, "翻译中…"),
                 log=lambda m: self.log.emit(m),
-                cancel=lambda: self._cancelled,
+                cancel=lambda: self._cancelled.is_set(),
                 doc_path=Path(self._source),
+                keep_original=keep_original,
             )
             translate_elapsed = time.monotonic() - translate_started
 
-            if self._cancelled:
+            if self._cancelled.is_set():
                 raise TranslationCancelled()
 
             # Batches that failed every retry kept their source text.  Say so:
@@ -167,7 +205,7 @@ class TranslateWorker(QObject):
 
     def cancel(self) -> None:
         """Request cancellation (safe to call from the GUI thread)."""
-        self._cancelled = True
+        self._cancelled.set()
 
     def _export(self, doc: pdfio.DocumentText, per_page: list[list[str]]) -> str:
         out = Path(self._output_path)
@@ -177,7 +215,9 @@ class TranslateWorker(QObject):
                 self._source, per_page, out, self._lang, doc.pages
             )
         elif kind == "translated_pdf":
-            pdfio.save_translated_pdf(self._source, doc.pages, per_page, out, self._lang)
+            pdfio.save_translated_pdf(
+                self._source, doc.pages, per_page, out, self._lang
+            )
         elif kind == "markdown":
             pdfio.save_markdown(
                 per_page, doc.blocks, doc.block_pages, out, self._lang, doc.title
