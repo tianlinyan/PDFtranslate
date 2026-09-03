@@ -15,7 +15,12 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from . import pdfio
 from .settings import ModelConfig
-from .translator import TranslationAborted, TranslationCancelled, TranslationEngine
+from .translator import (
+    TranslationAborted,
+    TranslationCancelled,
+    TranslationEngine,
+    make_review_fn,
+)
 
 #: Output formats offered by the translation dialog.
 OUTPUT_TYPES = {
@@ -88,11 +93,21 @@ class TranslateWorker(QObject):
             if self._ocr:
                 self.log.emit("已启用 OCR（自动识别原文语言），将识别无文本层的扫描页。")
             self.progress.emit(0, 0, "提取文本…")
+            # Whole-page AI review: after an OCR page is rebuilt, the original
+            # scan + the reconstruction are sent to the model, whose text fixes
+            # are applied conservatively and whose layout flags are logged.  Only
+            # for OCR'd (scanned) pages and only when the model opts in.
+            review = make_review_fn(self._model, self.log.emit) if self._ocr else None
+            if review is not None:
+                self.log.emit(
+                    "该模型支持视觉：将对重建的扫描页做整页审查（文字纠错 + 布局提示，不改几何）。"
+                )
             doc = pdfio.extract_document_text(
                 self._source,
                 ocr=self._ocr,
                 cancel=lambda: self._cancelled.is_set(),
                 log=lambda m: self.log.emit(m),
+                review_fn=review,
             )
             if doc.ocr_count:
                 self.log.emit(f"有 {doc.ocr_count} 个页面无文本层，已通过 OCR 提取。")

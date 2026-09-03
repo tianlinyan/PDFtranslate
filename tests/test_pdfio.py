@@ -1,8 +1,10 @@
 """Tests for PDF text extraction and the export writers."""
 import os
 import shutil
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import pymupdf as fitz
 
@@ -16,6 +18,25 @@ from tests._helpers import (
 )
 
 _OUT = Path(__file__).resolve().parent / "_out"
+
+
+class _OcrCacheIsolated(unittest.TestCase):
+    """Redirect the OCR / translation caches so integration tests never touch the
+    developer's ``~/.pdftranslate`` (and never hit a hot cache that would turn a
+    test green without exercising the review/OCR path)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.dict(
+            os.environ,
+            {
+                "PDFTRANSLATE_OCR_CACHE_DIR": str(tmp.name),
+                "PDFTRANSLATE_CACHE_DIR": str(tmp.name),
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 def _text_lines(page):
@@ -1205,6 +1226,103 @@ class WrapTest(unittest.TestCase):
         font = self._font()
         lines = pdfio._wrap(font, "仅供模拟使用", 585.1, 11.0)
         self.assertEqual(len(lines), 1)
+
+
+class WholePageReviewTest(unittest.TestCase):
+    """Conservative whole-page review: correct unreadable text, log structure."""
+
+    def _page(self):
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        self.addCleanup(doc.close)
+        return page
+
+    def _block(self, text, x0, y0, x1, y1):
+        return pdfio.Block(
+            text=text, page=0, x0=x0, y0=y0, x1=x1, y1=y1,
+            size=10.0, align="left", bold=False, single_line=True, ocr=True,
+        )
+
+    def test_applies_text_fix_and_logs_structure(self):
+        page = self._page()
+        blocks = [self._block("现金", 40, 50, 90, 66),
+                  self._block("12,34,56", 120, 50, 280, 66)]  # unreadable figure
+        z = pdfio._REVIEW_DPI / 72.0
+
+        def review(_i, _o, _r):
+            return {
+                "text_fixes": [{"bbox": [120 * z, 50 * z, 280 * z, 66 * z],
+                                "text": "12,345,600"}],
+                "structure_flags": [{"message": "列对齐略有偏差"}],
+            }
+
+        logs: list[str] = []
+        out = pdfio._apply_page_review(page, blocks, review, 0, logs.append)
+        self.assertEqual(out[1].text, "12,345,600")
+        self.assertEqual((out[1].x0, out[1].x1), (120.0, 280.0))  # geometry untouched
+        self.assertTrue(any("布局提示" in m for m in logs), logs)
+        self.assertTrue(any("采纳 1 处文字修正" in m for m in logs), logs)
+
+    def test_does_not_overwrite_a_clean_amount(self):
+        page = self._page()
+        blocks = [self._block("现金", 40, 50, 90, 66),
+                  self._block("17,485,938,749.91", 120, 50, 280, 66)]
+        z = pdfio._REVIEW_DPI / 72.0
+        logs: list[str] = []
+
+        def review(_i, _o, _r):
+            return {"text_fixes": [{"bbox": [120 * z, 50 * z, 280 * z, 66 * z],
+                                    "text": "17,485,938,749.9"}]}
+
+        out = pdfio._apply_page_review(page, blocks, review, 0, logs.append)
+        # A clean OCR amount is never replaced; the disagreement is surfaced.
+        self.assertEqual(out[1].text, "17,485,938,749.91")
+        self.assertTrue(any("请人工复核" in m for m in logs), logs)
+
+    def test_review_failure_is_noop(self):
+        page = self._page()
+        blocks = [self._block("现金", 40, 50, 90, 66)]
+        logs: list[str] = []
+
+        def review(_i, _o, _r):
+            raise RuntimeError("boom")
+
+        out = pdfio._apply_page_review(page, blocks, review, 0, logs.append)
+        self.assertEqual(out[0].text, "现金")
+        self.assertTrue(any("整页审查失败" in m for m in logs), logs)
+
+
+class WholePageReviewIntegrationTest(_OcrCacheIsolated):
+    """``extract_document_text`` runs the review on a rebuilt OCR page."""
+
+    def test_extract_applies_review_fix(self):
+        src = _OUT / "review_scan.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=300)
+        page.draw_rect(fitz.Rect(40, 40, 555, 200), color=None, fill=(0.9, 0.9, 0.9))
+        doc.save(str(src))
+        doc.close()
+
+        def quad(x0, y0, x1, y1):
+            return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+        def ocr_fn(_i, _p):
+            return [
+                (quad(60, 60, 130, 80), "12,34,56"),
+                (quad(60, 100, 130, 120), "5,000.00"),
+            ]
+
+        def review(_i, _o, _r):
+            z = pdfio._REVIEW_DPI / 72.0
+            return {"text_fixes": [{"bbox": [60 * z, 60 * z, 130 * z, 80 * z],
+                                    "text": "12,345,600"}]}
+
+        dt = pdfio.extract_document_text(
+            src, ocr=True, ocr_fn=ocr_fn, review_fn=review, log=lambda _m: None
+        )
+        texts = [b.text for b in dt.pages[0]]
+        self.assertIn("12,345,600", texts)
+        self.assertNotIn("12,34,56", texts)
 
 
 if __name__ == "__main__":

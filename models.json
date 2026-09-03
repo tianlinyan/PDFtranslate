@@ -4,11 +4,12 @@
       "id": "qwen3.8",
       "name": "qwen3.8",
       "type": "llama-server",
-      "endpoint": "http://192.168.0.48:8888/v1/chat/completions",
+      "endpoint": "http://192.168.0.19:8888",
       "model": "qwen3.8-27b",
       "reasoning_effort": "low",
       "concurrency": 1,
       "temperature":0.3,
+      "vision": true,
       "batch_size": 8000
     },
     {

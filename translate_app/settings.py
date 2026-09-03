@@ -42,6 +42,10 @@ class ModelConfig:
     max_tokens: int | None = None      # per-request max completion tokens (None → server default)
     concurrency: int = 1               # parallel batch requests per translation run
     batch_size: int = 4000             # source-character budget per batch request
+    #: When true, the model may be used to *review* an OCR-rebuilt scanned page:
+    #: the original page and the reconstruction are sent to it, and its text
+    #: corrections and layout hints are applied / surfaced (geometry untouched).
+    vision: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -69,6 +73,7 @@ class ModelConfig:
             ),
             concurrency=int(item.get("concurrency") or 1),
             batch_size=int(item.get("batch_size") or 4000),
+            vision=bool(item.get("vision", False)),
             extra={k: v for k, v in item.items() if k not in cls._KNOWN_FIELDS},
         )
 
@@ -86,6 +91,7 @@ class ModelConfig:
         "max_tokens",
         "concurrency",
         "batch_size",
+        "vision",
     }
 
     def request_params(self) -> dict[str, Any]:

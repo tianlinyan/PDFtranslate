@@ -776,6 +776,70 @@ class GlossaryTest(unittest.TestCase):
         self.assertEqual((0, 1), progress[0])  # cold again, not (1, 1)
 
 
+class WholePageReviewTest(unittest.TestCase):
+    """The vision whole-page reviewer (parse + gate)."""
+
+    def _model(self, **kw) -> ModelConfig:
+        base = dict(
+            id="v", name="v", type="llama-server",
+            endpoint="http://192.168.0.19:8888", model="qwen3.8-27b",
+        )
+        base.update(kw)
+        return ModelConfig.from_dict(base)
+
+    def test_parse_review_handles_wrapped_and_malformed(self):
+        self.assertEqual(
+            translator._parse_review(
+                '回答如下：{"text_fixes": [{"bbox": [1,2,3,4], "text": "x"}],'
+                ' "structure_flags": [{"message": "格子错位"}]} 完'
+            ),
+            {
+                "text_fixes": [{"bbox": [1, 2, 3, 4], "text": "x"}],
+                "structure_flags": [{"message": "格子错位"}],
+            },
+        )
+        self.assertEqual(translator._parse_review("没有"), {})
+        self.assertEqual(translator._parse_review('{"not": "expected"}'),
+                         {"text_fixes": [], "structure_flags": []})
+
+    def test_make_review_fn_gated_by_flag(self):
+        self.assertIsNone(translator.make_review_fn(self._model()))
+        self.assertIsInstance(
+            translator.make_review_fn(self._model(vision=True)), type(lambda: None)
+        )
+
+    def test_make_review_fn_calls_model_and_parses(self):
+        class _FakePixmap:
+            def tobytes(self, _fmt):
+                return b"PNG"
+
+        class _FakeResp:
+            class _Choice:
+                class _Msg:
+                    content = '{"text_fixes": [{"bbox":[0,0,10,10],"text":"42"}], "structure_flags": []}'
+                message = _Msg()
+            choices = [_Choice()]
+
+        class _FakeCompletions:
+            def create(self, **kwargs):
+                return _FakeResp()
+
+        class _FakeClient:
+            chat = type("_Chat", (), {"completions": _FakeCompletions()})()
+
+        class _FakeOpenAI:
+            def __init__(self, **kwargs):
+                pass
+
+            def __getattr__(self, _name):
+                return getattr(_FakeClient(), _name)
+
+        with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
+            fn = translator.make_review_fn(self._model(vision=True))
+        result = fn(0, b"ORIG", b"RECON")
+        self.assertEqual(result["text_fixes"][0]["text"], "42")
+
+
 if __name__ == "__main__":
     unittest.main()
 

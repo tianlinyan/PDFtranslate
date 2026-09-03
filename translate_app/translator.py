@@ -21,6 +21,7 @@ Key behaviours
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -823,3 +824,86 @@ def _write_cache(path: Path, cache: dict[str, str]) -> str | None:
         except OSError:
             pass
         return f"{type(exc).__name__}: {exc}"
+
+
+#: Prompt for the whole-page review.  The model sees the original scan and the
+#: OCR reconstruction side by side; it reports text it got wrong (with the box)
+#: and layout/structure problems.  It never proposes geometry changes we apply.
+_REVIEW_PROMPT = (
+    "这是同一页的两张图。第一张是原图/扫描件，第二张是 OCR 识别后重建的图"
+    "（每个框为识别到的文本块，蓝框为格子）。请对比两张图，找出 OCR 重建中的问题，"
+    "只输出一个 JSON 对象：\n"
+    "{\n"
+    "  \"text_fixes\": [{\"bbox\": [x0, y0, x1, y1], \"text\": \"正确的文字/数字\"}],\n"
+    "  \"structure_flags\": [{\"message\": \"布局/结构问题描述\"}]\n"
+    "}\n"
+    "规则：bbox 用**图片像素坐标**（x 范围为 0..图片宽，y 范围为 0..图片高）；"
+    "text_fixes 只列 OCR 读错或漏读的文字/数字（若读对了就不要列）；"
+    "structure_flags 用一句话说明格子错位/该合并被拆/缺格等结构问题。"
+    "没有则用空数组。不要输出除此 JSON 之外的文字。"
+)
+
+
+def _parse_review(content: str) -> dict:
+    """Parse a reviewer reply into ``{"text_fixes": [...], "structure_flags": [...]}``.
+
+    The model is asked for one JSON object; the reply often wraps it in prose or
+    markdown fences, so the outer ``{ ... }`` is extracted and decoded.  Any
+    malformed reply degrades to an empty review (a no-op for the caller).
+    """
+    if not content:
+        return {}
+    start = content.find("{")
+    if start < 0:
+        return {}
+    end = content.rfind("}")
+    if end <= start:
+        return {}
+    try:
+        data = json.loads(content[start:end + 1])
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "text_fixes": data.get("text_fixes") if isinstance(data.get("text_fixes"), list) else [],
+        "structure_flags": data.get("structure_flags") if isinstance(data.get("structure_flags"), list) else [],
+    }
+
+
+def make_review_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[int, bytes, bytes], dict] | None:
+    """Return a whole-page review callback for ``model``, or ``None`` if disabled.
+
+    A ``models.json`` entry declares ``vision: true`` (``ModelConfig.vision``).
+    The callback has the injectable ``review_fn`` signature
+    ``(page_index, original_png, reconstruction_png) -> dict``: it sends both
+    images to the model and parses the structured review.  Best-effort — any
+    failure returns ``{}`` so the caller keeps the OCR result unchanged.
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _review(page_index: int, original_png: bytes, recon_png: bytes) -> dict:
+        try:
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _REVIEW_PROMPT},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64," + base64.b64encode(original_png).decode("ascii")}},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64," + base64.b64encode(recon_png).decode("ascii")}},
+                ],
+            }]
+            resp = client.chat.completions.create(model=model.model, messages=messages, temperature=0.0)
+            content = getattr(resp.choices[0].message, "content", None) or ""
+            return _parse_review(content)
+        except Exception as exc:  # noqa: BLE001 — best-effort review
+            if log:
+                log(f"  第 {page_index + 1} 页整页审查失败：{type(exc).__name__}: {exc}")
+            return {}
+
+    return _review

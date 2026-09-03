@@ -127,6 +127,7 @@ def extract_document_text(
     ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
     cancel: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
+    review_fn: Callable[[int, bytes, bytes], dict] | None = None,
 ) -> DocumentText:
     """Extract text blocks from ``path`` in reading order.
 
@@ -156,6 +157,14 @@ def extract_document_text(
     written after every page, so a cancelled run keeps what it already did.
     ``cancel`` is polled per page (raising :class:`TranslationCancelled`), and
     ``log`` receives per-page OCR progress.
+
+    ``review_fn`` (optional) is a vision *whole-page reviewer*: after an OCR'd
+    page is rebuilt it is called ``(page_index, original_png, reconstruction_png)
+    -> dict``.  It may return ``text_fixes`` (applied conservatively: a figure
+    cell is corrected only when OCR's value is empty/unreadable, geometry is
+    never touched) and ``structure_flags`` (only surfaced through ``log``).
+    The review result is baked into the OCR cache (the cache key carries a
+    review marker), so a re-run needs no model call.
     """
     doc = fitz.open(str(path))
     result = DocumentText(title=title or Path(path).stem)
@@ -163,7 +172,7 @@ def extract_document_text(
     ocr_cache_path: Path | None = None
     ocr_cache_warned = False
     if ocr:
-        ocr_cache_path = _ocr_cache_path(path)
+        ocr_cache_path = _ocr_cache_path(path, review=review_fn is not None)
         ocr_cache = _load_ocr_cache(ocr_cache_path)
     try:
         for page_index in range(doc.page_count):
@@ -210,6 +219,10 @@ def extract_document_text(
                             page_index, page, ocr_fn, cancel, log
                         )
                         if page_blocks:
+                            if review_fn is not None:
+                                page_blocks = _apply_page_review(
+                                    page, page_blocks, review_fn, page_index, log
+                                )
                             ocr_cache[page_index] = [
                                 _block_to_dict(b) for b in page_blocks
                             ]
@@ -509,13 +522,15 @@ def _ocr_cache_dir() -> Path:
 _OCR_CACHE_VERSION = 5
 
 
-def _ocr_cache_path(doc_path: str | Path) -> Path:
+def _ocr_cache_path(doc_path: str | Path, review: bool = False) -> Path:
     """Cache file for a document's OCR results.
 
     The key includes the file's mtime and size, not just its path: reusing OCR
     results from a *replaced or edited* PDF would silently translate stale
-    content.  (The translation cache needs no such stamp — it looks blocks up
-    by content hash.)
+    content.  ``review`` (the whole-page AI review) changes the cached blocks,
+    so it is folded into the key and never shares a cache with plain OCR.
+    (The translation cache needs no such stamp — it looks blocks up by content
+    hash.)
     """
     p = Path(doc_path)
     try:
@@ -523,7 +538,8 @@ def _ocr_cache_path(doc_path: str | Path) -> Path:
         stamp = f"|{int(st.st_mtime)}|{st.st_size}"
     except OSError:
         stamp = ""
-    h = hashlib.sha1(f"{p.resolve()}{stamp}".encode("utf-8")).hexdigest()[:16]
+    mode = "|review" if review else ""
+    h = hashlib.sha1(f"{p.resolve()}{stamp}{mode}".encode("utf-8")).hexdigest()[:16]
     return _ocr_cache_dir() / f"ocr_v{_OCR_CACHE_VERSION}_{h}.json"
 
 
@@ -1029,6 +1045,141 @@ def _log_number_fixes(log, page_index: int, count: int, examples: list[str]) -> 
         + (f"（示例：{'；'.join(examples)}）" if examples else "")
         + "。若与报表实际金额不符，请人工复核。"
     )
+
+
+#: DPI the original page / reconstruction is rendered at for the whole-page review.
+_REVIEW_DPI = 150
+
+#: A plain (ungrouped) amount a reviewer may return, not in comma-grouped form.
+_AMOUNT_PLAIN_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?[%％]?\s*$")
+
+
+def _looks_like_amount(text: str) -> bool:
+    """True when ``text`` reads like a figure (grouped or plain)."""
+    t = str(text).strip()
+    return _is_numeric_cell(t) or bool(_AMOUNT_PLAIN_RE.match(t))
+
+
+def _render_page_png(page, dpi: int = _REVIEW_DPI) -> bytes:
+    """Render ``page`` to a PNG (the original scan the reviewer must compare)."""
+    return page.get_pixmap(dpi=dpi).tobytes("png")
+
+
+def _render_reconstruction(blocks: Sequence[Block], width: float, height: float,
+                           dpi: int = _REVIEW_DPI) -> bytes:
+    """Render the rebuilt blocks as a page (boxes + text) for the reviewer."""
+    doc = fitz.open()
+    page = doc.new_page(width=width, height=height)
+    tw = fitz.TextWriter(page.rect)
+    for b in blocks:
+        r = fitz.Rect(b.x0, b.y0, b.x1, b.y1)
+        page.draw_rect(r, color=(0.3, 0.3, 0.9), width=0.4)
+        if b.text:
+            fs = min(max(4.0, b.size), 12.0)
+            tw.append(fitz.Point(b.x0, r.y0 + r.height / 2.0), b.text,
+                      font=_CJK_FONT, fontsize=fs)
+    tw.write_text(page)
+    out = page.get_pixmap(dpi=dpi).tobytes("png")
+    doc.close()
+    return out
+
+
+def _nearest_review_block(blocks: Sequence[Block], bbox) -> Block | None:
+    """The block whose centre falls inside ``bbox`` (nearest, if several overlap)."""
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    rect = fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    cx = (rect.x0 + rect.x1) / 2.0
+    cy = (rect.y0 + rect.y1) / 2.0
+    best: Block | None = None
+    best_d = 1e9
+    for b in blocks:
+        bcx = (b.x0 + b.x1) / 2.0
+        bcy = (b.y0 + b.y1) / 2.0
+        if rect.x0 - 6.0 <= bcx <= rect.x1 + 6.0 and rect.y0 - 6.0 <= bcy <= rect.y1 + 6.0:
+            d = abs(bcx - cx) + abs(bcy - cy)
+            if d < best_d:
+                best_d, best = d, b
+    return best
+
+
+def _apply_review_fix(block: Block, text: str, page_index: int, log) -> bool:
+    """Apply one reviewer text fix, conservatively.
+
+    A *figure* block is corrected only when OCR left it empty or unreadable (it
+    does not read as a clean amount); a clean OCR amount is never overwritten —
+    a conflicting reading is surfaced instead of silently resolved.  A non-figure
+    block is filled only when OCR found nothing.  Returns True if text changed.
+    """
+    cur = str(block.text).strip()
+    cand = _normalize_number(str(text).strip())
+    if _is_number_atom(cur):
+        if not cur:
+            if _looks_like_amount(cand):
+                block.text = cand
+                return True
+            return False
+        if _looks_like_amount(cur):
+            if _looks_like_amount(cand) and cand != _normalize_number(cur) and log:
+                log(
+                    f"  第 {page_index + 1} 页：AI 认为「{cur}」应为「{cand}」，"
+                    "已保留 OCR 原文，请人工复核。"
+                )
+            return False
+        if _looks_like_amount(cand):
+            block.text = cand
+            return True
+        return False
+    if not cur and str(text).strip():
+        block.text = str(text).strip()
+        return True
+    return False
+
+
+def _apply_page_review(
+    page, blocks: Sequence[Block], review_fn, page_index: int,
+    log: Callable[[str], None] | None,
+) -> list[Block]:
+    """Send the original page + reconstruction to ``review_fn`` and refine.
+
+    Only text is ever touched, and only conservatively (:func:`_apply_review_fix`).
+    Every layout / structure flag the reviewer returns is surfaced through ``log``
+    as a hint — geometry is never adjusted.  A reviewer error is a no-op.
+    """
+    if review_fn is None or not blocks:
+        return list(blocks)
+    try:
+        original = _render_page_png(page)
+        recon = _render_reconstruction(blocks, page.rect.width, page.rect.height)
+        result = review_fn(page_index, original, recon)
+    except Exception as exc:  # noqa: BLE001 — best-effort, never abort
+        if log:
+            log(f"  第 {page_index + 1} 页整页审查失败：{type(exc).__name__}: {exc}")
+        return list(blocks)
+    if not isinstance(result, dict):
+        return list(blocks)
+    out = list(blocks)
+    # The model reports a fix's box in image pixels (it sees the rendered PNG);
+    # the blocks live in PDF points, so convert before matching.
+    zoom = _REVIEW_DPI / 72.0
+    n_fixed = 0
+    for fix in result.get("text_fixes") or []:
+        if not isinstance(fix, dict):
+            continue
+        text = fix.get("text")
+        bbox = fix.get("bbox")
+        if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        bbox_pt = [float(v) / zoom for v in bbox]
+        target = _nearest_review_block(out, bbox_pt)
+        if target is not None and _apply_review_fix(target, str(text), page_index, log):
+            n_fixed += 1
+    for flag in result.get("structure_flags") or []:
+        if isinstance(flag, dict) and flag.get("message") and log:
+            log(f"  第 {page_index + 1} 页布局提示：{flag['message']}")
+    if n_fixed and log:
+        log(f"  第 {page_index + 1} 页整页审查：采纳 {n_fixed} 处文字修正。")
+    return out
 
 
 def _needs_ocr(page) -> bool:
