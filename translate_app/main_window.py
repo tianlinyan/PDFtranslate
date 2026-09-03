@@ -305,6 +305,11 @@ class MainWindow(QWidget):
         # Clear the log *before* saving prefs so a prefs-save warning is not
         # wiped out.
         self._log.clear()
+        # A malformed endpoint string must not block the run (it can still be a
+        # valid bare base_url, and the vision review shares the same client
+        # config); surface it as a log hint instead.
+        for w in model.endpoint_warnings():
+            self._append_log(w)
         self._save_prefs(model.id, self._lang_combo.currentText(), key)
         self._stage.setText("准备…")
         self._progress.setValue(0)

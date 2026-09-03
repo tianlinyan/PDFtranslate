@@ -152,6 +152,36 @@ class ModelConfig:
                 issues.append(f"模型 {label} 的 api_key 环境变量未设置")
         return issues
 
+    def endpoint_warnings(self) -> list[str]:
+        """Return advisory (non-blocking) hints about the endpoint string.
+
+        Unlike :meth:`validate` (whose findings block a run), these never stop a
+        translation — they only surface a likely misconfiguration in the log, so
+        any feature (translation *and* the vision whole-page review, which share
+        :meth:`client_kwargs`) keeps working exactly as before.
+
+        The documented convention is a full ``.../chat/completions`` URL.  An
+        endpoint without that suffix is passed to the SDK as a ``base_url``,
+        which only works when the server mounts the OpenAI API at exactly that
+        root (e.g. ``http://host:8888/v1``).  A bare ``http://host:8888`` (no
+        versioned path) is the classic llama-server mistake: the SDK would
+        request ``http://host:8888/chat/completions``, which llama-server does
+        not serve.
+        """
+        if not self.endpoint:
+            return []
+        base = self.client_kwargs().get("base_url")
+        if not base:
+            return []
+        if self.endpoint.rstrip("/").endswith("/chat/completions"):
+            return []
+        effective = f"{base.rstrip('/')}/chat/completions"
+        return [
+            f"endpoint 未以 /chat/completions 结尾，将按 base_url 处理，"
+            f"实际会请求 {effective}。若该服务安装在 /v1 下，请改用形如 "
+            "http://host:port/v1/chat/completions 的完整地址。"
+        ]
+
 
 def substitute_env(value: str | None) -> str | None:
     """Replace ``${VAR}`` placeholders in ``value`` with environment values."""

@@ -4,7 +4,7 @@
       "id": "qwen3.8",
       "name": "qwen3.8",
       "type": "llama-server",
-      "endpoint": "http://192.168.0.19:8888",
+      "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
       "model": "qwen3.8-27b",
       "reasoning_effort": "low",
       "concurrency": 1,

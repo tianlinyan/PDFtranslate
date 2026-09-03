@@ -88,6 +88,22 @@ class SettingsTest(unittest.TestCase):
                         endpoint="http://x/v1", model="mod")
         self.assertEqual(m.client_kwargs()["timeout"], 300.0)
 
+    def test_endpoint_warnings_for_missing_chat_completions_suffix(self):
+        m = ModelConfig(id="m", name="m", type="openai",
+                        endpoint="http://host:8888", model="mod")
+        warns = m.endpoint_warnings()
+        self.assertEqual(len(warns), 1)
+        self.assertIn("http://host:8888/chat/completions", warns[0])
+
+    def test_endpoint_warnings_empty_for_full_chat_completions_url(self):
+        m = ModelConfig(id="m", name="m", type="openai",
+                        endpoint="http://host:8888/v1/chat/completions", model="mod")
+        self.assertEqual(m.endpoint_warnings(), [])
+
+    def test_endpoint_warnings_empty_when_endpoint_blank(self):
+        m = ModelConfig(id="m", name="m", type="openai", endpoint="", model="mod")
+        self.assertEqual(m.endpoint_warnings(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
