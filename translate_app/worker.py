@@ -19,6 +19,7 @@ from .translator import (
     TranslationAborted,
     TranslationCancelled,
     TranslationEngine,
+    TranslationResult,
     make_classify_review_fn,
     make_classify_tool_fn,
     make_merge_tool_fn,
@@ -166,6 +167,9 @@ class TranslateWorker(QObject):
         ocr: bool = False,
         render_qa: bool = True,
         ai_table_rebuild: bool = False,
+        preview_handler=None,
+        answer_handler=None,
+        agent_mode: bool = True,
     ):
         super().__init__()
         self._source = source_path
@@ -174,6 +178,17 @@ class TranslateWorker(QObject):
         self._output_type = output_type
         self._output_path = output_path
         self._ocr = ocr
+        # ``preview_handler`` (e.g. ``preview.PreviewBridge.get_region``) is the
+        # worker↔GUI channel the v0.3.0 agent uses to show a page and receive a
+        # user-framed region back (see ``agent.run_page_visual``).
+        self.preview_handler = preview_handler
+        # worker↔GUI channel for the agent's questions (see ``agent.run_page_visual``).
+        self.answer_handler = answer_handler
+        # v0.3.0: when on (default) the worker drives translation through the AI
+        # orchestration loop (``agent.run_page_visual``) instead of the batch
+        # translation engine; a non-vision model falls back to the deterministic
+        # baseline (fail-closed).
+        self._agent_mode = agent_mode
         # Rendered-output QA (report-only, read back the exported PDF).  Turned
         # off by the user via the "译文质检" checkbox; only a PDF output with a
         # vision-capable model actually runs it.
@@ -284,36 +299,43 @@ class TranslateWorker(QObject):
             # classifier error is a no-op so the rule's decision stands.  The
             # tool-use ``classify_block`` (text-based) is preferred; the image-based
             # whole-page review is the fallback.
-            if n_chart:
-                released: set[int] = set()
-                tool_classify = make_classify_tool_fn(self._model, self.log.emit)
-                if tool_classify is not None:
-                    released = _release_kept_blocks_via_tool(
-                        doc, keep_original, tool_classify, _KEEP_CONF_MIN, self.log.emit
-                    )
-                else:
-                    review_classify = make_classify_review_fn(self._model, self.log.emit)
-                    released = pdfio.classify_keep_blocks(
-                        self._source, doc.pages, review_classify,
-                        keep_original, self.log.emit,
-                    )
-                if released:
-                    keep_original -= released
-                    n_chart -= len(released)
-                    self.log.emit(
-                        f"保留复核后，实际保留 {n_chart} 个图表节点（其余将翻译）。"
-                    )
-
             translate_started = time.monotonic()
-            result = engine.translate_blocks(
-                doc.blocks,
-                self._lang,
-                on_progress=lambda d, t: self.progress.emit(d, t, "翻译中…"),
-                log=lambda m: self.log.emit(m),
-                cancel=lambda: self._cancelled.is_set(),
-                doc_path=Path(self._source),
-                keep_original=keep_original,
-            )
+            if self._agent_mode and getattr(self._model, "vision", False):
+                # v0.3.0 default: the AI orchestrator drives translation.  It does
+                # its own classification (keep/translate), so the deterministic
+                # chart-node *release* pass is skipped; ``keep_original`` (chart /
+                # name cells) is still forced verbatim after the loop.
+                self.log.emit("已启用 AI 编排：采用 agent 驱动的单页视觉闭环。")
+                result = self._run_agent(doc, keep_original)
+            else:
+                if n_chart:
+                    released: set[int] = set()
+                    tool_classify = make_classify_tool_fn(self._model, self.log.emit)
+                    if tool_classify is not None:
+                        released = _release_kept_blocks_via_tool(
+                            doc, keep_original, tool_classify, _KEEP_CONF_MIN, self.log.emit
+                        )
+                    else:
+                        review_classify = make_classify_review_fn(self._model, self.log.emit)
+                        released = pdfio.classify_keep_blocks(
+                            self._source, doc.pages, review_classify,
+                            keep_original, self.log.emit,
+                        )
+                    if released:
+                        keep_original -= released
+                        n_chart -= len(released)
+                        self.log.emit(
+                            f"保留复核后，实际保留 {n_chart} 个图表节点（其余将翻译）。"
+                        )
+                result = engine.translate_blocks(
+                    doc.blocks,
+                    self._lang,
+                    on_progress=lambda d, t: self.progress.emit(d, t, "翻译中…"),
+                    log=lambda m: self.log.emit(m),
+                    cancel=lambda: self._cancelled.is_set(),
+                    doc_path=Path(self._source),
+                    keep_original=keep_original,
+                )
             translate_elapsed = time.monotonic() - translate_started
 
             if self._cancelled.is_set():
@@ -420,6 +442,57 @@ class TranslateWorker(QObject):
     def cancel(self) -> None:
         """Request cancellation (safe to call from the GUI thread)."""
         self._cancelled.set()
+
+    def _run_agent(self, doc: pdfio.DocumentText, keep_original: set[int]):
+        """v0.3.0: drive translation through the AI-orchestration loop per page.
+
+        Each page is handed to :func:`agent.run_page_visual` (the model sees it,
+        calls the deterministic tools and writes its choices to ``out_doc``); the
+        resulting translations are collected back into a ``TranslationResult`` so
+        the rest of the pipeline (group_by_page → export) is unchanged.
+        ``keep_original`` (chart nodes / name cells) is always kept verbatim, and a
+        page that fails is fail-closed to its source text.
+        """
+        from . import agent as agent_mod
+
+        state = agent_mod.WorkflowState(src_path=self._source, lang=self._lang)
+        state.src_doc = doc
+        for i in range(doc.page_count):
+            if self._cancelled.is_set():
+                raise TranslationCancelled()
+            task = (
+                f"这是文档第 {i + 1} 页。请阅读页面，把需要翻译的块翻译成 {self._lang}；"
+                "数字/代码块保持原样。用 read_page 观察、用 set_text/translate_block 翻译，"
+                "最后用 check_residual 校验，没有可做的事就结束。"
+            )
+            try:
+                agent_mod.run_page_visual(
+                    state, i, self._model, task=task,
+                    log=self.log.emit,
+                    preview_handler=self.preview_handler,
+                    answer_handler=self.answer_handler,
+                    max_steps=24,
+                )
+            except Exception as exc:  # noqa: BLE001 — fail-closed per page
+                self.log.emit(f"  第 {i + 1} 页 AI 编排失败：{type(exc).__name__}: {exc}（该页保留原文）。")
+        translated = list(doc.blocks)
+        n_changed = 0
+        for idx, entry in (state.out_doc or {}).items():
+            if isinstance(entry, dict) and 0 <= idx < len(translated):
+                new = str(entry.get("text", "")).strip()
+                if new and new != str(translated[idx]):
+                    translated[idx] = new
+                    n_changed += 1
+        kept = 0
+        for i in keep_original:
+            if 0 <= i < len(translated):
+                translated[i] = str(doc.blocks[i])
+                kept += 1
+        if n_changed:
+            self.log.emit(f"  AI 编排完成：翻译 {n_changed} 块，强制保留 {kept} 块。")
+        else:
+            self.log.emit("  AI 编排未产生翻译（模型可能无法视觉编排），输出将保留原文。")
+        return TranslationResult(blocks=doc.blocks, translated=translated)
 
     def _export(self, doc: pdfio.DocumentText, per_page: list[list[str]]) -> str:
         out = Path(self._output_path)

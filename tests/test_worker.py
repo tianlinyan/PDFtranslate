@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+from translate_app import agent as agent_module
 from translate_app import pdfio
 from translate_app import worker as worker_module
 from translate_app.settings import ModelConfig
@@ -503,6 +504,78 @@ class RenderQaAdjustmentWiringTest(_WorkerTestBase):
         # No adjustments collected → the executor is never called.
         apply_mock.assert_not_called()
         self.assertEqual(9.0, block.size)
+        self.assertIn("finished", events)
+
+
+class AgentModeWiringTest(_WorkerTestBase):
+    """v0.3.0 default: ``agent_mode`` routes translation through the agent loop."""
+
+    def test_agent_mode_routes_to_agent_and_passes_preview_handler(self):
+        src = build_sample_pdf(self.tmp / "agent.pdf", pages=1)
+        out = self.tmp / "out.txt"
+        doc = pdfio.DocumentText(
+            pages=[[pdfio.Block(text="你好", page=0, x0=40, y0=40, x1=120, y1=60, size=10.0)]],
+            blocks=["你好"], block_pages=[0], title="agent",
+        )
+        model = ModelConfig.from_dict(dict(
+            id="v", name="v", type="llama-server",
+            endpoint="http://127.0.0.1:9/v1/chat/completions", model="qwen", vision=True))
+        captured: dict = {}
+        handler = object()
+
+        def fake_run_page_visual(state, page, _model, **kw):
+            captured["task"] = kw.get("task")
+            captured["preview_handler"] = kw.get("preview_handler")
+            state.out_doc = {0: {"text": "Hello from agent"}}
+            return state
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                raise AssertionError("deterministic engine must not run in agent mode")
+
+        logs: list[str] = []
+        worker = TranslateWorker(str(src), model, "English", "plain_text", str(out),
+                                 preview_handler=handler, agent_mode=True)
+        worker.log.connect(logs.append)
+        with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
+            with mock.patch.object(agent_module, "run_page_visual",
+                                   side_effect=fake_run_page_visual):
+                with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
+                    events = self._run(worker)
+        # The agent path ran once, handed the preview_handler through, and the
+        # resulting out_doc fed the export (not the deterministic engine).
+        self.assertEqual(handler, captured["preview_handler"])
+        self.assertIn("翻译成 English", captured["task"])
+        self.assertIn("set_text", captured["task"])
+        self.assertIn("Hello from agent", Path(out).read_text("utf-8"))
+        self.assertIn("finished", events)
+        self.assertTrue(any("已启用 AI 编排" in m for m in logs), logs)
+
+    def test_non_vision_model_falls_back_to_deterministic(self):
+        # agent_mode on but the model has no vision → the deterministic pipeline runs.
+        src = build_sample_pdf(self.tmp / "agent2.pdf", pages=1)
+        out = self.tmp / "out2.txt"
+        model = self._model("http://127.0.0.1:9/v1")   # non-vision
+        ran: dict = {}
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                ran["translated"] = True
+                return TranslationResult(blocks=list(blocks),
+                                         translated=[f"MOCK:{b}" for b in blocks])
+
+        worker = TranslateWorker(str(src), model, "English", "plain_text", str(out),
+                                 agent_mode=True)
+        with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
+            events = self._run(worker)
+        self.assertTrue(ran.get("translated"))
+        self.assertIn("MOCK:", Path(out).read_text("utf-8"))
         self.assertIn("finished", events)
 
 

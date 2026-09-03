@@ -29,6 +29,9 @@ from PyQt6.QtWidgets import (
 )
 
 from . import __app_name__, __version__
+from . import pdfio
+from . import preview
+from . import sidebar
 from .about_dialog import AboutDialog
 from .settings import ModelConfig, load_models, load_prefs, save_prefs
 from .translator import clear_translation_cache
@@ -190,6 +193,16 @@ class MainWindow(QWidget):
         ai_row.addStretch()
         form.addRow("扫描表格", ai_row)
 
+        # --- v0.3.0 AI orchestration (default on) ---
+        # 默认由 AI 编排（agent 视觉闭环）驱动翻译；关闭则回退到确定性批次流水线。仅当模型
+        # 支持视觉且勾选时生效。
+        self._agent_check = QCheckBox("AI 编排（默认：由 agent 视觉闭环驱动全流程翻译；关=确定性流水线）")
+        self._agent_check.setChecked(bool(prefs.get("agent_mode", True)))
+        agent_row = QHBoxLayout()
+        agent_row.addWidget(self._agent_check)
+        agent_row.addStretch()
+        form.addRow("智能编排", agent_row)
+
         # --- Progress + log ---
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
@@ -215,22 +228,43 @@ class MainWindow(QWidget):
         self._clear_cache_btn.clicked.connect(self._clear_cache)
         self._about_btn = QPushButton("关于")
         self._about_btn.clicked.connect(self._show_about)
+        self._preview_btn = QPushButton("预览")
+        self._preview_btn.clicked.connect(lambda: self._show_preview(0, "source"))
+
+        # Worker ↔ GUI channel for the AI preview round-trip: the agent may open a
+        # preview and wait for the user to frame a region and send it back.
+        self.preview_bridge = preview.PreviewBridge(self)
+        self.preview_bridge.showPreview.connect(self._show_preview)
 
         btn_row = QHBoxLayout()
         btn_row.addWidget(self._clear_cache_btn)
         btn_row.addStretch()
+        btn_row.addWidget(self._preview_btn)
         btn_row.addWidget(self._start_btn)
         btn_row.addWidget(self._cancel_btn)
         btn_row.addWidget(self._open_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._about_btn)
 
-        root = QVBoxLayout(self)
-        root.addLayout(form)
-        root.addWidget(self._stage)
-        root.addWidget(self._progress)
-        root.addWidget(self._log, 1)
-        root.addLayout(btn_row)
+        # --- AI interaction sidebar (chat + agent questions) ---
+        # worker↔GUI channels: agent asks (AnswerBridge) and preview (PreviewBridge).
+        self.answer_bridge = sidebar.AnswerBridge(self)
+        self.agent_sidebar = sidebar.SidebarChat()
+        self.answer_bridge.showQuestion.connect(self.agent_sidebar.show_question)
+        self.agent_sidebar.answerChosen.connect(self.answer_bridge.answer)
+        self.agent_sidebar.userMessage.connect(self._on_user_message)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.addLayout(form)
+        left_layout.addWidget(self._stage)
+        left_layout.addWidget(self._progress)
+        left_layout.addWidget(self._log, 1)
+        left_layout.addLayout(btn_row)
+
+        root = QHBoxLayout(self)
+        root.addWidget(left, 1)
+        root.addWidget(self.agent_sidebar)
 
         if self._models_error:
             QMessageBox.warning(
@@ -270,6 +304,39 @@ class MainWindow(QWidget):
         )
         if path:
             self.set_source_path(path)
+
+    def _on_user_message(self, text: str) -> None:
+        """A message from the sidebar; route it to the agent (chat channel)."""
+        self._append_log(f"[AI对话] {text}")
+
+    def _show_preview(self, page: int, what: str = "source") -> None:
+        """Open the preview window for ``page``; framed sends go to the bridge."""
+        if not self._source or not Path(self._source).exists():
+            QMessageBox.information(self, "预览", "请先选择一个要预览的 PDF。")
+            return
+        import pymupdf as fitz
+
+        try:
+            doc = fitz.open(str(self._source))
+            try:
+                if not (0 <= page < doc.page_count):
+                    png = b""
+                else:
+                    png = pdfio._render_page_png(doc[page], dpi=150)
+            finally:
+                doc.close()
+        except Exception:  # noqa: BLE001
+            png = b""
+        if not png:
+            QMessageBox.warning(self, "预览", "无法渲染该页。")
+            return
+        win = getattr(self, "_preview_win", None)
+        if win is None:
+            win = preview.PreviewWindow()
+            win.sendRequested.connect(self.preview_bridge.on_region)
+            self._preview_win = win
+        win.setWindowTitle("预览（原文）" if what == "source" else "预览（译文）")
+        win.show_png(png)
 
     def _browse_output(self) -> None:
         key = self._type_combo.currentData()
@@ -348,6 +415,9 @@ class MainWindow(QWidget):
             ocr=self._ocr_check.isChecked(),
             render_qa=self._render_qa_check.isChecked(),
             ai_table_rebuild=self._ai_table_check.isChecked(),
+            preview_handler=self.preview_bridge.get_region,
+            answer_handler=self.answer_bridge.ask,
+            agent_mode=self._agent_check.isChecked(),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -383,6 +453,7 @@ class MainWindow(QWidget):
                     "ocr": self._ocr_check.isChecked(),
                     "render_qa": self._render_qa_check.isChecked(),
                     "ai_table_rebuild": self._ai_table_check.isChecked(),
+                    "agent_mode": self._agent_check.isChecked(),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )
