@@ -1113,6 +1113,15 @@ def _render_reconstruction(blocks: Sequence[Block], width: float, height: float,
 #: pathological document cannot trigger an unbounded run of extra model calls.
 _RENDER_QA_MAX_PAGES = 60
 
+#: Minimum confidence for a rendered-QA issue to be reported (lower-confidence
+#: guesses are likely wrong and would flood the log with false positives).
+_QA_CONFIDENCE_MIN = 0.6
+
+#: QA issue kinds that are *correctable* (the worker re-translates the offending
+#: cell and re-exports).  Other kinds (overlap / too small / broken label) are
+#: layout hints only and are surfaced but not auto-fixed.
+_CORRECTABLE_QA_KINDS = frozenset(("残余中文", "内容缺失"))
+
 
 def review_rendered_pages(
     src_path: str | Path,
@@ -1120,17 +1129,23 @@ def review_rendered_pages(
     review_fn: Callable[[int, bytes, bytes], dict] | None,
     log: Callable[[str], None] | None = None,
     page_limit: int = _RENDER_QA_MAX_PAGES,
-) -> None:
-    """Run a report-only rendered-output QA on the exported PDF.
+) -> set[int]:
+    """Run a rendered-output QA on the exported PDF and return flagged pages.
 
     Each output page is rendered and compared with the corresponding source page
     by ``review_fn`` (created for a vision-capable model — see
     ``translator.make_rendered_review_fn``); the issues it returns are surfaced
     through ``log``.  This never modifies the export and never aborts — any
-    reviewer error is a no-op, so the export always succeeds regardless.
+    reviewer error is a no-op.
+
+    Returns the set of page indices that reported a *correctable* issue
+    (``残余中文`` / ``内容缺失``) at or above the confidence floor, so the caller
+    can re-translate those cells and re-export.  Layout-only hints are not
+    returned.
     """
     if review_fn is None:
-        return
+        return set()
+    flagged: set[int] = set()
     src = fitz.open(str(src_path))
     try:
         out = fitz.open(str(out_path))
@@ -1143,20 +1158,27 @@ def review_rendered_pages(
                     result = review_fn(i, original, rendered)
                 except Exception:  # noqa: BLE001 — fail-closed, never abort
                     continue
-                _report_render_issues(i, result, log)
+                if _report_render_issues(i, result, log):
+                    flagged.add(i)
         finally:
             out.close()
     finally:
         src.close()
+    return flagged
 
 
-def _report_render_issues(page_index: int, result, log) -> None:
-    """Surface one page's report-only render-QA issues (no-ops if none / malformed)."""
-    if not log or not isinstance(result, dict):
-        return
+def _report_render_issues(page_index: int, result, log) -> set[str]:
+    """Surface one page's report-only render-QA issues.
+
+    Returns the set of *correctable* kinds found (e.g. ``残余中文``), so the
+    caller can decide whether to re-translate the page.
+    """
+    if not isinstance(result, dict):
+        return set()
     issues = result.get("issues")
     if not isinstance(issues, list):
-        return
+        return set()
+    found: set[str] = set()
     shown = 0
     for it in issues:
         if not isinstance(it, dict):
@@ -1164,11 +1186,20 @@ def _report_render_issues(page_index: int, result, log) -> None:
         msg = str(it.get("message", "")).strip()
         if not msg:
             continue
+        try:
+            conf = float(it.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            conf = 1.0
+        if conf < _QA_CONFIDENCE_MIN:
+            continue
         kind = str(it.get("kind", "问题")).strip() or "问题"
+        if kind in _CORRECTABLE_QA_KINDS:
+            found.add(kind)
         log(f"  [渲染校验] 第 {page_index + 1} 页 {kind}: {msg}")
         shown += 1
     if shown:
         log(f"  [渲染校验] 第 {page_index + 1} 页共 {shown} 处待确认。")
+    return found
 
 
 #: Block-classifier ``kind`` values that mean "this should be translated", so a

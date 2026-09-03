@@ -1165,3 +1165,46 @@ def make_table_rebuild_fn(
             return None
 
     return _rebuild
+
+
+#: Direct re-translation of a single block, used by the QA→correction pass so a
+#: residual-Chinese or empty cell is re-translated *without* hitting the cache
+#: (which would return the same stale value).  The model is told to output only
+#: the translation in the target language and never leave the source language.
+_RETRANSLATE_PROMPT = (
+    "请把下面这段文字翻译成 {lang}。只输出译文本身，不要任何解释；"
+    "如果它已经是目标语言，原样输出。不要保留任何原文语言：\n{text}"
+)
+
+
+def make_retranslate_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[str, str], str] | None:
+    """Return a direct single-text re-translation callback, or ``None`` if disabled.
+
+    Signature ``(text, target_language) -> str``: sends one block to the model
+    with a "translate only, never leave the source language" prompt (cache and
+    number-protocol bypassed).  Best-effort — any failure returns the original
+    text, so a correction never makes a cell worse.
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _retranslate(text: str, lang: str) -> str:
+        try:
+            prompt = _RETRANSLATE_PROMPT.format(lang=lang, text=text)
+            resp = client.chat.completions.create(
+                model=model.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            content = getattr(resp.choices[0].message, "content", None) or ""
+            out = str(content).strip()
+            return out if out else text
+        except Exception as exc:  # noqa: BLE001 — fail-closed, keep the original
+            if log:
+                log(f"  质检修正重译失败：{type(exc).__name__}: {exc}")
+            return text
+
+    return _retranslate

@@ -1010,6 +1010,58 @@ class WholePageReviewTest(unittest.TestCase):
         self.assertIn("罗马数字", prompt)
         self.assertIn("(33)", prompt)
 
+    def test_make_retranslate_fn_gated_by_flag(self):
+        self.assertIsNone(translator.make_retranslate_fn(self._model()))
+        self.assertIsInstance(
+            translator.make_retranslate_fn(self._model(vision=True)),
+            type(lambda: None),
+        )
+
+    def test_make_retranslate_fn_calls_model(self):
+        class _FakeResp:
+            class _Choice:
+                class _Msg:
+                    content = "Retranslated text"
+                message = _Msg()
+            choices = [_Choice()]
+
+        class _FakeCompletions:
+            def create(self, **_kwargs):
+                return _FakeResp()
+
+        class _FakeClient:
+            chat = type("_Chat", (), {"completions": _FakeCompletions()})()
+
+        class _FakeOpenAI:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __getattr__(self, _name):
+                return getattr(_FakeClient(), _name)
+
+        with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
+            fn = translator.make_retranslate_fn(self._model(vision=True))
+        self.assertEqual(fn("未翻译", "English"), "Retranslated text")
+
+    def test_make_retranslate_fn_fail_closed(self):
+        class _FakeCompletions:
+            def create(self, **_kwargs):
+                raise RuntimeError("down")
+
+        class _FakeClient:
+            chat = type("_Chat", (), {"completions": _FakeCompletions()})()
+
+        class _FakeOpenAI:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __getattr__(self, _name):
+                return getattr(_FakeClient(), _name)
+
+        with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
+            fn = translator.make_retranslate_fn(self._model(vision=True))
+        self.assertEqual(fn("未翻译", "English"), "未翻译")  # keep the original
+
 
 class SystemPromptNumberingTest(unittest.TestCase):
     """The numbering rule defaults to ARABIC and only allows Roman when sourced."""

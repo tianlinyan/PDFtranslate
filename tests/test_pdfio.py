@@ -1554,6 +1554,31 @@ class RenderedQaTest(unittest.TestCase):
         pdfio.review_rendered_pages(src, out, lambda _i, _o, _r: {"issues": "bad"}, logs.append)
         self.assertEqual([], logs)
 
+    def test_review_rendered_pages_returns_correctable_pages(self):
+        src, out = self._pair()
+        logs: list[str] = []
+        flagged = pdfio.review_rendered_pages(
+            src, out,
+            lambda _i, _o, _r: {"issues": [{"kind": "残余中文", "message": "仍有中文", "confidence": 0.9}]},
+            logs.append,
+        )
+        # A correctable (残余中文) issue marks the page for correction.
+        self.assertIn(0, flagged)
+        # A layout-only issue is NOT correctable → not returned.
+        flagged2 = pdfio.review_rendered_pages(
+            src, out,
+            lambda _i, _o, _r: {"issues": [{"kind": "文本越线", "message": "越线", "confidence": 0.95}]},
+            logs.append,
+        )
+        self.assertNotIn(0, flagged2)
+        # A low-confidence residual is filtered (below the floor) → not returned.
+        flagged3 = pdfio.review_rendered_pages(
+            src, out,
+            lambda _i, _o, _r: {"issues": [{"kind": "残余中文", "message": "x", "confidence": 0.3}]},
+            logs.append,
+        )
+        self.assertNotIn(0, flagged3)
+
 
 class ClassifyKeepBlocksTest(unittest.TestCase):
     """Vision second opinion: release a rule-kept chart node the model says should translate."""

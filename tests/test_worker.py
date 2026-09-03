@@ -160,6 +160,48 @@ class FormatDurationTest(unittest.TestCase):
         self.assertEqual("1 小时 01 分 01 秒", format_duration(3661))
 
 
+class CorrectResidualBlocksTest(unittest.TestCase):
+    """QC → correction: re-translate residual / empty blocks on flagged pages."""
+
+    def _doc(self, block_pages, blocks=None):
+        class _Doc:
+            pass
+        d = _Doc()
+        d.block_pages = block_pages
+        d.blocks = blocks if blocks is not None else [f"s{i}" for i in range(len(block_pages))]
+        return d
+
+    def test_corrects_residual_and_empty_keeps_clean(self):
+        doc = self._doc([0, 0, 1, 1])
+        result = TranslationResult(
+            blocks=["a", "b", "c", "d"],
+            translated=["未翻译", "Good", "中文残留", ""],
+        )
+        retranslate = lambda _t, _l: "Retranslated"
+        # page 1 (indices 2,3) flagged; index 1 is clean; index 3 is empty.
+        n = worker_module._correct_residual_blocks(
+            doc, result, keep=set(), target_is_cjk=False,
+            flagged={1}, lang="English", retranslate=retranslate, log=None,
+        )
+        self.assertEqual(n, 2)                          # index 2 (中文残留) + index 3 (empty)
+        self.assertEqual(result.translated[2], "Retranslated")
+        self.assertEqual(result.translated[3], "Retranslated")
+        self.assertEqual(result.translated[1], "Good")  # clean block untouched
+        self.assertEqual(result.translated[0], "未翻译")  # page 0 not flagged
+
+    def test_respects_keep_and_cjk_target(self):
+        doc = self._doc([0])
+        result = TranslationResult(blocks=["a"], translated=["保留"])
+        retranslate = lambda _t, _l: "KeptChinese"
+        # Kept (name/chart) block, and a CJK target: neither is corrected.
+        n = worker_module._correct_residual_blocks(
+            doc, result, keep={0}, target_is_cjk=True,
+            flagged={0}, lang="English", retranslate=retranslate, log=None,
+        )
+        self.assertEqual(n, 0)
+        self.assertEqual(result.translated[0], "保留")
+
+
 class KeepOriginalDirectionTest(_WorkerTestBase):
     """Name cells stay source only for a CJK target; Latin targets romanize.
 

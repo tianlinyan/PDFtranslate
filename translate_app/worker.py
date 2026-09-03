@@ -21,6 +21,7 @@ from .translator import (
     TranslationEngine,
     make_classify_review_fn,
     make_rendered_review_fn,
+    make_retranslate_fn,
     make_review_fn,
     make_table_rebuild_fn,
 )
@@ -46,6 +47,49 @@ def format_duration(seconds: float) -> str:
     if hours:
         return f"{hours} 小时 {minutes:02d} 分 {secs:02d} 秒"
     return f"{minutes} 分 {secs:02d} 秒"
+
+
+def _contains_cjk(text: str) -> bool:
+    """True when ``text`` still carries CJK ideographs (a residual Chinese leak)."""
+    return any("一" <= c <= "鿿" for c in text)
+
+
+def _correct_residual_blocks(
+    doc,
+    result,
+    keep: set[int],
+    target_is_cjk: bool,
+    flagged: set[int],
+    lang: str,
+    retranslate,
+    log,
+) -> int:
+    """Re-translate residual / empty blocks on QC-flagged pages.
+
+    A block is "residual" when, for a non-CJK target, its translation still
+    contains Chinese, or when it came back empty (missing content).  Only those
+    are re-translated; kept blocks (names / chart nodes) are never touched, and
+    a block that already translated cleanly is left as-is.  Returns the count
+    corrected.  Best-effort — a re-translation failure keeps the original text.
+    """
+    corrected = 0
+    for bi, page in enumerate(doc.block_pages):
+        if page not in flagged:
+            continue
+        if bi in keep:
+            continue  # intentionally kept (name column / chart node)
+        txt = str(result.translated[bi])
+        residual = (not txt.strip()) or (not target_is_cjk and _contains_cjk(txt))
+        if not residual:
+            continue
+        new = retranslate(doc.blocks[bi], lang)
+        new = str(new or "").strip()
+        if new and new != txt:
+            result.translated[bi] = new
+            corrected += 1
+            if log:
+                log(f"    [修正] 块 {bi + 1} 已重译：{txt[:18]!r} -> {new[:18]!r}")
+    return corrected
 
 
 class TranslateWorker(QObject):
@@ -230,20 +274,38 @@ class TranslateWorker(QObject):
             out_path = self._export(doc, per_page)
             export_elapsed = time.monotonic() - export_started
 
-            # Report-only rendered-output QA: read back the exported PDF and
-            # surface anything a reader would notice (untranslated text, overlaps,
-            # overflowing glyphs, broken labels).  This never modifies the file and
-            # any reviewer error is a no-op.  PDF outputs only, and only for a
-            # vision-capable model — ``make_rendered_review_fn`` gates on that.
+            # Rendered-output QA: read back the exported PDF and surface anything
+            # a reader would notice (untranslated text, overlaps, overflowing
+            # glyphs, broken labels).  A *correctable* report (residual Chinese /
+            # missing content) triggers a bounded correction: re-translate those
+            # blocks and re-export.  Fail-closed: any reviewer error is a no-op.
             qa_elapsed = 0.0
+            correct_elapsed = 0.0
             if self._render_qa and self._output_type in ("translated_pdf", "bilingual_pdf"):
                 rendered_review = make_rendered_review_fn(self._model, self.log.emit)
                 if rendered_review is not None:
                     qa_started = time.monotonic()
-                    pdfio.review_rendered_pages(
+                    flagged = pdfio.review_rendered_pages(
                         self._source, out_path, rendered_review, self.log.emit
                     )
                     qa_elapsed = time.monotonic() - qa_started
+                    if flagged and not self._cancelled.is_set():
+                        retranslate = make_retranslate_fn(self._model, self.log.emit)
+                        if retranslate is not None:
+                            corrected = _correct_residual_blocks(
+                                doc, result, keep_original, target_is_cjk,
+                                flagged, self._lang, retranslate, self.log.emit,
+                            )
+                            if corrected:
+                                correct_started = time.monotonic()
+                                per_page = pdfio.group_by_page(
+                                    doc.block_pages, result.translated, doc.page_count
+                                )
+                                out_path = self._export(doc, per_page)
+                                correct_elapsed = time.monotonic() - correct_started
+                                self.log.emit(
+                                    f"  质检修正：重新翻译 {corrected} 个残留/空缺块并重新导出。"
+                                )
 
             total_elapsed = time.monotonic() - started
             self.log.emit(f"完成：{out_path}")
@@ -253,6 +315,7 @@ class TranslateWorker(QObject):
                 f"翻译 {format_duration(translate_elapsed)}，"
                 f"导出 {format_duration(export_elapsed)}"
                 + (f"，渲染校验 {format_duration(qa_elapsed)}" if qa_elapsed else "")
+                + (f"，质检修正 {format_duration(correct_elapsed)}" if correct_elapsed else "")
                 + "）"
             )
             self.finished.emit(out_path)
