@@ -128,6 +128,7 @@ def extract_document_text(
     cancel: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
     review_fn: Callable[[int, bytes, bytes], dict] | None = None,
+    verify_fn: Callable[[int, bytes, Sequence[dict]], list[dict]] | None = None,
 ) -> DocumentText:
     """Extract text blocks from ``path`` in reading order.
 
@@ -223,6 +224,25 @@ def extract_document_text(
                                 page_blocks = _apply_page_review(
                                     page, page_blocks, review_fn, page_index, log
                                 )
+                            # OCR-number verification (vision tool-use): ask the
+                            # model to re-read the figures it plausibly misread and
+                            # correct them in place, so the value is right before
+                            # translation.  Applied only to freshly OCR'd pages
+                            # (the corrected blocks are then baked into the cache).
+                            if verify_fn is not None:
+                                figures = [
+                                    {"index": bi, "value": b.text}
+                                    for bi, b in enumerate(page_blocks)
+                                    if _is_numeric_cell(b.text)
+                                    and any(ch in b.text for ch in ",.％%")
+                                ]
+                                if figures:
+                                    decisions = verify_fn(
+                                        page_index, _render_page_png(page), figures
+                                    )
+                                    fixed = _apply_number_fixes(page_blocks, decisions)
+                                    if fixed and log:
+                                        log(f"  第 {page_index + 1} 页：数字核验修正 {fixed} 处。")
                             ocr_cache[page_index] = [
                                 _block_to_dict(b) for b in page_blocks
                             ]
@@ -414,6 +434,35 @@ def _normalize_number(text: str) -> str:
     # Digit count cannot form valid 3-digit groups: leave it for human review
     # (silently "fixing" it could emit a wrong amount).
     return str(text)
+
+
+def _apply_number_fixes(page_blocks: Sequence[Block], decisions: Sequence[dict]) -> int:
+    """Apply ``verify_number`` corrections to the OCR block texts in place.
+
+    Only a decision that says the figure is *wrong* (``is_correct`` false) and
+    offers a non-empty ``corrected`` value is applied; the value is re-normalized
+    (the OCR-normalization routine still guards the digit sequence) and only
+    replaces the block text when it actually differs.  Returns the count fixed.
+    """
+    fixed = 0
+    for d in decisions:
+        if not isinstance(d, dict) or d.get("is_correct", True):
+            continue
+        corrected = str(d.get("corrected", "")).strip()
+        if not corrected:
+            continue
+        try:
+            idx = int(d.get("index", -1))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(page_blocks)):
+            continue
+        blk = page_blocks[idx]
+        norm = _normalize_number(corrected)
+        if norm and norm != blk.text:
+            blk.text = norm
+            fixed += 1
+    return fixed
 
 
 def _get_ocr_engine():
@@ -1117,10 +1166,13 @@ _RENDER_QA_MAX_PAGES = 60
 #: guesses are likely wrong and would flood the log with false positives).
 _QA_CONFIDENCE_MIN = 0.6
 
-#: QA issue kinds that are *correctable* (the worker re-translates the offending
-#: cell and re-exports).  Other kinds (overlap / too small / broken label) are
-#: layout hints only and are surfaced but not auto-fixed.
-_CORRECTABLE_QA_KINDS = frozenset(("残余中文", "内容缺失"))
+#: QA issue kinds that are *correctable* (the worker applies a deterministic
+#: fix and re-exports).  ``残余中文``/``内容缺失`` re-translate and refill the
+#: offending cell; ``字过小``/``译文需替换`` drive the structured adjustments
+#: (``apply_render_adjustments``: a font-size target / a replacement text).  The
+#: other kinds (overlap / broken label) are layout hints only — surfaced but not
+#: auto-fixed.
+_CORRECTABLE_QA_KINDS = frozenset(("残余中文", "内容缺失", "字过小", "译文需替换"))
 
 
 def review_rendered_pages(
@@ -1129,6 +1181,7 @@ def review_rendered_pages(
     review_fn: Callable[[int, bytes, bytes], dict] | None,
     log: Callable[[str], None] | None = None,
     page_limit: int = _RENDER_QA_MAX_PAGES,
+    adjustments: list | None = None,
 ) -> set[int]:
     """Run a rendered-output QA on the exported PDF and return flagged pages.
 
@@ -1138,10 +1191,16 @@ def review_rendered_pages(
     through ``log``.  This never modifies the export and never aborts — any
     reviewer error is a no-op.
 
+    ``adjustments`` (optionally a list the caller owns) is filled with the
+    *structured* fix proposals from the review (``kind`` ``text`` / ``font_size``
+    plus a ``bbox``/``text``/``size``), each tagged with its ``page`` index, so
+    the caller can apply them deterministically (``apply_render_adjustments``).
+    They are only the review's suggestion — applying is bounded and may drop them.
+
     Returns the set of page indices that reported a *correctable* issue
-    (``残余中文`` / ``内容缺失``) at or above the confidence floor, so the caller
-    can re-translate those cells and re-export.  Layout-only hints are not
-    returned.
+    (``残余中文`` / ``内容缺失`` / ``字过小`` / ``译文需替换``) at or above the
+    confidence floor, so the caller can re-translate those cells and re-export.
+    Layout-only hints are not returned.
     """
     if review_fn is None:
         return set()
@@ -1158,6 +1217,9 @@ def review_rendered_pages(
                     result = review_fn(i, original, rendered)
                 except Exception:  # noqa: BLE001 — fail-closed, never abort
                     continue
+                if adjustments is not None:
+                    for a in _collect_render_adjustments(result, i):
+                        adjustments.append(a)
                 if _report_render_issues(i, result, log):
                     flagged.add(i)
         finally:
@@ -1165,6 +1227,135 @@ def review_rendered_pages(
     finally:
         src.close()
     return flagged
+
+
+#: ``kind`` values an adjustment may carry; the executor applies only these.
+_RENDER_ADJUST_KINDS = frozenset(("text", "font_size"))
+
+
+def _collect_render_adjustments(result, page_index: int) -> list[dict]:
+    """Pull the validated, page-tagged adjustment proposals out of a QA reply."""
+    if not isinstance(result, dict):
+        return []
+    raw = result.get("adjustments")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for a in raw:
+        if not isinstance(a, dict):
+            continue
+        kind = str(a.get("kind", "")).strip()
+        if kind not in _RENDER_ADJUST_KINDS:
+            continue
+        bbox = a.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            conf = float(a.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            conf = 1.0
+        if conf < _QA_CONFIDENCE_MIN:
+            continue
+        adj = dict(a)
+        adj["page"] = page_index
+        out.append(adj)
+    return out
+
+
+def _flat_index_of(doc, block: Block) -> int | None:
+    """The flat index of ``block`` in ``doc`` (matching ``doc.blocks`` order)."""
+    idx = 0
+    for page in doc.pages:
+        for b in page:
+            if b is block:
+                return idx
+            idx += 1
+    return None
+
+
+def apply_render_adjustments(
+    doc,
+    translated: list[str],
+    adjustments: Sequence[dict],
+    keep_original: set[int],
+    log: Callable[[str], None] | None = None,
+) -> int:
+    """Apply the QA's structured fixes to the block model, bounded.
+
+    Only two kinds are actionable and both are bounded so a bad guess can never
+    corrupt the output:
+
+    - ``text`` (``{page, bbox, text}``): replace the translation of the block
+      under ``bbox`` with ``text``.  Skipped for kept / chart blocks, empty
+      replacements, or a replacement identical to the current text.
+    - ``font_size`` (``{page, bbox, size}``): set that block's render font to
+      ``size``, clamped to ``[_MIN_TABLE_READABLE, _MAX_FONT]`` — this only
+      changes the *target* the deterministic fitter starts from, so the actual
+      drawn size is still bounded by the fitter (it shrinks to fit and never
+      drops below the readability floor).
+
+    ``bbox`` is in the rendered page's image pixels (``_REVIEW_DPI``); it is
+    converted to PDF points and matched to the nearest source block.  Returns the
+    number of adjustments actually applied.
+    """
+    if not adjustments or translated is None:
+        return 0
+    zoom = _REVIEW_DPI / 72.0
+    applied = 0
+    for adj in adjustments:
+        if not isinstance(adj, dict):
+            continue
+        try:
+            conf = float(adj.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            conf = 1.0
+        if conf < _QA_CONFIDENCE_MIN:
+            continue
+        page_i = adj.get("page")
+        if not isinstance(page_i, int) or not (0 <= page_i < len(doc.pages)):
+            continue
+        kind = adj.get("kind")
+        if kind not in _RENDER_ADJUST_KINDS:
+            continue
+        bbox = adj.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        bbox_pt = [float(v) / zoom for v in bbox]
+        block = _nearest_review_block(doc.pages[page_i], bbox_pt)
+        if block is None:
+            continue
+        flat = _flat_index_of(doc, block)
+        if flat is None or flat >= len(translated):
+            continue
+        if flat in keep_original or getattr(block, "is_chart", False):
+            continue
+        if kind == "text":
+            new = str(adj.get("text", "")).strip()
+            if not new:
+                continue
+            cur = str(translated[flat])
+            if new == cur:
+                continue
+            translated[flat] = new
+            applied += 1
+            if log:
+                log(f"    [修正] 块 {flat + 1} 译文已替换：{cur[:18]!r} -> {new[:18]!r}")
+        else:  # font_size
+            try:
+                size = float(adj.get("size"))
+            except (TypeError, ValueError):
+                continue
+            if size <= 0:
+                continue
+            size = max(_MIN_TABLE_READABLE, min(_MAX_FONT, size))
+            old_size = float(block.size)
+            if abs(size - old_size) < 0.05:
+                continue
+            block.size = size
+            applied += 1
+            if log:
+                log(f"    [修正] 块 {flat + 1} 字体目标设为 {size:.1f}pt（原 {old_size:.1f}pt）")
+    return applied
 
 
 def _report_render_issues(page_index: int, result, log) -> set[str]:
@@ -3232,14 +3423,16 @@ _AI_TABLE_MIN_ROW = 11.0
 _AI_TABLE_MARGIN = 36.0
 
 
-def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font) -> None:
+def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font,
+                   merges: Sequence[dict] | None = None) -> None:
     """Draw a clean, regular N x M table from a translated 2D grid.
 
-    ``rows`` is the rebuilt grid (one list per table row).  Columns are equal
-    width across ``rect``; each row's height is grown to fit its tallest cell's
-    wrapped translation.  This is the *AI-table* path: the model has already
-    counted the rows/columns and translated the cells, so there is no OCR-frame
-    fragmentation and no label-colliding with a neighbouring column.
+    ``rows`` is the rebuilt grid (one list per table row).  Columns are sized by
+    content (the AI's relative widths, else the widest cell); each row is grown to
+    fit its tallest cell.  ``merges`` (from ``detect_table_merge``) gives explicit
+    spanning headers — the top-left cell is centred across its colspan and the
+    internal rules are omitted for the spanned rows; without it a top-two-row
+    heuristic is used.
     """
     n_rows = len(rows)
     n_cols = max(len(r) for r in rows) if rows else 0
@@ -3248,9 +3441,7 @@ def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font) -> None:
 
     # Content-based column widths: a column gets more width when its cells are
     # wider (long labels), and stays narrow when they are short (figures, line
-    # numbers).  Each column's desired width is its widest cell rendered as one
-    # line, capped so no single column dominates, floored so a numeric column
-    # stays usable, then scaled to fill the table width.
+    # numbers).
     base = rect.width / n_cols
     weights = []
     for j in range(n_cols):
@@ -3265,26 +3456,43 @@ def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font) -> None:
 
     xs = [rect.x0 + sum(col_widths[:j]) for j in range(n_cols + 1)]
 
-    # Detect merged header cells (top rows only): a non-empty cell followed by
-    # consecutive empty cells on the same row is a spanning header (e.g. the
-    # "December 31, 2025" header spans the 合并/母公司 sub-columns).  The header
-    # text is centred across the span and the internal column rule is omitted for
-    # that row, so the rebuilt table keeps a proper two-level header.
+    # Merged spans: explicit ``merges`` (from detect_table_merge) win; otherwise a
+    # top-two-row heuristic (a non-empty cell followed by consecutive empties).
+    # ``merged[i]`` = {col: colspan} for the top-left of a column span in row i;
+    # ``rowspan_internal`` = row -> set of internal column-boundary indices to omit
+    # (covers colspan of a merge that spans several rows).
     merged: dict[int, dict[int, int]] = {}
-    for i, r in enumerate(rows[:2]):
-        spans: dict[int, int] = {}
-        j = 0
-        while j < n_cols:
-            if str(r[j]).strip():
-                k = j + 1
-                while k < n_cols and not str(r[k]).strip():
-                    k += 1
-                if k - j > 1:
-                    spans[j] = k - j
-                j = k
-            else:
-                j += 1
-        merged[i] = spans
+    rowspan_internal: dict[int, set[int]] = {}
+    if merges:
+        for m in (merges if isinstance(merges, list) else []):
+            if not isinstance(m, dict):
+                continue
+            try:
+                r = int(m.get("r", 0)); c = int(m.get("c", 0))
+                rs = int(m.get("rowspan", 1)); cs = int(m.get("colspan", 1))
+            except (TypeError, ValueError):
+                continue
+            if rs >= 1 and cs >= 1 and 0 <= r < n_rows and 0 <= c < n_cols \
+                    and c + cs <= n_cols:
+                merged.setdefault(r, {})[c] = cs
+                for rr in range(r, min(n_rows, r + rs)):
+                    rowspan_internal.setdefault(rr, set()).update(range(c + 1, c + cs))
+    else:
+        for i, r in enumerate(rows[:2]):
+            spans: dict[int, int] = {}
+            j = 0
+            while j < n_cols:
+                if str(r[j]).strip():
+                    k = j + 1
+                    while k < n_cols and not str(r[k]).strip():
+                        k += 1
+                    if k - j > 1:
+                        spans[j] = k - j
+                    j = k
+                else:
+                    j += 1
+            merged[i] = spans
+            rowspan_internal[i] = {k for j, s in spans.items() for k in range(j + 1, j + s)}
 
     def cell_block(j: int, top: float, h: float, text: str) -> Block:
         w = col_widths[j]
@@ -3339,7 +3547,7 @@ def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font) -> None:
     # omitted for that row while the data rows below keep it.
     yy = rect.y0
     for i, h in enumerate(row_hs):
-        internal: set[int] = set()
+        internal: set[int] = set(rowspan_internal.get(i, set()))
         for j, s in merged.get(i, {}).items():
             internal.update(range(j + 1, j + s))
         for k in range(n_cols + 1):
@@ -3357,6 +3565,7 @@ def save_translated_pdf(
     lang: str,
     redraw_ocr: bool = False,
     table_rebuild_fn: Callable[[int, bytes], Sequence[Sequence[str]] | None] | None = None,
+    merge_tool_fn: Callable[[int, bytes, Sequence[Sequence[str]]], list[dict]] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> None:
     """Create a layout-preserving translation PDF.
@@ -3419,7 +3628,13 @@ def save_translated_pdf(
                             src[i].rect.width - _AI_TABLE_MARGIN,
                             src[i].rect.height - _AI_TABLE_MARGIN,
                         )
-                        _draw_ai_table(page, rebuilt, rect, font)
+                        merges = None
+                        if merge_tool_fn is not None:
+                            try:
+                                merges = merge_tool_fn(i, _render_page_png(src[i]), rebuilt)
+                            except Exception:  # noqa: BLE001 — fail-closed
+                                merges = None
+                        _draw_ai_table(page, rebuilt, rect, font, merges=merges)
                     else:
                         if log:
                             log(f"  第 {i + 1} 页 AI 表格重建不可用，回退几何重绘。")

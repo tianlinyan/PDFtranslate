@@ -20,10 +20,13 @@ from .translator import (
     TranslationCancelled,
     TranslationEngine,
     make_classify_review_fn,
+    make_classify_tool_fn,
+    make_merge_tool_fn,
     make_rendered_review_fn,
     make_retranslate_fn,
     make_review_fn,
     make_table_rebuild_fn,
+    make_verify_number_tool_fn,
 )
 
 #: Output formats offered by the translation dialog.
@@ -52,6 +55,53 @@ def format_duration(seconds: float) -> str:
 def _contains_cjk(text: str) -> bool:
     """True when ``text`` still carries CJK ideographs (a residual Chinese leak)."""
     return any("一" <= c <= "鿿" for c in text)
+
+
+#: Minimum confidence for the ``classify_block`` tool to release a rule-kept
+#: block for translation (only a confident judgement overrides the rule).
+_KEEP_CONF_MIN = 0.7
+
+
+def _release_kept_blocks_via_tool(
+    doc, keep_original: set[int], classify_fn, conf_min: float, log
+) -> set[int]:
+    """Release rule-kept chart-node blocks the tool confidently says to translate.
+
+    The tool-use ``classify_block`` is given the *text* of each kept chart-node
+    block (no page image needed); a block it judges ``translate`` at or above
+    ``conf_min`` is removed from ``keep_original``.  Only releases (never keeps
+    more), and a block not judged is left to the rule.
+    """
+    if classify_fn is None or not keep_original:
+        return set()
+    candidates: list[tuple[int, str]] = []
+    flat = 0
+    for page_blocks in doc.pages:
+        for b in page_blocks:
+            if flat in keep_original and getattr(b, "is_chart", False):
+                candidates.append((flat, b.text))
+            flat += 1
+    if not candidates:
+        return set()
+    decisions = classify_fn([t for _i, t in candidates])
+    released: set[int] = set()
+    for d in decisions:
+        try:
+            idx = int(d.get("index", -1))
+            conf = float(d.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(candidates)):
+            continue
+        if d.get("action") == "translate" and conf >= conf_min:
+            flat_idx = candidates[idx][0]
+            released.add(flat_idx)
+            if log:
+                log(
+                    f"  [保留复核] 块「{candidates[idx][1][:16]}」判定为应翻译"
+                    f"（@{conf:.2f}），已从保留集合释放。"
+                )
+    return released
 
 
 def _correct_residual_blocks(
@@ -160,12 +210,18 @@ class TranslateWorker(QObject):
                 self.log.emit(
                     "该模型支持视觉：将对重建的扫描页做整页审查（文字纠错 + 布局提示，不改几何）。"
                 )
+            # OCR-number verification (vision tool-use): re-read the plausible
+            # misreads on a freshly OCR'd page and correct them in place, so the
+            # figures feeding the translation are right.  Only for OCR'd pages and
+            # only when the model opts in (make_* returns None otherwise).
+            verify_fn = make_verify_number_tool_fn(self._model, self.log.emit) if self._ocr else None
             doc = pdfio.extract_document_text(
                 self._source,
                 ocr=self._ocr,
                 cancel=lambda: self._cancelled.is_set(),
                 log=lambda m: self.log.emit(m),
                 review_fn=review,
+                verify_fn=verify_fn,
             )
             if doc.ocr_count:
                 self.log.emit(f"有 {doc.ocr_count} 个页面无文本层，已通过 OCR 提取。")
@@ -225,20 +281,28 @@ class TranslateWorker(QObject):
             # and keep it untranslated.  A vision model that sees the source page
             # may flag such a block as translatable content — this pass only
             # *releases* (never keeps more), and only on high confidence; any
-            # classifier error is a no-op so the rule's decision stands.
+            # classifier error is a no-op so the rule's decision stands.  The
+            # tool-use ``classify_block`` (text-based) is preferred; the image-based
+            # whole-page review is the fallback.
             if n_chart:
-                classify_fn = make_classify_review_fn(self._model, self.log.emit)
-                if classify_fn is not None:
+                released: set[int] = set()
+                tool_classify = make_classify_tool_fn(self._model, self.log.emit)
+                if tool_classify is not None:
+                    released = _release_kept_blocks_via_tool(
+                        doc, keep_original, tool_classify, _KEEP_CONF_MIN, self.log.emit
+                    )
+                else:
+                    review_classify = make_classify_review_fn(self._model, self.log.emit)
                     released = pdfio.classify_keep_blocks(
-                        self._source, doc.pages, classify_fn,
+                        self._source, doc.pages, review_classify,
                         keep_original, self.log.emit,
                     )
-                    if released:
-                        keep_original -= released
-                        n_chart -= len(released)
-                        self.log.emit(
-                            f"保留复核后，实际保留 {n_chart} 个图表节点（其余将翻译）。"
-                        )
+                if released:
+                    keep_original -= released
+                    n_chart -= len(released)
+                    self.log.emit(
+                        f"保留复核后，实际保留 {n_chart} 个图表节点（其余将翻译）。"
+                    )
 
             translate_started = time.monotonic()
             result = engine.translate_blocks(
@@ -276,36 +340,49 @@ class TranslateWorker(QObject):
 
             # Rendered-output QA: read back the exported PDF and surface anything
             # a reader would notice (untranslated text, overlaps, overflowing
-            # glyphs, broken labels).  A *correctable* report (residual Chinese /
-            # missing content) triggers a bounded correction: re-translate those
-            # blocks and re-export.  Fail-closed: any reviewer error is a no-op.
+            # glyphs, broken labels, too-small text).  A *correctable* report
+            # (residual Chinese / missing content) triggers a bounded re-translate
+            # of those cells; the QA may also return structured *adjustments* (a
+            # replacement text / a font-size target), applied deterministically by
+            # ``apply_render_adjustments``.  Either way we re-export once, bounded
+            # (single pass).  Fail-closed: any reviewer error is a no-op.
             qa_elapsed = 0.0
             correct_elapsed = 0.0
             if self._render_qa and self._output_type in ("translated_pdf", "bilingual_pdf"):
                 rendered_review = make_rendered_review_fn(self._model, self.log.emit)
                 if rendered_review is not None:
                     qa_started = time.monotonic()
+                    adjustments: list = []
                     flagged = pdfio.review_rendered_pages(
-                        self._source, out_path, rendered_review, self.log.emit
+                        self._source, out_path, rendered_review,
+                        self.log.emit, adjustments=adjustments,
                     )
                     qa_elapsed = time.monotonic() - qa_started
-                    if flagged and not self._cancelled.is_set():
-                        retranslate = make_retranslate_fn(self._model, self.log.emit)
+                    if (flagged or adjustments) and not self._cancelled.is_set():
+                        changed = 0
+                        retranslate = (
+                            make_retranslate_fn(self._model, self.log.emit) if flagged else None
+                        )
                         if retranslate is not None:
-                            corrected = _correct_residual_blocks(
+                            changed = _correct_residual_blocks(
                                 doc, result, keep_original, target_is_cjk,
                                 flagged, self._lang, retranslate, self.log.emit,
                             )
-                            if corrected:
-                                correct_started = time.monotonic()
-                                per_page = pdfio.group_by_page(
-                                    doc.block_pages, result.translated, doc.page_count
-                                )
-                                out_path = self._export(doc, per_page)
-                                correct_elapsed = time.monotonic() - correct_started
-                                self.log.emit(
-                                    f"  质检修正：重新翻译 {corrected} 个残留/空缺块并重新导出。"
-                                )
+                        if adjustments:
+                            changed += pdfio.apply_render_adjustments(
+                                doc, result.translated, adjustments,
+                                keep_original, self.log.emit,
+                            )
+                        if changed:
+                            correct_started = time.monotonic()
+                            per_page = pdfio.group_by_page(
+                                doc.block_pages, result.translated, doc.page_count
+                            )
+                            out_path = self._export(doc, per_page)
+                            correct_elapsed = time.monotonic() - correct_started
+                            self.log.emit(
+                                f"  质检修正：应用 {changed} 处修改并重新导出。"
+                            )
 
             total_elapsed = time.monotonic() - started
             self.log.emit(f"完成：{out_path}")
@@ -353,12 +430,17 @@ class TranslateWorker(QObject):
             )
         elif kind == "translated_pdf":
             table_rebuild = (
-                make_table_rebuild_fn(self._model, self.log.emit) if self._ai_table_rebuild else None
+                make_table_rebuild_fn(self._model, self._lang, self.log.emit)
+                if self._ai_table_rebuild else None
+            )
+            merge_tool = (
+                make_merge_tool_fn(self._model, self.log.emit) if self._ai_table_rebuild else None
             )
             pdfio.save_translated_pdf(
                 self._source, doc.pages, per_page, out, self._lang,
                 redraw_ocr=self._ai_table_rebuild,
                 table_rebuild_fn=table_rebuild,
+                merge_tool_fn=merge_tool,
                 log=self.log.emit,
             )
         elif kind == "markdown":

@@ -871,6 +871,33 @@ class WholePageReviewTest(unittest.TestCase):
             {"issues": []},
         )
 
+    def test_parse_render_adjustments_handles_wrapped_and_malformed(self):
+        self.assertEqual(
+            translator._parse_render_adjustments(
+                '校验结果：{"adjustments": ['
+                '{"kind": "text", "bbox": [1, 2, 3, 4], "text": "新的译文", "confidence": 0.9},'
+                '{"kind": "font_size", "bbox": [5, 6, 7, 8], "size": 8.0}'
+                ']} 完'
+            ),
+            [
+                {"kind": "text", "bbox": [1, 2, 3, 4],
+                 "text": "新的译文", "confidence": 0.9},
+                {"kind": "font_size", "bbox": [5, 6, 7, 8], "size": 8.0},
+            ],
+        )
+        self.assertEqual(translator._parse_render_adjustments("没有"), [])
+        # Unknown kind / malformed bbox are dropped.
+        self.assertEqual(
+            translator._parse_render_adjustments(
+                '{"adjustments": ['
+                '{"kind": "structure", "bbox": [1, 2, 3, 4]},'
+                '{"kind": "text", "bbox": [1, 2, 3]},'   # bbox not length 4
+                '{"kind": "text", "bbox": [1, 2, 3, 4], "text": "x"}'    # valid
+                ']}'
+            ),
+            [{"kind": "text", "bbox": [1, 2, 3, 4], "text": "x"}],
+        )
+
     def test_make_rendered_review_fn_gated_by_flag(self):
         self.assertIsNone(translator.make_rendered_review_fn(self._model()))
         self.assertIsInstance(
@@ -969,9 +996,9 @@ class WholePageReviewTest(unittest.TestCase):
         self.assertIsNone(translator._parse_table_grid(json.dumps(big)))
 
     def test_make_table_rebuild_fn_gated_by_flag(self):
-        self.assertIsNone(translator.make_table_rebuild_fn(self._model()))
+        self.assertIsNone(translator.make_table_rebuild_fn(self._model(), "English"))
         self.assertIsInstance(
-            translator.make_table_rebuild_fn(self._model(vision=True)),
+            translator.make_table_rebuild_fn(self._model(vision=True), "English"),
             type(lambda: None),
         )
 
@@ -998,7 +1025,7 @@ class WholePageReviewTest(unittest.TestCase):
                 return getattr(_FakeClient(), _name)
 
         with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
-            fn = translator.make_table_rebuild_fn(self._model(vision=True))
+            fn = translator.make_table_rebuild_fn(self._model(vision=True), "English")
         grid = fn(0, b"ORIG")
         self.assertEqual(grid[1][1], "32,613,779.11")
 
@@ -1009,6 +1036,19 @@ class WholePageReviewTest(unittest.TestCase):
         self.assertIn("阿拉伯数字", prompt)
         self.assertIn("罗马数字", prompt)
         self.assertIn("(33)", prompt)
+
+    def test_table_rebuild_prompt_names_the_target_language(self):
+        # A prompt that says "translate into the target language" without naming it
+        # leaves the model guessing, so the rebuild echoed the source Chinese.  The
+        # prompt carries a ``@@TARGET_LANG@@`` placeholder that ``make_table_rebuild_fn``
+        # substitutes with the real language (so a "English" run gets an explicit
+        # target and an instruction never to echo the Chinese).
+        prompt = translator._REVIEW_TABLE_PROMPT
+        self.assertIn("@@TARGET_LANG@@", prompt)
+        self.assertIn("绝不能把原文", prompt)
+        replaced = prompt.replace("@@TARGET_LANG@@", "English")
+        self.assertIn("English", replaced)
+        self.assertNotIn("@@TARGET_LANG@@", replaced)
 
     def test_make_retranslate_fn_gated_by_flag(self):
         self.assertIsNone(translator.make_retranslate_fn(self._model()))
@@ -1061,6 +1101,54 @@ class WholePageReviewTest(unittest.TestCase):
         with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
             fn = translator.make_retranslate_fn(self._model(vision=True))
         self.assertEqual(fn("未翻译", "English"), "未翻译")  # keep the original
+
+    def test_parse_classify_tool_calls(self):
+        _Fn = type("_Fn", (), {"name": "classify_block",
+                               "arguments": '{"index": 2, "text": "标题", "action": "translate", "confidence": 0.9}'})
+        _TC = type("_TC", (), {"function": _Fn()})
+        msg = type("_Msg", (), {"tool_calls": [_TC()]})()
+        out = translator._parse_classify_tool_calls(msg)
+        self.assertEqual(out[0]["action"], "translate")
+        self.assertEqual(out[0]["index"], 2)
+
+        # A non-classify_block call is dropped.
+        other_fn = type("_Fn", (), {"name": "other", "arguments": "{}"})()
+        other_tc = type("_TC", (), {"function": other_fn})()
+        msg2 = type("_Msg", (), {"tool_calls": [_TC(), other_tc]})()
+        self.assertEqual(len(translator._parse_classify_tool_calls(msg2)), 1)
+
+        # Malformed args are dropped.
+        m_fn = type("_Fn", (), {"name": "classify_block", "arguments": "{not json}"})()
+        m_tc = type("_TC", (), {"function": m_fn})()
+        msg3 = type("_Msg", (), {"tool_calls": [m_tc]})()
+        self.assertEqual(translator._parse_classify_tool_calls(msg3), [])
+
+    def test_parse_merge_tool_calls(self):
+        _Fn = type("_Fn", (), {"name": "detect_table_merge",
+                               "arguments": '{"row": 0, "col": 3, "rowspan": 1, "colspan": 2}'})
+        _TC = type("_TC", (), {"function": _Fn()})
+        msg = type("_Msg", (), {"tool_calls": [_TC()]})()
+        out = translator._parse_merge_tool_calls(msg)
+        self.assertEqual(out[0]["colspan"], 2)
+        # Non-merge call is dropped.
+        other = type("_Fn", (), {"name": "other", "arguments": "{}"})()
+        msg2 = type("_Msg", (), {"tool_calls": [_TC(), type("_TC", (), {"function": other})()]})()
+        self.assertEqual(len(translator._parse_merge_tool_calls(msg2)), 1)
+        self.assertEqual(translator._parse_merge_tool_calls(type("_Msg", (), {"tool_calls": None})()), [])
+
+    def test_parse_verify_number_tool_calls(self):
+        _Fn = type("_Fn", (), {"name": "verify_number",
+                               "arguments": '{"index": 3, "value": "3,702.726,474.45",'
+                                            ' "is_correct": false, "corrected": "3,702,726,474.45"}'})
+        _TC = type("_TC", (), {"function": _Fn()})
+        msg = type("_Msg", (), {"tool_calls": [_TC()]})()
+        out = translator._parse_verify_tool_calls(msg)
+        self.assertFalse(out[0]["is_correct"])
+        self.assertEqual(out[0]["corrected"], "3,702,726,474.45")
+        # Non-verify call dropped.
+        other = type("_Fn", (), {"name": "other", "arguments": "{}"})()
+        msg2 = type("_Msg", (), {"tool_calls": [_TC(), type("_TC", (), {"function": other})()]})()
+        self.assertEqual(len(translator._parse_verify_tool_calls(msg2)), 1)
 
 
 class SystemPromptNumberingTest(unittest.TestCase):

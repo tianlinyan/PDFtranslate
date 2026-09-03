@@ -957,8 +957,12 @@ _REVIEW_RENDER_PROMPT = (
     "请对比两张图，检查译文渲染中的问题，只输出一个 JSON 对象：\n"
     "{\n"
     "  \"issues\": [\n"
-    "    {\"kind\": \"残余中文|内容缺失|原文压叠|文本越线|字过小|标签断行|编号不符\","
+    "    {\"kind\": \"残余中文|内容缺失|原文压叠|文本越线|字过小|标签断行|编号不符|译文需替换\","
     " \"message\": \"一句话说明\", \"confidence\": 0.9}\n"
+    "  ],\n"
+    "  \"adjustments\": [\n"
+    "    {\"kind\": \"text\", \"bbox\": [x0,y0,x1,y1], \"text\": \"替代译文\", \"confidence\": 0.9},\n"
+    "    {\"kind\": \"font_size\", \"bbox\": [x0,y0,x1,y1], \"size\": 8.0, \"confidence\": 0.9}\n"
     "  ]\n"
     "}\n"
     "规则：\n"
@@ -968,14 +972,22 @@ _REVIEW_RENDER_PROMPT = (
     "- 字过小：字体大小小于可读下限。\n"
     "- 标签断行：本应整行的标签被不合理切断。\n"
     "- 编号不符：报表/科目/附注编号与原文不一致。\n"
-    "只在确有问题时列 issue；没有则用空数组。不要输出除此 JSON 之外的文字。"
+    "- 译文需替换：译文措辞有误/漏译，需要直接换成更准确的一句。\n"
+    "adjustments 是可执行的修改指令，只在确信、有具体目标时给出：bbox 用第二张渲染图的像素坐标"
+    "（x0,y0 左上、x1,y1 右下，近似即可）；kind=text 带替代译文 text；kind=font_size 带目标字号 size。"
+    "不要对按规则保留的块（报表/科目编号、人名、手写签字、图表节点）给 adjustment。"
+    "只在确有问题时列 issue/adjustment；没有问题则两者都用空数组。不要输出除此 JSON 之外的文字。"
 )
 
 
 #: Possible ``kind`` values the render QA may emit (so parsers can whitelist).
 _RENDER_ISSUE_KINDS = frozenset(
-    ("残余中文", "内容缺失", "原文压叠", "文本越线", "字过小", "标签断行", "编号不符")
+    ("残余中文", "内容缺失", "原文压叠", "文本越线", "字过小", "标签断行", "编号不符", "译文需替换")
 )
+
+#: Possible ``kind`` values a render-QA *adjustment* may carry.  Only these are
+#: ever applied by the caller's deterministic executor (see ``apply_render_adjustments``).
+_RENDER_ADJUST_KINDS = frozenset(("text", "font_size"))
 
 
 def _parse_render_issues(content: str) -> dict:
@@ -989,6 +1001,33 @@ def _parse_render_issues(content: str) -> dict:
         if isinstance(it, dict) and str(it.get("message", "")).strip()
     ]
     return {"issues": issues}
+
+
+def _parse_render_adjustments(content: str) -> list[dict]:
+    """Parse a render-QA reply into a validated ``adjustments`` list.
+
+    Each adjustment is a dict meant for :func:`pdfio.apply_render_adjustments`:
+    ``{kind, bbox, text?, size?, confidence?}``.  Entries with an unknown kind or
+    a malformed ``bbox`` are dropped; the executor applies further bounds.
+    """
+    data = _extract_json_object(content)
+    if data is None:
+        return []
+    raw = data.get("adjustments")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for a in raw:
+        if not isinstance(a, dict):
+            continue
+        kind = str(a.get("kind", "")).strip()
+        if kind not in _RENDER_ADJUST_KINDS:
+            continue
+        bbox = a.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        out.append(a)
+    return out
 
 
 def make_rendered_review_fn(
@@ -1011,7 +1050,9 @@ def make_rendered_review_fn(
                 client, model.model, _REVIEW_RENDER_PROMPT,
                 [original_png, rendered_png],
             )
-            return _parse_render_issues(content)
+            issues = _parse_render_issues(content).get("issues", [])
+            adjustments = _parse_render_adjustments(content)
+            return {"issues": issues, "adjustments": adjustments}
         except Exception as exc:  # noqa: BLE001 — report-only, never abort
             if log:
                 log(f"  第 {page_index + 1} 页译文校验失败：{type(exc).__name__}: {exc}")
@@ -1093,14 +1134,17 @@ def make_classify_review_fn(
 #: / column structure so we can draw a *clean*, regular table — instead of
 #: reconstructing it from noisy OCR boxes (which over-fragments rows).
 _REVIEW_TABLE_PROMPT = (
-    "这是原图中的一张财务报表（扫描件）。请把整张表的内容提取并翻译成目标语言，"
-    "输出一个 JSON 二维数组，**保持原表的行数、列数和单元格结构**：\n"
+    "这是原图中的一张财务报表（扫描件）。请把整张表的内容提取并**翻译成 @@TARGET_LANG@@**"
+    "（目标语言：@@TARGET_LANG@@），输出一个 JSON 二维数组，**保持原表的行数、列数和单元格结构**：\n"
     "{\"rows\": [[\"第1行第1格\", \"第1行第2格\", ...], [\"第2行第1格\", ...]]}\n"
     "规则：\n"
+    "- **每个单元格都必须用 @@TARGET_LANG@@ 书写，绝不能把原文（中文）原样照抄进译文**。"
+    "只有本身就是数字/代码的项（报表/科目代码如会企01表-1、行次数字、单位）保持原样；"
+    "其余全部翻译成语目标语言。若某个单元格的原文已经是目标语言则按原文输出。\n"
     "- 逐格对应原表的行/列。跨列/跨行合并的单元格（如二级表头 2025年度 → 合并/母公司）"
     "只写一次：内容放在它覆盖区域的**第一个**格子，同一行/列被它覆盖的其余格子留空；"
     "子表头（合并/母公司）另起一行。不要在每个子列重复表头。\n"
-    "- 每个单元格用目标语言翻译。数字一律用**阿拉伯数字**：中文序数/编号"
+    "- 数字一律用**阿拉伯数字**：中文序数/编号"
     "（一、二、三、（三十三））转成 1、2、3、(33)；仅当原文**字面用罗马数字**"
     "（Ⅰ、Ⅱ、I. II.）时才保留罗马数字。单位、报表/科目代码（会企01表-1、行次数字）保持原样。\n"
     "- 表头行放数组第一行，数据行依次往下；没有内容的格子用空字符串占位。\n"
@@ -1142,22 +1186,26 @@ def _parse_table_grid(content: str) -> list[list[str]] | None:
 
 
 def make_table_rebuild_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
+    model: ModelConfig, target_lang: str, log: Callable[[str], None] | None = None
 ) -> Callable[[int, bytes], list[list[str]] | None] | None:
     """Return a whole-table rebuild callback for ``model``, or ``None`` if disabled.
 
     Signature ``(page_index, original_png) -> list[list[str]] | None``: it sends the
     original scanned table page to a vision model, which returns the table as a
-    translated 2D grid (row/column structure preserved).  Best-effort — any
-    failure or implausible result returns ``None`` so the caller falls back.
+    translated 2D grid (row/column structure preserved).  ``target_lang`` is baked
+    into the prompt so the model actually knows what language to translate into
+    (a prompt that says "translate into the target language" without naming it
+    leaves the model guessing and it tends to echo the source Chinese).  Best-effort
+    — any failure or implausible result returns ``None`` so the caller falls back.
     """
     if not model.vision:
         return None
     client = OpenAI(**model.client_kwargs())
+    prompt = _REVIEW_TABLE_PROMPT.replace("@@TARGET_LANG@@", str(target_lang))
 
     def _rebuild(page_index: int, original_png: bytes) -> list[list[str]] | None:
         try:
-            content = _vision_call(client, model.model, _REVIEW_TABLE_PROMPT, [original_png])
+            content = _vision_call(client, model.model, prompt, [original_png])
             return _parse_table_grid(content)
         except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
             if log:
@@ -1208,3 +1256,273 @@ def make_retranslate_fn(
             return text
 
     return _retranslate
+
+
+#: OpenAI ``tools`` schema for the block-classification judgment tool, used by
+#: the tool-use POC.  The model calls it per ambiguous block; the deterministic
+#: caller applies the decision (release / keep) rather than letting the model
+#: draw the table.
+_CLASSIFY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "classify_block",
+        "description": "判断一个文本块应保留原文（组织架构/架构图节点标签、报表/科目代码、手写签字）"
+                         "还是翻译成目标语言",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "description": "输入块列表中的序号"},
+                "text": {"type": "string", "description": "块文本"},
+                "action": {"type": "string",
+                           "enum": ["keep", "translate", "signature"],
+                           "description": "keep=保留原文；translate=翻译；signature=手写签字"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "reason": {"type": "string", "description": "一句话理由"},
+            },
+            "required": ["index", "text", "action"],
+        },
+    },
+}
+
+
+def _parse_classify_tool_calls(msg) -> list[dict]:
+    """Turn the model's ``classify_block`` tool_calls into decision dicts.
+
+    Each entry is ``{"index", "text", "action", "confidence", "reason"}``; a
+    malformed / non-``classify_block`` call is dropped so a noisy reply degrades
+    to an empty decision list rather than crashing the caller.
+    """
+    out: list[dict] = []
+    tcs = getattr(msg, "tool_calls", None)
+    if not tcs:
+        return out
+    for tc in tcs:
+        fn = getattr(tc, "function", None)
+        if getattr(fn, "name", None) != "classify_block":
+            continue
+        args = getattr(fn, "arguments", None)
+        try:
+            data = json.loads(args) if args else {}
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        data.setdefault("confidence", 0.5)
+        out.append(data)
+    return out
+
+
+def make_classify_tool_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[Sequence[str]], list[dict]] | None:
+    """Return a tool-use block-classification callback, or ``None`` if disabled.
+
+    Signature ``(blocks) -> [decision, ...]``: it sends the list of ambiguous
+    block texts to ``classify_block`` (OpenAI ``tools``) and parses the returned
+    ``tool_calls`` into decisions.  Since the model reasons before emitting a
+    tool call, a generous ``max_tokens`` is used.  Best-effort — any failure
+    returns ``[]`` so the caller falls back to the rule-based decision.
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _classify(blocks: Sequence[str]) -> list[dict]:
+        items = "\n".join(f"[{i}] {str(b)[:60]!r}" for i, b in enumerate(blocks))
+        prompt = (
+            "请判断下列每个文本块应保留原文（组织架构/架构图节点标签、报表/科目代码、手写签字）"
+            "还是翻译成目标语言，逐一调用 classify_block：\n" + items
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=model.model, temperature=0.0, max_tokens=4096,
+                tools=[_CLASSIFY_TOOL], tool_choice="auto",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            msg = resp.choices[0].message
+            decisions = _parse_classify_tool_calls(msg)
+            if not decisions and log:
+                log("  分类工具未返回 tool_call：" + str(getattr(msg, "content", "")))
+            return decisions
+        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
+            if log:
+                log(f"  分类工具调用失败：{type(exc).__name__}: {exc}")
+            return []
+
+    return _classify
+
+
+#: OpenAI ``tools`` schema for the table-merge judgment tool: the model looks at
+#: the scanned table and calls it per spanning header cell (e.g. the 2025年度
+#: header spans the 合并/母公司 sub-columns), so the rebuilt table can draw a
+#: proper two-level header.
+_MERGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "detect_table_merge",
+        "description": "标注原表中需要跨列/跨行合并的单元格（如二级表头 2025年度 跨 合并/母公司）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "row": {"type": "integer", "description": "合并单元格左上角行号（0 起）"},
+                "col": {"type": "integer", "description": "合并单元格左上角列号（0 起）"},
+                "rowspan": {"type": "integer", "description": "跨行数（≥1）"},
+                "colspan": {"type": "integer", "description": "跨列数（≥1）"},
+                "reason": {"type": "string"},
+            },
+            "required": ["row", "col", "rowspan", "colspan"],
+        },
+    },
+}
+
+
+def _parse_merge_tool_calls(msg) -> list[dict]:
+    """Extract ``detect_table_merge`` tool_calls into ``[{row,col,rowspan,colspan}]``."""
+    out: list[dict] = []
+    tcs = getattr(msg, "tool_calls", None)
+    if not tcs:
+        return out
+    for tc in tcs:
+        fn = getattr(tc, "function", None)
+        if getattr(fn, "name", None) != "detect_table_merge":
+            continue
+        args = getattr(fn, "arguments", None)
+        try:
+            data = json.loads(args) if args else {}
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def make_merge_tool_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[int, bytes, Sequence[Sequence[str]]], list[dict]] | None:
+    """Return a tool-use table-merge detector, or ``None`` if disabled.
+
+    Signature ``(page_index, original_png, grid) -> [{row,col,rowspan,colspan}, ...]``:
+    it sends the scanned table page + the OCR grid to ``detect_table_merge`` and
+    parses the returned merges.  Best-effort — any failure returns ``[]`` so the
+    caller draws without explicit merges.
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _merges(page_index: int, original_png: bytes, grid: Sequence[Sequence[str]]) -> list[dict]:
+        g = "\n".join(f"[{i}] " + " | ".join(str(c) for c in row) for i, row in enumerate(grid))
+        prompt = (
+            "这是原图中的表格。请标注需要跨列/跨行合并的单元格（如二级表头：2025年度 跨 合并/母公司 "
+            "两列、表头跨两行），逐一调用 detect_table_merge。表格内容如下：\n" + g
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=model.model, temperature=0.0, max_tokens=4096,
+                tools=[_MERGE_TOOL], tool_choice="auto",
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": _image_data_url(original_png)}},
+                ]}],
+            )
+            msg = resp.choices[0].message
+            merges = _parse_merge_tool_calls(msg)
+            if not merges and log:
+                log("  detect_table_merge 未返回 tool_call：" + str(getattr(msg, "content", "")))
+            return merges
+        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
+            if log:
+                log(f"  合并检测失败：{type(exc).__name__}: {exc}")
+            return []
+
+    return _merges
+
+
+#: OpenAI ``tools`` schema for the OCR-number verification tool.  The model is
+#: given the scanned table page and the OCR'd figure values; it calls
+#: ``verify_number`` per figure the OCR plausibly misread (RapidOCR often gets
+#: thousands separators / decimal points wrong), so the caller can correct the
+#: value deterministically before translation.
+_VERIFY_NUMBER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "verify_number",
+        "description": "核查一个 OCR 识别的数字是否与扫描原件一致，读错时给出正确值",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "integer", "description": "输入数字列表中的序号"},
+                "value": {"type": "string", "description": "OCR 识别的值"},
+                "is_correct": {"type": "boolean", "description": "true=与原件一致"},
+                "corrected": {"type": "string", "description": "正确值（若读错）"},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "reason": {"type": "string"},
+            },
+            "required": ["index", "value", "is_correct"],
+        },
+    },
+}
+
+
+def _parse_verify_tool_calls(msg) -> list[dict]:
+    """Extract ``verify_number`` tool_calls into decision dicts."""
+    out: list[dict] = []
+    tcs = getattr(msg, "tool_calls", None)
+    if not tcs:
+        return out
+    for tc in tcs:
+        fn = getattr(tc, "function", None)
+        if getattr(fn, "name", None) != "verify_number":
+            continue
+        args = getattr(fn, "arguments", None)
+        try:
+            data = json.loads(args) if args else {}
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            data.setdefault("is_correct", True)
+            out.append(data)
+    return out
+
+
+def make_verify_number_tool_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[int, bytes, Sequence[dict]], list[dict]] | None:
+    """Return a tool-use OCR-number verifier, or ``None`` if disabled.
+
+    Signature ``(page_index, original_png, figures) -> [decision, ...]``:
+    ``figures`` is ``[{"index": i, "value": "3,702,726,474.45"}, ...]``.  It sends
+    the scanned page + the figure values to ``verify_number`` and parses the
+    returned corrections.  Best-effort — any failure returns ``[]``.
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _verify(page_index: int, original_png: bytes, figures: Sequence[dict]) -> list[dict]:
+        items = "\n".join(f"[{f.get('index')}] {f.get('value')}" for f in figures)
+        prompt = (
+            "这是原图（扫描件）中的数字。请逐个核查下列 OCR 识别的数字是否与原件一致，"
+            "对**读错**的调用 verify_number 并给出 corrected（只有读错/不确定时才调用，"
+            "读对的就不要调）：\n" + items
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=model.model, temperature=0.0, max_tokens=4096,
+                tools=[_VERIFY_NUMBER_TOOL], tool_choice="auto",
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": _image_data_url(original_png)}},
+                ]}],
+            )
+            msg = resp.choices[0].message
+            decisions = _parse_verify_tool_calls(msg)
+            if not decisions and log:
+                log("  verify_number 未返回 tool_call：" + str(getattr(msg, "content", "")))
+            return decisions
+        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
+            if log:
+                log(f"  数字核验失败：{type(exc).__name__}: {exc}")
+            return []
+
+    return _verify

@@ -201,6 +201,38 @@ class CorrectResidualBlocksTest(unittest.TestCase):
         self.assertEqual(n, 0)
         self.assertEqual(result.translated[0], "保留")
 
+    def test_release_kept_blocks_via_tool(self):
+        class _Doc:
+            pass
+        doc = _Doc()
+        doc.pages = [[
+            pdfio.Block(text="董事会", page=0, x0=0, y0=0, x1=30, y1=30, is_chart=True),
+            pdfio.Block(text="二、公司组织架构图", page=0, x0=0, y0=40, x1=30, y1=50, is_chart=True),
+            pdfio.Block(text="正文", page=0, x0=0, y0=60, x1=100, y1=70, is_chart=False),
+        ]]
+        keep = {0, 1, 2}
+        # Tool judges index 0 keep, index 1 translate (conf 0.95).  Block 2 is
+        # not a chart node, so it is not a candidate (stays kept).
+        classify_fn = lambda _texts: [
+            {"index": 0, "action": "keep", "confidence": 0.9},
+            {"index": 1, "action": "translate", "confidence": 0.95},
+        ]
+        released = worker_module._release_kept_blocks_via_tool(doc, keep, classify_fn, 0.7, None)
+        self.assertEqual(released, {1})
+
+    def test_release_kept_blocks_via_tool_low_conf_not_released(self):
+        class _Doc:
+            pass
+        doc = _Doc()
+        doc.pages = [[pdfio.Block(text="二、公司组织架构图", page=0, x0=0, y0=40,
+                                  x1=30, y1=50, is_chart=True)]]
+        keep = {0}
+        classify_fn = lambda _texts: [
+            {"index": 0, "action": "translate", "confidence": 0.4},
+        ]
+        released = worker_module._release_kept_blocks_via_tool(doc, keep, classify_fn, 0.7, None)
+        self.assertEqual(released, set())
+
 
 class KeepOriginalDirectionTest(_WorkerTestBase):
     """Name cells stay source only for a CJK target; Latin targets romanize.
@@ -318,6 +350,160 @@ class ChartNodeDirectionTest(_WorkerTestBase):
         captured, logs = self._run_capture("English")
         self.assertEqual({0}, captured["keep"])
         self.assertTrue(any("组织结构图/架构图节点" in m for m in logs), logs)
+
+
+def _verify_sentinel(_i, _png, _figures):
+    """Stand-in for ``make_verify_number_tool_fn``'s returned verifier."""
+    return []
+
+
+class VerifyNumberWiringTest(_WorkerTestBase):
+    """The worker hands the OCR-number verifier into ``extract_document_text``.
+
+    Only an OCR-enabled run wires a verifier; ``verify_fn`` stays ``None`` when
+    OCR is off.  ``make_verify_number_tool_fn`` itself is already covered in
+    ``test_translator``, so here it is stubbed to a sentinel so the wiring (not
+    the tool construction) is the unit under test.
+    """
+
+    def _run_capture(self, ocr: bool):
+        doc = pdfio.DocumentText(
+            pages=[[pdfio.Block(text="Body text to translate.", page=0,
+                                x0=60, y0=60, x1=200, y1=80, size=10.0)]],
+            blocks=["Body text to translate."],
+            block_pages=[0],
+            title="verify",
+        )
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                return TranslationResult(
+                    blocks=list(blocks),
+                    translated=[f"MOCK:{b}" for b in blocks],
+                )
+
+        captured: dict = {}
+        logs: list[str] = []
+
+        def _fake_extract(source, **kwargs):
+            captured["verify_fn"] = kwargs.get("verify_fn")
+            captured["review_fn"] = kwargs.get("review_fn")
+            return doc
+
+        worker = TranslateWorker(
+            str(self.tmp / "verify.pdf"),
+            self._model("http://127.0.0.1:9/v1"), "简体中文",
+            "plain_text", str(self.tmp / "out.txt"), ocr=ocr,
+        )
+        worker.log.connect(logs.append)
+        with mock.patch.object(worker_module, "make_verify_number_tool_fn",
+                               return_value=_verify_sentinel):
+            with mock.patch.object(worker_module, "make_review_fn", return_value=None):
+                with mock.patch.object(pdfio, "extract_document_text",
+                                       side_effect=_fake_extract):
+                    with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
+                        self._run(worker)
+        return captured["verify_fn"]
+
+    def test_ocr_run_wires_verifier(self):
+        self.assertIs(_verify_sentinel, self._run_capture(ocr=True))
+
+    def test_non_ocr_run_leaves_verifier_none(self):
+        self.assertIsNone(self._run_capture(ocr=False))
+
+
+def _empty_render_review(_i, _o, _r):
+    return {"issues": [], "adjustments": []}
+
+
+class RenderQaAdjustmentWiringTest(_WorkerTestBase):
+    """The worker collects the QA's adjustments and applies them before re-export."""
+
+    def _fixture(self, block):
+        doc = pdfio.DocumentText(
+            pages=[[block]],
+            blocks=[block.text],
+            block_pages=[0],
+            title="adj",
+        )
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                return TranslationResult(
+                    blocks=list(blocks),
+                    translated=[f"MOCK:{b}" for b in blocks],
+                )
+
+        return doc, _StubEngine
+
+    def test_worker_applies_render_adjustments_then_reexports(self):
+        src = build_sample_pdf(self.tmp / "adj.pdf", pages=1)
+        out = self.tmp / "out.pdf"
+        block = pdfio.Block(text="Body text.", page=0, x0=60, y0=60,
+                            x1=200, y1=80, size=9.0, single_line=True)
+        doc, stub = self._fixture(block)
+        # A font-size adjustment targeting the block (bbox in render-pixel space).
+        z = pdfio._REVIEW_DPI / 72.0
+        adj_bbox = [60 * z, 60 * z, 200 * z, 80 * z]
+
+        def fake_review_rendered_pages(_src, _out, _review_fn, _log, adjustments=None):
+            assert adjustments is not None
+            adjustments.append({
+                "kind": "font_size", "page": 0, "bbox": adj_bbox,
+                "size": 12.0, "confidence": 0.9,
+            })
+            return set()          # no flagged pages → no retranslate path
+
+        logs: list[str] = []
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "简体中文",
+            "translated_pdf", str(out), render_qa=True,
+        )
+        worker.log.connect(logs.append)
+        with mock.patch.object(worker_module, "make_rendered_review_fn",
+                               return_value=_empty_render_review):
+            with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
+                with mock.patch.object(pdfio, "review_rendered_pages",
+                                       side_effect=fake_review_rendered_pages):
+                    with mock.patch.object(worker_module, "TranslationEngine", stub):
+                        events = self._run(worker)
+        # The adjustment was applied (block.font target raised, clamped) and the
+        # run re-exported the PDF instead of failing.
+        self.assertEqual(12.0, block.size)
+        self.assertIn("finished", events)
+        self.assertIn("stopped", events)
+        self.assertTrue(any("质检修正" in m for m in logs), logs)
+
+    def test_worker_no_adjustments_skips_apply(self):
+        src = build_sample_pdf(self.tmp / "adj2.pdf", pages=1)
+        out = self.tmp / "out2.pdf"
+        block = pdfio.Block(text="Body text.", page=0, x0=60, y0=60,
+                            x1=200, y1=80, size=9.0, single_line=True)
+        doc, stub = self._fixture(block)
+
+        with mock.patch.object(worker_module, "make_rendered_review_fn",
+                               return_value=_empty_render_review):
+            with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
+                with mock.patch.object(pdfio, "review_rendered_pages",
+                                       side_effect=lambda *_a, **_k: set()):
+                    with mock.patch.object(pdfio, "apply_render_adjustments",
+                                           wraps=pdfio.apply_render_adjustments) as apply_mock:
+                        with mock.patch.object(worker_module, "TranslationEngine", stub):
+                            worker = TranslateWorker(
+                                str(src), self._model("http://127.0.0.1:9/v1"), "简体中文",
+                                "translated_pdf", str(out), render_qa=True,
+                            )
+                            events = self._run(worker)
+        # No adjustments collected → the executor is never called.
+        apply_mock.assert_not_called()
+        self.assertEqual(9.0, block.size)
+        self.assertIn("finished", events)
 
 
 if __name__ == "__main__":

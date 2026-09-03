@@ -1509,6 +1509,121 @@ class WholePageReviewIntegrationTest(_OcrCacheIsolated):
         self.assertIn("党群", texts)
 
 
+class NumberFixTest(unittest.TestCase):
+    """``_apply_number_fixes`` applies only provable verify_number corrections."""
+
+    def _block(self, text):
+        return pdfio.Block(text=text, page=0, x0=0, y0=0, x1=100, y1=20, size=10)
+
+    def test_applies_difference_correction(self):
+        blocks = [self._block("3,702.726,474.45"), self._block("5,000.00")]
+        decisions = [
+            {"index": 0, "value": "3,702.726,474.45", "is_correct": False,
+             "corrected": "3,702,726,474.45"},
+            {"index": 1, "value": "5,000.00", "is_correct": True, "corrected": "5,000.00"},
+        ]
+        fixed = pdfio._apply_number_fixes(blocks, decisions)
+        self.assertEqual(1, fixed)
+        self.assertEqual("3,702,726,474.45", blocks[0].text)
+        self.assertEqual("5,000.00", blocks[1].text)
+
+    def test_ignores_correct_and_empty_and_bad_index(self):
+        blocks = [self._block("92.5%")]
+        decisions = [
+            {"index": 0, "value": "92.5%", "is_correct": True},            # correct
+            {"index": 0, "value": "92.5%", "is_correct": False,
+             "corrected": "   "},                                          # empty corrected
+            {"index": 5, "value": "92.5%", "is_correct": False,
+             "corrected": "93.5%"},                                        # out of range
+            {"index": "x", "value": "92.5%", "is_correct": False,
+             "corrected": "93.5%"},                                        # bad index
+            "not a dict",                                                  # malformed
+        ]
+        fixed = pdfio._apply_number_fixes(blocks, decisions)
+        self.assertEqual(0, fixed)
+        self.assertEqual("92.5%", blocks[0].text)
+
+    def test_only_replaces_when_differing(self):
+        blocks = [self._block("3,702,726,474.45")]
+        decisions = [{"index": 0, "is_correct": False, "corrected": "3,702,726,474.45"}]
+        fixed = pdfio._apply_number_fixes(blocks, decisions)
+        self.assertEqual(0, fixed)
+
+
+class VerifyNumberIntegrationTest(_OcrCacheIsolated):
+    """``extract_document_text`` collects figure cells and applies verify fixes."""
+
+    def test_extract_verifies_and_corrects_figures(self):
+        src = _OUT / "verify_scan.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=300)
+        page.draw_rect(fitz.Rect(40, 40, 555, 200), color=None, fill=(0.9, 0.9, 0.9))
+        doc.save(str(src))
+        doc.close()
+
+        def quad(x0, y0, x1, y1):
+            return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+        def ocr_fn(_i, _p):
+            # One column → deterministic (top-to-bottom) index order.
+            return [
+                (quad(60, 60, 130, 80), "3,702.726,474.45"),
+                (quad(60, 100, 130, 120), "5,000.00"),
+                (quad(60, 140, 130, 160), "92.5%"),
+                (quad(60, 180, 130, 200), "营业收入"),   # label, not a figure
+            ]
+
+        seen = {}
+
+        def verify(_i, _png, figures):
+            seen["figures"] = figures
+            seen["png"] = _png is not None and len(_png) > 0
+            # Values arrive already OCR-normalized; correct one dollar figure.
+            return [
+                {"index": 1, "value": "5,000.00", "is_correct": False,
+                 "corrected": "5,000,000.00"},
+            ]
+
+        dt = pdfio.extract_document_text(
+            src, ocr=True, ocr_fn=ocr_fn, verify_fn=verify, log=lambda _m: None
+        )
+        texts = [b.text for b in dt.pages[0]]
+        # Only numeric figures are sent for verification (label excluded); the
+        # misread is normalized even before the verify pass, so value is clean.
+        self.assertEqual(
+            [{"index": 0, "value": "3,702,726,474.45"},
+             {"index": 1, "value": "5,000.00"},
+             {"index": 2, "value": "92.5%"}],
+            seen["figures"],
+        )
+        self.assertTrue(seen["png"])
+        # The correction was applied; the label was never a figure.
+        self.assertIn("5,000,000.00", texts)
+        self.assertNotIn("5,000.00", texts)
+        self.assertIn("营业收入", texts)
+
+    def test_extract_no_verify_fn_is_noop(self):
+        """A ``None``/absent verifier must never touch the OCR result."""
+        src = _OUT / "verify_none.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=300)
+        page.draw_rect(fitz.Rect(40, 40, 555, 200), color=None, fill=(0.9, 0.9, 0.9))
+        doc.save(str(src))
+        doc.close()
+
+        def quad(x0, y0, x1, y1):
+            return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+        def ocr_fn(_i, _p):
+            return [(quad(60, 60, 130, 80), "3,702.726,474.45")]
+
+        dt = pdfio.extract_document_text(
+            src, ocr=True, ocr_fn=ocr_fn, verify_fn=None, log=lambda _m: None
+        )
+        # With no verifier the (already-normalized) OCR value is kept as-is.
+        self.assertEqual("3,702,726,474.45", dt.pages[0][0].text)
+
+
 class RenderedQaTest(unittest.TestCase):
     """The report-only rendered-output QA (``review_rendered_pages``)."""
 
@@ -1578,6 +1693,143 @@ class RenderedQaTest(unittest.TestCase):
             logs.append,
         )
         self.assertNotIn(0, flagged3)
+
+    def test_draw_ai_table_honours_explicit_merges(self):
+        # The tool-provided merges drive a two-level header: the date spans the
+        # Consolidated / Parent Company sub-columns (internal rule omitted).
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        font = fitz.Font("cjk")
+        rows = [["Item", "December 31, 2025", "", "December 31, 2024", ""],
+                ["", "", "Consolidated", "", "Parent Company"],
+                ["Total assets", "1,234", "2,345", "3,456", "4,567"]]
+        rect = fitz.Rect(36, 36, 559, 806)
+        pdfio._draw_ai_table(page, rows, rect, font, merges=[
+            {"r": 0, "c": 1, "rowspan": 1, "colspan": 2},
+            {"r": 0, "c": 3, "rowspan": 1, "colspan": 2},
+        ])
+        text = page.get_text("text").replace("\n", " ")
+        doc.close()
+        self.assertIn("December 31", text)
+        self.assertIn("Consolidated", text)
+        self.assertIn("Parent Company", text)
+        self.assertIn("Total assets", text)
+
+
+class RenderAdjustmentTest(unittest.TestCase):
+    """``apply_render_adjustments`` bounds the structured QA fixes."""
+
+    def _fixture(self):
+        b0 = pdfio.Block(text="alpha", page=0, x0=60, y0=60, x1=160, y1=80, size=9.0)
+        b1 = pdfio.Block(text="beta", page=0, x0=60, y0=100, x1=160, y1=120, size=9.0)
+        doc = pdfio.DocumentText(
+            pages=[[b0, b1]], blocks=["alpha", "beta"], block_pages=[0, 0]
+        )
+        return doc, b0, b1
+
+    def _px(self, bbox):
+        # Turn a PDF-point bbox into the rendered-image-pixel space the QA uses.
+        z = pdfio._REVIEW_DPI / 72.0
+        return [b * z for b in bbox]
+
+    def test_applies_text_replacement_to_matched_block(self):
+        doc, b0, b1 = self._fixture()
+        translated = ["TR-alpha", "TR-beta"]
+        adj = [{"kind": "text", "page": 0, "bbox": self._px([60, 100, 160, 120]),
+                "text": "TR-beta (fixed)", "confidence": 0.9}]
+        logs: list[str] = []
+        applied = pdfio.apply_render_adjustments(doc, translated, adj, set(), logs.append)
+        self.assertEqual(1, applied)
+        self.assertEqual("TR-beta (fixed)", translated[1])
+        self.assertEqual("TR-alpha", translated[0])
+        self.assertTrue(any("译文已替换" in m for m in logs), logs)
+
+    def test_text_skips_kept_empty_and_same(self):
+        doc, b0, b1 = self._fixture()
+        translated = ["TR-alpha", "TR-beta"]
+        adj = [
+            {"kind": "text", "page": 0, "bbox": self._px([60, 100, 160, 120]),
+             "text": "kept", "confidence": 0.9},     # b1 is in keep_original
+            {"kind": "text", "page": 0, "bbox": self._px([60, 60, 160, 80]),
+             "text": "   ", "confidence": 0.9},        # empty replacement
+            {"kind": "text", "page": 0, "bbox": self._px([60, 60, 160, 80]),
+             "text": "TR-alpha", "confidence": 0.9},   # identical
+        ]
+        applied = pdfio.apply_render_adjustments(doc, translated, adj, {1}, None)
+        self.assertEqual(0, applied)
+        self.assertEqual(["TR-alpha", "TR-beta"], translated)
+
+    def test_applies_font_size_clamped_to_readable_range(self):
+        doc, b0, b1 = self._fixture()
+        translated = ["TR-alpha", "TR-beta"]
+        applied = pdfio.apply_render_adjustments(doc, translated, [
+            {"kind": "font_size", "page": 0, "bbox": self._px([60, 60, 160, 80]), "size": 100.0},
+            {"kind": "font_size", "page": 0, "bbox": self._px([60, 100, 160, 120]), "size": 1.0},
+        ], set(), None)
+        self.assertEqual(2, applied)
+        self.assertEqual(pdfio._MAX_FONT, b0.size)          # 100 clamped to the cap
+        self.assertEqual(pdfio._MIN_TABLE_READABLE, b1.size)  # 1 clamped to the floor
+
+    def test_ignores_bad_kind_low_confidence_bad_bbox_and_page(self):
+        doc, b0, b1 = self._fixture()
+        translated = ["TR-alpha", "TR-beta"]
+        adj = [
+            {"kind": "structure", "page": 0, "bbox": self._px([60, 60, 160, 80]), "confidence": 1.0},
+            {"kind": "text", "page": 0, "bbox": self._px([60, 60, 160, 80]), "text": "x", "confidence": 0.3},
+            {"kind": "text", "page": 0, "bbox": [1, 2, 3], "text": "x", "confidence": 1.0},
+            {"kind": "text", "page": 99, "bbox": self._px([60, 60, 160, 80]), "text": "x", "confidence": 1.0},
+            "not a dict",
+        ]
+        applied = pdfio.apply_render_adjustments(doc, translated, adj, set(), None)
+        self.assertEqual(0, applied)
+        self.assertEqual(["TR-alpha", "TR-beta"], translated)
+
+    def test_matches_nearest_block_by_bbox(self):
+        doc, b0, b1 = self._fixture()
+        translated = ["TR-alpha", "TR-beta"]
+        # A tight box around b1's centre (offset a little) still lands on b1.
+        applied = pdfio.apply_render_adjustments(doc, translated, [
+            {"kind": "text", "page": 0, "bbox": self._px([95, 105, 125, 115]),
+             "text": "made it", "confidence": 0.9},
+        ], set(), None)
+        self.assertEqual(1, applied)
+        self.assertEqual("made it", translated[1])
+
+
+class RenderQaAdjustmentsIntegrationTest(_OcrCacheIsolated):
+    """``review_rendered_pages`` surfaces the QA's structured adjustments."""
+
+    def test_review_collects_page_tagged_adjustments(self):
+        src = _OUT / "adj_src.pdf"
+        build_sample_pdf(src, pages=1)
+        out = _OUT / "adj_out.pdf"
+        doc = fitz.open()
+        doc.insert_pdf(fitz.open(str(src)))
+        doc.save(str(out))
+        doc.close()
+
+        def review(_i, _o, _r):
+            return {
+                "issues": [{"kind": "字过小", "message": "字号可读性差", "confidence": 0.9}],
+                "adjustments": [
+                    {"kind": "font_size", "bbox": [10, 10, 20, 20], "size": 8.0, "confidence": 0.9},
+                    {"kind": "structure", "bbox": [1, 2, 3, 4], "confidence": 0.9},   # dropped
+                    {"kind": "font_size", "bbox": [1, 2, 3], "confidence": 0.9},       # dropped
+                ],
+            }
+
+        collected: list = []
+        logs: list[str] = []
+        flagged = pdfio.review_rendered_pages(
+            src, out, review, logs.append, adjustments=collected
+        )
+        # The correctable kind (字过小) flags the page; valid adjustments are
+        # collected and tagged with the page index.
+        self.assertIn(0, flagged)
+        self.assertEqual(1, len(collected))
+        self.assertEqual("font_size", collected[0]["kind"])
+        self.assertEqual(0, collected[0]["page"])
+        self.assertEqual([8.0], [c["size"] for c in collected])
 
 
 class ClassifyKeepBlocksTest(unittest.TestCase):
