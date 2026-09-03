@@ -52,6 +52,20 @@ _WORD_HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: A Chinese ordinal enumeration heading on its own line: ``一、`` ``二、`` ``（四）`` ``十二、``.
+#: These are translated to ``1.`` ``2.`` ``(4)`` ``12.`` for a Latin target, so they
+#: must be recognised here (the source carries no digit for them) or the section
+#: sequences would be thought to differ.
+_CN_ORD_HEADING_RE = re.compile(
+    r"^\s*(?:[（(]\s*([一二三四五六七八九十]{1,3})\s*[)）]|([一二三四五六七八九十]{1,3})\s*[、．])"
+)
+
+#: A parenthesised ordinal / note marker at the start of a line: ``(4)`` / ``（4）``.
+#: For a Latin target the model renders （四） as (4), so the translation side must
+#: recognise this form too or its headings would look absent next to the source's
+#: recognised （四） → 4.
+_PAREN_HEADING_RE = re.compile(r"^\s*[（(]\s*([0-9]{1,4})\s*[)）]\s*\S")
+
 _CN_NUMERALS = "零一二三四五六七八九"
 
 
@@ -79,11 +93,48 @@ def _cn_to_int(text: str) -> int | None:
     return total + current
 
 
-def _page_numbers(text: str) -> Counter[str]:
-    """All numeric tokens of a page, as canonical number strings.
+#: Chinese ordinal markers that the model renders as Arabic digits for a
+#: Latin-script target: ``一、二、…十、`` and ``（一）（二）…（十）`` plus ``第X节/章/条/篇``.
+#: The digit comparator normalizes these in BOTH texts so converting them
+#: (``一、``→``1.``, ``（四）``→``(4)``, ``第X节``→``Section X``) is not mistaken for a
+#: figure the source lacks — those are section numbers, not amounts.
+_CN_ORD_PATTERN = re.compile(
+    r"第\s*([一二三四五六七八九十]{1,3})\s*[章节条篇]"
+    r"|([一二三四五六七八九十]{1,3})\s*[、．]"
+    r"|[（(]\s*([一二三四五六七八九十]{1,3})\s*[)）]"
+)
 
-    Each token keeps its digits *and* the role of each separator
-    (``,`` -> C, ``.`` -> D): ``3,702,726,474.45`` becomes
+
+def _normalize_cjk_ordinals(text: str) -> str:
+    """Turn Chinese ordinal markers into their Arabic digit value.
+
+    Only applies to enumeration markers (a numeral followed by ``、``/``．``,
+    inside ``()``/``（）``, or after ``第``).  An unrecognisable numeral (containing
+    ``百``/``千``) or one outside the ordinal range is left untouched, so prose
+    amounts in words are never rewritten.
+    """
+
+    def repl(m: re.Match[str]) -> str:
+        for i in (1, 2, 3):
+            num = m.group(i)
+            if num:
+                val = _cn_to_int(num)
+                if val is not None and 1 <= val <= 99:
+                    return str(val)
+                return m.group(0)
+        return m.group(0)
+
+    return _CN_ORD_PATTERN.sub(repl, text)
+
+
+def _page_numbers(text: str) -> Counter[str]:
+    """All *amount-shaped* number tokens of a page, as canonical strings.
+
+    A bare integer (``1``, ``2025``, ``22``) is usually a section/ordinal marker,
+    a year or a ``Tier 1`` term, not a figure that a misread separator could
+    corrupt — so only tokens carrying a thousands/decimal separator or a ``%``
+    are compared.  Each kept token keeps its digits *and* the role of each
+    separator (``,`` -> C, ``.`` -> D): ``3,702,726,474.45`` becomes
     ``3C702C726C474D45``, so a comma/dot swap like ``3,702.726,474.45``
     is caught even though the digit sequences are identical, and the
     leading zero is kept so a lost ``0.`` (a dropped decimal point)
@@ -91,6 +142,8 @@ def _page_numbers(text: str) -> Counter[str]:
     """
     out: Counter[str] = Counter()
     for tok in _NUM_TOKEN_RE.findall(text):
+        if not any(ch in ",.，．%" for ch in tok):
+            continue  # no amount structure — ordinal/year/"Tier 1", not a figure
         canonical: list[str] = []
         neg = False
         for ch in tok:
@@ -134,6 +187,18 @@ def _section_numbers(text: str) -> list[tuple[str, int]]:
         m = _WORD_HEADING_RE.match(line)
         if m:
             found.append((f"word {m.group(1)}", int(m.group(1))))
+            continue
+        m = _CN_ORD_HEADING_RE.match(line)
+        if m:
+            num = m.group(1) or m.group(2)
+            value = _cn_to_int(num)
+            if value is not None:
+                found.append((num, value))
+                continue
+        m = _PAREN_HEADING_RE.match(line)
+        if m:
+            found.append((m.group(1), int(m.group(1))))
+            continue
     return found
 
 
@@ -163,6 +228,64 @@ def _snippet(text: str, width: int = 60) -> str:
 
 def _has_cjk(text: str) -> bool:
     return any("一" <= c <= "鿿" for c in text)
+
+
+def _is_scan_like_text(text: str) -> bool:
+    """True when a page's text layer carries no real content.
+
+    A scanned statement often leaves only a page number (``22``) in the text
+    layer; that is still a scan, and its figures live in the raster image so the
+    digit check has nothing to stand on.  A page with any letter-like character
+    (Latin *or* CJK — ``str.isalpha`` covers both) is real content and stays.
+
+    A bare digit page is a scan only when it holds no *amount-shaped* number
+    (a thousands/decimal separator or ``%``): a sparse but genuine text page can
+    contain just a figure such as ``1,234.56``, which must still be checked.
+    """
+    if not text:
+        return True
+    if any(c.isalpha() for c in text):
+        return False
+    for tok in _NUM_TOKEN_RE.findall(text):
+        if any(ch in ",，.．%" for ch in tok):
+            return False  # an amount, not a page number → real content
+    return True
+
+
+#: A short structured statement / subject code (``会商银02表``, ``会企01表-1``): mostly
+#: CJK plus digits and separators.  These are deliberately not translated (codes
+#: are exact identifiers), so their CJK must not be counted as residual prose.
+_CODE_TOKEN_RE = re.compile(
+    r"^[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9\-－（）()、\s]{0,15}$"
+)
+#: A run of code-ish characters (CJK + digits + separators) used to locate
+#: candidate tokens inside a page's text.
+_CODE_CAND_RE = re.compile(r"[\u4e00-\u9fff0-9A-Za-z\-－（）()、]+")
+
+
+def _is_statement_code(text: str) -> bool:
+    """True when ``text`` is a kept statement / subject code, not prose.
+
+    Mirrors ``translate_app.pdfio._looks_like_code_token``: short (≤16), contains
+    a digit, and no more than four CJK chars — so a document title with a year
+    (``2025年年度报告``) or a long label is not mistaken for a code.
+    """
+    t = str(text).strip()
+    if not (1 <= len(t) <= 16) or not any(c.isdigit() for c in t):
+        return False
+    cjk = sum(1 for c in t if "\u4e00" <= c <= "\u9fff")
+    if cjk == 0 or cjk > 4:
+        return False
+    return bool(_CODE_TOKEN_RE.match(t))
+
+
+def _cjk_residual(text: str) -> list[str]:
+    """CJK chars in ``text`` that are not part of a kept statement code."""
+    excluded: set[int] = set()
+    for m in _CODE_CAND_RE.finditer(text):
+        if _is_statement_code(m.group(0).strip()):
+            excluded.update(range(m.start(), m.end()))
+    return [ch for i, ch in enumerate(text) if "一" <= ch <= "鿿" and i not in excluded]
 
 
 class Checker:
@@ -222,12 +345,13 @@ class Checker:
         where = f"第 {i + 1} 页"
         src_text = src_page.get_text("text") or ""
         tgt_text = tgt_page.get_text("text") or ""
-        if skip_scan and not src_text.strip():
-            return "mixed"  # 无文本层的扫描页：数字来自 OCR，不能作为基准
+        if skip_scan and _is_scan_like_text(src_text):
+            return "mixed"  # 扫描页（文本层仅页码/无内容）：数字来自 OCR，不能作为基准
 
-        # 1) 数字一致性：逐位比较数字序列。
-        src_nums = _page_numbers(src_text)
-        tgt_nums = _page_numbers(tgt_text)
+        # 1) 数字一致性：逐位比较数字序列。先归一化中文序数（一、→1.、 二、→2.、（四）→(4)、
+        #    第X节→Section X），否则这些预期转换会被当作“译文多出的数字”。
+        src_nums = _page_numbers(_normalize_cjk_ordinals(src_text))
+        tgt_nums = _page_numbers(_normalize_cjk_ordinals(tgt_text))
         only_src = src_nums - tgt_nums
         only_tgt = tgt_nums - src_nums
         if only_src or only_tgt:
@@ -244,9 +368,10 @@ class Checker:
                 f"{where}: 数字序列不一致：" + "；".join(diffs)
             )
 
-        # 2) 残留中文（仅西文目标）。
+        # 2) 残留中文（仅西文目标）。报表/科目号（会商银02表、会企01表-1）按规则保留
+        #    不翻译，对其 CJK 不报残留（它们是精确标识，不是漏译）。
         if not _has_cjk(self.lang):
-            residual = [ch for ch in tgt_text if "一" <= ch <= "鿿"]
+            residual = _cjk_residual(tgt_text)
             if residual:
                 self.cjk.append(
                     f"{where}: 残留 {len(residual)} 个中文字符"

@@ -12,7 +12,15 @@ from pathlib import Path
 
 import pymupdf as fitz
 
-from check_translation import _cn_to_int, _section_numbers, main, run_checks
+from check_translation import (
+    _cjk_residual,
+    _is_scan_like_text,
+    _normalize_cjk_ordinals,
+    _section_numbers,
+    _cn_to_int,
+    main,
+    run_checks,
+)
 
 
 def _pdf(path: Path, page_lines: list[list[str]]) -> Path:
@@ -133,6 +141,61 @@ class CheckerTest(unittest.TestCase):
         self.assertEqual(45, _cn_to_int("四十五"))
         self.assertIsNone(_cn_to_int("三百"))
         self.assertEqual(4, _section_numbers("第四章 结果")[0][1])
+
+    def test_sparse_text_scan_page_is_skipped(self):
+        # A scanned statement often leaves only a page number in the text layer
+        # (e.g. "22").  That is still a scan whose figures live in the image, so
+        # the page must be skipped rather than digit-compared against it.
+        src = _pdf(self.tmp / "src.pdf", [["22"]])
+        tgt = _pdf(self.tmp / "tgt.pdf", [["22", "97,923,282.04 NP 65,334,085.99"]])
+        checker = run_checks(src, tgt)
+        self.assertTrue(checker.numeric_ok(), checker.numeric)
+        self.assertTrue(checker.all_clear())
+
+    def test_chinese_ordinals_normalized_not_flagged_as_numbers(self):
+        # 一、二、 → 1. 2. and （四） → (4) are the expected rendering of section
+        # markers for a Latin target, not a new figure the source lacks.
+        src = _pdf(self.tmp / "src.pdf", [["一、主要会计数据", "总资产 1,234,567.89"]])
+        tgt = _pdf(self.tmp / "tgt.pdf", [["1. Key Accounting Data", "Total assets 1,234,567.89"]])
+        checker = run_checks(src, tgt, lang="English")
+        self.assertTrue(checker.numeric_ok(), checker.numeric)
+
+    def test_cn_ordinal_enum_recognized_as_section(self):
+        # A Chinese ordinal enumeration heading (一、 二、 （四）) must be picked up
+        # as a section marker so it aligns with the translated "1." / "2." / "(4)".
+        self.assertEqual(1, _section_numbers("一、主要会计数据")[0][1])
+        self.assertEqual(2, _section_numbers("二、补充财务数据")[0][1])
+        self.assertEqual(4, _section_numbers("（四）市场风险")[0][1])
+
+    def test_paren_headings_align_between_languages(self):
+        # （四）（五） → (4) (5): both the source's Chinese ordinal and the
+        # translation's parenthesised Arabic form must be seen as the same
+        # section markers, so no "numbering mismatch" / "style" warning fires.
+        src = _pdf(self.tmp / "src.pdf", [["（四）市场风险", "（五）流动性风险"]])
+        tgt = _pdf(self.tmp / "tgt.pdf", [["(4) Market risk", "(5) Liquidity risk"]])
+        checker = run_checks(src, tgt, lang="English")
+        self.assertEqual([], checker.numbering, checker.numbering)
+
+    def test_normalize_cjk_ordinals_handles_common_forms(self):
+        # The marker's punctuation is dropped; the digit is what the number
+        # comparator uses to match the translated "1." / "(4)" / "Section 2".
+        self.assertEqual("1主要", _normalize_cjk_ordinals("一、主要"))
+        self.assertEqual("4市场", _normalize_cjk_ordinals("（四）市场"))
+        self.assertEqual("2 数据", _normalize_cjk_ordinals("第二节 数据"))
+
+    def test_statement_codes_exempt_from_residual_cjk(self):
+        # Statement / subject codes (会商银02表, 会企01表-1) are deliberately kept
+        # verbatim; their CJK must not be reported as residual Chinese.
+        self.assertEqual([], _cjk_residual("Statement code 会商银01表-1 is kept."))
+        # Prose around the code is still counted.
+        residual = _cjk_residual("正文 中文 会商银02表 残留")
+        self.assertEqual("正文中文残留", "".join(residual))
+
+    def test_scan_like_text_detector(self):
+        self.assertTrue(_is_scan_like_text(""))
+        self.assertTrue(_is_scan_like_text("22"))
+        self.assertFalse(_is_scan_like_text("二、公司组织架构图"))
+        self.assertFalse(_is_scan_like_text("Total assets"))
 
 
 if __name__ == "__main__":

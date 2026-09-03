@@ -1048,6 +1048,23 @@ class VerticalLabelTest(unittest.TestCase):
         pdfio._flag_chart_nodes(plain)
         self.assertTrue(all(not b.is_chart for b in plain))
 
+    def test_compact_section_heading_is_not_a_chart_node(self):
+        # A compact ORDINAL-LEADING heading on a diagram page (二、公司组织架构图, a
+        # wide-flat box that matches the square-node *shape*) is a heading, not a
+        # diagram node: it must still be translated, not kept as a chart label.
+        anchor = [self._block(y0=50, y1=79.5)]
+        squares = [self._square(x0=200, y0=50), self._square(x0=260, y0=50)]
+        heading = pdfio.Block(
+            text="二、公司组织架构图", page=0, x0=90, y0=78, x1=201.5, y1=91.4,
+            size=12.0, align="left", single_line=True,
+        )
+        blocks = [heading] + anchor + squares
+        self.assertTrue(pdfio._is_org_chart_page(blocks))
+        self.assertFalse(pdfio._is_chart_node(heading))
+        pdfio._flag_chart_nodes(blocks)
+        self.assertFalse(heading.is_chart)
+        self.assertTrue(all(b.is_chart for b in anchor + squares))
+
 
 class ChartPageDetectionIntegrationTest(unittest.TestCase):
     """``extract_document_text`` flags org-chart / architecture node labels.

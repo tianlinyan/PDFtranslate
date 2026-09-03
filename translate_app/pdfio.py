@@ -2433,6 +2433,18 @@ _CHART_SQUARE_MAX_H = 50.0
 #: Node labels are short (a few characters); anything that long is prose.
 _CHART_NODE_MAX_CHARS = 12
 
+#: A block whose text begins with a section / enumeration marker (一、二、…、十、
+#: （一）（二）…、第X节/章/条) is a heading, not a diagram node.  Org-chart node
+#: labels are organisational units (董事会 / 委员会 / 分行 / 部门), never numbered
+#: sections — so on a chart page such a *compact* heading (e.g. 二、公司组织架构图,
+#: a wide-flat box that matches the square-node shape but must still translate)
+#: is excluded from the loose square-node match.
+_SECTION_START_RE = re.compile(
+    r"^\s*(?:[一二三四五六七八九十]{1,3}[、．]"
+    r"|[（(][一二三四五六七八九十]{1,3}[)）]"
+    r"|第[一二三四五六七八九十0-9]+[章节条篇节])"
+)
+
 
 def _is_narrow_tall_box(block: Block) -> bool:
     """True for a narrow-tall vertical-label box (a strong diagram signature).
@@ -2469,6 +2481,7 @@ def _is_chart_node(block: Block) -> bool:
     return (
         len(block.text.strip()) <= _CHART_NODE_MAX_CHARS
         and w <= _CHART_SQUARE_MAX_W and h <= _CHART_SQUARE_MAX_H
+        and not _SECTION_START_RE.match(block.text.strip())
     )
 
 
