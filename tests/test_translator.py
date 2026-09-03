@@ -802,6 +802,16 @@ class WholePageReviewTest(unittest.TestCase):
         self.assertEqual(translator._parse_review('{"not": "expected"}'),
                          {"text_fixes": [], "structure_flags": []})
 
+    def test_parse_review_passes_merge_action(self):
+        parsed = translator._parse_review(
+            '{"structure_flags": [{"action": "merge_cells", "cells": [[1,2,3,4],[5,6,7,8]],'
+            ' "confidence": 0.91, "message": "应合并"}]}'
+        )
+        flag = parsed["structure_flags"][0]
+        self.assertEqual(flag["action"], "merge_cells")
+        self.assertEqual(flag["cells"], [[1, 2, 3, 4], [5, 6, 7, 8]])
+        self.assertEqual(flag["confidence"], 0.91)
+
     def test_make_review_fn_gated_by_flag(self):
         self.assertIsNone(translator.make_review_fn(self._model()))
         self.assertIsInstance(

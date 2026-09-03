@@ -1136,6 +1136,84 @@ def _apply_review_fix(block: Block, text: str, page_index: int, log) -> bool:
     return False
 
 
+#: Minimum confidence a reviewer must give a ``merge_cells`` action before it is
+#: auto-applied; below this it is only surfaced as a hint.
+_MERGE_CONFIDENCE_MIN = 0.7
+
+#: Max gap (points) between two blocks for them to be considered adjacent.
+_MERGE_GAP = 6.0
+
+
+def _blocks_adjacent(a: Block, b: Block) -> bool:
+    """True when ``a`` and ``b`` are neighbouring (share a row or column and a
+    small gap) — a plausible "one cell was split into two" fix."""
+    # Horizontal candidate: same row (y ranges within a small gap) and adjacent
+    # or overlapping in x.
+    same_row = not (a.y1 < b.y0 - _MERGE_GAP or b.y1 < a.y0 - _MERGE_GAP)
+    if same_row and max(a.x0 - b.x1, b.x0 - a.x1) <= _MERGE_GAP:
+        return True
+    # Vertical candidate: same column and adjacent or overlapping in y.
+    same_col = not (a.x1 < b.x0 - _MERGE_GAP or b.x1 < a.x0 - _MERGE_GAP)
+    if same_col and max(a.y0 - b.y1, b.y0 - a.y1) <= _MERGE_GAP:
+        return True
+    return False
+
+
+def _merge_block(a: Block, b: Block) -> Block:
+    """Combine two adjacent blocks into one: bbox = union, text joined."""
+    text = _join_fragments(a.text, b.text)
+    base = a if a.text.strip() else b
+    return replace(
+        base,
+        text=text,
+        x0=round(min(a.x0, b.x0), 2), y0=round(min(a.y0, b.y0), 2),
+        x1=round(max(a.x1, b.x1), 2), y1=round(max(a.y1, b.y1), 2),
+    )
+
+
+def _merge_flagged_blocks(blocks: list[Block], flag: dict, page_index: int, log) -> bool:
+    """Auto-apply a reviewer ``merge_cells`` action, conservatively.
+
+    The geometry of the merged block comes from the union of the two OCR blocks
+    (the AI supplies only the *topology* — which two cells are one).  The merge
+    is rejected when it is not confident enough, when either block is a figure
+    (merging numbers would scramble two values), when the two are not adjacent,
+    or when either cannot be located.  On success the merged block replaces the
+    first and the second is dropped (order preserved); ``blocks`` is mutated.
+    """
+    cells = flag.get("cells")
+    if not isinstance(cells, (list, tuple)) or len(cells) != 2:
+        return False
+    try:
+        conf = float(flag.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if conf < _MERGE_CONFIDENCE_MIN:
+        return False
+    zoom = _REVIEW_DPI / 72.0
+    targets: list[Block | None] = []
+    for cell in cells:
+        if not isinstance(cell, (list, tuple)) or len(cell) != 4:
+            return False
+        bbox_pt = [float(v) / zoom for v in cell]
+        targets.append(_nearest_review_block(blocks, bbox_pt))
+    a, b = targets[0], targets[1]
+    if a is None or b is None or a is b:
+        return False
+    if _is_number_atom(a.text) or _is_number_atom(b.text):
+        return False
+    if not _blocks_adjacent(a, b):
+        return False
+    merged = _merge_block(a, b)
+    blocks[:] = [merged if blk is a else blk for blk in blocks if blk is not b]
+    if log:
+        log(
+            f"  第 {page_index + 1} 页：已自动合并两个拆分格"
+            f"「{a.text.strip()} + {b.text.strip()}」。"
+        )
+    return True
+
+
 def _apply_page_review(
     page, blocks: Sequence[Block], review_fn, page_index: int,
     log: Callable[[str], None] | None,
@@ -1143,8 +1221,12 @@ def _apply_page_review(
     """Send the original page + reconstruction to ``review_fn`` and refine.
 
     Only text is ever touched, and only conservatively (:func:`_apply_review_fix`).
-    Every layout / structure flag the reviewer returns is surfaced through ``log``
-    as a hint — geometry is never adjusted.  A reviewer error is a no-op.
+    A layout flag with ``action == "merge_cells"`` is *auto-applied* when it is
+    confident enough and passes the adjacency / non-figure validation
+    (:func:`_merge_flagged_blocks`); every other structure flag — and any merge
+    that fails the checks — is surfaced through ``log`` as a hint.  Geometry is
+    only ever recomputed from the OCR blocks, never from the AI's own
+    coordinates.  A reviewer error is a no-op.
     """
     if review_fn is None or not blocks:
         return list(blocks)
@@ -1174,11 +1256,21 @@ def _apply_page_review(
         target = _nearest_review_block(out, bbox_pt)
         if target is not None and _apply_review_fix(target, str(text), page_index, log):
             n_fixed += 1
+    n_merged = 0
     for flag in result.get("structure_flags") or []:
-        if isinstance(flag, dict) and flag.get("message") and log:
+        if not isinstance(flag, dict):
+            continue
+        if flag.get("action") == "merge_cells" and _merge_flagged_blocks(
+            out, flag, page_index, log
+        ):
+            n_merged += 1
+            continue
+        if flag.get("message") and log:
             log(f"  第 {page_index + 1} 页布局提示：{flag['message']}")
     if n_fixed and log:
         log(f"  第 {page_index + 1} 页整页审查：采纳 {n_fixed} 处文字修正。")
+    if n_merged and log:
+        log(f"  第 {page_index + 1} 页整页审查：自动合并 {n_merged} 处。")
     return out
 
 

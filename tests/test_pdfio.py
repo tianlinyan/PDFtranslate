@@ -1291,6 +1291,93 @@ class WholePageReviewTest(unittest.TestCase):
         self.assertEqual(out[0].text, "现金")
         self.assertTrue(any("整页审查失败" in m for m in logs), logs)
 
+    def test_merges_adjacent_split_label(self):
+        page = self._page()
+        blocks = [self._block("党", 40, 50, 90, 66),
+                  self._block("群", 94, 50, 144, 66)]  # adjacent fragments
+        z = pdfio._REVIEW_DPI / 72.0
+        logs: list[str] = []
+
+        def review(_i, _o, _r):
+            return {"structure_flags": [{
+                "action": "merge_cells",
+                "cells": [[40 * z, 50 * z, 90 * z, 66 * z],
+                          [94 * z, 50 * z, 144 * z, 66 * z]],
+                "confidence": 0.9, "message": "拆分的标签应合并",
+            }]}
+
+        out = pdfio._apply_page_review(page, blocks, review, 0, logs.append)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].text, "党群")                 # CJK joins w/o space
+        self.assertEqual((out[0].x0, out[0].x1), (40.0, 144.0))  # bbox = union
+        self.assertTrue(any("自动合并" in m for m in logs), logs)
+
+    def test_merge_rejected_when_block_is_figure(self):
+        page = self._page()
+        blocks = [self._block("现金", 40, 50, 90, 66),
+                  self._block("5,000.00", 94, 50, 144, 66)]
+        z = pdfio._REVIEW_DPI / 72.0
+        logs: list[str] = []
+
+        def review(_i, _o, _r):
+            return {"structure_flags": [{
+                "action": "merge_cells",
+                "cells": [[40 * z, 50 * z, 90 * z, 66 * z],
+                          [94 * z, 50 * z, 144 * z, 66 * z]],
+                "confidence": 0.95, "message": "标签与数字不应合并",
+            }]}
+
+        out = pdfio._apply_page_review(page, blocks, review, 0, logs.append)
+        self.assertEqual(len(out), 2)                          # not merged
+        self.assertTrue(any("布局提示" in m for m in logs), logs)  # prompted
+
+    def test_merge_rejected_low_confidence(self):
+        page = self._page()
+        blocks = [self._block("党", 40, 50, 90, 66), self._block("群", 94, 50, 144, 66)]
+        z = pdfio._REVIEW_DPI / 72.0
+        logs: list[str] = []
+
+        def review(_i, _o, _r):
+            return {"structure_flags": [{
+                "action": "merge_cells",
+                "cells": [[40 * z, 50 * z, 90 * z, 66 * z],
+                          [94 * z, 50 * z, 144 * z, 66 * z]],
+                "confidence": 0.5,
+            }]}
+
+        out = pdfio._apply_page_review(page, blocks, review, 0, logs.append)
+        self.assertEqual(len(out), 2)
+
+    def test_merge_rejected_not_adjacent(self):
+        page = self._page()
+        blocks = [self._block("党", 40, 50, 90, 66), self._block("群", 300, 50, 350, 66)]
+        z = pdfio._REVIEW_DPI / 72.0
+        logs: list[str] = []
+
+        def review(_i, _o, _r):
+            return {"structure_flags": [{
+                "action": "merge_cells",
+                "cells": [[40 * z, 50 * z, 90 * z, 66 * z],
+                          [300 * z, 50 * z, 350 * z, 66 * z]],
+                "confidence": 0.9,
+            }]}
+
+        out = pdfio._apply_page_review(page, blocks, review, 0, logs.append)
+        self.assertEqual(len(out), 2)
+
+    def test_non_action_structure_flag_hints_only(self):
+        page = self._page()
+        blocks = [self._block("党", 40, 50, 90, 66), self._block("群", 94, 50, 144, 66)]
+        z = pdfio._REVIEW_DPI / 72.0
+        logs: list[str] = []
+
+        def review(_i, _o, _r):
+            return {"structure_flags": [{"message": "列对齐略有偏差"}]}
+
+        out = pdfio._apply_page_review(page, blocks, review, 0, logs.append)
+        self.assertEqual(len(out), 2)
+        self.assertTrue(any("布局提示" in m for m in logs), logs)
+
 
 class WholePageReviewIntegrationTest(_OcrCacheIsolated):
     """``extract_document_text`` runs the review on a rebuilt OCR page."""
@@ -1323,6 +1410,40 @@ class WholePageReviewIntegrationTest(_OcrCacheIsolated):
         texts = [b.text for b in dt.pages[0]]
         self.assertIn("12,345,600", texts)
         self.assertNotIn("12,34,56", texts)
+
+    def test_extract_merges_split_label(self):
+        src = _OUT / "review_merge.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=300)
+        page.draw_rect(fitz.Rect(40, 40, 555, 200), color=None, fill=(0.9, 0.9, 0.9))
+        doc.save(str(src))
+        doc.close()
+
+        def quad(x0, y0, x1, y1):
+            return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+        def ocr_fn(_i, _p):
+            return [
+                (quad(60, 60, 110, 80), "党"),     # split label fragments
+                (quad(114, 60, 164, 80), "群"),
+                (quad(60, 100, 130, 120), "5,000.00"),
+            ]
+
+        def review(_i, _o, _r):
+            z = pdfio._REVIEW_DPI / 72.0
+            return {"structure_flags": [{
+                "action": "merge_cells",
+                "cells": [[60 * z, 60 * z, 110 * z, 80 * z],
+                          [114 * z, 60 * z, 164 * z, 80 * z]],
+                "confidence": 0.92,
+            }]}
+
+        dt = pdfio.extract_document_text(
+            src, ocr=True, ocr_fn=ocr_fn, review_fn=review, log=lambda _m: None
+        )
+        texts = [b.text for b in dt.pages[0]]
+        self.assertEqual(len(dt.pages[0]), 2)   # two fragments merged, cell kept
+        self.assertIn("党群", texts)
 
 
 if __name__ == "__main__":

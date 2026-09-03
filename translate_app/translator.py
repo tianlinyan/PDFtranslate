@@ -828,19 +828,25 @@ def _write_cache(path: Path, cache: dict[str, str]) -> str | None:
 
 #: Prompt for the whole-page review.  The model sees the original scan and the
 #: OCR reconstruction side by side; it reports text it got wrong (with the box)
-#: and layout/structure problems.  It never proposes geometry changes we apply.
+#: and layout/structure problems.  A "split one cell into two" is reported as a
+#: machine-readable ``merge_cells`` action that the caller may auto-apply.
 _REVIEW_PROMPT = (
     "这是同一页的两张图。第一张是原图/扫描件，第二张是 OCR 识别后重建的图"
     "（每个框为识别到的文本块，蓝框为格子）。请对比两张图，找出 OCR 重建中的问题，"
     "只输出一个 JSON 对象：\n"
     "{\n"
     "  \"text_fixes\": [{\"bbox\": [x0, y0, x1, y1], \"text\": \"正确的文字/数字\"}],\n"
-    "  \"structure_flags\": [{\"message\": \"布局/结构问题描述\"}]\n"
+    "  \"structure_flags\": [\n"
+    "    {\"action\": \"merge_cells\", \"cells\": [[x0,y0,x1,y1],[x0,y0,x1,y1]], \"confidence\": 0.9,"
+    " \"message\": \"一句话说明\"},\n"
+    "    {\"message\": \"只提示不处理的问题描述\"}\n"
+    "  ]\n"
     "}\n"
     "规则：bbox 用**图片像素坐标**（x 范围为 0..图片宽，y 范围为 0..图片高）；"
-    "text_fixes 只列 OCR 读错或漏读的文字/数字（若读对了就不要列）；"
-    "structure_flags 用一句话说明格子错位/该合并被拆/缺格等结构问题。"
-    "没有则用空数组。不要输出除此 JSON 之外的文字。"
+    "text_fixes 只列 OCR 读错或漏读的文字/数字（若读对了就不要列）。"
+    "structure_flags：若某格/单元格被错误拆成两格、本应是一格，用 action=merge_cells"
+    " 给出两格的 bbox、置信度(0~1)和一句话说明；其它布局问题只用 message 一句话说明"
+    "（不要给 action）。没有则用空数组。不要输出除此 JSON 之外的文字。"
 )
 
 
