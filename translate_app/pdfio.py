@@ -1109,6 +1109,136 @@ def _render_reconstruction(blocks: Sequence[Block], width: float, height: float,
     return out
 
 
+#: Hard cap on the number of pages the rendered-output QA reviews, so a
+#: pathological document cannot trigger an unbounded run of extra model calls.
+_RENDER_QA_MAX_PAGES = 60
+
+
+def review_rendered_pages(
+    src_path: str | Path,
+    out_path: str | Path,
+    review_fn: Callable[[int, bytes, bytes], dict] | None,
+    log: Callable[[str], None] | None = None,
+    page_limit: int = _RENDER_QA_MAX_PAGES,
+) -> None:
+    """Run a report-only rendered-output QA on the exported PDF.
+
+    Each output page is rendered and compared with the corresponding source page
+    by ``review_fn`` (created for a vision-capable model — see
+    ``translator.make_rendered_review_fn``); the issues it returns are surfaced
+    through ``log``.  This never modifies the export and never aborts — any
+    reviewer error is a no-op, so the export always succeeds regardless.
+    """
+    if review_fn is None:
+        return
+    src = fitz.open(str(src_path))
+    try:
+        out = fitz.open(str(out_path))
+        try:
+            n = min(src.page_count, out.page_count, page_limit)
+            for i in range(n):
+                try:
+                    original = _render_page_png(src[i])
+                    rendered = _render_page_png(out[i])
+                    result = review_fn(i, original, rendered)
+                except Exception:  # noqa: BLE001 — fail-closed, never abort
+                    continue
+                _report_render_issues(i, result, log)
+        finally:
+            out.close()
+    finally:
+        src.close()
+
+
+def _report_render_issues(page_index: int, result, log) -> None:
+    """Surface one page's report-only render-QA issues (no-ops if none / malformed)."""
+    if not log or not isinstance(result, dict):
+        return
+    issues = result.get("issues")
+    if not isinstance(issues, list):
+        return
+    shown = 0
+    for it in issues:
+        if not isinstance(it, dict):
+            continue
+        msg = str(it.get("message", "")).strip()
+        if not msg:
+            continue
+        kind = str(it.get("kind", "问题")).strip() or "问题"
+        log(f"  [渲染校验] 第 {page_index + 1} 页 {kind}: {msg}")
+        shown += 1
+    if shown:
+        log(f"  [渲染校验] 第 {page_index + 1} 页共 {shown} 处待确认。")
+
+
+#: Block-classifier ``kind`` values that mean "this should be translated", so a
+#: rule-kept (chart-node) block may be released from the keep set.
+_CLASSIFY_TRANSLATE_KINDS = frozenset(("translate_heading", "translate_prose"))
+
+
+def classify_keep_blocks(
+    src_path: str | Path,
+    pages: Sequence[Sequence[Block]],
+    classify_fn: Callable[[int, bytes, Sequence[tuple]], dict] | None,
+    keep_original: set[int],
+    log: Callable[[str], None] | None = None,
+    conf_min: float = 0.75,
+) -> set[int]:
+    """Ask the model to confirm each rule-kept chart node is really kept.
+
+    The rule-based ``is_chart`` detection can misjudge a compact heading (e.g.
+    ``二、公司组织架构图``, a wide-flat box) as a diagram node and keep it
+    untranslated.  A vision-capable model that sees the source page can flag such
+    a block as translatable content.  This pass **only releases** — it never adds
+    a block to the keep set, and only when the model is confident enough.  It
+    returns the flat indices to remove from ``keep_original``; any classifier
+    error is a no-op (the rule's decision stays).
+    """
+    if classify_fn is None or not keep_original:
+        return set()
+    src = fitz.open(str(src_path))
+    released: set[int] = set()
+    try:
+        flat = 0
+        for page_index, page_blocks in enumerate(pages):
+            n_page = len(page_blocks)
+            candidates = [
+                (flat + i, (b.x0, b.y0, b.x1, b.y1), b.text)
+                for i, b in enumerate(page_blocks)
+                if (flat + i) in keep_original and getattr(b, "is_chart", False)
+            ]
+            if candidates and page_index < src.page_count:
+                try:
+                    original = _render_page_png(src[page_index])
+                    result = classify_fn(page_index, original, candidates)
+                except Exception:  # noqa: BLE001 — fail-closed, never abort
+                    flat += n_page
+                    continue
+                by_idx = {
+                    c["index"]: c for c in result.get("classifications", [])
+                    if isinstance(c, dict)
+                }
+                for idx, _bbox, text in candidates:
+                    c = by_idx.get(idx)
+                    if not c or str(c.get("kind", "")) not in _CLASSIFY_TRANSLATE_KINDS:
+                        continue
+                    try:
+                        conf = float(c.get("confidence", 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    if conf >= conf_min:
+                        released.add(idx)
+                        if log:
+                            log(
+                                f"  [保留复核] 第 {page_index + 1} 页块「{str(text)[:16]}」"
+                                f"判定为应翻译（{c.get('kind')} @{conf:.2f}），已从保留集合释放。"
+                            )
+            flat += n_page
+    finally:
+        src.close()
+    return released
+
+
 def _nearest_review_block(blocks: Sequence[Block], bbox) -> Block | None:
     """The block whose centre falls inside ``bbox`` (nearest, if several overlap)."""
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
@@ -2593,7 +2723,12 @@ def _draw_translated_block(page: fitz.Page, font, block: Block, text: str) -> No
         return ascent + (len(lines) - 1) * fs * leading + descent
 
     y = r.y0 + ascent
-    if block.single_line:
+    # Multi-line text in a table cell hugs the cell's top rule instead of being
+    # vertically centred: a centred wrap can push the last line down toward the
+    # cell's lower boundary (and, for a scanned *row band*, out of the band),
+    # while top-anchoring keeps the block inside and leans on the empty space
+    # below.  A single-line cell stays centred as before.
+    if block.single_line and not (block.in_table and len(lines) > 1):
         y = r.y0 + max(0.0, (r.height - height()) / 2) + ascent
     # Every block renders with the same CJK font.  Bold is intentionally NOT
     # simulated: the bundled font has no bold face, and mixing a second font
@@ -2983,12 +3118,215 @@ def _compute_table_layout(tables, mapping, blocks, trans, font):
     return shifts, new_bottoms, grid, bboxes
 
 
+def _has_ocr_grid(blocks: Sequence[Block]) -> bool:
+    """True when ``blocks`` contain a reconstructed OCR table grid."""
+    return bool(_reconstruct_ocr_tables(blocks))
+
+
+def _draw_ocr_grid_page(
+    page: "fitz.Page",
+    blocks: Sequence[Block],
+    trans: Sequence[str],
+    font,
+) -> None:
+    """Regenerate a scanned table page as a clean table.
+
+    ``page`` is already a *blank* page of the source's size.  The OCR blocks are
+    clustered into rows / columns; each row is then expanded to fit its longest
+    translated cell (the OCR row height fits the short Chinese source, but the
+    English translation is usually longer), the grid rules are drawn at the
+    expanded boundaries, then each cell's translation on top.  Nothing from the
+    original raster — the scan background, stamps, photos or handwriting
+    (signatures are dropped earlier in extraction) — is copied.
+    """
+    ocr = [(b, t) for b, t in zip(blocks, trans)
+           if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)]
+    if len(ocr) < 4:
+        return
+    # items carry a trailing index so a row/column cluster can be mapped back to
+    # its block (the clustering helpers only read the first five fields).
+    items = [(b.y0, b.x0, b.x1, b.y1, b.text, i) for i, (b, _t) in enumerate(ocr)]
+    rows = _cluster_ocr_rows(items)
+    cols = _cluster_ocr_columns(items)
+    if len(rows) < 2 or len(cols) < 2:
+        return
+    rows_sorted = sorted(rows, key=lambda r: min(it[0] for it in r))
+    cols_sorted = sorted(cols, key=lambda c: min(it[1] for it in c))
+
+    # Expand each row to fit its longest translated cell, then lay the rows out
+    # top-to-bottom (a taller row pushes the ones below it down).
+    row_tops: list[float] = []
+    row_bots: list[float] = []
+    cur = min(it[0] for it in rows_sorted[0])
+    for r in rows_sorted:
+        orig_h = max(it[3] for it in r) - min(it[0] for it in r)
+        need = orig_h
+        for it in r:
+            b, t = ocr[it[5]]
+            need = max(need, _measure_block_height(b, font, t))
+        row_tops.append(cur)
+        cur += max(orig_h, need)
+        row_bots.append(cur)
+
+    # Column boundaries: one line per gap between the (left-to-right) columns,
+    # plus the outer left / right edges.
+    xs = [round(min(it[1] for it in cols_sorted[0]), 0)]
+    for a, b_ in zip(cols_sorted, cols_sorted[1:]):
+        xs.append(round((max(it[2] for it in a) + min(it[1] for it in b_)) / 2, 0))
+    xs.append(round(max(it[2] for it in cols_sorted[-1]), 0))
+    xs = sorted(set(xs))
+    left, right = xs[0], xs[-1]
+    top, bot = row_tops[0], row_bots[-1]
+
+    # Draw the grid rules at the (expanded) row boundaries and the column gaps.
+    for y in set(round(v, 1) for v in row_tops + [bot]):
+        page.draw_line(fitz.Point(left, y), fitz.Point(right, y), color=(0, 0, 0), width=0.5)
+    for x in xs:
+        page.draw_line(fitz.Point(x, top), fitz.Point(x, bot), color=(0, 0, 0), width=0.5)
+
+    # Draw each cell's translation, top-anchored in its own expanded row band
+    # (the column gap keeps the label from spilling into the next column).
+    for b, t in ocr:
+        _draw_translated_block(page, font, b, t)
+
+
+#: Base font size for a rebuilt (AI) table cell, before the wrap shrinks it.
+_AI_TABLE_FONT = 7.0
+#: Left/right inset (pt) inside each rebuilt table cell, so the text sits clear
+#: of the grid rules instead of touching the column borders.
+_AI_TABLE_PAD = 4.0
+#: Minimum row height (pt) for a rebuilt table's empty / numeric rows.
+_AI_TABLE_MIN_ROW = 11.0
+#: Page margin (pt) used when drawing a rebuilt table.
+_AI_TABLE_MARGIN = 36.0
+
+
+def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font) -> None:
+    """Draw a clean, regular N x M table from a translated 2D grid.
+
+    ``rows`` is the rebuilt grid (one list per table row).  Columns are equal
+    width across ``rect``; each row's height is grown to fit its tallest cell's
+    wrapped translation.  This is the *AI-table* path: the model has already
+    counted the rows/columns and translated the cells, so there is no OCR-frame
+    fragmentation and no label-colliding with a neighbouring column.
+    """
+    n_rows = len(rows)
+    n_cols = max(len(r) for r in rows) if rows else 0
+    if n_rows < 1 or n_cols < 1:
+        return
+
+    # Content-based column widths: a column gets more width when its cells are
+    # wider (long labels), and stays narrow when they are short (figures, line
+    # numbers).  Each column's desired width is its widest cell rendered as one
+    # line, capped so no single column dominates, floored so a numeric column
+    # stays usable, then scaled to fill the table width.
+    base = rect.width / n_cols
+    weights = []
+    for j in range(n_cols):
+        w = 0.0
+        for r in rows:
+            cell = str(r[j]) if j < len(r) else ""
+            if cell.strip():
+                w = max(w, font.text_length(cell, fontsize=_AI_TABLE_FONT))
+        weights.append(max(base * 0.35, min(w, rect.width * 0.33)))
+    tot_w = sum(weights)
+    col_widths = [rect.width * w / tot_w for w in weights] if tot_w > 0 else [base] * n_cols
+
+    xs = [rect.x0 + sum(col_widths[:j]) for j in range(n_cols + 1)]
+
+    # Detect merged header cells (top rows only): a non-empty cell followed by
+    # consecutive empty cells on the same row is a spanning header (e.g. the
+    # "December 31, 2025" header spans the 合并/母公司 sub-columns).  The header
+    # text is centred across the span and the internal column rule is omitted for
+    # that row, so the rebuilt table keeps a proper two-level header.
+    merged: dict[int, dict[int, int]] = {}
+    for i, r in enumerate(rows[:2]):
+        spans: dict[int, int] = {}
+        j = 0
+        while j < n_cols:
+            if str(r[j]).strip():
+                k = j + 1
+                while k < n_cols and not str(r[k]).strip():
+                    k += 1
+                if k - j > 1:
+                    spans[j] = k - j
+                j = k
+            else:
+                j += 1
+        merged[i] = spans
+
+    def cell_block(j: int, top: float, h: float, text: str) -> Block:
+        w = col_widths[j]
+        return Block(
+            text="", page=0, x0=xs[j] + _AI_TABLE_PAD, y0=top,
+            x1=xs[j] + w - _AI_TABLE_PAD, y1=top + h,
+            size=_AI_TABLE_FONT, align="right" if _is_numeric_cell(text) else "left",
+            single_line=False, in_table=False,
+        )
+
+    def cell_height(cell: str, j: int) -> float:
+        if not str(cell).strip():
+            return 0.0
+        width = max(1.0, col_widths[j] - 2 * _AI_TABLE_PAD)
+        lines = _wrap(font, str(cell), width, _AI_TABLE_FONT)
+        return _wrapped_height(font, lines, _AI_TABLE_FONT, _LOOSE_LEADING)
+
+    # Row heights: grow each row to fit its tallest cell (keep a minimum).
+    row_hs = [max(_AI_TABLE_MIN_ROW, max((cell_height(c, j) for j, c in enumerate(r)), default=0.0))
+              for r in rows]
+    # If the table overflows the page, shrink the base font proportionally.
+    total = sum(row_hs)
+    if total > rect.height:
+        factor = rect.height / total
+        for i, h in enumerate(row_hs):
+            row_hs[i] = max(_AI_TABLE_MIN_ROW * 0.6, h * factor)
+
+    y = rect.y0
+    for i, r in enumerate(rows):
+        h = row_hs[i]
+        spans = merged.get(i, {})
+        for j, cell in enumerate(r):
+            text = str(cell)
+            if j in spans:
+                s = spans[j]
+                cb = Block(
+                    text="", page=0, x0=xs[j] + _AI_TABLE_PAD, y0=y,
+                    x1=xs[j + s] - _AI_TABLE_PAD, y1=y + h,
+                    size=_AI_TABLE_FONT, align="center", single_line=False, in_table=False,
+                )
+            else:
+                cb = cell_block(j, y, h, text)
+            _draw_translated_block(page, font, cb, text)
+        y += h
+    # Horizontal rules.
+    yy = rect.y0
+    for h in row_hs:
+        page.draw_line(fitz.Point(rect.x0, yy), fitz.Point(rect.x1, yy), color=(0, 0, 0), width=0.5)
+        yy += h
+    page.draw_line(fitz.Point(rect.x0, yy), fitz.Point(rect.x1, yy), color=(0, 0, 0), width=0.5)
+    # Vertical rules, drawn per row so a merged header's internal boundary is
+    # omitted for that row while the data rows below keep it.
+    yy = rect.y0
+    for i, h in enumerate(row_hs):
+        internal: set[int] = set()
+        for j, s in merged.get(i, {}).items():
+            internal.update(range(j + 1, j + s))
+        for k in range(n_cols + 1):
+            if k in internal:
+                continue
+            page.draw_line(fitz.Point(xs[k], yy), fitz.Point(xs[k], yy + h), color=(0, 0, 0), width=0.5)
+        yy += h
+
+
 def save_translated_pdf(
     src_path: str | Path,
     pages: Sequence[Sequence[Block]],
     per_page: Sequence[Sequence[str]],
     out_path: str | Path,
     lang: str,
+    redraw_ocr: bool = False,
+    table_rebuild_fn: Callable[[int, bytes], Sequence[Sequence[str]] | None] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> None:
     """Create a layout-preserving translation PDF.
 
@@ -2996,6 +3334,18 @@ def save_translated_pdf(
     vector graphics in their exact places), while the original text is redacted
     and replaced by the translated text at the same positions.  This is the
     ``仅译文 / translation in place`` output.
+
+    With ``redraw_ocr``, a scanned (OCR-reconstructed) table page is instead
+    regenerated as a *clean* page: a blank page carrying only the table's grid
+    rules and the translated cells, with the raster background, stamps and
+    handwriting explicitly ignored (signatures are already dropped at
+    extraction).  Non-OCR / non-table pages keep the in-place behaviour.
+
+    ``table_rebuild_fn`` is the AI-table rebuild callback (see
+    ``translator.make_table_rebuild_fn``): when ``redraw_ocr`` is on and it is
+    provided, an OCR table page is drawn from a model-derived translated 2D grid
+    (clean, regular N x M table) instead of the geometric OCR-frame redraw; any
+    failure / implausible grid falls back to the geometric redraw.
     """
     src = fitz.open(str(src_path))
     out_doc = fitz.open()
@@ -3003,13 +3353,50 @@ def save_translated_pdf(
         font = _CJK_FONT
         n = min(src.page_count, len(per_page))
         for i in range(n):
-            out_doc.insert_pdf(src, from_page=i, to_page=i)
-            page = out_doc[-1]
             blocks = pages[i] if i < len(pages) else []
             trans = per_page[i]
             m = min(len(blocks), len(trans))
             if m == 0:
+                out_doc.insert_pdf(src, from_page=i, to_page=i)
                 continue
+
+            # Clean redraw of an OCR table page: start from a blank page, draw
+            # only the reconstructed grid rules + translated cells, and ignore
+            # the scan's raster background / stamps / handwriting.  Handle only
+            # genuine *tables* — a diagram page (org chart) has node labels, not
+            # data cells, so it is left on the in-place path.
+            if redraw_ocr:
+                table_blocks = [
+                    b for b in blocks
+                    if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)
+                ]
+                if len(table_blocks) >= 4 and _reconstruct_ocr_tables(table_blocks):
+                    page = out_doc.new_page(width=src[i].rect.width, height=src[i].rect.height)
+                    rebuilt = None
+                    if table_rebuild_fn is not None:
+                        if log:
+                            log(f"  正在 AI 表格重建：第 {i + 1} 页…")
+                        try:
+                            rebuilt = table_rebuild_fn(i, _render_page_png(src[i]))
+                        except Exception:  # noqa: BLE001 — fail-closed
+                            rebuilt = None
+                    if rebuilt:
+                        if log:
+                            log(f"  AI 表格重建完成（第 {i + 1} 页，{len(rebuilt)} 行）。")
+                        rect = fitz.Rect(
+                            _AI_TABLE_MARGIN, _AI_TABLE_MARGIN,
+                            src[i].rect.width - _AI_TABLE_MARGIN,
+                            src[i].rect.height - _AI_TABLE_MARGIN,
+                        )
+                        _draw_ai_table(page, rebuilt, rect, font)
+                    else:
+                        if log:
+                            log(f"  第 {i + 1} 页 AI 表格重建不可用，回退几何重绘。")
+                        _draw_ocr_grid_page(page, blocks, trans, font)
+                    continue
+
+            out_doc.insert_pdf(src, from_page=i, to_page=i)
+            page = out_doc[-1]
 
             # Ruled tables are re-laid-out: an English translation is usually
             # longer than the Chinese it replaces, so a table row that no longer
@@ -3080,6 +3467,24 @@ def save_translated_pdf(
                     else:
                         # Prose below a grown table shifts down with it.
                         draw_b = replace(b, y0=b.y0 + dy, y1=b.y1 + dy)
+                # A table cell whose translation wraps to >1 line is anchored at the
+                # cell's OWN top border rather than the source glyph box top: the
+                # glyph box starts a few points below the row's top (cell padding)
+                # and a single-line source box is short, so a centred/wraps stretch
+                # would push the last line past the row's bottom rule.  Anchoring at
+                # the cell's full vertical span keeps the wrapped block inside.  This
+                # covers both ``find_tables`` (text-layer) and reconstructed OCR
+                # grids (``mapping`` is non-empty for either).
+                if j in mapping and getattr(b, "in_table", False):
+                    if len(_fit_block(b, font, trans[j])[0]) > 1:
+                        t_i, r_i = mapping[j]
+                        row = tables[t_i]["rows"][r_i]
+                        dy = shifts.get(j, 0.0)
+                        draw_b = replace(
+                            draw_b,
+                            y0=min(c.y0 for c in row) + dy,
+                            y1=max(c.y1 for c in row) + dy,
+                        )
                 if b.ocr:
                     # Cover the underlying scan pixels so the translation does
                     # not overprint the original (raster) text.  Use the (possibly

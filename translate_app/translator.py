@@ -860,26 +860,59 @@ _REVIEW_PROMPT = (
 )
 
 
+def _image_data_url(png: bytes) -> str:
+    """Encode a PNG as a ``data:image/png;base64,`` URL for the chat API."""
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _extract_json_object(content: str) -> dict | None:
+    """Pull the outer ``{ ... }`` out of a model reply and decode it.
+
+    The reply often wraps the object in prose or markdown fences, so the whole
+    reply is scanned for the outermost brace pair.  Anything malformed returns
+    ``None`` (the caller treats it as an empty / no-op result).
+    """
+    if not content:
+        return None
+    start = content.find("{")
+    if start < 0:
+        return None
+    end = content.rfind("}")
+    if end <= start:
+        return None
+    try:
+        data = json.loads(content[start:end + 1])
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _vision_call(client, model: str, prompt: str, images: list[bytes],
+                 temperature: float = 0.0) -> str:
+    """Send ``prompt`` plus ``images`` to the model and return the assistant text."""
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    content.extend(
+        {"type": "image_url", "image_url": {"url": _image_data_url(img)}}
+        for img in images
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": content}],
+        temperature=temperature,
+    )
+    return getattr(resp.choices[0].message, "content", None) or ""
+
+
 def _parse_review(content: str) -> dict:
     """Parse a reviewer reply into ``{"text_fixes": [...], "structure_flags": [...]}``.
 
     The model is asked for one JSON object; the reply often wraps it in prose or
-    markdown fences, so the outer ``{ ... }`` is extracted and decoded.  Any
-    malformed reply degrades to an empty review (a no-op for the caller).
+    markdown fences, so the outer ``{ ... }`` is extracted and decoded (see
+    :func:`_extract_json_object`).  Any malformed reply degrades to an empty
+    review (a no-op for the caller).
     """
-    if not content:
-        return {}
-    start = content.find("{")
-    if start < 0:
-        return {}
-    end = content.rfind("}")
-    if end <= start:
-        return {}
-    try:
-        data = json.loads(content[start:end + 1])
-    except Exception:
-        return {}
-    if not isinstance(data, dict):
+    data = _extract_json_object(content)
+    if data is None:
         return {}
     return {
         "text_fixes": data.get("text_fixes") if isinstance(data.get("text_fixes"), list) else [],
@@ -904,18 +937,9 @@ def make_review_fn(
 
     def _review(page_index: int, original_png: bytes, recon_png: bytes) -> dict:
         try:
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _REVIEW_PROMPT},
-                    {"type": "image_url", "image_url": {
-                        "url": "data:image/png;base64," + base64.b64encode(original_png).decode("ascii")}},
-                    {"type": "image_url", "image_url": {
-                        "url": "data:image/png;base64," + base64.b64encode(recon_png).decode("ascii")}},
-                ],
-            }]
-            resp = client.chat.completions.create(model=model.model, messages=messages, temperature=0.0)
-            content = getattr(resp.choices[0].message, "content", None) or ""
+            content = _vision_call(
+                client, model.model, _REVIEW_PROMPT, [original_png, recon_png]
+            )
             return _parse_review(content)
         except Exception as exc:  # noqa: BLE001 — best-effort review
             if log:
@@ -923,3 +947,221 @@ def make_review_fn(
             return {}
 
     return _review
+
+
+#: Prompt for the rendered-output QA.  The model sees the original page and the
+#: FINAL rendered translation page and reports what a reader would notice.  This
+#: is *report-only*: nothing here is auto-applied, and a failure is a no-op.
+_REVIEW_RENDER_PROMPT = (
+    "这是同一页的两张图。第一张是原文/扫描件，第二张是该页翻译后的最终渲染图。"
+    "请对比两张图，检查译文渲染中的问题，只输出一个 JSON 对象：\n"
+    "{\n"
+    "  \"issues\": [\n"
+    "    {\"kind\": \"残余中文|内容缺失|原文压叠|文本越线|字过小|标签断行|编号不符\","
+    " \"message\": \"一句话说明\", \"confidence\": 0.9}\n"
+    "  ]\n"
+    "}\n"
+    "规则：\n"
+    "- 残余中文：译文页仍出现未翻译的中文（按规则保留的报表/科目编号、人名、手写签字除外）。\n"
+    "- 内容缺失：源页有实质内容但译文页对应位置为空。\n"
+    "- 原文压叠 / 文本越线：译文文字压到相邻元素，或跨过表格线/框边界。\n"
+    "- 字过小：字体大小小于可读下限。\n"
+    "- 标签断行：本应整行的标签被不合理切断。\n"
+    "- 编号不符：报表/科目/附注编号与原文不一致。\n"
+    "只在确有问题时列 issue；没有则用空数组。不要输出除此 JSON 之外的文字。"
+)
+
+
+#: Possible ``kind`` values the render QA may emit (so parsers can whitelist).
+_RENDER_ISSUE_KINDS = frozenset(
+    ("残余中文", "内容缺失", "原文压叠", "文本越线", "字过小", "标签断行", "编号不符")
+)
+
+
+def _parse_render_issues(content: str) -> dict:
+    """Parse a render-QA reply into ``{"issues": [...]}`` (empty on malformed)."""
+    data = _extract_json_object(content)
+    if data is None:
+        return {}
+    raw = data.get("issues")
+    issues = [
+        it for it in (raw if isinstance(raw, list) else [])
+        if isinstance(it, dict) and str(it.get("message", "")).strip()
+    ]
+    return {"issues": issues}
+
+
+def make_rendered_review_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[int, bytes, bytes], dict] | None:
+    """Return a rendered-output QA callback for ``model``, or ``None`` if disabled.
+
+    Signature ``(page_index, original_png, rendered_png) -> dict``; it sends the
+    original page and the FINAL rendered translation page to the model and parses
+    a report-only issue list.  Best-effort — any failure returns ``{}`` so the
+    caller keeps the exported file untouched.
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _review(page_index: int, original_png: bytes, rendered_png: bytes) -> dict:
+        try:
+            content = _vision_call(
+                client, model.model, _REVIEW_RENDER_PROMPT,
+                [original_png, rendered_png],
+            )
+            return _parse_render_issues(content)
+        except Exception as exc:  # noqa: BLE001 — report-only, never abort
+            if log:
+                log(f"  第 {page_index + 1} 页译文校验失败：{type(exc).__name__}: {exc}")
+            return {}
+
+    return _review
+
+
+#: Lead-in for the block-classification reviewer.  ``@@CANDIDATES@@`` is replaced
+#: with the numbered candidate list before the call (the JSON braces in the
+#: output spec would collide with ``str.format``, so a plain replace is used).
+_REVIEW_CLASSIFY_PROMPT = (
+    "这是原图页面。下面是程序判定为「组织结构图/架构图节点标签，应保留原文不翻译」的候选块。"
+    "请结合原图判断每一块真的是节点标签（应保留），还是其实是**应该翻译**的标题/正文/图表说明。\n\n"
+    "候选块：\n"
+    "@@CANDIDATES@@\n\n"
+    "只输出一个 JSON 对象，用 index 对应上面的编号：\n"
+    "{\"classifications\": [{\"index\": 0, "
+    "\"kind\": \"keep_chart_node|keep_verbatim|signature|translate_heading|translate_prose\", "
+    "\"confidence\": 0.9, \"message\": \"一句话说明\"}]}\n"
+    "kind 说明：keep_chart_node/keep_verbatim=节点或整体保留；signature=手写签字；"
+    "translate_heading/translate_prose=应翻译的标题/正文。只列出你有把握的块；没有则用空数组。"
+    "不要输出除此 JSON 之外的文字。"
+)
+
+
+#: ``kind`` values that mean a candidate block should actually be translated.
+_REVIEW_KIND_TRANSLATE = frozenset(("translate_heading", "translate_prose"))
+
+
+def _parse_classify(content: str) -> dict:
+    """Parse a block-classification reply into ``{"classifications": [...]}``."""
+    data = _extract_json_object(content)
+    if data is None:
+        return {}
+    raw = data.get("classifications")
+    return {
+        "classifications": [
+            c for c in (raw if isinstance(raw, list) else []) if isinstance(c, dict)
+        ]
+    }
+
+
+def make_classify_review_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[int, bytes, Sequence[tuple]], dict] | None:
+    """Return a block-classification callback for ``model`` (or ``None`` if disabled).
+
+    Signature ``(page_index, original_png, candidates) -> dict``, where
+    ``candidates`` is ``[(flat_index, bbox, text), ...]``.  It invoices the model
+    to say whether each rule-kept candidate is really a structural label (keep)
+    or actually translatable content, returning ``{"classifications": [...]}``.
+    Best-effort: any failure returns ``{}``, so the caller keeps the rule's
+    decision unchanged (safe).
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _classify(page_index: int, original_png: bytes, candidates: Sequence[tuple]) -> dict:
+        try:
+            lines = [
+                f"[{idx}] bbox=({b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}) text={str(text)[:40]!r}"
+                for idx, b, text in candidates
+            ]
+            prompt = _REVIEW_CLASSIFY_PROMPT.replace("@@CANDIDATES@@", "\n".join(lines))
+            content = _vision_call(client, model.model, prompt, [original_png])
+            return _parse_classify(content)
+        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
+            if log:
+                log(f"  第 {page_index + 1} 页保留复核失败：{type(exc).__name__}: {exc}")
+            return {}
+
+    return _classify
+
+
+#: Prompt for the whole-table rebuild.  The model sees the scanned statement
+#: page and returns the table as a translated 2D grid, keeping the original row
+#: / column structure so we can draw a *clean*, regular table — instead of
+#: reconstructing it from noisy OCR boxes (which over-fragments rows).
+_REVIEW_TABLE_PROMPT = (
+    "这是原图中的一张财务报表（扫描件）。请把整张表的内容提取并翻译成目标语言，"
+    "输出一个 JSON 二维数组，**保持原表的行数、列数和单元格结构**：\n"
+    "{\"rows\": [[\"第1行第1格\", \"第1行第2格\", ...], [\"第2行第1格\", ...]]}\n"
+    "规则：\n"
+    "- 逐格对应原表的行/列。跨列/跨行合并的单元格（如二级表头 2025年度 → 合并/母公司）"
+    "只写一次：内容放在它覆盖区域的**第一个**格子，同一行/列被它覆盖的其余格子留空；"
+    "子表头（合并/母公司）另起一行。不要在每个子列重复表头。\n"
+    "- 每个单元格用目标语言翻译。数字一律用**阿拉伯数字**：中文序数/编号"
+    "（一、二、三、（三十三））转成 1、2、3、(33)；仅当原文**字面用罗马数字**"
+    "（Ⅰ、Ⅱ、I. II.）时才保留罗马数字。单位、报表/科目代码（会企01表-1、行次数字）保持原样。\n"
+    "- 表头行放数组第一行，数据行依次往下；没有内容的格子用空字符串占位。\n"
+    "- 忽略表格之外的非文本内容（手写签字、印章、水印、照片）。\n"
+    "不要输出除此 JSON 之外的文字。"
+)
+
+
+#: Sanity cap on a rebuilt table, so a model that "hallucinates" a giant grid is
+#: rejected and the caller falls back to the geometric redraw.
+_TABLE_REBUILD_MAX_ROWS = 200
+_TABLE_REBUILD_MAX_COLS = 40
+
+
+def _parse_table_grid(content: str) -> list[list[str]] | None:
+    """Parse a table-rebuild reply into a padded 2D grid, or ``None`` if invalid.
+
+    Each row is a list of cell strings; rows shorter than the widest are padded
+    with empty strings so the grid is rectangular.  Returns ``None`` for anything
+    malformed or implausible, so the caller falls back rather than drawing junk.
+    """
+    data = _extract_json_object(content)
+    if data is None:
+        return None
+    raw = data.get("rows")
+    if not isinstance(raw, list) or not raw:
+        return None
+    grid: list[list[str]] = []
+    for r in raw:
+        if not isinstance(r, list):
+            continue
+        grid.append([str(c) for c in r])
+    if not grid:
+        return None
+    n_cols = max(len(r) for r in grid)
+    if len(grid) > _TABLE_REBUILD_MAX_ROWS or n_cols > _TABLE_REBUILD_MAX_COLS or n_cols == 0:
+        return None
+    return [r + [""] * (n_cols - len(r)) for r in grid]
+
+
+def make_table_rebuild_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[int, bytes], list[list[str]] | None] | None:
+    """Return a whole-table rebuild callback for ``model``, or ``None`` if disabled.
+
+    Signature ``(page_index, original_png) -> list[list[str]] | None``: it sends the
+    original scanned table page to a vision model, which returns the table as a
+    translated 2D grid (row/column structure preserved).  Best-effort — any
+    failure or implausible result returns ``None`` so the caller falls back.
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _rebuild(page_index: int, original_png: bytes) -> list[list[str]] | None:
+        try:
+            content = _vision_call(client, model.model, _REVIEW_TABLE_PROMPT, [original_png])
+            return _parse_table_grid(content)
+        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
+            if log:
+                log(f"  第 {page_index + 1} 页表格重建失败：{type(exc).__name__}: {exc}")
+            return None
+
+    return _rebuild

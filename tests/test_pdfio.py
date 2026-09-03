@@ -313,6 +313,27 @@ class PdfioTest(unittest.TestCase):
             (rect.y0 + rect.y1) / 2, (100 + 200) / 2, delta=2.0,
         )
 
+    def test_multiline_table_cell_is_top_anchored(self):
+        # A table cell whose translation must wrap to >1 line: it should hug the
+        # cell's top rule instead of being vertically centred, so the wrapped
+        # block stays inside the cell rather than drifting toward the bottom line.
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="", page=0, x0=50, y0=100, x1=110, y1=130,
+            size=12.0, align="left", bold=False, single_line=True,
+            in_table=True,
+        )
+        pdfio._draw_translated_block(
+            page, font, block, "Net Assets Per Share Attributable (Yuan)"
+        )
+        lines = _text_lines(page)
+        self.assertGreater(len(lines), 1)
+        # The first (top) line's glyph top sits at the cell's top rule, not centred.
+        first = min(lines, key=lambda it: it[0].y0)
+        self.assertLess(first[0].y0 - block.y0, 6.0)
+
     def test_right_aligned_block_hugs_right_edge(self):
         doc = fitz.open()
         page = doc.new_page(width=400, height=200)
@@ -1486,6 +1507,293 @@ class WholePageReviewIntegrationTest(_OcrCacheIsolated):
         texts = [b.text for b in dt.pages[0]]
         self.assertEqual(len(dt.pages[0]), 2)   # two fragments merged, cell kept
         self.assertIn("党群", texts)
+
+
+class RenderedQaTest(unittest.TestCase):
+    """The report-only rendered-output QA (``review_rendered_pages``)."""
+
+    def _pair(self, pages: int = 1):
+        src = _OUT / "qa_src.pdf"
+        build_sample_pdf(src, pages=pages)
+        out = _OUT / "qa_out.pdf"
+        doc = fitz.open()
+        doc.insert_pdf(fitz.open(str(src)))
+        doc.save(str(out))
+        doc.close()
+        return src, out
+
+    def test_review_rendered_pages_reports_issues(self):
+        src, out = self._pair()
+        logs: list[str] = []
+        pdfio.review_rendered_pages(
+            src, out,
+            lambda _i, _o, _r: {"issues": [{"kind": "残余中文", "message": "仍有中文"}]},
+            logs.append,
+        )
+        self.assertTrue(any("残余中文" in m and "仍有中文" in m for m in logs), logs)
+        self.assertTrue(any("共 1 处待确认" in m for m in logs), logs)
+
+    def test_review_rendered_pages_fail_closed(self):
+        src, out = self._pair()
+        logs: list[str] = []
+
+        def boom(_i, _o, _r):
+            raise RuntimeError("model down")
+
+        # A reviewer error must never abort the export-side QA nor leave a log.
+        pdfio.review_rendered_pages(src, out, boom, logs.append)
+        self.assertEqual([], logs)
+        # A ``None`` reviewer (vision model disabled) is a no-op.
+        pdfio.review_rendered_pages(src, out, None, logs.append)
+        self.assertEqual([], logs)
+
+    def test_review_rendered_pages_ignores_malformed_result(self):
+        src, out = self._pair()
+        logs: list[str] = []
+        pdfio.review_rendered_pages(src, out, lambda _i, _o, _r: "not a dict", logs.append)
+        pdfio.review_rendered_pages(src, out, lambda _i, _o, _r: {"issues": "bad"}, logs.append)
+        self.assertEqual([], logs)
+
+
+class ClassifyKeepBlocksTest(unittest.TestCase):
+    """Vision second opinion: release a rule-kept chart node the model says should translate."""
+
+    def _chart(self, text: str):
+        return pdfio.Block(text=text, page=0, x0=90, y0=78, x1=201.5, y1=91.4,
+                           size=12.0, single_line=True, is_chart=True)
+
+    def _src(self, name: str):
+        p = _OUT / name
+        build_sample_pdf(p, pages=1)
+        return p
+
+    def test_classify_releases_confident_translate(self):
+        src = self._src("cls_src.pdf")
+        pages = [[self._chart("二、公司组织架构图"), self._chart("股东大会")]]
+        keep = {0, 1}
+
+        def classify(_i, _o, _candidates):
+            return {"classifications": [
+                {"index": 0, "kind": "translate_heading", "confidence": 0.9},
+            ]}
+
+        released = pdfio.classify_keep_blocks(src, pages, classify, keep, None)
+        self.assertEqual(released, {0})
+        self.assertEqual(keep - released, {1})
+
+    def test_classify_does_not_release_low_conf_or_keep_kind(self):
+        src = self._src("cls_src2.pdf")
+        pages = [[self._chart("二、公司组织架构图"), self._chart("股东大会")]]
+        keep = {0, 1}
+
+        def classify(_i, _o, _candidates):
+            return {"classifications": [
+                {"index": 0, "kind": "translate_heading", "confidence": 0.5},  # low
+                {"index": 1, "kind": "keep_chart_node", "confidence": 0.9},     # keep kind
+            ]}
+
+        self.assertEqual(pdfio.classify_keep_blocks(src, pages, classify, keep, None), set())
+
+    def test_classify_fail_closed(self):
+        src = self._src("cls_src3.pdf")
+        pages = [[self._chart("x")]]
+        keep = {0}
+
+        def boom(_i, _o, _candidates):
+            raise RuntimeError("down")
+
+        self.assertEqual(pdfio.classify_keep_blocks(src, pages, boom, keep, None), set())
+        # A None classifier (vision disabled) is a no-op.
+        self.assertEqual(pdfio.classify_keep_blocks(src, pages, None, keep, None), set())
+
+
+class MultilineCellAnchorTest(unittest.TestCase):
+    """A table cell whose translation wraps to >1 line is anchored at the cell's
+    top border (using the row's full height), so it stays inside the cell."""
+
+    def _grid(self) -> Path:
+        path = _OUT / "cellgrid.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        cols = [60, 200, 360]
+        tops = [80, 120, 160]
+        for x in cols:
+            page.draw_line(fitz.Point(x, tops[0]), fitz.Point(x, tops[-1]),
+                           color=(0, 0, 0), width=0.6)
+        for y in tops:
+            page.draw_line(fitz.Point(cols[0], y), fitz.Point(cols[-1], y),
+                           color=(0, 0, 0), width=0.6)
+        page.insert_text((70, 112), "Net Assets Per Share Attributable", fontsize=9)
+        page.insert_text((210, 112), "0.21", fontsize=9)
+        doc.save(str(path))
+        doc.close()
+        return path
+
+    def test_multiline_cell_stays_inside_cell(self):
+        src = self._grid()
+        dt = pdfio.extract_document_text(src, log=lambda _m: None)
+        label = next(b for b in dt.pages[0] if "Net Assets" in b.text)
+        self.assertTrue(label.in_table)
+        cell = pdfio._extract_tables(fitz.open(str(src))[0])[0]["rows"][0][0]
+        cell_top, cell_bot = cell.y0, cell.y1
+        per = [
+            ("Net Assets Per Share Attributable to Shareholders of the Parent Company"
+             if b is label else b.text)
+            for b in dt.pages[0]
+        ]
+        out = _OUT / "cellgrid_out.pdf"
+        pdfio.save_translated_pdf(src, [dt.pages[0]], [per], str(out), "English")
+        doc = fitz.open(str(out))
+        spans = []
+        for bb in doc[0].get_text("dict")["blocks"]:
+            if bb.get("type") != 0:
+                continue
+            for l in bb.get("lines", []):
+                for s in l.get("spans", []):
+                    b = s["bbox"]
+                    if s["text"].strip() and b[0] >= cell.x0 - 4 and b[2] <= cell.x1 + 4 \
+                            and b[1] >= cell_top - 6 and b[3] <= cell_bot + 6:
+                        spans.append(s["bbox"])
+        doc.close()
+        self.assertGreater(len(spans), 1)  # the label wrapped to >1 line
+        # It must sit on the cell's top border (not the source glyph top / centred)
+        # and stay inside the cell rather than overflowing the bottom rule.
+        self.assertLess(min(s[1] for s in spans) - cell_top, 8.0)
+        self.assertLessEqual(max(s[3] for s in spans), cell_bot + 1.0)
+
+
+class OcrTableRedrawTest(unittest.TestCase):
+    """``redraw_ocr`` regenerates a scanned table page as a clean table."""
+
+    def test_redraw_ocr_table_drops_raster_and_draws_cells(self):
+        src = _OUT / "redraw_src.pdf"
+        build_sample_pdf(src, pages=1)  # used only for the page size
+        blocks = [
+            pdfio.Block(text="总资产", page=0, x0=60, y0=100, x1=200, y1=112,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="1,234,567.89", page=0, x0=210, y0=100, x1=360, y1=112,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="总负债", page=0, x0=60, y0=120, x1=200, y1=132,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="9,876,543.21", page=0, x0=210, y0=120, x1=360, y1=132,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+        ]
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21"]
+        out = _OUT / "redraw_out.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English", redraw_ocr=True)
+        doc = fitz.open(str(out))
+        page = doc[0]
+        self.assertEqual(0, len(page.get_images(full=True)))  # no raster background
+        self.assertGreater(len(page.get_drawings()), 0)       # grid rules drawn
+        text = page.get_text("text")
+        self.assertIn("Total assets", text)
+        self.assertIn("9,876,543.21", text)
+        doc.close()
+
+    def test_redraw_ocr_off_keeps_inplace(self):
+        src = _OUT / "redraw_src2.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = [
+            pdfio.Block(text="总资产", page=0, x0=60, y0=100, x1=200, y1=112,
+                        size=9.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="1,234,567.89", page=0, x0=210, y0=100, x1=360, y1=112,
+                        size=9.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="总负债", page=0, x0=60, y0=120, x1=200, y1=132,
+                        size=9.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="9,876,543.21", page=0, x0=210, y0=120, x1=360, y1=132,
+                        size=9.0, single_line=True, ocr=True, in_table=True),
+        ]
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21"]
+        out = _OUT / "redraw_out2.pdf"
+        # redraw_ocr=False (default) → the source page (with its raster/page content) is kept.
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English", redraw_ocr=False)
+        doc = fitz.open(str(out))
+        self.assertEqual(doc[0].rect.height, fitz.open(str(src))[0].rect.height)
+        doc.close()
+
+    def test_redraw_skips_chart_page(self):
+        # A diagram (org chart) page has node labels, not data cells: redraw must
+        # NOT blank it into an empty table. The page falls through to in-place.
+        src = _OUT / "redraw_chart.pdf"
+        build_sample_pdf(src, pages=1)
+        chart_blocks = [
+            pdfio.Block(text="董事会", page=0, x0=60, y0=100, x1=88, y1=130,
+                        size=6.0, single_line=True, ocr=True, is_chart=True),
+            pdfio.Block(text="监事会", page=0, x0=60, y0=140, x1=88, y1=170,
+                        size=6.0, single_line=True, ocr=True, is_chart=True),
+            pdfio.Block(text="委员会", page=0, x0=110, y0=100, x1=138, y1=130,
+                        size=6.0, single_line=True, ocr=True, is_chart=True),
+            pdfio.Block(text="3", page=0, x0=300, y0=270, x1=310, y1=282,
+                        size=8.0, single_line=True, ocr=True),
+        ]
+        trans = [b.text for b in chart_blocks]
+        out = _OUT / "redraw_chart_out.pdf"
+        pdfio.save_translated_pdf(src, [chart_blocks], [trans], str(out), "English", redraw_ocr=True)
+        doc = fitz.open(str(out))
+        # Not redrawn: the original (source) page is kept, so its text survives.
+        self.assertEqual(1, doc.page_count)
+        self.assertIn("Page 1 heading", doc[0].get_text("text"))
+        doc.close()
+
+    def test_ai_table_rebuild_draws_regular_table(self):
+        # With a model-derived grid, the OCR table page is drawn as a clean,
+        # regular N x M table (no raster, regular grid, translated cells).
+        src = _OUT / "ai_table_src.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = [
+            pdfio.Block(text="总资产", page=0, x0=60, y0=100, x1=200, y1=112,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="1,234,567.89", page=0, x0=210, y0=100, x1=360, y1=112,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="总负债", page=0, x0=60, y0=120, x1=200, y1=132,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="9,876,543.21", page=0, x0=210, y0=120, x1=360, y1=132,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+        ]
+        trans = [b.text for b in blocks]
+        grid = [["Item", "2025", "2024"],
+                ["Total assets", "1,234,567.89", "999,999.99"],
+                ["Total liabilities", "9,876,543.21", "888,888.88"]]
+        out = _OUT / "ai_table_out.pdf"
+        logs: list[str] = []
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True, table_rebuild_fn=lambda _i, _png: grid,
+                                  log=logs.append)
+        doc = fitz.open(str(out))
+        page = doc[0]
+        self.assertEqual(0, len(page.get_images(full=True)))   # clean, no raster
+        self.assertGreater(len(page.get_drawings()), 0)        # regular grid
+        text = page.get_text("text")
+        self.assertIn("Total assets", text)
+        self.assertIn("999,999.99", text)
+        self.assertIn("Item", text)
+        doc.close()
+        # The AI-table-rebuild progress is surfaced in the log.
+        self.assertTrue(any("正在 AI 表格重建" in m for m in logs), logs)
+        self.assertTrue(any("AI 表格重建完成" in m for m in logs), logs)
+
+    def test_ai_table_rebuild_invalid_falls_back(self):
+        # An invalid / implausible rebuilt grid falls back to the geometric redraw.
+        src = _OUT / "ai_table_src2.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = [
+            pdfio.Block(text="总资产", page=0, x0=60, y0=100, x1=200, y1=112,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="1,234,567.89", page=0, x0=210, y0=100, x1=360, y1=112,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="总负债", page=0, x0=60, y0=120, x1=200, y1=132,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="9,876,543.21", page=0, x0=210, y0=120, x1=360, y1=132,
+                        size=6.0, single_line=True, ocr=True, in_table=True),
+        ]
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21"]
+        out = _OUT / "ai_table_out2.pdf"
+        # table_rebuild_fn returns None → geometric redraw still produces content.
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True, table_rebuild_fn=lambda _i, _png: None)
+        doc = fitz.open(str(out))
+        self.assertIn("Total assets", doc[0].get_text("text"))
+        doc.close()
 
 
 if __name__ == "__main__":

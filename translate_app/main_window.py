@@ -169,6 +169,27 @@ class MainWindow(QWidget):
         ocr_row.addStretch()
         form.addRow("识别扫描页", ocr_row)
 
+        # --- Rendered-output QA ---
+        # 渲染校验：生成译文 PDF 后用视觉模型「读回」译文页，报告残留中文/重叠/越线等
+        # 问题（只报告不改文件）。默认开启；PDF 输出且模型支持视觉时才生效。
+        self._render_qa_check = QCheckBox("渲染校验（读回译文 PDF，报告残留/重叠/越线等问题）")
+        self._render_qa_check.setChecked(bool(prefs.get("render_qa", True)))
+        qa_row = QHBoxLayout()
+        qa_row.addWidget(self._render_qa_check)
+        qa_row.addStretch()
+        form.addRow("译文质检", qa_row)
+
+        # --- AI table rebuild ---
+        # 扫描(OCR)表格页默认沿用原扫描底图、把译文叠上去。勾选后由视觉模型数行列并重建一张
+        # 干净的规整表格（忽略扫描底图、印章、手写签字等非文本内容）；模型不可用/读不好时
+        # 回退到几何重绘。
+        self._ai_table_check = QCheckBox("AI 表格重建（由视觉模型数行列，重建干净表格，忽略扫描底图/印章/签字）")
+        self._ai_table_check.setChecked(bool(prefs.get("ai_table_rebuild", False)))
+        ai_row = QHBoxLayout()
+        ai_row.addWidget(self._ai_table_check)
+        ai_row.addStretch()
+        form.addRow("扫描表格", ai_row)
+
         # --- Progress + log ---
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
@@ -325,6 +346,8 @@ class MainWindow(QWidget):
             key,
             out_path,
             ocr=self._ocr_check.isChecked(),
+            render_qa=self._render_qa_check.isChecked(),
+            ai_table_rebuild=self._ai_table_check.isChecked(),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -358,6 +381,8 @@ class MainWindow(QWidget):
                     "language": language,
                     "output_type": output_key,
                     "ocr": self._ocr_check.isChecked(),
+                    "render_qa": self._render_qa_check.isChecked(),
+                    "ai_table_rebuild": self._ai_table_check.isChecked(),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )

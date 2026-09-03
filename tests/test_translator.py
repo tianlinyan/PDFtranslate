@@ -856,6 +856,160 @@ class WholePageReviewTest(unittest.TestCase):
         self.assertIn("会企01表-1", prompt)
         self.assertIn("精确标识", prompt)
 
+    def test_parse_render_issues_handles_wrapped_and_malformed(self):
+        self.assertEqual(
+            translator._parse_render_issues(
+                '校验结果：{"issues": [{"kind": "原文压叠", "message": "正文与表格线重叠",'
+                ' "confidence": 0.9}]} 完'
+            ),
+            {"issues": [{"kind": "原文压叠", "message": "正文与表格线重叠", "confidence": 0.9}]},
+        )
+        self.assertEqual(translator._parse_render_issues("没有"), {})
+        # An issue without a message is not reportable — drop it.
+        self.assertEqual(
+            translator._parse_render_issues('{"issues": [{"kind": "原文压叠"}]}'),
+            {"issues": []},
+        )
+
+    def test_make_rendered_review_fn_gated_by_flag(self):
+        self.assertIsNone(translator.make_rendered_review_fn(self._model()))
+        self.assertIsInstance(
+            translator.make_rendered_review_fn(self._model(vision=True)),
+            type(lambda: None),
+        )
+
+    def test_make_rendered_review_fn_calls_model_and_parses(self):
+        class _FakeResp:
+            class _Choice:
+                class _Msg:
+                    content = '{"issues": [{"kind": "残余中文", "message": "还有中文"}]}'
+                message = _Msg()
+            choices = [_Choice()]
+
+        class _FakeCompletions:
+            def create(self, **_kwargs):
+                return _FakeResp()
+
+        class _FakeClient:
+            chat = type("_Chat", (), {"completions": _FakeCompletions()})()
+
+        class _FakeOpenAI:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __getattr__(self, _name):
+                return getattr(_FakeClient(), _name)
+
+        with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
+            fn = translator.make_rendered_review_fn(self._model(vision=True))
+        result = fn(0, b"ORIG", b"REND")
+        self.assertEqual(result["issues"][0]["kind"], "残余中文")
+
+    def test_parse_classify_handles_wrapped_and_malformed(self):
+        self.assertEqual(
+            translator._parse_classify(
+                '结果：{"classifications": [{"index": 0, "kind": "translate_heading",'
+                ' "confidence": 0.9, "message": "这是标题"}]} 完'
+            ),
+            {"classifications": [
+                {"index": 0, "kind": "translate_heading", "confidence": 0.9,
+                 "message": "这是标题"}
+            ]},
+        )
+        self.assertEqual(translator._parse_classify("没有"), {})
+        self.assertEqual(translator._parse_classify('{"bad": 1}'), {"classifications": []})
+
+    def test_make_classify_review_fn_gated_by_flag(self):
+        self.assertIsNone(translator.make_classify_review_fn(self._model()))
+        self.assertIsInstance(
+            translator.make_classify_review_fn(self._model(vision=True)),
+            type(lambda: None),
+        )
+
+    def test_make_classify_review_fn_calls_model_and_parses(self):
+        class _FakeResp:
+            class _Choice:
+                class _Msg:
+                    content = ('{"classifications": [{"index": 0, "kind": "translate_heading",'
+                               ' "confidence": 0.9}]}')
+                message = _Msg()
+            choices = [_Choice()]
+
+        class _FakeCompletions:
+            def create(self, **_kwargs):
+                return _FakeResp()
+
+        class _FakeClient:
+            chat = type("_Chat", (), {"completions": _FakeCompletions()})()
+
+        class _FakeOpenAI:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __getattr__(self, _name):
+                return getattr(_FakeClient(), _name)
+
+        with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
+            fn = translator.make_classify_review_fn(self._model(vision=True))
+        result = fn(0, b"ORIG", [(0, (0, 0, 10, 10), "二、公司组织架构图")])
+        self.assertEqual(result["classifications"][0]["kind"], "translate_heading")
+
+    def test_parse_table_grid(self):
+        # Pads short rows to the widest, so the grid is rectangular.
+        self.assertEqual(
+            translator._parse_table_grid('{"rows": [["a", "b"], ["c"]]}'),
+            [["a", "b"], ["c", ""]],
+        )
+        self.assertIsNone(translator._parse_table_grid('{"rows": []}'))
+        self.assertIsNone(translator._parse_table_grid("not json"))
+        self.assertIsNone(translator._parse_table_grid('{"rows": "not-a-list"}'))
+
+    def test_parse_table_grid_rejects_implausible_size(self):
+        big = {"rows": [[str(i)] for i in range(translator._TABLE_REBUILD_MAX_ROWS + 1)]}
+        self.assertIsNone(translator._parse_table_grid(json.dumps(big)))
+
+    def test_make_table_rebuild_fn_gated_by_flag(self):
+        self.assertIsNone(translator.make_table_rebuild_fn(self._model()))
+        self.assertIsInstance(
+            translator.make_table_rebuild_fn(self._model(vision=True)),
+            type(lambda: None),
+        )
+
+    def test_make_table_rebuild_fn_calls_model_and_parses(self):
+        class _FakeResp:
+            class _Choice:
+                class _Msg:
+                    content = '{"rows": [["Item", "2025"], ["Total assets", "32,613,779.11"]]}'
+                message = _Msg()
+            choices = [_Choice()]
+
+        class _FakeCompletions:
+            def create(self, **_kwargs):
+                return _FakeResp()
+
+        class _FakeClient:
+            chat = type("_Chat", (), {"completions": _FakeCompletions()})()
+
+        class _FakeOpenAI:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __getattr__(self, _name):
+                return getattr(_FakeClient(), _name)
+
+        with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
+            fn = translator.make_table_rebuild_fn(self._model(vision=True))
+        grid = fn(0, b"ORIG")
+        self.assertEqual(grid[1][1], "32,613,779.11")
+
+    def test_table_rebuild_prompt_arabic_by_default(self):
+        # The AI table rebuild must render numerals in Arabic unless the source
+        # literally uses Roman numerals (一、二、… → 1, 2, …; （三十三） → (33)).
+        prompt = translator._REVIEW_TABLE_PROMPT
+        self.assertIn("阿拉伯数字", prompt)
+        self.assertIn("罗马数字", prompt)
+        self.assertIn("(33)", prompt)
+
 
 class SystemPromptNumberingTest(unittest.TestCase):
     """The numbering rule defaults to ARABIC and only allows Roman when sourced."""

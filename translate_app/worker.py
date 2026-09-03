@@ -19,7 +19,10 @@ from .translator import (
     TranslationAborted,
     TranslationCancelled,
     TranslationEngine,
+    make_classify_review_fn,
+    make_rendered_review_fn,
     make_review_fn,
+    make_table_rebuild_fn,
 )
 
 #: Output formats offered by the translation dialog.
@@ -67,6 +70,8 @@ class TranslateWorker(QObject):
         output_type: str,
         output_path: str,
         ocr: bool = False,
+        render_qa: bool = True,
+        ai_table_rebuild: bool = False,
     ):
         super().__init__()
         self._source = source_path
@@ -75,6 +80,15 @@ class TranslateWorker(QObject):
         self._output_type = output_type
         self._output_path = output_path
         self._ocr = ocr
+        # Rendered-output QA (report-only, read back the exported PDF).  Turned
+        # off by the user via the "译文质检" checkbox; only a PDF output with a
+        # vision-capable model actually runs it.
+        self._render_qa = render_qa
+        # AI table rebuild of scanned (OCR) statement pages: on, the vision model
+        # counts rows/columns and redraws a clean, regular table (ignoring the
+        # raster background / stamps / handwriting).  Falls back to the geometric
+        # OCR-grid redraw if the model is unavailable or misreads the table.
+        self._ai_table_rebuild = ai_table_rebuild
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
         # written from the GUI thread (``cancel``) and read from the worker
         # thread: the Event gives explicit, memory-model-safe signalling
@@ -162,6 +176,26 @@ class TranslateWorker(QObject):
                     f"目标语言为西文，{n_names} 个姓名块将按规则罗马化（不保留中文原文）。"
                 )
 
+            # Vision second opinion (P1c): the rule-based chart-node detection can
+            # misjudge a compact heading (e.g. 二、公司组织架构图) as a diagram node
+            # and keep it untranslated.  A vision model that sees the source page
+            # may flag such a block as translatable content — this pass only
+            # *releases* (never keeps more), and only on high confidence; any
+            # classifier error is a no-op so the rule's decision stands.
+            if n_chart:
+                classify_fn = make_classify_review_fn(self._model, self.log.emit)
+                if classify_fn is not None:
+                    released = pdfio.classify_keep_blocks(
+                        self._source, doc.pages, classify_fn,
+                        keep_original, self.log.emit,
+                    )
+                    if released:
+                        keep_original -= released
+                        n_chart -= len(released)
+                        self.log.emit(
+                            f"保留复核后，实际保留 {n_chart} 个图表节点（其余将翻译）。"
+                        )
+
             translate_started = time.monotonic()
             result = engine.translate_blocks(
                 doc.blocks,
@@ -196,13 +230,30 @@ class TranslateWorker(QObject):
             out_path = self._export(doc, per_page)
             export_elapsed = time.monotonic() - export_started
 
+            # Report-only rendered-output QA: read back the exported PDF and
+            # surface anything a reader would notice (untranslated text, overlaps,
+            # overflowing glyphs, broken labels).  This never modifies the file and
+            # any reviewer error is a no-op.  PDF outputs only, and only for a
+            # vision-capable model — ``make_rendered_review_fn`` gates on that.
+            qa_elapsed = 0.0
+            if self._render_qa and self._output_type in ("translated_pdf", "bilingual_pdf"):
+                rendered_review = make_rendered_review_fn(self._model, self.log.emit)
+                if rendered_review is not None:
+                    qa_started = time.monotonic()
+                    pdfio.review_rendered_pages(
+                        self._source, out_path, rendered_review, self.log.emit
+                    )
+                    qa_elapsed = time.monotonic() - qa_started
+
             total_elapsed = time.monotonic() - started
             self.log.emit(f"完成：{out_path}")
             self.log.emit(
                 f"总用时：{format_duration(total_elapsed)}"
                 f"（提取 {format_duration(extract_elapsed)}，"
                 f"翻译 {format_duration(translate_elapsed)}，"
-                f"导出 {format_duration(export_elapsed)}）"
+                f"导出 {format_duration(export_elapsed)}"
+                + (f"，渲染校验 {format_duration(qa_elapsed)}" if qa_elapsed else "")
+                + "）"
             )
             self.finished.emit(out_path)
         except TranslationCancelled:
@@ -238,8 +289,14 @@ class TranslateWorker(QObject):
                 self._source, per_page, out, self._lang, doc.pages
             )
         elif kind == "translated_pdf":
+            table_rebuild = (
+                make_table_rebuild_fn(self._model, self.log.emit) if self._ai_table_rebuild else None
+            )
             pdfio.save_translated_pdf(
-                self._source, doc.pages, per_page, out, self._lang
+                self._source, doc.pages, per_page, out, self._lang,
+                redraw_ocr=self._ai_table_rebuild,
+                table_rebuild_fn=table_rebuild,
+                log=self.log.emit,
             )
         elif kind == "markdown":
             pdfio.save_markdown(
