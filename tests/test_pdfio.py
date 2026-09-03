@@ -1291,6 +1291,31 @@ class WholePageReviewTest(unittest.TestCase):
         self.assertEqual(out[0].text, "现金")
         self.assertTrue(any("整页审查失败" in m for m in logs), logs)
 
+    def test_adopts_corrected_statement_code(self):
+        # A statement / subject code OCR misread (会企01表-1 -> 公司01目-1): the
+        # reviewer's re-read is adopted — codes are exact identifiers, unlike a
+        # clean amount which would never be overwritten.
+        b = self._block("公司01目-1", 40, 50, 90, 66)
+        self.assertTrue(pdfio._looks_like_code_token(b.text))
+        changed = pdfio._apply_review_fix(b, "会企01表-1", 0, None)
+        self.assertTrue(changed)
+        self.assertEqual(b.text, "会企01表-1")
+
+    def test_does_not_treat_title_with_year_as_code(self):
+        # A document title that happens to contain a year is prose, not a code —
+        # the reviewer's reading must not be adopted for it.
+        b = self._block("2025年年度报告（摘要）", 40, 50, 300, 66)
+        self.assertFalse(pdfio._looks_like_code_token(b.text))
+        changed = pdfio._apply_review_fix(b, "MTB 2025 Annual Report", 0, None)
+        self.assertFalse(changed)
+        self.assertEqual(b.text, "2025年年度报告（摘要）")
+
+    def test_does_not_treat_long_prose_as_code(self):
+        b = self._block("编制单位：浙江民泰商业银行股份有限公司", 40, 50, 300, 66)
+        self.assertFalse(pdfio._looks_like_code_token(b.text))
+        changed = pdfio._apply_review_fix(b, "Prepared by: Mintai bank", 0, None)
+        self.assertFalse(changed)
+
     def test_merges_adjacent_split_label(self):
         page = self._page()
         blocks = [self._block("党", 40, 50, 90, 66),

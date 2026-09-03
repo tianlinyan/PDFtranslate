@@ -849,6 +849,23 @@ class WholePageReviewTest(unittest.TestCase):
         result = fn(0, b"ORIG", b"RECON")
         self.assertEqual(result["text_fixes"][0]["text"], "42")
 
+    def test_review_prompt_emphasizes_codes(self):
+        # The whole-page review must single out statement / subject codes
+        # (会企01表-1) as exact, error-prone identifiers to re-verify.
+        prompt = translator._REVIEW_PROMPT
+        self.assertIn("会企01表-1", prompt)
+        self.assertIn("精确标识", prompt)
+
+
+class SystemPromptNumberingTest(unittest.TestCase):
+    """The numbering rule defaults to ARABIC and only allows Roman when sourced."""
+
+    def test_english_prompt_defaults_to_arabic_not_roman(self):
+        prompt = translator.TranslationEngine._system_prompt("English", {})
+        self.assertIn("default to ARABIC digits", prompt)
+        self.assertIn("Chinese note markers", prompt)      # （二）（三十三）→ (2)(33)
+        self.assertIn("only when the source literally uses Roman numerals", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

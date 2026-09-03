@@ -1053,6 +1053,31 @@ _REVIEW_DPI = 150
 #: A plain (ungrouped) amount a reviewer may return, not in comma-grouped form.
 _AMOUNT_PLAIN_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?[%％]?\s*$")
 
+#: A short structured identifier mixing CJK with digits / letters / separators —
+#: a statement / subject code (会企01表-1), a model or sheet number, a row code.
+#: These are exact tokens that OCR tends to misread, so the reviewer's re-read is
+#: adopted (unlike a clean amount, which is never overwritten).
+_CODE_TOKEN_RE = re.compile(
+    r"^[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9\-－（）()、\s]{0,15}$"
+)
+
+
+def _looks_like_code_token(text: str) -> bool:
+    """True when ``text`` is a short structured code (CJK + digits), not prose.
+
+    A statement / subject / sheet code is short, mostly digits with at most a few
+    CJK characters (会企01表-1, 科目1001).  A document title with a year (2025年年度
+    报告) or a prose label is deliberately excluded so the reviewer's reading is
+    only adopted for genuine identifiers, not headings.
+    """
+    t = str(text).strip()
+    if not (1 <= len(t) <= 16) or not any(c.isdigit() for c in t):
+        return False
+    cjk = sum(1 for c in t if "\u4e00" <= c <= "\u9fff")
+    if cjk > 4:
+        return False
+    return bool(_CODE_TOKEN_RE.match(t))
+
 
 def _looks_like_amount(text: str) -> bool:
     """True when ``text`` reads like a figure (grouped or plain)."""
@@ -1108,8 +1133,11 @@ def _apply_review_fix(block: Block, text: str, page_index: int, log) -> bool:
 
     A *figure* block is corrected only when OCR left it empty or unreadable (it
     does not read as a clean amount); a clean OCR amount is never overwritten —
-    a conflicting reading is surfaced instead of silently resolved.  A non-figure
-    block is filled only when OCR found nothing.  Returns True if text changed.
+    a conflicting reading is surfaced instead of silently resolved.  A *code
+    token* (a statement / subject / sheet number, e.g. 会企01表-1) is adopted when
+    the reviewer offers a code-shaped reading (the AI saw the original and these
+    are exact identifiers OCR misreads).  A non-figure block is filled only when
+    OCR found nothing.  Returns True if text changed.
     """
     cur = str(block.text).strip()
     cand = _normalize_number(str(text).strip())
@@ -1127,6 +1155,13 @@ def _apply_review_fix(block: Block, text: str, page_index: int, log) -> bool:
                 )
             return False
         if _looks_like_amount(cand):
+            block.text = cand
+            return True
+        return False
+    if _looks_like_code_token(cur):
+        # A structured identifier: exact, error-prone — adopt the reviewer's
+        # reading when it is itself a code-shaped token.
+        if _looks_like_code_token(cand) and cand != cur:
             block.text = cand
             return True
         return False

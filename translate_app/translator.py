@@ -64,8 +64,11 @@ _CHAR_BUDGET = 4000
 #: and such an entry would otherwise be reused forever.  Bumped to 5 when the
 #: glossary entered the key and the name romanization rule was added; to 6 when
 #: the name-order rule changed to given name first (cached entries made under
-#: the old surname-first rule would otherwise be reused unchanged).
-_CACHE_VERSION = 6
+#: the old surname-first rule would otherwise be reused unchanged); to 7 when the
+#: numbering rule was hardened to default to ARABIC (一、二、三 / （二） → 1., 2., (2)),
+#: so a cache written under the old, loose style (which let the model emit I., II.,
+#: (XXXIII)) is never reused.
+_CACHE_VERSION = 7
 
 #: Delay between batch attempts (seconds); injectable so tests don't sleep.
 _TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
@@ -303,8 +306,13 @@ class TranslationEngine:
             "— for example translate 万元 as \"ten thousand yuan\" in English, or "
             "\"diez mil yuanes\" in Spanish — so the numeric value itself never "
             "changes.\n"
-            "- Keep section numbers in the document's own numbering style (e.g. "
-            "1., 1.1, 第4条); do not renumber or invent a different style.\n"
+            "- Keep section numbers and note references in the document's own "
+            "numbering style and default to ARABIC digits: Chinese listing "
+            "numerals (一、二、三) and Chinese note markers （一）（二）（三十三） render as "
+            "1., 2., 3. and (1), (2), (33); 第4条 / 第二节 render as 'Article 4' / "
+            "'Section 2'; Arabic digits stay Arabic. Use Roman numerals (I., II., "
+            "(III)) only when the source literally uses Roman numerals (Ⅰ. Ⅱ. or I. "
+            "II.). Do not renumber or invent a different style.\n"
             "- Keep official statement and report codes as they are: do not "
             "transliterate a code like a statement number; use the standard "
         )
@@ -844,6 +852,8 @@ _REVIEW_PROMPT = (
     "}\n"
     "规则：bbox 用**图片像素坐标**（x 范围为 0..图片宽，y 范围为 0..图片高）；"
     "text_fixes 只列 OCR 读错或漏读的文字/数字（若读对了就不要列）。"
+    "**特别注意**：报表/科目/附注编号（如 会企01表-1、会企02表、附注编号、行次数字）是"
+    "精确标识，OCR 极易把数字或汉字读错；请用 text_fixes 给出与原文一致的正确编号。"
     "structure_flags：若某格/单元格被错误拆成两格、本应是一格，用 action=merge_cells"
     " 给出两格的 bbox、置信度(0~1)和一句话说明；其它布局问题只用 message 一句话说明"
     "（不要给 action）。没有则用空数组。不要输出除此 JSON 之外的文字。"
