@@ -1092,6 +1092,40 @@ class ReviewPageTaskPromptTest(unittest.TestCase):
         self.assertIn("不要修改任何译文", task)
 
 
+class LlmInterpretTest(unittest.TestCase):
+    """The M3 special-page answer is AI-interpreted, fail-closed to the matcher."""
+
+    def test_make_llm_interpret_classifies_answer(self):
+        seen: list = []
+        queue = [_FakeResp(_FakeMsg(content="translate"))]
+        client = _FakeClient(queue, seen)
+        with mock.patch.object(translator, "OpenAI", lambda **_k: client):
+            interpret = agent.make_llm_interpret(_vision_model())
+        self.assertIsNotNone(interpret)
+        self.assertEqual("translate", interpret("用OCR识别一下", "scan"))
+        # The model got the classification prompt as a translation-side, temperature-0 call.
+        call = seen[0]
+        self.assertEqual(0.0, call["temperature"])
+        self.assertIn("特殊页", call["messages"][0]["content"])
+
+    def test_make_llm_interpret_fails_closed_to_matcher(self):
+        client = _FakeClient([_FakeResp(_FakeMsg(content=""))], [])
+
+        def boom(**kw):
+            raise RuntimeError("net down")
+
+        client.chat.completions.create = boom
+        with mock.patch.object(translator, "OpenAI", lambda **_k: client):
+            interpret = agent.make_llm_interpret(_vision_model())
+        # A network error never raises / hangs — it degrades to the flexible matcher.
+        self.assertEqual("keep", interpret("保留原文", "scan"))
+        self.assertEqual("translate", interpret("OCR并翻译", "scan"))
+
+    def test_make_llm_interpret_no_client_returns_none(self):
+        with mock.patch.object(translator, "OpenAI", side_effect=RuntimeError("no cfg")):
+            self.assertIsNone(agent.make_llm_interpret(_vision_model()))
+
+
 class TranslationPromptScriptTest(unittest.TestCase):
     """Russian / Japanese / Korean are now target languages."""
 

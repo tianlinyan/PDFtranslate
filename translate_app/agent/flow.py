@@ -209,7 +209,7 @@ import json
 
 from .. import prompts
 from .. import translator as _tr
-from .flow_steps import FlowCancelled, STANDARD_FLOWS, run_flow
+from .flow_steps import FlowCancelled, STANDARD_FLOWS, interpret_decision, run_flow
 
 
 def _image_url(png: bytes) -> str:
@@ -377,6 +377,48 @@ def make_llm_decide(model, *, task: str, image_provider=None,
         return Decision(action="call", tool=tc.function.name, arguments=args)
 
     return _decision
+
+
+def make_llm_interpret(model, log: Callable[[str], None] | None = None):
+    """Return an ``interpret(answer, kind) -> 'translate'|'keep'|'skip'`` backed by the LLM.
+
+    This is the AI-driven reading of a special-page answer (the M3 negotiation lets the
+    user pick a button OR type free text; the model classifies whatever they said).  It
+    is a translation-side call (``model.client_kwargs`` + ``request_params``), a tiny
+    temperature-0 classification.  Fail-closed: on a bad client / network error / an
+    unparseable reply it degrades to :func:`interpret_decision`, so the negotiation
+    never hangs.
+    """
+    from .. import translator as _tr
+
+    try:
+        client = _tr.OpenAI(**model.client_kwargs())
+    except Exception:  # noqa: BLE001 — no client → no AI interpretation, use the matcher
+        return None
+
+    def interpret(answer, kind):
+        try:
+            kwargs: dict[str, Any] = {
+                "model": model.model,
+                "temperature": 0.0,
+                "max_tokens": 4,
+                "messages": [{"role": "user",
+                              "content": prompts.interpret_special_answer(str(answer or ""), str(kind or ""))}],
+            }
+            body = model.request_params()
+            if body:
+                kwargs["extra_body"] = body
+            resp = client.chat.completions.create(**kwargs)
+            text = (getattr(resp.choices[0].message, "content", "") or "").strip().lower()
+            for action in ("translate", "keep", "skip"):
+                if action in text:
+                    return action
+        except Exception as exc:  # noqa: BLE001 — fail-closed to the matcher
+            if log:
+                log(f"  特殊页回答 AI 解读失败：{type(exc).__name__}: {exc}（用规则匹配落回）。")
+        return interpret_decision(answer)
+
+    return interpret
 
 
 def make_source_tools(state: WorkflowState, *, src_path=None) -> dict[str, Callable]:
@@ -1108,6 +1150,7 @@ class DocumentSession:
         show_preview: Callable[[int, str], None] | None = None,
         render_handler: Callable[[int, str], bytes | None] | None = None,
         audit: Callable[..., dict[str, Any]] | None = None,
+        interpret: Callable[[str, str], str] | None = None,
         max_steps_per_page: int = 24,
     ) -> None:
         self.state = state
@@ -1125,20 +1168,38 @@ class DocumentSession:
         #: check before/after an AgentStep.  Defaults to ``audit_page`` over the live
         #: state; a test injects a fake to control which pages flow to the AI fix pass.
         self.audit = audit or (lambda page=None, checks=None: audit_page(self.state, page, checks))
+        #: M3 negotiation: ``interpret(answer, kind) -> 'translate'|'keep'|'skip'`` reads the
+        #: user's special-page answer (incl. free text) — an AI interpretation; defaults to
+        #: the flexible ``interpret_decision`` matcher when not injected.
+        self.interpret = interpret
         self.max_steps_per_page = max_steps_per_page
 
+    #: phase-name → phase constant, used to set ``state.phase`` as the plan advances.
+    _PHASE_OF = {
+        "preprocess": PHASE_PREPROCESS,
+        "translate_normal": PHASE_TRANSLATE_NORMAL,
+        "special_pages": PHASE_SPECIAL_PAGES,
+        "review": PHASE_REVIEW,
+        "completed": PHASE_COMPLETED,
+    }
+
+
     def run(self) -> WorkflowState:
-        """Run the phase state machine to completion (or raise on cancel)."""
-        self.state.phase = PHASE_PREPROCESS
-        self._preprocess()
-        self.state.phase = PHASE_TRANSLATE_NORMAL
-        self._translate_normal()
-        self.state.phase = PHASE_SPECIAL_PAGES
-        self._special_pages()
-        self.state.phase = PHASE_REVIEW
-        self._review()
-        self.state.phase = PHASE_COMPLETED
-        self._completed()
+        """Run the phase state machine to completion (or raise on cancel).
+
+        The top-level phase ORDER is declared as data in ``translate_doc.scope["phases"]``
+        (a standard flow), so this is a thin dispatcher over the declared plan instead of
+        a hardcoded call sequence.  Each phase method remains the command implementation
+        (and is itself flow-driven at the per-page unit level).
+        """
+        plan = list(STANDARD_FLOWS["translate_doc"].scope.get(
+            "phases", ["preprocess", "translate_normal", "special_pages", "review", "completed"]))
+        for name in plan:
+            self.state.phase = self._PHASE_OF.get(name, self.state.phase)
+            method = getattr(self, f"_{name}", None)
+            if method is None:
+                raise ValueError(f"未知阶段：{name}")
+            method()
         self.state.phase = PHASE_DONE
         return self.state
 
@@ -1221,6 +1282,7 @@ class DocumentSession:
             t = self.state.triage[i]
             ps = self.state.page(i)
             kind = t.kind
+            question, options = prompts.special_page_question(i, kind)
             # Show the pending original page so the user can look at it while the
             # question is up (non-blocking; the answer below is what blocks).
             self.log(f"  [特殊页] 第 {i + 1} 页（{kind}）请在预览查看，并在【侧栏】选择处理方式…")
@@ -1229,13 +1291,33 @@ class DocumentSession:
                     self.show_preview(i, "source")
                 except Exception:  # noqa: BLE001 — preview is cosmetic
                     pass
-            question, options = self._negotiation_question(i, kind)
-            decision = self._ask_decision(question, options, target=f"page:{i}")
+            # Drive the negotiation through the registered ``special_page`` flow (a
+            # UserStep ask); the decision is then interpreted by the phase (AI-injectable
+            # via ``self.interpret``, else the flexible ``interpret_decision`` matcher),
+            # which also executes the translate/keep/skip.
+            decision, raw = "keep", ""
+            if self.answer_handler is not None:
+                try:
+                    rs = run_flow(STANDARD_FLOWS["special_page"],
+                                  ask=self.answer_handler, cancel=self.cancel,
+                                  params={"page": i, "kind": kind, "lang": self.state.lang})
+                    if rs.ok:
+                        ans = rs.result.get(f"user:page:{i}") or {}
+                        raw = ans.get("value") if isinstance(ans, dict) else ans
+                        decision = self._interpret_answer(raw, kind)
+                    else:
+                        self.log(f"  特殊页问答未完成：{rs.error}（按保留原文处理）。")
+                except FlowCancelled:
+                    raise _tr.TranslationCancelled()
+                except Exception as exc:  # noqa: BLE001 — fail-closed to retain
+                    self.log(f"  特殊页问答失败：{type(exc).__name__}: {exc}（按保留原文处理）。")
+            else:
+                self.log(f"  （无问答通道，第 {i + 1} 特殊页按保留原文处理。）")
             t.decided = True
             t.decision = decision
             ps.issues.append(f"特殊页（{kind}）按用户意见：{decision}")
             self.state.record_op(
-                tool="ask_user", args={"question": question, "options": options},
+                tool="ask_user", args={"question": question, "options": options, "answer": raw},
                 target=f"page:{i}", reason=f"特殊页 {kind} 协商",
                 user_confirmed=self.answer_handler is not None,
             )
@@ -1254,34 +1336,22 @@ class DocumentSession:
                 ps.status = STATUS_NEEDS_USER   # keep / skip → left as the source
         self.log(f"  [特殊页] 全部 {len(special)} 页处理完毕。")
 
-    def _negotiation_question(self, page_index: int, kind: str) -> tuple[str, list[str]]:
-        """The per-kind question + options for a special page (text lives in ``prompts``)."""
-        return prompts.special_page_question(page_index, kind)
+    def _interpret_answer(self, answer: Any, kind: str) -> str:
+        """Interpret a special-page answer into ``translate`` / ``keep`` / ``skip``.
 
-    def _ask_decision(self, question: str, options: list[str], *, target: str) -> str:
-        """Ask the user and map the chosen option to ``translate`` / ``keep`` / ``skip``.
-
-        Without an ``answer_handler`` (e.g. unit tests, or a model that can't
-        negotiate) it conservatively returns ``"keep"`` instead of blocking.
+        An injected ``self.interpret`` (the AI reading the user's free text) wins;
+        otherwise the flexible ``interpret_decision`` matcher handles the button values
+        and common phrasings.  A malformed AI result degrades to the matcher.
         """
-        if self.answer_handler is None:
-            self.log(f"  （无问答通道，第 {target} 特殊页按保留原文处理。）")
-            return "keep"
-        try:
-            ans = self.answer_handler(question, list(options), target)
-        except Exception as exc:  # noqa: BLE001 — fail-closed to retain
-            self.log(f"  特殊页问答失败：{type(exc).__name__}: {exc}（按保留原文处理）。")
-            return "keep"
-        value = (ans or {}).get("value") if isinstance(ans, dict) else ans
-        value = str(value or "").strip()
-        if value in ("OCR并翻译", "翻译", "translate"):
-            return "translate"
-        if value in ("保留原文", "keep"):
-            return "keep"
-        if value in ("跳过", "skip"):
-            return "skip"
-        self.log(f"  特殊页问答返回未识别值 {value!r}，按保留原文处理。")
-        return "keep"
+        v = str(answer or "").strip()
+        if self.interpret is not None:
+            try:
+                d = str(self.interpret(v, kind)).strip().lower()
+                if d in ("translate", "keep", "skip"):
+                    return d
+            except Exception:  # noqa: BLE001 — a bad AI read degrades to the matcher
+                pass
+        return interpret_decision(v)
 
     def _translate_special_page(self, page_index: int, kind: str) -> bool:
         """Translate a special page; return ``True`` on success (or ``False`` on failure/cancel).

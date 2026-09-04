@@ -364,6 +364,21 @@ def chat_tool_hint() -> str:
     )
 
 
+def interpret_special_answer(answer: str, kind: str) -> str:
+    """Ask the model to classify a user's special-page answer into translate/keep/skip.
+
+    The M3 negotiation surfaces buttons AND a free-text field; the model reads whatever
+    the user said (including skips/retains/paraphrases) and returns one of the three
+    actions, so the decision is AI-interpreted rather than exact-string matched.
+    """
+    return (
+        f"用户在处理一个特殊页（类型：{kind}）。用户给出的选择是：\n"
+        f"{answer}\n"
+        "请判断用户想要哪种处理：翻译该页(translate)、保留原文不动(keep)、跳过(skip)。"
+        "只回复一个词：translate 或 keep 或 skip，不要任何其他文字。"
+    )
+
+
 #: The message the app sends to the chat on startup so the assistant greets the user.
 CHAT_GREETING = "你好"
 

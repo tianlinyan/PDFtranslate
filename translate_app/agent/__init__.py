@@ -43,6 +43,7 @@ from .flow import (
     FlowAgent,
     audit_page,
     make_llm_decide,
+    make_llm_interpret,
     make_page_executors,
     make_source_tools,
     run_agent_run,
@@ -61,6 +62,7 @@ from .flow_steps import (
     STEP_KINDS,
     ToolStep,
     UserStep,
+    interpret_decision,
     run_flow,
 )
 from .user_flows import (
@@ -122,8 +124,10 @@ __all__ = [
     "compile_from_user",
     "flow_tool_names",
     "get_user_flow",
+    "interpret_decision",
     "load_user_flow_specs",
     "make_llm_decide",
+    "make_llm_interpret",
     "make_page_executors",
     "make_source_tools",
     "run_agent_run",

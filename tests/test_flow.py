@@ -145,10 +145,31 @@ class RunFlowTest(unittest.TestCase):
 
 class RegistryTest(unittest.TestCase):
     def test_standard_flows_are_registered(self):
-        self.assertEqual({"preprocess", "translate_page", "translate_normal",
+        self.assertEqual({"preprocess", "translate_doc", "translate_page", "translate_normal",
                           "special_page", "special_pages", "self_check_page",
                           "ai_self_check", "export"},
                          set(agent.STANDARD_FLOWS))
+
+    def test_translate_doc_declares_phase_order(self):
+        # The top-level phase ORDER is data (declarative), which ``DocumentSession.run``
+        # dispatches over — not a hardcoded call sequence.
+        phases = agent.STANDARD_FLOWS["translate_doc"].scope["phases"]
+        self.assertEqual(["preprocess", "translate_normal", "special_pages", "review", "completed"],
+                         phases)
+
+    def test_report_hook_called_per_page(self):
+        # A ``ForEachPage`` reports per-page progress to an orchestrator.
+        seen: list = []
+
+        def read(page):
+            return {"page": page}
+
+        flow = fs.Flow(name="f", description="", params={"pages": [0, 3]},
+                       steps=[fs.ForEachPage(pages="{{pages}}",
+                                             body=[fs.ToolStep("read", {"page": "{{page}}"})])])
+        agent.run_flow(flow, tools={"read": read},
+                       report=lambda _phase, done, total, page: seen.append((done, total, page)))
+        self.assertEqual([(1, 2, 0), (2, 2, 3)], seen)
 
     def test_foreach_page_iterates_and_binds_page(self):
         seen: list = []
@@ -183,34 +204,31 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual([("第几页？", ["a", "b"], "page:3")], asked)
         self.assertEqual({"value": "a"}, rs.result.get("user:page:3"))
 
-    def test_special_pages_negotiation_flow(self):
-        # P4 unit flow: ask → translate / keep. With a "翻译" answer the agent runs.
-        agent_calls: list = []
+    def test_special_page_flow_asks_and_records_answer(self):
+        # P4 unit flow is now the negotiation UserStep (the decision + execution live in
+        # the ``DocumentSession`` phase, which injects ``interpret``).
+        asked: list = []
 
         def ask(question, options, target):
+            asked.append((question, options, target))
             return {"value": "OCR并翻译", "target": target}
 
-        def run_agent(*, task, page, **kw):
-            agent_calls.append((task, page))
-            return {"ok": True}
-
         rs = agent.run_flow(
             agent.STANDARD_FLOWS["special_page"],
-            ask=ask, run_agent=run_agent, params={"page": 4, "kind": "scan"})
+            ask=ask, run_agent=lambda *a, **kw: self.fail("flow no longer runs the agent"),
+            params={"page": 4, "kind": "scan"})
         self.assertTrue(rs.ok)
-        self.assertEqual(1, len(agent_calls))
-        self.assertEqual((4,), (agent_calls[0][1],))
+        self.assertEqual([("page:4",)], [(a[2],) for a in asked])
+        self.assertEqual("OCR并翻译", rs.result["user:page:4"]["value"])
 
-    def test_special_pages_keep_skips_agent(self):
-        def ask(question, options, target):
-            return {"value": "保留原文", "target": target}
-
-        rs = agent.run_flow(
-            agent.STANDARD_FLOWS["special_page"],
-            ask=ask, run_agent=lambda *a, **kw: (self.fail("agent must not run")),
-            params={"page": 2, "kind": "chart"})
-        self.assertTrue(rs.ok)
-        self.assertNotIn("agent:", rs.applied)
+    def test_interpret_decision_maps_free_text(self):
+        # The special-page decision is a flexible matcher (an injected AI ``interpret``
+        # can override it): buttons, synonyms and free text map to translate/keep/skip.
+        cases = {"OCR并翻译": "translate", "翻译一下这页": "translate", "用OCR识别": "translate",
+                 "保留原文": "keep", "不动，保留": "keep", "不翻译": "keep",
+                 "跳过": "skip", "skip this page": "skip"}
+        for answer, want in cases.items():
+            self.assertEqual(want, agent.interpret_decision(answer), answer)
 
     def test_self_check_page_step_kinds_in_order(self):
         flow = agent.STANDARD_FLOWS["self_check_page"]

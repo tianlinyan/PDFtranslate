@@ -33,7 +33,7 @@ import os
 import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .flow_steps import Flow, STANDARD_FLOWS, ForEachPage, ToolStep
 
@@ -144,15 +144,63 @@ def _base_from(req: str, default: str) -> str:
     return default
 
 
-def compile_from_user(req: str, *, default_base: str = "self_check_page") -> FlowSpec:
-    """``compile_from_user("自检只查数字和表格，第3到第8页，把保留页也算，自动改")`` -> FlowSpec.
+def _spec_from_ai(data: dict | None, default_base: str) -> FlowSpec:
+    """Build a validated :class:`FlowSpec` from an AI slot-filler's dict.
 
-    A deterministic parser over known patterns: it fills ``checks`` / ``scope`` /
-    ``include_kept`` / ``auto_fix`` / ``base`` from the requirement.  Unrecognised
-    text is ignored (the spec keeps its defaults), so unknown phrasing degrades
-    gracefully rather than failing.
+    The AI output is a JSON-serialisable mapping of ``FlowSpec`` fields.  Unknown /
+    malformed values degrade to defaults (never raise), so a bad AI response still
+    yields a valid spec for the caller to confirm before running.
+    """
+    data = data or {}
+    base = str(data.get("base") or default_base)
+    if base not in STANDARD_FLOWS:
+        base = default_base   # fail-closed: unknown base -> the safe default
+    checks = data.get("checks")
+    checks = [str(c) for c in checks] if isinstance(checks, list) else None
+    scope = data.get("scope")
+    if isinstance(scope, (int, float)):
+        scope = [int(scope)]
+    elif isinstance(scope, list):
+        scope = [int(s) for s in scope]
+    else:
+        scope = None
+    return FlowSpec(
+        base=base,
+        checks=checks,
+        scope=scope,
+        include_kept=bool(data.get("include_kept", False)),
+        auto_fix=data.get("auto_fix"),
+        page=int(data["page"]) if data.get("page") is not None else None,
+        lang=str(data.get("lang", "")),
+        kind=data.get("kind"),
+        output_type=data.get("output_type"),
+        extra=dict(data.get("extra") or {}),
+    )
+
+
+def compile_from_user(req: str, *, default_base: str = "self_check_page",
+                      llm: Callable[[str], dict] | None = None) -> FlowSpec:
+    """``compile_from_user("自检只查数字和表格，第3到第8页…")`` -> FlowSpec.
+
+    Two paths (AI-driven by default when an LLM is injected):
+
+    * ``llm`` (optional) is an **AI slot-filler** ``callable(req) -> dict`` that
+      interprets the requirement into JSON-serialisable ``FlowSpec`` fields — this
+      replaces hardcoded keyword rules with the model reading arbitrary phrasing.
+    * No ``llm`` → a deterministic rule parser fills ``checks``/``scope``/
+      ``include_kept``/``auto_fix``/``base`` from the known patterns (the robust
+      offline fallback); unrecognised text is ignored (keeps defaults).
+
+    Either way the result is validated over defaults, so a partial/bad response
+    degrades gracefully instead of failing.
     """
     r = str(req or "").strip()
+    if llm is not None:
+        try:
+            data = llm(r) or {}
+        except Exception:  # noqa: BLE001 — a failing/fake LLM degrades to defaults
+            data = {}
+        return _spec_from_ai(data, default_base)
     return FlowSpec(
         base=_base_from(r, default_base),
         checks=_parse_checks(r),

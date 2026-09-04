@@ -459,6 +459,7 @@ class TranslateWorker(QObject):
                 answer_handler=self.answer_handler,
                 show_preview=self._show_preview,
                 render_handler=self.render_page_for_agent,
+                interpret=agent_mod.make_llm_interpret(self._model, log=self.log.emit),
                 max_steps_per_page=48,
             ).run()
         finally:

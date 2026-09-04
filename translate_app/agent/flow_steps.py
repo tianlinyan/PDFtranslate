@@ -205,13 +205,17 @@ class _Executor:
     def __init__(self, *, tools=None, run_agent=None, ask=None,
                  log: Callable[[str], None] | None = None,
                  cancel: Callable[[], bool] | None = None,
-                 max_steps: int | None = None) -> None:
+                 max_steps: int | None = None,
+                 report: Callable[[str, int, int, int], None] | None = None) -> None:
         self.tools = tools or {}
         self.run_agent = run_agent
         self.ask = ask
         self.log = log or (lambda _m: None)
         self.cancel = cancel
         self.max_steps = max_steps
+        #: ``report(phase, done, total, page)`` is called once per page by a
+        #: ``ForEachPage`` so an orchestrator can surface per-page progress / status.
+        self.report = report
 
     def run(self, steps: list[FlowStep], rs: FlowRunState,
             params: dict[str, Any]) -> FlowRunState:
@@ -323,10 +327,13 @@ class _Executor:
         if not isinstance(pages, list):
             rs.error = f"foreach_page needs a page list, got {type(pages).__name__}"
             return
-        for page in [int(p) for p in pages]:
+        pages = [int(p) for p in pages]
+        for done, page in enumerate(pages, start=1):
             page_params = dict(params)
             page_params["page"] = page
             self.run(step.body, rs, page_params)
+            if self.report is not None:
+                self.report(step.label or step.kind, done, len(pages), page)
 
 
 #: The exported step kinds (for introspection / tests / a future UI).
@@ -339,6 +346,7 @@ def run_flow(flow: Flow, *, tools: dict[str, Callable] | None = None,
              log: Callable[[str], None] | None = None,
              cancel: Callable[[], bool] | None = None,
              max_steps: int | None = None,
+             report: Callable[[str, int, int, int], None] | None = None,
              params: dict[str, Any] | None = None) -> FlowRunState:
     """Execute a :class:`Flow` with the caller-supplied channels and return the run state.
 
@@ -356,7 +364,7 @@ def run_flow(flow: Flow, *, tools: dict[str, Callable] | None = None,
         merged.update(params)
     rs = FlowRunState()
     executor = _Executor(tools=tools, run_agent=run_agent, ask=ask, log=log,
-                         cancel=cancel, max_steps=max_steps)
+                         cancel=cancel, max_steps=max_steps, report=report)
     try:
         executor.run(flow.steps, rs, merged)
     except FlowCancelled:
@@ -459,12 +467,23 @@ def _answered(rs: FlowRunState):
     return None
 
 
-def _special_should_translate(rs: FlowRunState) -> bool:
-    """Whether the recorded special-page decision is 'translate' (else keep/skip)."""
-    ans = _answered(rs)
-    if ans is None:
-        return False
-    return str(ans.get("value", "")).strip() in ("OCR并翻译", "翻译", "translate")
+def interpret_decision(answer: Any) -> str:
+    """Interpret a user's special-page answer into ``translate`` / ``keep`` / ``skip``.
+
+    Replaces the old exact-string match with a flexible matcher that also handles the
+    free-text answers typed into the sidebar field (an injected ``interpret`` channel can
+    override this with a real LLM reading).  Order matters: negation / keep-intent is
+    recognised before the bare "翻译" token (so "不翻译" → keep, not translate).
+    """
+    v = str(answer or "").strip().lower()
+    if any(k in v for k in ("跳过", "略过", "停")) or v.startswith("skip") or v in ("skipped", "none"):
+        return "skip"
+    if any(k in v for k in ("保留", "原样", "不动", "不翻", "别译", "不用", "维持")):
+        return "keep"
+    if any(k in v for k in ("翻译", "ocr", "转成", "译成", "换成")) or v.startswith("translate"):
+        return "translate"
+    # A bare fallback: don't translate what the user did not clearly ask to translate.
+    return "keep"
 
 
 def make_translate_page() -> Flow:
@@ -494,35 +513,73 @@ def make_translate_normal() -> Flow:
 
 
 def make_special_page() -> Flow:
-    """P4 unit: negotiate one special page (ask → translate / keep / skip)."""
+    """P4 unit: negotiate one special page — ask the user (the decision + execution
+    is the ``DocumentSession`` phase's job, so it can inject an AI ``interpret``)."""
     return Flow(
         name="special_page",
-        description="处理一个特殊页：按页型询问用户，再按决定翻译或保留。",
+        description="对某个特殊页按页型询问用户处理方式（翻译/保留/跳过）。",
         params={"page": 0, "lang": "", "kind": "scan"},
         steps=[
             UserStep(question=_special_question_builder, target="page:{{page}}"),
-            IfStep(cond=_special_should_translate, then=[
-                AgentStep(task=_page_task_builder, page="{{page}}", image=True),
-            ]),
         ],
     )
 
 
 def make_special_pages() -> Flow:
-    """P4 special_pages: loop over every non-normal page and negotiate."""
+    """P4 special_pages: loop over every non-normal page and ask the user."""
     return Flow(
         name="special_pages",
-        description="逐特殊页与用户协商，按页型决定翻译/保留/跳过。",
+        description="逐特殊页询问用户处理方式（翻译/保留/跳过）。",
         params={"pages": [], "lang": "", "kind": "scan"},
         steps=[
             ForEachPage(pages="{{pages}}", body=[
                 UserStep(question=_special_question_builder, target="page:{{page}}"),
-                IfStep(cond=_special_should_translate, then=[
-                    AgentStep(task=_page_task_builder, page="{{page}}", image=True),
-                ]),
             ]),
         ],
         guards={"protect": True},
+    )
+
+
+def _review_mode_question_builder(rs: FlowRunState, params: dict[str, Any]):
+    from .. import prompts
+
+    return prompts.review_mode_question()
+
+
+def _review_export_question_builder(rs: FlowRunState, params: dict[str, Any]):
+    from .. import prompts
+
+    return prompts.review_export_question()
+
+
+def make_translate_doc() -> Flow:
+    """P3: the top-level orchestration flow (the phase ORDER declared as a Flow).
+
+    Preprocess is a prerequisite (it computes the page sets above) and stays in
+    ``DocumentSession``; this flow drives the downstream phases whose page sets are
+    known once preprocess ran — normal translation, special-page negotiation, review
+    mode, the self-check gate, and the export confirmation.
+    """
+    return Flow(
+        name="translate_doc",
+        description="整篇翻译顶层编排：正常页→特殊页协商→复核→导出确认。",
+        params={"normal_pages": [], "special_pages": [], "review_pages": [],
+                "lang": "", "checks": None, "auto_fix": True, "max_iter": 3},
+        # The top-level phase ORDER, declared as data so ``DocumentSession.run`` is a thin
+        # dispatcher over it (rather than a hardcoded call sequence).  Preprocess stays a
+        # prerequisite (it computes the page sets the steps below need).
+        scope={"phases": ["preprocess", "translate_normal", "special_pages", "review", "completed"]},
+        steps=[
+            ForEachPage(pages="{{normal_pages}}", body=[
+                AgentStep(task=_page_task_builder, page="{{page}}", image=True),
+            ]),
+            ForEachPage(pages="{{special_pages}}", body=[
+                UserStep(question=_special_question_builder, target="page:{{page}}"),
+            ]),
+            UserStep(question=_review_mode_question_builder, target="review_mode"),
+            ForEachPage(pages="{{review_pages}}", body=make_self_check_page().steps),
+            UserStep(question=_review_export_question_builder, target="export"),
+        ],
     )
 
 
@@ -542,6 +599,7 @@ def make_ai_self_check() -> Flow:
 #: through ``run_flow`` once Ph3 wires it up).
 STANDARD_FLOWS: dict[str, Flow] = {
     "preprocess": make_preprocess(),
+    "translate_doc": make_translate_doc(),
     "translate_page": make_translate_page(),
     "translate_normal": make_translate_normal(),
     "special_page": make_special_page(),

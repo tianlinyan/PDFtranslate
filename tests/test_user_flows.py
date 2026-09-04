@@ -36,6 +36,39 @@ class CompileFromUserTest(unittest.TestCase):
         self.assertIsNone(spec.checks)
         self.assertIsNone(spec.scope)
 
+    def test_ai_slot_filler_builds_spec(self):
+        # AI-driven: an injected LLM interprets the requirement into FlowSpec fields,
+        # replacing hardcoded keyword rules.
+        seen: list[str] = []
+
+        def llm(req):
+            seen.append(req)
+            return {"base": "self_check_page", "checks": ["numbers", "table"],
+                    "scope": [2, 3, 4], "include_kept": True, "auto_fix": False}
+
+        spec = agent.compile_from_user("自检只查数字和表格，第3到第8页，把保留页也算，不修改",
+                                       llm=llm)
+        self.assertEqual(["自检只查数字和表格，第3到第8页，把保留页也算，不修改"], seen)
+        self.assertEqual({"numbers", "table"}, set(spec.checks))
+        self.assertEqual([2, 3, 4], spec.scope)
+        self.assertTrue(spec.include_kept)
+        self.assertFalse(spec.auto_fix)
+
+    def test_ai_slot_filler_falls_back_on_error(self):
+        def llm(_req):
+            raise RuntimeError("model down")
+        # A failing LLM must not crash — it degrades to the default spec (no AI fields).
+        spec = agent.compile_from_user("自检第3页", llm=llm)
+        self.assertEqual("self_check_page", spec.base)
+        self.assertIsNone(spec.scope)
+        self.assertIsNone(spec.checks)
+
+    def test_ai_slot_filler_unknown_base_falls_back(self):
+        # A bad/unknown base must not crash or produce a flow nobody can run.
+        spec = agent.compile_from_user("自检", llm=lambda _r: {"base": "nope"})
+        self.assertEqual("self_check_page", spec.base)
+        self.assertIn(spec.base, agent.STANDARD_FLOWS)
+
 
 class BuildFlowTest(unittest.TestCase):
     def test_single_page_self_check_overrides_knobs(self):
