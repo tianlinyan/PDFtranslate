@@ -73,6 +73,8 @@ class TranslateWorker(QObject):
         show_preview=None,
         agent_mode: bool = True,
         overlay: dict[int, dict] | None = None,
+        re_export: bool = False,
+        last_translated: list[str] | None = None,
     ):
         super().__init__()
         self._source = source_path
@@ -89,6 +91,17 @@ class TranslateWorker(QObject):
         #: is applied.  ``MainWindow`` reads this after a successful run to update the
         #: chat's ``DocContext`` so the chat sees the real current translation.
         self._last_translated: list[str] | None = None
+        #: "重新导出" mode: skip translation and re-write the output from
+        #: ``_last_translated`` (seeded from ``last_translated``) with the current
+        #: overlay applied — the cheap path for the user to get their chat/annotation
+        #: edits into a fresh PDF without waiting for a re-translation.
+        self._re_export = re_export
+        if re_export and last_translated:
+            self._last_translated = list(last_translated)
+        #: The PDF this run exported (set only for a PDF output type).  The preview
+        #: window's "译文" side renders from THIS after the run — the exported
+        #: translation — while a live run shows the in-progress translation (below).
+        self._last_pdf: str | None = None
         # ``preview_handler`` (e.g. ``preview.PreviewBridge.get_region``) is the
         # worker↔GUI channel the v0.3.0 agent uses to show a page and receive a
         # user-framed region back (see ``agent.run_page_visual``).
@@ -119,6 +132,12 @@ class TranslateWorker(QObject):
         try:
             if self._cancelled.is_set():
                 raise TranslationCancelled()
+
+            # "重新导出" mode: no extraction pipeline / translation — just re-write the
+            # last committed translation with the current overlay applied.
+            if self._re_export:
+                self._run_re_export()
+                return
 
             self.log.emit(f"开始时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
             self.log.emit(f"正在提取文本：{self._source}")
@@ -204,6 +223,10 @@ class TranslateWorker(QObject):
             export_started = time.monotonic()
             out_path = self._export(doc, per_page)
             export_elapsed = time.monotonic() - export_started
+            # Remember the exported PDF (if any) so the preview window can show the
+            # real translated output after the run, not the source fallback.
+            if self._output_type in ("translated_pdf", "bilingual_pdf"):
+                self._last_pdf = str(out_path)
 
             total_elapsed = time.monotonic() - started
             self.log.emit(f"完成：{out_path}")
@@ -263,9 +286,16 @@ class TranslateWorker(QObject):
         runs.  On a cancelled or errored run the overlay is simply not applied (the
         run reports as usual).
         """
-        if not self._overlay:
-            return
         translated = list(result.translated)
+        changed = self._apply_overlay_text(translated)
+        result.translated = translated
+        if changed:
+            self.log.emit(f"  已应用 {changed} 处 AI 对话/标注编辑（受保护覆盖）。")
+
+    def _apply_overlay_text(self, translated: list[str]) -> int:
+        """Apply ``self._overlay`` in place to ``translated``; return changed count."""
+        if not self._overlay:
+            return 0
         changed = 0
         for idx, entry in self._overlay.items():
             if isinstance(entry, dict) and 0 <= idx < len(translated):
@@ -273,9 +303,36 @@ class TranslateWorker(QObject):
                 if new and new != str(translated[idx]):
                     translated[idx] = new
                     changed += 1
-        result.translated = translated
+        return changed
+
+    def _run_re_export(self) -> None:
+        """Re-write the output from the last translation with the current overlay.
+
+        Skips extraction/translation entirely: reuse ``self._last_translated`` (the
+        previous run's committed output), apply the *current* protected overlay (the
+        chat / annotation edits made after that run), and re-run the export step.  The
+        document is re-extracted (cached, so cheap) only to rebuild the per-page
+        block lists the exporter needs.
+        """
+        if not self._last_translated:
+            self.error.emit("没有上一次的译文可重新导出。")
+            return
+        self.log.emit(f"正在导出：已应用当前对话/标注编辑，重新生成 {self._source} 的译文…")
+        doc = pdfio.extract_document_text(
+            self._source,
+            ocr=self._ocr,
+            cancel=lambda: self._cancelled.is_set(),
+            log=lambda m: self.log.emit(m),
+        )
+        translated = list(self._last_translated)
+        changed = self._apply_overlay_text(translated)
         if changed:
             self.log.emit(f"  已应用 {changed} 处 AI 对话/标注编辑（受保护覆盖）。")
+        per_page = pdfio.group_by_page(doc.block_pages, translated, doc.page_count)
+        self.log.emit("正在生成输出文件…")
+        out_path = self._export(doc, per_page)
+        self.log.emit(f"完成：{out_path}")
+        self.finished.emit(out_path)
 
     def set_current_page(self, page: int) -> None:
         """Update the running session's ``current_page`` (preview navigation)."""
@@ -397,7 +454,7 @@ class TranslateWorker(QObject):
                 answer_handler=self.answer_handler,
                 show_preview=self._show_preview,
                 render_handler=self.render_page_for_agent,
-                max_steps_per_page=24,
+                max_steps_per_page=48,
             ).run()
         finally:
             self._agent_state = None

@@ -130,8 +130,6 @@ PAGE_UNCERTAIN = "uncertain"
 #: A page is treated as a *chart* (org / architecture diagram) when at least this
 #: many narrow-tall node boxes are present (the strong diagram signature).
 _CHART_NODE_MIN = 3
-#: A page is treated as a *table* when this fraction of its blocks are table cells.
-_TABLE_PAGE_RATIO = 0.5
 
 
 def detect_language(texts: Sequence[str]) -> str:
@@ -158,26 +156,24 @@ def detect_language(texts: Sequence[str]) -> str:
 
 
 def classify_page(blocks: Sequence[Block]) -> str:
-    """Classify one page as ``normal`` / ``scan`` / ``chart`` / ``table`` / ``uncertain``.
+    """Classify one page as ``normal`` / ``scan`` / ``chart`` / ``uncertain``.
 
     Deterministic, block-flag based (no model call):
-    * ``scan`` — every block came from OCR (``Block.ocr``) i.e. a scanned raster page.
-    * ``table`` — most blocks are ruled-table cells (``Block.in_table``).
+    * ``scan`` — every block came from OCR (``Block.ocr``) i.e. a scanned raster page
+      (this includes scanned statements / tables — those stay special for negotiation).
     * ``chart`` — at least ``_CHART_NODE_MIN`` narrow-tall node boxes
       (``_is_vertical_label``), the org-chart / architecture-diagram signature.
     * ``uncertain`` — mixed OCR + text, or ambiguous (very few blocks).
-    * ``normal`` — everything else.
+    * ``normal`` — everything else, **including a non-scanned (text-layer) table page**:
+      a normal table is just ordinary text to translate, not a special page.
     """
     if not blocks:
         return PAGE_UNCERTAIN
     n = len(blocks)
     n_ocr = sum(1 for b in blocks if getattr(b, "ocr", False))
-    n_table = sum(1 for b in blocks if getattr(b, "in_table", False))
     n_vertical = sum(1 for b in blocks if _is_vertical_label(b))
     if n_ocr == n:
         return PAGE_SCAN
-    if n_table >= max(3, int(n * _TABLE_PAGE_RATIO)):
-        return PAGE_TABLE
     if n_vertical >= _CHART_NODE_MIN:
         return PAGE_CHART
     # A mixed OCR + text page (or a genuinely ambiguous one) is flagged for the
@@ -286,8 +282,11 @@ def extract_document_text(
     ocr_cache_warned = False
     if ocr:
         try:
-            ocr_cache_path = _ocr_cache_path(path)
-            ocr_cache = _load_ocr_cache(ocr_cache_path)
+            # In-memory-only runs (production) keep ``ocr_cache_path`` None so OCR
+            # results are never read from / written to disk — just the final output.
+            if _ocr_cache_persist_enabled():
+                ocr_cache_path = _ocr_cache_path(path)
+                ocr_cache = _load_ocr_cache(ocr_cache_path)
         except Exception:
             # The main ``finally`` only starts below, so close the document here
             # rather than leaking the open file handle on a cache failure.
@@ -568,6 +567,16 @@ def _warn_ocr_unavailable(log: Callable[[str], None] | None) -> None:
     _OCR_WARNED = True
     if log:
         log("  OCR 引擎不可用：未安装 rapidocr_onnxruntime，扫描页将不识别。")
+
+
+def _ocr_cache_persist_enabled() -> bool:
+    """Whether OCR results persist to disk (OPT-IN via ``PDFTRANSLATE_OCR_CACHE_DIR``).
+
+    Production is in-memory only (minimise disk writes / SSD wear): OCR results live
+    in memory for the run and are not written, so a re-run re-OCRs scans.  Tests set
+    the env dir, which they ALSO use to enable persistence so the cache stays tested.
+    """
+    return bool(os.environ.get("PDFTRANSLATE_OCR_CACHE_DIR"))
 
 
 def _ocr_cache_dir() -> Path:

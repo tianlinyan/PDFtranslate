@@ -123,6 +123,12 @@ class SidebarChat(QWidget):
         self._log.moveCursor(QTextCursor.MoveOperation.End)
         self._log.ensureCursorVisible()
 
+    def add_notice(self, text: str) -> None:
+        """A muted system line (not a user/AI bubble), e.g. "已复制图片"."""
+        self._log.append(f'<p style="color:#718096"><i>{str(text)}</i></p>')
+        self._log.moveCursor(QTextCursor.MoveOperation.End)
+        self._log.ensureCursorVisible()
+
     def show_question(self, question: str, options: list[str], target: str) -> None:
         """Display an agent question with answer buttons; forward the answer."""
         self.add_message("ai", question)
@@ -140,16 +146,19 @@ class SidebarChat(QWidget):
             self._asks_layout.removeWidget(row)
             row.deleteLater()
 
-    def send_message(self, text: str) -> None:
-        """Send ``text`` as a user message (shown in the log + emitted as ``userMessage``).
+    def send_message(self, text: str, show: bool = True) -> None:
+        """Send ``text`` as a user message (emitted as ``userMessage``).
 
-        Used both by the input box (``_send``) and to auto-send a startup greeting,
-        so the AI interaction channel always sees the same signal.
+        ``show`` controls whether it is also rendered as a "我" bubble in the log
+        (True for the input box).  The startup greeting passes ``show=False`` so the
+        conversation opens and the AI replies, but the hidden "你好" is not echoed in
+        the sidebar.
         """
         text = (text or "").strip()
         if not text:
             return
-        self.add_message("我", text)
+        if show:
+            self.add_message("我", text)
         self.userMessage.emit(text)
 
     def _send(self) -> None:

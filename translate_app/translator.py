@@ -67,8 +67,11 @@ _CHAR_BUDGET = 4000
 #: the old surname-first rule would otherwise be reused unchanged); to 7 when the
 #: numbering rule was hardened to default to ARABIC (一、二、三 / （二） → 1., 2., (2)),
 #: so a cache written under the old, loose style (which let the model emit I., II.,
-#: (XXXIII)) is never reused.
-_CACHE_VERSION = 7
+#: (XXXIII)) is never reused; to 8 when the CJK-target detection was fixed — a Chinese
+#: target used to be misclassified as Latin, wrongly appending the name-romanization
+#: rule, so Chinese-target translations cached under that wrong prompt would otherwise
+#: be reused unchanged.
+_CACHE_VERSION = 8
 
 #: Delay between batch attempts (seconds); injectable so tests don't sleep.
 _TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
@@ -117,6 +120,17 @@ class TranslationResult:
 
     def __len__(self) -> int:
         return len(self.blocks)
+
+
+def _cache_persist_enabled() -> bool:
+    """Whether the translation cache persists to disk.
+
+    Persistence is OPT-IN: production runs are in-memory only (to minimise disk
+    writes and protect SSD lifespan) and write only the final output, so a run is
+    effectively fresh each time.  Tests set ``PDFTRANSLATE_CACHE_DIR`` (a temp dir),
+    which both redirects AND enables persistence so the cache logic stays tested.
+    """
+    return bool(os.environ.get("PDFTRANSLATE_CACHE_DIR"))
 
 
 def _cache_dir() -> Path:
@@ -531,10 +545,13 @@ class TranslationEngine:
         if extra_glossary:
             log(f"  并合并 {len(extra_glossary)} 条 AI/对话术语。")
 
-        # Load the on-disk cache so repeated runs are cheap.
+        # Load the on-disk cache so repeated runs are cheap.  In production the
+        # cache is in-memory only (``_cache_persist_enabled`` False), so ``cache``
+        # starts empty, every non-skip block is requested, and nothing is written
+        # to disk beyond the final output.
         cache: dict[str, str] = {}
         cache_path: Path | None = None
-        if resume and doc_path is not None:
+        if resume and doc_path is not None and _cache_persist_enabled():
             # An absent glossary keeps the hash empty, so the cache key is the
             # same as before the glossary feature existed (only the version tag
             # differs); a glossary's content is part of the key.
@@ -668,7 +685,9 @@ class TranslationEngine:
                             # the work completed so far (resume reuses it).  The
                             # snapshot is taken under the lock; the disk I/O is
                             # not, so concurrent batches do not serialize on it.
-                            _persist_cache(snapshot, seq)
+                            # In-memory-only runs skip this entirely (no disk write).
+                            if cache_path is not None:
+                                _persist_cache(snapshot, seq)
                         else:
                             for i in chunk:
                                 result.errors.append(f"块 {i + 1} 翻译失败，保留原文")

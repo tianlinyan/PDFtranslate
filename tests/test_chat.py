@@ -111,6 +111,30 @@ class ChatSessionTest(unittest.TestCase):
         self.assertEqual({"reasoning_effort": "medium"}, kw["extra_body"])
         self.assertEqual("mod", kw["model"])
 
+    def test_reply_attaches_image_for_vision_model(self):
+        # A preview image buffered for the chat is sent as a vision input (image_url)
+        # alongside the user's text, for a multimodal model.
+        seen: list = []
+        with mock.patch.object(chat, "OpenAI", lambda **_k: _FakeClient("ok", seen)):
+            session = chat.ChatSession(_model())   # vision=True
+        session.reply("看这张图", image=b"\x89PNG\x0d\x0a\x1a\x0a")
+        user = next(m for m in seen[0]["messages"] if m["role"] == "user")
+        content = user["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual("看这张图", content[0]["text"])
+        self.assertIn("image_url", content[1])
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_reply_ignores_image_for_non_vision_model(self):
+        # A non-vision model must keep the plain message string (no image) — sending
+        # an image_url would make the request fail.
+        seen: list = []
+        with mock.patch.object(chat, "OpenAI", lambda **_k: _FakeClient("ok", seen)):
+            session = chat.ChatSession(_model(vision=False))
+        session.reply("hi", image=b"\x89PNG")
+        user = next(m for m in seen[0]["messages"] if m["role"] == "user")
+        self.assertEqual("hi", user["content"])
+
     def test_reply_honours_configured_interaction_overrides(self):
         seen: list = []
         with mock.patch.object(chat, "OpenAI", lambda **_k: _FakeClient("ok", seen)):

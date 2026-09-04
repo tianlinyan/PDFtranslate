@@ -18,6 +18,7 @@ session the chat tool set (``chat_tools``) and the session runs a bounded
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any, Callable
 
@@ -35,6 +36,10 @@ _MAX_TOOL_ROUNDS = 8
 
 #: Default output cap for a chat reply (the translation config may raise it).
 _CHAT_MAX_TOKENS = 1024
+
+
+def _png_data_url(png: bytes) -> str:
+    return "data:image/png;base64," + base64.b64encode(png).decode()
 
 
 class ChatSession:
@@ -55,14 +60,24 @@ class ChatSession:
         message: str,
         tools: list[dict[str, Any]] | None = None,
         executor: Callable[[str, dict[str, Any]], Any] | None = None,
+        image: bytes | None = None,
     ) -> str:
         """Append the user message, ask the interaction model, record and return the reply.
 
-        When ``tools`` / ``executor`` are given, the model may call tools; each tool
+        ``image`` (optional PNG bytes) is attached to the user message as a vision
+        input for a multimodal model (ignored for a non-vision model).  When
+        ``tools`` / ``executor`` are given, the model may call tools; each tool
         result is fed back (``tool`` role message) and the model is asked again, up to
         :data:`_MAX_TOOL_ROUNDS`, until it returns plain content.
         """
-        self.history.append({"role": "user", "content": message})
+        if image and getattr(self.model, "vision", False):
+            content: Any = [
+                {"type": "text", "text": message},
+                {"type": "image_url", "image_url": {"url": _png_data_url(image)}},
+            ]
+        else:
+            content = message
+        self.history.append({"role": "user", "content": content})
         for _ in range(_MAX_TOOL_ROUNDS):
             resp = self._call(tools=tools)
             msg = resp.choices[0].message
@@ -153,21 +168,24 @@ class ChatWorker(QObject):
     there and the reply is signalled back to the GUI (queued connection → main thread).
     """
 
-    ask_requested = pyqtSignal(str, object)   # text, ModelConfig
+    ask_requested = pyqtSignal(str, object, object)   # text, ModelConfig, image_bytes|None
     reply_ready = pyqtSignal(str)
     error = pyqtSignal(str)
 
     def __init__(self, log: Callable[[str], None] | None = None,
                  ctx: Any | None = None,
-                 show_preview: Callable[[int, str], None] | None = None) -> None:
+                 show_preview: Callable[[int, str], None] | None = None,
+                 re_export: Callable[[], None] | None = None) -> None:
         super().__init__()
         self._log = log or (lambda m: None)
         self._session: ChatSession | None = None
         #: Optional persistent document context (``DocContext``) whose tools the
         #: interaction model may call.  ``show_preview`` is a thread-safe channel to
-        #: open a preview page (the GUI connects it on the GUI thread).
+        #: open a preview page; ``re_export`` re-exports the last translation with the
+        #: current edits — the GUI wires both to bridges so they run on the GUI thread.
         self._ctx = ctx
         self._show_preview = show_preview
+        self._re_export = re_export
 
     def _ensure_session(self, model: ModelConfig) -> ChatSession:
         if self._session is None or self._session.model is not model:
@@ -187,7 +205,9 @@ class ChatWorker(QObject):
             return None, None
         from .chat_tools import chat_openai_tools, make_chat_tools
 
-        tools_map = make_chat_tools(self._ctx, show_preview=self._show_preview)
+        tools_map = make_chat_tools(
+            self._ctx, show_preview=self._show_preview, re_export=self._re_export,
+        )
 
         def executor(name: str, args: dict[str, Any]) -> Any:
             fn = tools_map.get(name)
@@ -200,15 +220,15 @@ class ChatWorker(QObject):
 
         return chat_openai_tools(list(tools_map)), executor
 
-    @pyqtSlot(str, object)
-    def ask(self, text: str, model: ModelConfig | None) -> None:
+    @pyqtSlot(str, object, object)
+    def ask(self, text: str, model: ModelConfig | None, image: bytes | None = None) -> None:
         if model is None:
             self.error.emit("没有可用的 AI 模型，无法对话。")
             return
         try:
             session = self._ensure_session(model)
             tools, executor = self._build_tools()
-            reply = session.reply(str(text), tools=tools, executor=executor)
+            reply = session.reply(str(text), tools=tools, executor=executor, image=image)
             self.reply_ready.emit(reply)
         except Exception as exc:  # noqa: BLE001 — best-effort, never crash the thread
             self._log(f"  对话请求失败：{type(exc).__name__}: {exc}")

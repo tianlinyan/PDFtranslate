@@ -26,6 +26,7 @@ PHASE_PREPROCESS = "preprocess"
 PHASE_TRANSLATE_NORMAL = "translate_normal"
 PHASE_SPECIAL_PAGES = "special_pages"
 PHASE_COMPLETED = "completed"
+PHASE_REVIEW = "review"
 PHASE_DONE = "done"
 
 
@@ -172,6 +173,7 @@ class WorkflowState:
     triage: dict[int, PageTriage] = field(default_factory=dict)   # per-page kind
     current_page: int = 0                            # preview navigation pointer
     summary: str = ""                                # pipeline summary
+    review_mode: str = ""                            # M4: "ai" | "user"
 
     def page(self, index: int) -> PageState:
         """The ``PageState`` for ``index``, created on first access."""

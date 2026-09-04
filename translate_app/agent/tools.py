@@ -124,6 +124,12 @@ AGENT_TOOLS: list[ToolDef] = [
           returns="残留块列表 [{index, text}]"),
     _tool("check_missing", {"page": {"type": "integer"}}, ["page"], CAT_VERIFY,
           returns="缺失块索引列表"),
+    _tool("check_numbers", {"page": {"type": "integer"}}, ["page"], CAT_VERIFY,
+          returns="数字/金额不一致的块 [{index, source, translation, missing, extra}]"),
+    _tool("check_table", {"page": {"type": "integer"}}, ["page"], CAT_VERIFY,
+          returns="{source_cells, translated_cells, empty_cells, empty_text, complete}"),
+    _tool("check_layout", {"page": {"type": "integer"}}, ["page"], CAT_VERIFY,
+          returns="版面问题块 [{index, kind, detail}]"),
     # --- D. 交互 / 预览（供用户查看，不修改文档）-------------------------------
     _tool("preview_page",
           {"page": {"type": "integer", "description": "页号（0 起）"},
@@ -154,11 +160,25 @@ def agent_openai_tools(names: list[str] | None = None) -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": t.name,
-                "description": t.description,
+                # Backed by ``prompts.AGENT_TOOL_DESCRIPTIONS`` (the WHAT) plus the
+                # tool's ``returns`` (the RESULT shape and any index semantics) —
+                # both are prompt text the model reads to understand a tool's
+                # capability and pick the right one.  Without ``returns`` the model
+                # never sees e.g. read_page's "每块 index 为全文档扁平索引" or
+                # check_table's field names.
+                "description": _compose_description(t),
                 "parameters": t.parameters,
             },
         })
     return out
+
+
+def _compose_description(t: ToolDef) -> str:
+    """A tool's model-facing description: WHAT it does + what it returns."""
+    desc = t.description
+    if t.returns:
+        desc = f"{desc}。返回：{t.returns}"
+    return desc
 
 
 def by_name(name: str) -> ToolDef | None:

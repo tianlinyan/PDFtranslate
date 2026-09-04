@@ -89,7 +89,7 @@ class ChatToolsTest(_CtxTest):
     def test_tools_expose_expected_set(self):
         self.assertEqual({
             "get_doc_info", "classify_page", "read_page", "goto_page",
-            "set_block_text", "delete_block_text", "apply_annotation",
+            "set_block_text", "delete_block_text", "apply_annotation", "re_export",
         }, self._tool_names())
 
     def test_get_doc_info(self):
@@ -174,6 +174,19 @@ class ChatToolsTest(_CtxTest):
         res = tools["goto_page"](2, "translation")
         self.assertTrue(res["ok"])
         self.assertEqual([(2, "translation")], calls)
+
+    def test_re_export_requires_channel(self):
+        # No re-export channel wired → fail-closed, not a crash.
+        res = self.tools["re_export"]()
+        self.assertFalse(res["ok"])
+        self.assertIn("重新导出通道", res["error"])
+
+    def test_re_export_calls_channel(self):
+        calls: list = []
+        tools = chat_tools.make_chat_tools(self.ctx, re_export=lambda: calls.append(1))
+        res = tools["re_export"]()
+        self.assertTrue(res["ok"])
+        self.assertEqual([1], calls)
 
     def test_classify_page_ok(self):
         res = self.tools["classify_page"](0)

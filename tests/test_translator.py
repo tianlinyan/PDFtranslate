@@ -814,6 +814,15 @@ class SystemPromptNumberingTest(unittest.TestCase):
         self.assertIn("Chinese note markers", prompt)      # （二）（三十三）→ (2)(33)
         self.assertIn("only when the source literally uses Roman numerals", prompt)
 
+    def test_simplified_chinese_prompt_does_not_romanize_names(self):
+        # Regression: an ASCII language name ("Simplified Chinese") used to be
+        # misclassified as Latin, wrongly adding the Chinese-name-romanization rule
+        # to a Chinese-target prompt.
+        prompt = translator.TranslationEngine._system_prompt("Simplified Chinese", {})
+        self.assertNotIn("Romanize Chinese personal names", prompt)
+        # The example output stays in the target language (a Chinese figure).
+        self.assertIn("点击", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -69,6 +69,7 @@ CHAT_TOOL_SPECS: list[dict[str, Any]] = [
            "text": {"type": "string", "description": "替换译文（action=set 时必填）"},
            "action": {"type": "string", "enum": ["set", "delete"], "default": "set"}},
           ["page", "bbox"]),
+    _tool("re_export", {}, []),
 ]
 
 
@@ -80,12 +81,15 @@ def chat_openai_tools(names: list[str] | None = None) -> list[dict[str, Any]]:
 
 
 def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = None,
+                    re_export: Callable[[], None] | None = None,
                     log: Callable[[str], None] | None = None) -> dict[str, Callable]:
     """Bind the chat tools to a live :class:`DocContext` (``ctx``).
 
     ``show_preview`` (optional, thread-safe) opens a preview page — the GUI wires it
-    to the preview bridge so ``goto_page`` runs on the GUI thread.  When ``None``,
-    ``goto_page`` reports "预览通道未接线" instead of crashing.
+    to the preview bridge so ``goto_page`` runs on the GUI thread.  ``re_export``
+    (optional, thread-safe) re-exports the last translation with the current overlay
+    edits — the GUI wires it to a signal so ``re_export`` runs on the GUI thread.
+    When ``None``, these report "通道未接线" instead of crashing.
     """
     from . import pdfio
 
@@ -184,6 +188,16 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         return {"ok": True, "page": page, "index": flat, "action": action,
                 "text": str(text)}
 
+    def _re_export():
+        """Re-write the exported output with the current overlay edits, no re-translate."""
+        if re_export is None:
+            return {"ok": False, "error": "重新导出通道未接线"}
+        try:
+            re_export()
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": True, "message": "已触发重新导出（后台执行，完成会在主窗口日志/进度提示）。"}
+
     return {
         "get_doc_info": get_doc_info,
         "classify_page": classify_page,
@@ -192,4 +206,5 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         "set_block_text": set_block_text,
         "delete_block_text": delete_block_text,
         "apply_annotation": apply_annotation,
+        "re_export": _re_export,
     }

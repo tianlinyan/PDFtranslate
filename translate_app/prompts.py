@@ -158,17 +158,69 @@ def translation_system_prompt(language: str, glossary: dict[str, str] | None = N
 # ---------------------------------------------------------------------------
 
 def agent_interaction_rules() -> str:
-    """Rules appended to the agent's system prompt so the model knows *when* to ask
-    the user (``ask_user``).  This is the "该问就问" trigger — the model calls the
-    ``ask_user`` tool at these decision points and the sidebar answers it.
+    """Rules appended to the agent's system prompt: the ONLY times to ask the user.
+
+    The model calls ``ask_user`` at these decision points and the sidebar answers it;
+    outside these it must not interrupt the user.
     """
     return (
-        "\n\n【与用户交互】在以下情况，必须先调用 ask_user 获取用户决定，再继续：\n"
-        "1) 术语/专有名词/报表科目名翻译不确定时（给出候选译文让用户选）。\n"
-        "2) 某块该保留原文还是翻译、判断不确定时（给出『保留/翻译』）。\n"
-        "3) 需要删除/覆盖/擦除译文或页（不可逆/破坏性）时（先确认）。\n"
-        "4) 接近预算上限、或当前无法推进时（询问是否收尾或继续）。\n"
-        "没有上述情况不要打扰用户。ask_user 的结果会作为工具结果返回，请据此继续。"
+        "\n\n【与用户交互】仅在这 4 种情况先调 ask_user 拿用户决定，再继续：\n"
+        "① 术语/专有名/报表科目名不确定时（给出候选）。"
+        "② 某块保留原文还是翻译、判断不确定时（『保留/翻译』）。"
+        "③ 要删除/覆盖/擦除译文或整页（不可逆，先确认）。"
+        "④ 接近预算上限、或当前无法推进时（询问是否收尾/继续）。\n"
+        "其余情况不要打扰用户。ask_user 返回的是用户的选择，据此继续。"
+    )
+
+
+def agent_tool_policy() -> str:
+    """The per-tool reference (function + usage) appended to the agent system prompt.
+
+    The ``tools`` array carries each tool's schema; this spells out the HOW (index
+    semantics, what it returns, gotchas) grouped by category, so the model picks the
+    right tool without guessing.
+    """
+    return (
+        "\n\n【工具功能与用法】先观察、再修改、最后校验；能一步拿到就不要分多次，已读过的页不要重读；"
+        "改完必须校验；某工具返回 ok=false 先读 error 判断原因、别盲目重试。\n"
+        "① 观察（只读原文，绝不改写）：\n"
+        "- read_page(page, offset=0, limit=None)：读该页文本块与**每块扁平 index**（写回就靠它）；超大页可 offset/limit 分页。\n"
+        "- get_layout(page)：该页行列/表格网格。get_doc_info()：整篇页数/类型/块数。classify_page(page)：判页型。\n"
+        "- render_page(page, what=translation)：把译到该页的译文渲染成 PNG。preview_page(page, what, region)：弹窗给用户看。\n"
+        "② 修改（写可编辑译文，原文不可动；index 一律用 read_page 的扁平 index）：\n"
+        "- translate_block(index, text, target_lang)：翻译某块并**写入译文**——首选。set_text(page, index, text)：直接写已知译名（数字/代码块被拒）。\n"
+        "- retranslate_block(text, target_lang)：**避开缓存**重译，**只返回译文**，需再 set_text 写入。"
+        "apply_terminology(source, target)：锁定术语。delete_block(page, index)：撤某块为原文。apply_annotation(page, bbox, text, action)：按用户框选改动。\n"
+        "③ 校验（无副作用，只报告问题）：\n"
+        "- check_residual(page)：残留（西文目标看残留中文、中文目标看未译英文成句；纯代码/缩写/单位不算）+空块。"
+        "check_missing(page)：源有译文空的块（纯数字/代码不算）。\n"
+        "- check_numbers(page)：数字/金额**按值**一致——只有源里的数值被删/改错才报（千分位/小数/单位拆分格式差异不计；【序数→数字】如 二→2 不算）。\n"
+        "- check_table(page)：表格格与普通文本块完整性（返回 source_cells/translated_cells/empty_cells/empty_text/complete）。\n"
+        "- check_layout(page)：仿导出器量版面——低于可读下限、溢出自身框、压入**同列**下一块（两栏只比同栏）。\n"
+        "④ 交互：ask_user(question, options=None, target)：术语/歧义/保留还是翻译/破坏性操作等拿不准时先问；没有这些情况别打扰。"
+    )
+
+
+def agent_workflow() -> str:
+    """The general translation METHOD appended to the agent system prompt.
+
+    This is the order/decision flow — BUILD, EDIT/MODIFY, VERIFY — per page.  Tool
+    names/params live in ``agent_tool_policy``; here we only chain them and state the
+    hard requirements, so nothing is duplicated.
+    """
+    return (
+        "\n\n【翻译通用工作法】整篇逐页推进；每页固定顺序：观察 → 构建/编辑 → 校验 → 复检 → 完成。"
+        "工具名与参数见【工具功能与用法】，这里只讲顺序与硬性要求。\n"
+        "① 构建（第 1 遍）：get_doc_info / classify_page 认清整篇与页型；read_page 取该页全部块并记下扁平 index；"
+        "术语先 apply_terminology 锁定；对每个**应翻译**的块 translate_block；纯数字/代码/单位块保持原样、不调用翻译工具。\n"
+        "② 编辑/修改（复核或修错）：read_page + render_page 看当前译文与版面；按 "
+        "check_residual / check_missing / check_numbers / check_table / check_layout 的问题清单决定改哪里——"
+        "确知译名 set_text；需重译 translate_block 或 retranslate_block（后者只返回译文）；按框选 apply_annotation；"
+        "恢复原文 delete_block。\n"
+        "③ 校验：每改一处复跑对应 check_*；直到 check_residual / check_missing 无问题、且（本页适用时）"
+        "check_numbers / check_table / check_layout 无实质问题，才可结束。扫描表报的「字号偏小/行带受限」是物理极限，可留意但不必强修。\n"
+        "④ 收尾：整页确认满足才结束；拿不准/术语/保留还是翻译→ask_user；某工具 ok=false→先读 error 再决定、别盲目重试；"
+        "改完必须校验，不要提前结束。"
     )
 
 
@@ -176,14 +228,21 @@ def page_task(page_index: int, lang: str, kind: str | None = None) -> str:
     """The per-page task handed to ``run_page_visual``.
 
     ``kind`` (normal / scan / chart / table / uncertain) is appended when given (a
-    special page), so the model knows what sort of page it is looking at.
+    special page), so the model knows what sort of page it is looking at.  The task
+    is deliberately strict about the target language: every text block of the page
+    must end up in ``lang`` (only numeric / amount / code / unit blocks stay verbatim),
+    and the model may not stop while ``check_residual`` still reports untranslated
+    content.  This avoids "翻译不完全" where the model skips blocks it judged not to
+    need translating.
     """
     n = page_index + 1
     head = f"这是文档第 {n} 页" + (f"（{kind} 页）" if kind else "") + "。"
     return (
-        f"{head}请阅读页面，把需要翻译的块翻译成 {lang}；数字/代码块保持原样。"
-        "用 read_page 观察、用 set_text/translate_block 翻译，最后用 check_residual 校验，"
-        "没有可做的事就结束。"
+        f"{head}请把本页**所有文本块**均翻译成 {lang}——整页最终应**全部是 {lang}**；"
+        "只有纯数字/金额/代码/单位块保持原样。\n"
+        "① read_page(page) 读本页全部块并记下 index；② 对每个**应翻译**的块 translate_block(index)（自动用该块原文），"
+        "确知的译名可直接 set_text(page, index, text)；③ 最后**必须** check_residual 校验。"
+        f"若仍报有块未译/残留，必须继续翻译——**确认整页都已译成 {lang}、且无残留才结束，不得提前结束**。"
     )
 
 
@@ -205,6 +264,39 @@ def special_page_question(page_index: int, kind: str) -> tuple[str, list[str]]:
     return (f"第 {n} 页类型不确定。如何处理？", ["翻译", "保留原文", "跳过"])
 
 
+def review_mode_question() -> tuple[str, list[str]]:
+    """M4: ask whether the draft is handed to the AI self-check or the user checks it."""
+    return ("全文初稿已生成。交由 AI 自检，还是你手动检查？", ["AI 自检", "我手动检查"])
+
+
+def review_export_question() -> tuple[str, list[str]]:
+    """M4: after the review, confirm whether to export the result."""
+    return ("复核完成。是否导出？", ["导出", "继续检查"])
+
+
+def review_page_task(page_index: int) -> str:
+    """M4 AI_SELFCHECK: the per-page task that re-reads the translation and fixes issues.
+
+    The agent first loads the page into context (``read_page`` + ``render_page``),
+    then runs a deterministic four-area audit — structure/layout, missing
+    translation, number fidelity, and table/text completeness — and fixes what it
+    finds (``set_text`` / ``retranslate_block`` / ``apply_annotation``).  It may only
+    end once every check that applies to the page returns clean.
+    """
+    n = page_index + 1
+    return (
+        f"这是文档第 {n} 页（页号 {page_index}，从 0 起）的【复核】。先 read_page({page_index}) + render_page({page_index}) "
+        "拿到本页原文与译文，再逐项核对、就地修正：\n"
+        "① 版面 check_layout：有无被压得过小、溢出自身框、压入同列下一块。\n"
+        "② 漏译 check_residual + check_missing：只有**应翻译而未翻译**的普通文本块才算问题；"
+        "纯数字/金额/单位/代码块是刻意保留的原文，**不属于漏译**。\n"
+        "③ 数字 check_numbers：与原文**按值**一致（千分位/小数/单位拆分等格式差异不算问题）。\n"
+        "④ 完整性 check_table：表格单元格与普通文本块都齐全、无空缺。\n"
+        "修正：set_text 写入已知译文；retranslate_block 只返回译文、需再 set_text 写入；apply_annotation 按用户框选改动。\n"
+        "**必须**让本页适用的上述检查都无问题才结束，否则继续修正，不得提前结束。"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 3. Interaction chat — system prompt + tool hint + greeting.
 # ---------------------------------------------------------------------------
@@ -219,13 +311,16 @@ def chat_system_prompt() -> str:
 
 def chat_tool_hint() -> str:
     """Appended to the chat system prompt ONLY when the model is given tools, so it
-    knows it can inspect / navigate / edit the loaded PDF.
+    knows it can inspect / navigate / edit / re-export the loaded PDF.
     """
     return (
-        "\n\n【可用工具】当用户要你查看或修改当前 PDF 时，请主动调用工具："
-        "get_doc_info 看文档概览，classify_page 判页型，read_page 读某页原文与现译文，"
-        "goto_page 打开预览窗口，set_block_text / delete_block_text / apply_annotation "
-        "改写或删除译文。只在确实需要文档信息、或用户明确要求改动时调用；纯闲聊不要调用工具。"
+        "\n\n【可用工具】用户要看/改/重新导出当前 PDF 时主动调用："
+        "get_doc_info 看概览，classify_page 判页型，read_page 读某页，goto_page 打开预览，"
+        "set_block_text / delete_block_text / apply_annotation 改或删译文。"
+        "**用户要最新译文 → 直接调 re_export 重新导出**（用当前修改重新生成，秒级、不重译）。"
+        "只在确需文档信息、或用户明确要求改动/导出时调用；纯闲聊不要用。"
+        "若 re_export 不可用（还没翻译过/没加载源文件），提示用户点主界面的「重新导出」按钮，"
+        "**不要说自己没有导出功能**——应用有「重新导出」。"
     )
 
 
@@ -247,16 +342,19 @@ CHAT_GREETING = "你好"
 AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "read_page": "读取指定页的文本块与布局元数据",
     "get_layout": "提取某页的行/列聚类、二维网格与单元格跨度",
-    "get_doc_info": "返回原文件信息：页数/标题/语言/文本页/扫描页/图表页/表格页/块数",
-    "classify_page": "判定某页类型：normal/scan/chart/table/uncertain",
-    "translate_block": "把某一块文本翻译成目标语言（走缓存+编号协议）",
-    "retranslate_block": "强制重译某文本（绕过缓存，常用于残中/空缺修正）",
+    "get_doc_info": "返回原文件信息：页数/标题/语言/文本页/扫描页/图表页/块数/每页类型（表格页恒为 0）",
+    "classify_page": "判定某页类型：normal/scan/chart/uncertain",
+    "translate_block": "翻译某块并写入其译文（走缓存+编号协议）",
+    "retranslate_block": "避开缓存强制重译一段文本，**只返回译文**（不会写入；需再用 set_text 把它写到目标块）。常用于残中/空缺修正",
     "set_text": "把某块文本直接置为指定值（数字/代码块会被拒绝）",
     "apply_annotation": "按预览中用户框选的区域改写/删除对应块（M6）",
     "apply_terminology": "为某源词设定统一的术语译文（会并入本页翻译所用的术语表）",
     "delete_block": "移除某块的译文覆盖，恢复为保留原文（不再翻译该块）",
-    "check_residual": "检查某页是否有残留中文/漏译的块",
-    "check_missing": "检查某页是否有源有译文空的块（内容缺失）",
+    "check_residual": "检查某页是否有未翻译残留（目标为西文时看残留中文；目标为中文时看未译的英文成句；纯代码/缩写/单位不算）与空块",
+    "check_missing": "检查某页是否有源有译文空的块（内容缺失；纯数字/代码块不算）",
+    "check_numbers": "核对某页译文的数字/金额是否与原文**按值**一致：源里的数值被删或改错才报告（千分位/小数/单位拆分等格式差异不算；中文【序数→数字】如 二→2 不算），返回不一致的块",
+    "check_table": "检查某页表格单元格与普通文本块的完整性：源可译单元格数 vs 已译数、空/缺失单元格、遗漏文本块",
+    "check_layout": "仿照导出器重新测量某页译文的版面：看是否低于可读下限、溢出自身框、压入同列下一块（两栏页只与同栏比较）",
     "render_page": "把当前处理到该页的译文渲染成 PNG 供视觉自检（检查溢出/越线/密度）",
     "preview_page": "在预览窗口显示指定页面（供用户查看），可聚焦某区域/块",
     "ask_user": "向用户提问并等待回答（关键决策/歧义/术语确认）",
@@ -264,11 +362,12 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
 
 #: The interaction-chat tool descriptions (``chat_tools.py``), keyed by tool name.
 CHAT_TOOL_DESCRIPTIONS: dict[str, str] = {
-    "get_doc_info": "返回当前 PDF 的信息：页数/标题/语言/文本页/扫描页/图表页/表格页/块数/每页类型。",
-    "classify_page": "判定某页类型：normal/scan/chart/table/uncertain。",
+    "get_doc_info": "返回当前 PDF 的信息：页数/标题/语言/文本页/扫描页/图表页/块数/每页类型（表格页恒为 0）。",
+    "classify_page": "判定某页类型：normal/scan/chart/uncertain。",
     "read_page": "读取某页的原始文本块与当前译文，含扁平块索引（供 set_block_text 使用）与布局元数据。",
     "goto_page": "在预览窗口显示指定页（原文/译文侧）。",
     "set_block_text": "把某块的译文直接置为指定文本（数字/代码块会被拒绝；写的是受保护的译文层）。",
     "delete_block_text": "移除某块的 AI 编辑，恢复为未被覆盖的译文。",
     "apply_annotation": "按预览中用户框选的区域改写/删除对应块（用 read_page 拿到的 bbox）。",
+    "re_export": "用当前已加载 PDF 上一次的成功译文，重新导出（应用本次对话/标注里已有的修改；不重新翻译、秒级）。",
 }

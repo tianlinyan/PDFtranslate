@@ -37,7 +37,6 @@ from .chat import ChatWorker
 from .doc_context import DocContext
 from . import prompts
 from .settings import ModelConfig, load_models, load_prefs, save_prefs
-from .translator import clear_translation_cache
 from .worker import OUTPUT_TYPES, TranslateWorker
 
 #: (display label, language name sent to the model)
@@ -158,10 +157,28 @@ class MainWindow(QWidget):
         self._worker: TranslateWorker | None = None
         self._last_output: str | None = None
         self._models_error = ""
+        #: An image taken from the preview ("发送" in the preview window) and buffered
+        #: until the next chat send, so it is sent to the AI together with the user's
+        #: typed text.  Cleared after it is consumed.
+        self._pending_image: bytes | None = None
+        #: Right-shifts the window once on first show so the preview (docked to the
+        #: left) has room.  Set in ``showEvent`` the first time.
+        self._geometry_set = False
         #: The last page + side (source/translation) shown in the preview window; the
         #: "预览" button reopens at this page/side instead of always page 0 / source.
         self._preview_current_page = 0
         self._preview_current_what = "source"
+        #: The exported PDF of the last successful run + its output type.  Kept here
+        #: (not just on the worker) because ``_cleanup`` drops the worker reference
+        #: after the run — the preview's "译文" side needs this to render the real
+        #: translated output, and ``self._last_output`` may be a .md/.txt.
+        self._last_pdf: str | None = None
+        self._last_output_type: str = ""
+        #: The last run's final aligned translation (flat index → text) and the source
+        #: it came from.  Lets "重新导出" re-write the output with the current chat /
+        #: annotation edits without re-translating.
+        self._last_translated: list[str] | None = None
+        self._last_translated_source: str | None = None
         # Run outcome, used by ``_cleanup`` to decide whether to reset the
         # progress bar / stage (a cancelled run leaves the bar spinning).
         self._run_ok = False
@@ -275,24 +292,31 @@ class MainWindow(QWidget):
         self._open_btn = QPushButton("打开输出")
         self._open_btn.setEnabled(False)
         self._open_btn.clicked.connect(self._open_output)
-        self._clear_cache_btn = QPushButton("清除缓存")
-        self._clear_cache_btn.clicked.connect(self._clear_cache)
         self._about_btn = QPushButton("关于")
         self._about_btn.clicked.connect(self._show_about)
         self._preview_btn = QPushButton("预览")
         self._preview_btn.clicked.connect(
             lambda: self._show_preview(self._preview_current_page, self._preview_current_what)
         )
+        self._re_export_btn = QPushButton("重新导出")
+        self._re_export_btn.setEnabled(False)
+        self._re_export_btn.setToolTip(
+            "用对话/标注里已有的修改，重新导出上一次的译文（不重新翻译）。"
+        )
+        self._re_export_btn.clicked.connect(self._re_export)
 
         # Worker ↔ GUI channel for the AI preview round-trip: the agent may open a
         # preview and wait for the user to frame a region and send it back.
         self.preview_bridge = preview.PreviewBridge(self)
         self.preview_bridge.showPreview.connect(self._show_preview)
+        # The chat AI's ``re_export`` tool triggers the same re-export on the GUI
+        # thread (the tool runs on the chat worker thread).
+        self.preview_bridge.reExportRequested.connect(self._re_export)
 
         btn_row = QHBoxLayout()
-        btn_row.addWidget(self._clear_cache_btn)
         btn_row.addStretch()
         btn_row.addWidget(self._preview_btn)
+        btn_row.addWidget(self._re_export_btn)
         btn_row.addWidget(self._start_btn)
         btn_row.addWidget(self._cancel_btn)
         btn_row.addWidget(self._open_btn)
@@ -315,11 +339,13 @@ class MainWindow(QWidget):
         # signal, so the worker never touches Qt widgets.
         self._chat_thread = QThread(self)
         # ``ctx`` lets the interaction model call the chat tools (read/navigate/edit
-        # the document); ``show_preview`` is the thread-safe bridge to open a page.
+        # the document); ``show_preview`` is the thread-safe bridge to open a page;
+        # ``re_export`` triggers the same re-export (thread-safe via the bridge).
         self._chat_worker = ChatWorker(
             ctx=self.doc_ctx,
             log=self._chat_log.log.emit,
             show_preview=self.preview_bridge.showPreview.emit,
+            re_export=self.preview_bridge.reExportRequested.emit,
         )
         self._chat_worker.moveToThread(self._chat_thread)
         self._chat_worker.ask_requested.connect(self._chat_worker.ask)
@@ -346,7 +372,21 @@ class MainWindow(QWidget):
 
         # On startup, proactively say hi to the AI so the conversation is open and the
         # user sees the assistant respond using the configured interaction model.
-        self.agent_sidebar.send_message(prompts.CHAT_GREETING)
+        # ``show=False``: the greeting is a hidden prompt — the AI still receives and
+        # replies, but the "你好" is not echoed as a sidebar user bubble.
+        self.agent_sidebar.send_message(prompts.CHAT_GREETING, show=False)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """On first show, shift the window 200px right of its default position.
+
+        Qt/WM places the window (usually centred) on ``show()``; nudging it 200px
+        to the right once gives the preview window (docked to its LEFT, right edge
+        abutting this window's left edge) room to sit beside it on screen.
+        """
+        super().showEvent(event)
+        if not self._geometry_set:
+            self._geometry_set = True
+            self.move(self.x() + 200, self.y())
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -414,12 +454,19 @@ class MainWindow(QWidget):
         # its next decision sees it (a no-op if no agent run is active).
         if self._worker is not None and text.strip():
             self._worker.add_user_requirement(text)
-        # Persistent chat: ask the interaction model on the background thread.  The
-        # model is captured here (GUI thread) and passed over, so the worker never
-        # touches Qt widgets.
+        # Persistent chat: ask the interaction model on the background thread.  A
+        # buffered preview image (from the preview's "发送") is sent together with the
+        # user's text when the model is vision-capable; otherwise the image is dropped
+        # (a non-vision model cannot see it) and only the text is sent.
         model = self._selected_model()
         if model is not None:
-            self._chat_worker.ask_requested.emit(text, model)
+            img = self._pending_image
+            self._pending_image = None
+            if img is not None and getattr(model, "vision", False):
+                self.agent_sidebar.add_notice("（已附上截图与文本发送）")
+                self._chat_worker.ask_requested.emit(text, model, img)
+            else:
+                self._chat_worker.ask_requested.emit(text, model, None)
 
     def _on_chat_reply(self, reply: str) -> None:
         """The interaction model answered; show it only in the sidebar."""
@@ -435,14 +482,13 @@ class MainWindow(QWidget):
             return
         import pymupdf as fitz
 
-        if what == "translation" and self._worker is not None:
-            # During an AI-orchestrated run, render the in-progress translation for
-            # this page (redact + redraw the blocks already translated).  The worker
-            # is blocked in the preview round trip, so this reads its state safely.
-            trans = self._worker.render_translation(page)
-            if trans:
-                png = trans
-            else:
+        if what == "translation":
+            # Show the translated output: after a run this renders from the exported
+            # PDF (the real translation); during a live agent run it shows the
+            # in-progress translation.  Falls back to the source page when neither is
+            # available (e.g. an in-place page the user chose to keep).
+            png = self._render_translation_preview(page)
+            if not png:
                 png = self._render_source_preview(page)
         else:
             png = self._render_source_preview(page)
@@ -452,7 +498,7 @@ class MainWindow(QWidget):
         win = getattr(self, "_preview_win", None)
         if win is None:
             win = preview.PreviewWindow()
-            win.sendRequested.connect(self.preview_bridge.on_region)
+            win.sendRequested.connect(self._on_preview_send)
             win.pageChanged.connect(self._on_preview_page_changed)
             self._preview_win = win
         # Remember the page + side so a later re-open (the "预览" button) shows the
@@ -463,7 +509,15 @@ class MainWindow(QWidget):
         win.set_page_info(page, self._page_count())
         prefix = "预览（原文）" if what == "source" else "预览（译文）"
         win.setWindowTitle(f"{prefix} · 第 {page + 1} 页")
-        win.show_png(png)
+        # A fresh popup resets size/zoom and re-docks the window; an in-place refresh
+        # (prev/next/jump inside the window) keeps the user's resized window, zoomed
+        # view and where they parked it.
+        popup = not win.isVisible()
+        win.show_png(png, reset_geometry=popup)
+        if popup:
+            # Sit the preview to the LEFT of the main window, its right edge abutting
+            # the main window's left edge (restored every time it pops up).
+            win.place_left_of(self.frameGeometry())
 
     def _page_count(self) -> int:
         """The source PDF page count (1 if unavailable)."""
@@ -483,6 +537,18 @@ class MainWindow(QWidget):
         if self._worker is not None:
             self._worker.set_current_page(page)
         self._show_preview(page, self._preview_current_what)
+
+    def _on_preview_send(self, png: bytes, pdf_rect: list[float]) -> None:
+        """The preview's "发送" pressed: serve the agent annotation flow AND buffer a copy.
+
+        ``preview_bridge.on_region`` unblocks a waiting agent ``get_region`` (M6
+        annotation); in parallel the cropped image is buffered so the next chat send
+        carries it together with the user's text (the sidebar shows "已复制图片").
+        """
+        self.preview_bridge.on_region(png, pdf_rect)
+        if png:
+            self._pending_image = png
+            self.agent_sidebar.add_notice("已复制图片，发送消息时将连同文本一起发给 AI。")
 
     def _maybe_preview_command(self, text: str) -> bool:
         """Route M5 preview-navigation commands; returns True if handled.
@@ -520,6 +586,50 @@ class MainWindow(QWidget):
                 doc.close()
         except Exception:  # noqa: BLE001
             return b""
+
+    def _render_translation_preview(self, page: int) -> bytes | None:
+        """Render the *translated* output for ``page`` (``None`` if unavailable).
+
+        Priority: (1) the exported PDF (the real translated output — this is what the
+        user wants to see after a run, and what fixes the "preview shows only the
+        source" bug); (2) the worker's in-progress translation during a live agent
+        run.  The caller falls back to the source page when this returns ``None``.
+        """
+        pdf_path = self._last_pdf
+        if pdf_path and Path(pdf_path).exists():
+            out_page = self._translation_output_page(page, self._last_output_type)
+            return self._render_pdf_page_png(pdf_path, out_page)
+        worker = self._worker
+        if worker is not None:
+            return worker.render_translation(page)
+        return None
+
+    def _translation_output_page(self, page: int, kind: str) -> int:
+        """Map a source ``page`` to its page index in the exported PDF.
+
+        ``translated_pdf`` overlays the translation in place, so the output page
+        index equals the source index.  ``bilingual_pdf`` inserts a mirror
+        translation page after every source page, so source ``i`` lives at output
+        ``2*i + 1``.  Any other kind keeps the index unchanged.
+        """
+        if kind == "bilingual_pdf":
+            return page * 2 + 1
+        return page
+
+    def _render_pdf_page_png(self, path: str | Path, page: int) -> bytes | None:
+        """Render ``page`` of the PDF at ``path`` to a PNG (``None`` if unusable)."""
+        import pymupdf as fitz
+
+        try:
+            doc = fitz.open(str(path))
+            try:
+                if not (0 <= page < doc.page_count):
+                    return None
+                return pdfio._render_page_png(doc[page], dpi=200)
+            finally:
+                doc.close()
+        except Exception:  # noqa: BLE001
+            return None
 
     def _browse_output(self) -> None:
         key = self._type_combo.currentData()
@@ -577,6 +687,7 @@ class MainWindow(QWidget):
         self._run_ok = False
         self._cancelled_by_user = False
         self._errored = False
+        self._last_pdf = None   # the previous run's exported PDF no longer applies
         # Clear the log *before* saving prefs so a prefs-save warning is not
         # wiped out.
         self._log.clear()
@@ -592,8 +703,7 @@ class MainWindow(QWidget):
         self._cancel_btn.setEnabled(True)
         self._open_btn.setEnabled(False)
 
-        self._thread = QThread(self)
-        self._worker = TranslateWorker(
+        self._launch_worker(TranslateWorker(
             self._source,
             model,
             str(lang),
@@ -605,18 +715,24 @@ class MainWindow(QWidget):
             show_preview=self.preview_bridge.show_page,
             agent_mode=True,
             overlay=self.doc_ctx.overlay(),
-        )
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.log.connect(self._append_log)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-        # ``stopped`` fires on every exit path — including a cancellation, which
-        # emits neither ``finished`` nor ``error``.  Quitting the thread from it
-        # (instead of from those two) guarantees ``_cleanup`` always runs and the
-        # "开始翻译" button comes back.
-        #
+        ))
+
+    def _launch_worker(self, worker: TranslateWorker) -> None:
+        """Move ``worker`` onto a fresh thread and wire its signals.
+
+        ``stopped`` fires on every exit path — including a cancellation, which
+        emits neither ``finished`` nor ``error``.  Quitting the thread from it
+        (instead of from those two) guarantees ``_cleanup`` always runs and the
+        "开始翻译" button comes back.
+        """
+        self._worker = worker
+        self._thread = QThread(self)
+        worker.moveToThread(self._thread)
+        self._thread.started.connect(worker.run)
+        worker.progress.connect(self._on_progress)
+        worker.log.connect(self._append_log)
+        worker.finished.connect(self._on_finished)
+        worker.error.connect(self._on_error)
         # ``stopped`` is also where the worker C++ object is scheduled for
         # deletion: at this moment the worker thread's event loop is still
         # running, so the ``DeferredDelete`` is actually processed and the
@@ -624,8 +740,8 @@ class MainWindow(QWidget):
         # after the thread has finished), would post the ``DeferredDelete`` to
         # a dead event loop that never processes it, leaking one QObject per
         # run.
-        self._worker.stopped.connect(self._worker.deleteLater)
-        self._worker.stopped.connect(self._thread.quit)
+        worker.stopped.connect(worker.deleteLater)
+        worker.stopped.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup)
         self._thread.start()
 
@@ -655,6 +771,56 @@ class MainWindow(QWidget):
             self._append_log("正在取消…")
         self._cancel_btn.setEnabled(False)
 
+    def _re_export(self) -> None:
+        """Re-write the output with the current chat / annotation edits, no re-translation.
+
+        The AI interaction chat edits the protected overlay (``doc_ctx``).  Re-running
+        "开始翻译" would apply it but re-translate everything (expensive).  This reuses
+        the last run's committed translation and re-runs only the export step with the
+        current overlay applied — so the user sees their edits in a fresh PDF quickly.
+        """
+        if self._thread is not None:
+            return
+        if not self._last_translated:
+            QMessageBox.information(self, "重新导出", "还没有可重新导出的译文。")
+            return
+        if not self._source or not Path(self._source).exists():
+            QMessageBox.information(self, "重新导出", "请先选择源 PDF。")
+            return
+        if self._last_translated_source and self._last_translated_source != self._source:
+            QMessageBox.warning(
+                self, "重新导出",
+                "源文件已变更，上一次的译文不再适用，请直接点「开始翻译」重新翻译。",
+            )
+            return
+        model = self._selected_model()
+        if model is None:
+            QMessageBox.warning(self, "重新导出", "没有可用模型，请检查 models.json 配置。")
+            return
+        key = self._type_combo.currentData()
+        out_path = self._path_edit.text().strip() or self._default_output_path()
+        self._run_ok = False
+        self._cancelled_by_user = False
+        self._errored = False
+        self._log.clear()
+        self._stage.setText("重新导出…")
+        self._start_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
+        self._re_export_btn.setEnabled(False)
+        self._open_btn.setEnabled(False)
+        self._launch_worker(TranslateWorker(
+            self._source,
+            model,
+            self._target_language(),
+            key,
+            out_path,
+            ocr=True,
+            agent_mode=False,
+            overlay=self.doc_ctx.overlay(),
+            re_export=True,
+            last_translated=self._last_translated,
+        ))
+
     def _on_progress(self, done: int, total: int, stage: str) -> None:
         if total:
             # determinate: show a live percentage AND the block ratio
@@ -680,21 +846,6 @@ class MainWindow(QWidget):
         self._progress.setValue(value)
         self._stage.setText(stage)
 
-    def _clear_cache(self) -> None:
-        reply = QMessageBox.question(
-            self,
-            "清除缓存",
-            "确定要清除所有翻译缓存吗？\n已缓存的译文将丢失，下次需重新翻译。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            removed = clear_translation_cache()
-            self._append_log(f"已清除 {removed} 个缓存文件。")
-        except Exception as exc:
-            self._append_log(f"清除缓存失败：{exc}")
-
     def _show_about(self) -> None:
         AboutDialog(self).exec()
 
@@ -718,6 +869,17 @@ class MainWindow(QWidget):
         worker = self._worker
         if worker is not None and getattr(worker, "_last_translated", None):
             self.doc_ctx.set_last_translated(worker._last_translated)
+            self._last_translated = list(worker._last_translated)
+            self._last_translated_source = self._source
+            self._re_export_btn.setEnabled(True)
+        # Remember the exported PDF + its type so the preview's "译文" side can
+        # render the REAL translated output after the run.  ``_cleanup`` drops the
+        # worker reference, so this must live here.
+        if worker is not None:
+            self._last_pdf = getattr(worker, "_last_pdf", None)
+            self._last_output_type = getattr(worker, "_output_type", "")
+        else:
+            self._last_pdf = None
 
     def _on_error(self, msg: str) -> None:
         # Settle the progress bar (it may be stuck in the busy state) and mark
@@ -764,6 +926,7 @@ class MainWindow(QWidget):
         self._errored = False
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
+        self._re_export_btn.setEnabled(self._last_translated is not None)
 
     # ------------------------------------------------------------------
     # Drag & drop a PDF to set the source

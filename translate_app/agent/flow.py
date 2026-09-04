@@ -18,7 +18,10 @@ See ``docs/0.3.0-设计.md`` §4.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
+import re
+from collections import Counter
 
 from .state import (
     DocInfo,
@@ -27,6 +30,7 @@ from .state import (
     PHASE_COMPLETED,
     PHASE_DONE,
     PHASE_PREPROCESS,
+    PHASE_REVIEW,
     PHASE_SPECIAL_PAGES,
     PHASE_TRANSLATE_NORMAL,
     STATUS_DONE,
@@ -280,7 +284,7 @@ def make_llm_decide(model, *, task: str, image_provider=None,
         return None
     client = _tr.OpenAI(**model.client_kwargs())
     specs = agent_openai_tools(names=list(tool_names) if tool_names is not None else None)
-    messages: list[dict] = [{"role": "system", "content": str(task) + prompts.agent_interaction_rules()}]
+    messages: list[dict] = [{"role": "system", "content": str(task) + prompts.agent_interaction_rules() + prompts.agent_tool_policy() + prompts.agent_workflow()}]
     sent_image = False
     pending_assistant: dict | None = None
     pending_call_id: str = ""
@@ -454,8 +458,103 @@ def _has_cjk(text: Any) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in str(text))
 
 
-def _target_is_cjk(state: WorkflowState) -> bool:
-    return any("\u4e00" <= ch <= "\u9fff" for ch in state.lang)
+#: Full-width digit / decimal-separator rune → ASCII (accounts for OCR/PDF runs that
+#: mix full-width glyphs so the number-fidelity check compares equal values).
+_FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９．，", "0123456789.,")
+#: Unicode minus (U+2212) and dashes used in PDF runs → ASCII hyphen-minus.
+_UNICODE_MINUS = str.maketrans("−–—", "---")
+#: A numeric token: an integer (optionally comma-grouped) or a decimal run; sign kept.
+_NUM_TOKEN_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+#: Month names in date runs map to their number (``December 31, 2023`` must compare
+#: equal to ``2023年12月31日``).  Capitalized only — "may be" must stay prose, never
+#: become the digit 5.
+_MONTH_RE = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\b")
+_MONTH_NUM = {"January": "1", "February": "2", "March": "3", "April": "4",
+              "May": "5", "June": "6", "July": "7", "August": "8",
+              "September": "9", "October": "10", "November": "11", "December": "12"}
+#: Unit multipliers that legitimately change a value's appearance: 万/亿 in a CJK
+#: source, and thousand/million/billion/trillion (with ten/hundred prefixes) in a
+#: Latin translation — ``3.14 亿元`` and ``314 million yuan`` are the same value.
+_UNIT_EN_RE = re.compile(
+    r"^\s*((?:ten|hundred)\s+)?(thousand|million|billion|trillion)\b", re.IGNORECASE)
+_UNIT_EN_POWER = {"thousand": 3, "million": 6, "billion": 9, "trillion": 12}
+_UNIT_CN_RE = re.compile(r"^\s*(万亿|亿|万)\s*")
+_UNIT_CN_POWER = {"万亿": 12, "亿": 8, "万": 4}
+#: Latin words used by the residual-prose detector (a code like ``GB/T 33436-2016``
+#: is not prose, an untranslated sentence is).
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]+(?:[’'-][A-Za-z]+)*")
+
+
+def _unit_multiplier(window: str) -> Decimal:
+    """The scale a unit word right after a number applies to it (``1`` when none)."""
+    m = _UNIT_EN_RE.match(window)
+    if m:
+        power = _UNIT_EN_POWER[m.group(2).lower()]
+        prefix = (m.group(1) or "").lower().strip()
+        return Decimal(10) ** (power + (2 if prefix == "hundred" else
+                                        1 if prefix == "ten" else 0))
+    m = _UNIT_CN_RE.match(window)
+    if m:
+        return Decimal(10) ** _UNIT_CN_POWER[m.group(1)]
+    return Decimal(1)
+
+
+def _number_signature(text: Any) -> "Counter[Decimal]":
+    """The multiset of *values* (not token strings) that ``text`` contains.
+
+    Full-width glyphs, Unicode minus and hyphen-separated runs (``2023-12-31``)
+    are normalized first; month names in dates count as their number; and a unit
+    multiplier directly attached to a value is applied.  So ``3,702,726,474.45``,
+    ``３０７２７２６４７４．４５`` and ``December 31, 2023``
+    all compare against their exact source forms *by value*, while a translation
+    that drops / alters / invents a digit still does not.
+    """
+    t = str(text).translate(_FULLWIDTH_DIGITS).translate(_UNICODE_MINUS)
+    # Month names first — the month-substituted digits must stay SEPARATE tokens
+    # from the day/year ("December 31, 2023" == "2023年12月31日"), so no space
+    # normalization may merge them.
+    t = _MONTH_RE.sub(lambda m: _MONTH_NUM[m.group(0)], t)
+    t = t.replace(",", "").replace("，", "")
+    # Only the sign-adjacent space is an artifact: "− 7,326.50" keeps its sign
+    # while "3.14 亿元" / "314 million yuan" keep the space the unit matcher
+    # needs to attach the multiplier to the right value.
+    t = re.sub(r"(?<=[-+])\s+(?=\d)", "", t)
+    # A hyphen between digits is a run separator (2023-12-31), not a sign: putting
+    # spaces around it keeps the tokenizer from reading "-12" as a negative number.
+    t = re.sub(r"(?<=\d)-(?=\d)", " - ", t)
+    out: Counter[Decimal] = Counter()
+    spans = list(_NUM_TOKEN_RE.finditer(t))
+    for i, m in enumerate(spans):
+        tok = m.group(0)
+        if tok in ("", "-", "+", "."):
+            continue
+        try:
+            v = Decimal(tok)
+        except InvalidOperation:
+            continue
+        # The unit that belongs to THIS value sits between the token and the next
+        # number (a unit cannot skip over another figure).
+        unit_win = (t[m.end():spans[i + 1].start()] if i + 1 < len(spans)
+                    else t[m.end():m.end() + 16])
+        out[v * _unit_multiplier(unit_win)] += 1
+    return out
+
+
+def _is_latin_prose(text: Any) -> bool:
+    """True when ``text`` looks like untranslated Latin *prose*, not a code/acronym.
+
+    A CJK target legitimately keeps Latin codes / units / acronyms (``GB/T
+    33436-2016``, ``GDP``, ``USD 100 million``), so at least three Latin words and
+    no CJK glyph at all are required before a block is reported as residual — the
+    review loop otherwise burns its budget fixing a genuine figure.
+    """
+    t = str(text)
+    if any("一" <= ch <= "鿿" for ch in t):
+        return False
+    return len(_LATIN_WORD_RE.findall(t)) >= 3
+
+
 
 
 def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] | None = None,
@@ -558,6 +657,8 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         b = _block(index)
         if b is None:
             return {"ok": False, "error": f"bad index {index}"}
+        if pdfio._is_numeric_cell(str(b.text)):
+            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
         src = str(text) if text is not None else str(b.text)
         translated = _translate(src, target_lang or state.lang)
         _write(index, translated)
@@ -620,6 +721,8 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
                 "text": _read(flat)}
 
     def retranslate_block(text: str, target_lang: str | None = None):
+        if pdfio._is_numeric_cell(str(text)):
+            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
         if retranslate is None:
             return {"ok": False, "error": "重译不可用（非视觉模型）"}
         return {"ok": True, "text": retranslate(str(text), target_lang or state.lang)}
@@ -646,17 +749,48 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         return {"ok": True, "page": int(page), "what": what or "translation",
                 "image": png or b""}
 
+    def _verbatim(b) -> bool:
+        """True for a block the engine never sends for translation (pure number /
+        code / symbol) — it is kept byte-identical by design."""
+        return not _tr._needs_translation(str(b.text))
+
+    def _protected(b) -> bool:
+        """True for a block that must stay byte-identical: the engine skips it
+        (``_verbatim``) **or** the write gate refuses to rewrite it
+        (``pdfio._is_numeric_cell``).
+
+        The audit checks skip these so the review loop never tries to "fix" a figure
+        it is forbidden to change — the old checks used only the engine predicate, so
+        a numeric cell could be reported "missing / residual" indefinitely.
+        """
+        return _verbatim(b) or pdfio._is_numeric_cell(str(b.text))
+
     def check_residual(page: int | None = None):
+        """Untranslated content left on ``page`` (``None`` = whole doc).
+
+        A block with no translation at all is ``empty``.  For a Latin target a
+        remaining CJK run is residual; for a CJK target the mirror is untranslated
+        Latin *prose* (``_is_latin_prose`` — codes / units / acronyms legitimately
+        stay Latin).  Whether the target is a CJK language is decided by *identity*
+        (``prompts._is_cjk_language``), never by scanning the language name for CJK
+        glyphs: the default Chinese target is ASCII ("Simplified Chinese"), and a
+        glyph scan would judge it Latin-only and flag every Chinese translation as
+        residual — the review loop then burns its budget fixing a clean page.
+        """
         blocks, offset, _ = _page_range(page)
+        cjk_target = prompts._is_cjk_language(state.lang)
         out = []
         for i, b in enumerate(blocks):
-            if b.is_chart:
+            if b.is_chart or _protected(b):
                 continue
             idx = offset + i
             t = _read(idx)
             if not t.strip():
                 out.append({"index": idx, "text": str(b.text), "reason": "empty"})
-            elif not _target_is_cjk(state) and _has_cjk(t):
+            elif cjk_target:
+                if _is_latin_prose(t):
+                    out.append({"index": idx, "text": str(b.text), "reason": "residual_latin"})
+            elif _has_cjk(t):
                 out.append({"index": idx, "text": str(b.text), "reason": "residual_cjk"})
         return {"residual": out, "page": page}
 
@@ -664,10 +798,133 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         blocks, offset, _ = _page_range(page)
         out = []
         for i, b in enumerate(blocks):
+            if _protected(b):
+                continue
             idx = offset + i
             if str(b.text).strip() and not _read(idx).strip():
                 out.append({"index": idx, "text": str(b.text)})
         return {"missing": out, "page": page}
+
+    def check_numbers(page: int | None = None):
+        """Number fidelity: are the page's numerals preserved in the translation?
+
+        A translation may re-format thousands separators / decimals, but the *value*
+        must match the source.  Returns every block whose canonical number set
+        differs (``missing`` = in source but not in translation; ``extra`` = invented).
+        Numeric-only blocks are kept verbatim, so they pass trivially; a block the
+        AI wrongly rewrote is exactly what this flags.
+        """
+        blocks, offset, _ = _page_range(page)
+        out = []
+        for i, b in enumerate(blocks):
+            idx = offset + i
+            t = _read(idx)
+            if not t.strip():
+                continue   # untranslated → handled by check_missing, not number fidelity
+            src = _number_signature(str(b.text))
+            trans = _number_signature(t)
+            missing = list((src - trans).elements())
+            extra = list((trans - src).elements())
+            if missing or extra:
+                out.append({"index": idx, "source": str(b.text), "translation": t,
+                            "missing": missing, "extra": extra})
+        return {"numbers": out, "page": page}
+
+    def check_table(page: int | None = None):
+        """Table / text completeness for ``page`` (``None`` = whole doc).
+
+        Lists the translatable table cells and ordinary text blocks that still have
+        no translation, and reports whether everything is complete.  Verbatim and
+        chart blocks are excluded (they are preserved, not translated).
+        """
+        blocks, offset, _ = _page_range(page)
+        cells: list[tuple[int, str]] = []
+        texts: list[tuple[int, str]] = []
+        for i, b in enumerate(blocks):
+            if _protected(b) or getattr(b, "is_chart", False):
+                continue
+            idx = offset + i
+            (cells if getattr(b, "in_table", False) else texts).append((idx, str(b.text)))
+
+        def _empty(cands: list[tuple[int, str]]) -> list[int]:
+            return [idx for idx, _ in cands if not _read(idx).strip()]
+
+        empty_cells = _empty(cells)
+        empty_text = _empty(texts)
+        return {
+            "page": page,
+            "source_cells": len(cells),
+            "translated_cells": len(cells) - len(empty_cells),
+            "empty_cells": empty_cells,
+            "empty_text_count": len(empty_text),
+            "empty_text": empty_text,
+            "complete": not empty_cells and not empty_text,
+        }
+
+    def check_layout(page: int | None = None):
+        """Structure / layout integrity for ``page`` using the exporter's own fit rules.
+
+        One ``pdfio._fit_block`` per block (the height is derived from its result —
+        the exporter is *never* run twice for the same block) with
+        ``pdfio._line_leading``, so the measured height matches what the export
+        actually draws.  Flags a translated block that is (a) below the exporter's
+        own floor, (b) drawn past its own box (``overflow``), or (c) tall enough to
+        cover the next block on the same column (``crowding``).
+
+        ``too_small`` uses *exporter-parity* floors — table cells ``_MIN_TABLE_FLOOR``
+        (a scanned row band is the limit), prose ``min(start size, _MIN_READABLE)`` —
+        so a legally small source (a 5.4pt footnote) or a scanned cell that
+        legitimately wraps small is never flagged; only a fit below what the exporter
+        can ever produce is a real defect.  ``crowding`` measures the gap on the SAME
+        COLUMN only (blocks must x-overlap): on a two-column page the paired column's
+        blocks sit at the same y and must not count — the columns are independent and
+        the exporter never covers one with the other.  Overflow and crowding are
+        reported independently (one block can genuinely be both).  Vertical labels
+        are rotated by the exporter (``_draw_vertical_label``) and do not follow the
+        horizontal fit rules, so they are skipped here.  Protected blocks are not
+        translated and never change their footprint.
+        """
+        blocks, offset, _ = _page_range(page)
+        font = pdfio._CJK_FONT
+        issues: list[dict[str, Any]] = []
+        for i, b in enumerate(blocks):
+            if _protected(b) or pdfio._is_vertical_label(b):
+                continue
+            idx = offset + i
+            t = _read(idx)
+            if not t.strip():
+                continue
+            try:
+                lines, fs = pdfio._fit_block(b, font, t)
+            except Exception:  # noqa: BLE001 — a block we cannot measure is skipped
+                continue
+            in_table = bool(getattr(b, "in_table", False))
+            leading = pdfio._line_leading(font, in_table=in_table, n_lines=len(lines))
+            height = pdfio._wrapped_height(font, lines, fs, leading)
+            box_h = max(0.5, b.y1 - b.y0)
+            start_fs = max(5.0, min(b.size, pdfio._MAX_FONT))
+            floor = pdfio._MIN_TABLE_FLOOR if in_table else min(start_fs, pdfio._MIN_READABLE)
+            if fs + 1e-9 < floor:
+                issues.append({"index": idx, "kind": "too_small",
+                               "detail": f"译文字号 {fs:.2f}pt 低于可读下限 {floor:.2f}pt"})
+            if height > box_h + 2.0:
+                issues.append({"index": idx, "kind": "overflow",
+                               "detail": f"译文高度 {height:.1f}pt 超过自身框 {box_h:.1f}pt"})
+            # Only blocks on the same column (x-overlapping) are the "next" block:
+            # a two-column page has sibling blocks at the same y on the other column.
+            # Crowding is about covering a REAL next block — when nothing sits below
+            # (last block of the page), the ``overflow`` flag already covers the
+            # "too tall" case, and a fake 2×box gap would only add noise.
+            below = [nb for nb in blocks
+                     if nb is not b and nb.y0 >= b.y1 - 0.5
+                     and nb.x0 < b.x1 and nb.x1 > b.x0]
+            if below:
+                gap = min(nb.y0 for nb in below) - b.y1
+                if height > box_h + gap + 2.0:
+                    issues.append({"index": idx, "kind": "crowding",
+                                   "detail": f"译文高 {height:.1f}pt 会压入下一块（剩余 {gap:.1f}pt）"})
+        return {"page": page, "count": len(issues), "issues": issues[:60],
+                "truncated": len(issues) > 60}
 
     def preview_page(page: int, what: str = "translation", region=None, **_kw):
         if preview_handler is None:
@@ -704,6 +961,9 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         "apply_terminology": apply_terminology,
         "check_residual": check_residual,
         "check_missing": check_missing,
+        "check_numbers": check_numbers,
+        "check_table": check_table,
+        "check_layout": check_layout,
         "render_page": render_page,
         "preview_page": preview_page,
         "ask_user": ask_user,
@@ -825,6 +1085,8 @@ class DocumentSession:
         self._translate_normal()
         self.state.phase = PHASE_SPECIAL_PAGES
         self._special_pages()
+        self.state.phase = PHASE_REVIEW
+        self._review()
         self.state.phase = PHASE_COMPLETED
         self._completed()
         self.state.phase = PHASE_DONE
@@ -977,3 +1239,83 @@ class DocumentSession:
                 f"已完成正常页 {d.text_pages}/{d.pages}，特殊页 {d.special_pages} 页待协商。"
             )
             self.log(f"  [完成] {self.state.summary}")
+
+    def _answer_value(self, val) -> str:
+        """Normalise an ``answer_handler`` result to a trimmed string."""
+        value = (val or {}).get("value") if isinstance(val, dict) else val
+        return str(value or "").strip()
+
+    def _review(self) -> None:
+        """M4 REVIEW: pick AI self-check / manual check, then confirm export.
+
+        After every page is drafted the session surfaces the review-mode question
+        (``review_mode_question``).  ``ai`` runs a per-page self-check-fix pass;
+        ``user`` lets the user inspect via the preview / sidebar (M5/M6 tools already
+        exist).  Either way the session then confirms export before completing —
+        a "继续检查" answer keeps the session in manual-review mode (the worker just
+        exports afterwards; a non-exporting review can be resumed from the chat).
+        """
+        mode = "ai"
+        if self.answer_handler is not None:
+            try:
+                q, opts = prompts.review_mode_question()
+                ans = self._answer_value(self.answer_handler(q, list(opts), "review_mode"))
+                if ans in ("我手动检查", "user"):
+                    mode = "user"
+            except Exception as exc:  # noqa: BLE001 — fail-closed to AI self-check
+                self.log(f"  复核模式询问失败：{type(exc).__name__}: {exc}（按 AI 自检处理）。")
+        self.state.review_mode = mode
+        if mode == "ai":
+            self._ai_self_check()
+        else:
+            self.log("  [复核] 手动检查：请在预览/侧边栏查看并标注，检查完成后确认导出。")
+        # Confirm export (fail-closed to export).
+        export = True
+        if self.answer_handler is not None:
+            try:
+                q, opts = prompts.review_export_question()
+                ans = self._answer_value(self.answer_handler(q, list(opts), "export"))
+                if ans in ("继续检查", "continue"):
+                    export = False
+            except Exception as exc:  # noqa: BLE001 — fail-closed to export
+                self.log(f"  复核导出确认失败：{type(exc).__name__}: {exc}（按导出处理）。")
+        if not export:
+            self.state.review_mode = "user"
+            self.log("  [复核] 用户选择继续检查：可在侧边栏/预览继续，然后重新导出。")
+
+    def _ai_self_check(self) -> None:
+        """M4 AI_SELFCHECK: re-read each page, find and fix issues via the agent loop.
+
+        Only pages that were actually translated are re-checked.  Pages the user chose
+        to keep / skip (``triage.decision`` in keep/skip) carry the source text verbatim
+        — there is no AI translation to review there, and re-checking them would
+        (wrongly) try to translate the intentionally-kept original.  Honouring the
+        user's manual choice, those pages are skipped.
+        """
+        kept = {i for i, t in self.state.triage.items()
+                if t.decided and t.decision in ("keep", "skip")}
+        pages = [i for i in self.state.triage if i not in kept]
+        total = len(pages)
+        if not total:
+            self.log("  [复核] 无待复核页（全部为保留/跳过页）。")
+            return
+        if kept:
+            self.log(f"  [复核] AI 自检：跳过 {len(kept)} 页用户选择保留/跳过（{sorted(kept)}）。")
+        self.log(f"  [复核] AI 自检：逐页回读并修正（共 {total} 页）。")
+        for done, i in enumerate(pages, start=1):
+            if self.cancel():
+                raise _tr.TranslationCancelled()
+            task = prompts.review_page_task(i)
+            try:
+                self.translate_page(
+                    self.state, i, self.model, task=task, log=self.log,
+                    preview_handler=self.preview_handler, answer_handler=self.answer_handler,
+                    max_steps=self.max_steps_per_page, cancel=self.cancel,
+                    render_handler=self.render_handler,
+                )
+            except _tr.TranslationCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 — a failed review is not fatal
+                self.log(f"  第 {i + 1} 页自检失败：{type(exc).__name__}: {exc}（保留译文）。")
+            self.progress(done, total, "复核")
+            self.state.page(i).issues.append("已复核")

@@ -8,7 +8,12 @@ from __future__ import annotations
 
 import unittest
 
-from translate_app.main_window import LANGUAGES, parse_preview_command, resolve_language
+from translate_app.main_window import (
+    LANGUAGES,
+    MainWindow,
+    parse_preview_command,
+    resolve_language,
+)
 
 
 class ResolveLanguageTest(unittest.TestCase):
@@ -51,11 +56,33 @@ class ParsePreviewCommandTest(unittest.TestCase):
         self.assertEqual(("goto", 2, "translation"), parse_preview_command("预览译文第三页"))
         self.assertEqual(("goto", 1, "source"), parse_preview_command("预览原文第二页"))
         self.assertEqual(("goto", 12, "translation"), parse_preview_command("预览译文第十三页"))
+        # "翻译" is a shorthand for the translation side (regression).
+        self.assertEqual(("goto", 2, "translation"), parse_preview_command("打开翻译第 3 页"))
 
     def test_not_a_navigation_command(self):
         self.assertIsNone(parse_preview_command("把第 3 页公司名换成 Bank"))
         self.assertIsNone(parse_preview_command(""))
         self.assertIsNone(parse_preview_command("   "))
+
+
+class TranslationOutputPageTest(unittest.TestCase):
+    """Preview bug: the "译文" side showed only the source after export.
+
+    The source page → exported-PDF page mapping (in-place vs bilingual) must be
+    right so the preview actually renders the translated output, not the source.
+    """
+
+    def test_inplace_pdf_keeps_same_page_index(self):
+        # translated_pdf overlays the translation in place → same page index.
+        self.assertEqual(3, MainWindow._translation_output_page(None, 3, "translated_pdf"))
+
+    def test_bilingual_pdf_mirrors_to_2i_plus_1(self):
+        # bilingual inserts a translation page after every source page.
+        self.assertEqual(1, MainWindow._translation_output_page(None, 0, "bilingual_pdf"))
+        self.assertEqual(7, MainWindow._translation_output_page(None, 3, "bilingual_pdf"))
+
+    def test_unknown_kind_keeps_index(self):
+        self.assertEqual(2, MainWindow._translation_output_page(None, 2, "markdown"))
 
 
 if __name__ == "__main__":

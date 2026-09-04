@@ -78,6 +78,21 @@ class AgentToolsTest(unittest.TestCase):
             self.assertIsInstance(params.get("properties"), dict)
             self.assertIsInstance(params.get("required"), list)
 
+    def test_openai_tools_description_includes_returns(self):
+        # Regression: the model-facing description must include each tool's ``returns``
+        # (result shape / index semantics).  Without it the model never learns e.g.
+        # read_page's "每块 index 为全文档扁平索引" or check_table's field names, so it
+        # can't reliably use the returned fields.
+        descs = {t["function"]["name"]: t["function"]["description"]
+                 for t in agent.agent_openai_tools()}
+        self.assertIn("扁平", descs["read_page"])
+        self.assertIn("complete", descs["check_table"])
+        self.assertIn("missing", descs["check_numbers"])
+        self.assertTrue(descs["set_text"].startswith("把某块文本直接置为指定值"))
+        # The retranslate_block description must be truthful: it returns text only.
+        self.assertIn("只返回译文", descs["retranslate_block"])
+
+
     def test_existing_judgment_tools_registered(self):
         # ``classify_block`` is a standalone classifier (via ``make_agent_tools``),
         # not part of the per-page ``AGENT_TOOLS`` registry that ``run_page_visual``
@@ -268,6 +283,12 @@ class FlowAgentTest(unittest.TestCase):
         self.assertIs(out, s)
         self.assertEqual(2, s.budget.used_steps)   # capped at max_rounds
 
+    def test_run_agent_run_requires_decide(self):
+        # Passing ``decide=None`` must fail fast with a clear error, not crash on
+        # the first step when the loop tries to ask the model.
+        with self.assertRaises(ValueError):
+            agent.run_agent_run(agent.WorkflowState("a.pdf", "English"), {}, None)
+
 
 def _vision_model() -> ModelConfig:
     return ModelConfig.from_dict(dict(
@@ -404,6 +425,19 @@ class LlmDecideAndPageLoopTest(unittest.TestCase):
         self.assertIn("ask_user", system)
         self.assertIn("【与用户交互】", system)
         self.assertIn("ask_user", [f["function"]["name"] for f in seen[0]["tools"]])
+        # The system prompt carries the tool function + usage reference, so the model
+        # reads every tool's contract here (not just one-line descriptions in the
+        # tools array): grouped, with the gotchas it must not guess.
+        self.assertIn("工具功能与用法", system)
+        self.assertIn("扁平 index", system)          # read_page index semantics
+        self.assertIn("只返回译文", system)           # retranslate_block: returns text only
+        self.assertIn("check_table", system)
+        self.assertIn("ask_user(question", system)
+        # The system prompt also carries the general wording WORKFLOW: how to chain
+        # the tools to build / edit / verify, so the method is in the prompt too.
+        self.assertIn("翻译通用工作法", system)
+        self.assertIn("构建", system)
+        self.assertIn("校验", system)
 
     def test_llm_decide_reinjects_preview_region_image(self):
         # After a ``preview_page`` call, the user-framed region is injected as a
@@ -443,6 +477,10 @@ class LlmDecideAndPageLoopTest(unittest.TestCase):
         layout = agent.make_source_tools(s)["get_layout"](0)
         self.assertEqual(2, layout["rows"])
         self.assertIn(["A", "B"], layout["grid"])
+        # An out-of-range page fails closed (returns an empty grid, not an IndexError).
+        empty = agent.make_source_tools(s)["get_layout"](99)
+        self.assertEqual(0, empty["rows"])
+        self.assertEqual([], empty["grid"])
 
     def test_run_page_visual_skips_when_model_has_no_vision(self):
         model = ModelConfig.from_dict(dict(id="x", name="x", type="llama-server",
@@ -494,6 +532,249 @@ class PageExecutorsTest(unittest.TestCase):
         s.out_doc = {0: {"text": "Total assets"}}
         residual = tools["check_residual"]()
         self.assertTrue(any(r["index"] == 2 for r in residual["residual"]), residual)
+
+    def test_check_residual_honors_page(self):
+        # Regression: check_residual used to scan the whole document regardless of
+        # the required ``page`` — a per-page request now only reports that page.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("总资产", page=0, x0=0, y0=0, x1=50, y1=10)],
+                   [pdfio.Block("营业收入", page=1, x0=0, y0=0, x1=50, y1=10)]],
+            blocks=["总资产", "营业收入"], block_pages=[0, 1])
+        s.out_doc = {}
+        tools = agent.make_page_executors(s, _dummy_model())
+        page1 = tools["check_residual"](1)
+        self.assertEqual(1, page1["page"])
+        self.assertEqual([1], [r["index"] for r in page1["residual"]])
+        page0 = tools["check_residual"](0)
+        self.assertEqual([0], [r["index"] for r in page0["residual"]])
+
+    def test_check_tools_ignore_verbatim_number_blocks(self):
+        # Regression: a pure-number cell (17,485,938,749.91) is kept verbatim and must
+        # NOT be flagged as "empty / missing" — otherwise the review loop tries to
+        # "fix" a numeric cell it is forbidden to rewrite and gets stuck.
+        s = self._state()
+        tools = agent.make_page_executors(s, _dummy_model())
+        s.out_doc = {}   # nothing translated yet
+        missing = [m["index"] for m in tools["check_missing"]()["missing"]]
+        residual = [r["index"] for r in tools["check_residual"]()["residual"]]
+        # The numeric block (index 1) is excluded from both.
+        self.assertNotIn(1, missing)
+        self.assertNotIn(1, residual)
+        # The translatable text labels (0 总资产, 2 总负债) are still flagged as missing.
+        self.assertIn(0, missing)
+        self.assertIn(2, missing)
+
+    def test_review_check_tools_registered(self):
+        # The three new audit tools are part of the registry (and thus advertised).
+        for n in ("check_numbers", "check_table", "check_layout"):
+            t = agent.by_name(n)
+            self.assertIsNotNone(t, n)
+            self.assertEqual("verify", t.category, n)
+            self.assertFalse(t.destructive, n)
+
+    def test_check_numbers_detects_altered_number(self):
+        # A translation that drops/alters a digit must be flagged.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("2023 年营收 3.14 亿元", page=0, x0=0, y0=0, x1=100, y1=10)]],
+            blocks=["2023 年营收 3.14 亿元"], block_pages=[0])
+        s.out_doc = {0: {"text": "In 2023 revenue was 3.1 hundred million yuan"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["check_numbers"](0)
+        self.assertTrue(any(r["index"] == 0 and r["missing"] for r in res["numbers"]), res)
+
+    def test_check_numbers_ignores_separator_format(self):
+        # Re-formatting thousands separators is NOT a defect — the value is equal.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("总资产 17,485,938,749.91 元", page=0, x0=0, y0=0, x1=100, y1=10)]],
+            blocks=["总资产 17,485,938,749.91 元"], block_pages=[0])
+        s.out_doc = {0: {"text": "Total assets 17485938749.91 yuan"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        self.assertEqual([], tools["check_numbers"](0)["numbers"])
+        # A wrong value (transposed digits) IS flagged.
+        s.out_doc = {0: {"text": "Total assets 17485938749.19 yuan"}}
+        self.assertTrue(tools["check_numbers"](0)["numbers"])
+
+    def test_check_numbers_ignores_unit_and_date_forms(self):
+        # A report date in any spelling ("December 31, 2023" / "2023-12-31" /
+        # "2023年12月31日") is the same value set, and "3.14 亿元" is the same value
+        # as "314 million yuan" — a correct translation of either must not be
+        # flagged.  The old string-reformat compare merged "December 31, 2023"
+        # into one giant token and could not attach a Latin unit multiplier.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("2023 年 12 月 31 日，公司营收 3.14 亿元", page=0,
+                                x0=0, y0=0, x1=100, y1=10)]],
+            blocks=["2023 年 12 月 31 日，公司营收 3.14 亿元"], block_pages=[0])
+        tools = agent.make_page_executors(s, _dummy_model())
+        s.out_doc = {0: {"text": "On December 31, 2023 revenue was 314 million yuan"}}
+        self.assertEqual([], tools["check_numbers"](0)["numbers"])
+        # A dropped digit (31 million vs the source's 314 million) IS flagged.
+        s.out_doc = {0: {"text": "As of May 2023 revenue was 31 million yuan"}}
+        self.assertTrue(tools["check_numbers"](0)["numbers"])
+
+    def test_check_residual_ignores_cjk_translation_for_cjk_target(self):
+        # Regression (fix 1): the residual check scanned the language NAME for CJK
+        # glyphs, so the default Chinese target ("Simplified Chinese" is ASCII) was
+        # judged "Latin-only" and every Chinese translation was reported as
+        # residual.  The target's script is decided by IDENTITY now, so a CJK
+        # target never flags its own translations.
+        s = agent.WorkflowState("a.pdf", "Simplified Chinese")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("Unchecked fixed assets", page=0, x0=0, y0=0,
+                                x1=100, y1=10)]],
+            blocks=["Unchecked fixed assets"], block_pages=[0])
+        s.out_doc = {0: {"text": "未审定的固定资产"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        self.assertEqual([], tools["check_residual"](0)["residual"])
+
+    def test_check_residual_flags_untranslated_latin_prose_for_cjk_target(self):
+        # Symmetric residual window for a CJK target: an untranslated English
+        # SENTENCE is residual; a code / unit run (GB/T 33436-2016) is not.
+        s = agent.WorkflowState("a.pdf", "Simplified Chinese")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("group revenue", page=0, x0=0, y0=0, x1=100, y1=10),
+                    pdfio.Block("标准", page=0, x0=0, y0=20, x1=100, y1=30)]],
+            blocks=["group revenue", "标准"], block_pages=[0])
+        s.out_doc = {0: {"text": "The revenue of the group grew strongly this year"},
+                     1: {"text": "GB/T 33436-2016"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        self.assertEqual([0], [r["index"] for r in tools["check_residual"](0)["residual"]])
+
+    def test_numeric_cells_refused_on_review_path(self):
+        # Regression (fix 9): only set_text (not translate_block/retranslate_block)
+        # was write-protected — the AI "correcting" a figure through those tools
+        # could change it.  Both now refuse a numeric source outright.
+        s = self._state()
+        tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["translate_block"](1, "1,234,567.89")
+        self.assertFalse(res["ok"])
+        self.assertIn("不可被 AI 改写", res["error"])
+        self.assertNotIn(1, (s.out_doc or {}))
+        res = tools["retranslate_block"]("1,234,567.89")
+        self.assertFalse(res["ok"])
+        self.assertIn("不可被 AI 改写", res["error"])
+
+    def test_check_table_reports_empty_cells(self):
+        # A translatable table cell with no translation and an empty prose block are
+        # reported; verbatim numerics are excluded from the counts.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("营业利润", page=0, x0=0, y0=0, x1=50, y1=10, in_table=True),
+                    pdfio.Block("总资产", page=0, x0=0, y0=20, x1=50, y1=30)]],
+            blocks=["营业利润", "总资产"], block_pages=[0])
+        s.out_doc = {0: {"text": "Operating profit"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["check_table"](0)
+        self.assertEqual(1, res["source_cells"])
+        self.assertEqual(1, res["translated_cells"])
+        self.assertEqual([], res["empty_cells"])
+        self.assertEqual([1], res["empty_text"])
+        self.assertFalse(res["complete"])
+
+    def test_check_table_complete_when_all_translated(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("营业利润", page=0, x0=0, y0=0, x1=50, y1=10, in_table=True),
+                    pdfio.Block("总资产", page=0, x0=0, y0=20, x1=50, y1=30)]],
+            blocks=["营业利润", "总资产"], block_pages=[0])
+        s.out_doc = {0: {"text": "Operating profit"}, 1: {"text": "Total assets"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["check_table"](0)
+        self.assertTrue(res["complete"])
+        self.assertEqual([], res["empty_cells"])
+        self.assertEqual([], res["empty_text"])
+
+    def test_check_layout_flags_overflowing_prose_block(self):
+        # A much-longer prose translation that cannot fit its box is flagged (fs hit
+        # the readable floor and still overflows) — the exporter draws it past the box.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("Total assets were 17,485,938,749.91 yuan at end of 2023",
+                                page=0, x0=0, y0=0, x1=120, y1=14, size=10)]],
+            blocks=["Total assets were 17,485,938,749.91 yuan at end of 2023"],
+            block_pages=[0])
+        s.out_doc = {0: {"text": "The total assets of the group as at 31 December 2023 amounted to "
+                                 "one hundred seventy four billion eight hundred fifty nine million "
+                                 "three hundred ninety thousand seven hundred forty nine point "
+                                 "nine one yuan for the consolidated and parent entities combined"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        kinds = {i["kind"] for i in tools["check_layout"](0)["issues"]}
+        self.assertTrue(kinds, "expected the long translation to be flagged")
+        self.assertTrue({"overflow", "too_small", "crowding"}.intersection(kinds))
+
+    def test_check_layout_clean_for_short_translation(self):
+        # A translation that fits its box is NOT flagged (no false positives).
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("总资产", page=0, x0=0, y0=0, x1=50, y1=10, size=10)]],
+            blocks=["总资产"], block_pages=[0])
+        s.out_doc = {0: {"text": "Total assets"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        self.assertEqual([], tools["check_layout"](0)["issues"])
+
+    def test_check_layout_legal_small_source_not_flagged(self):
+        # Regression (fix 3): the flat 7pt readability floor flagged a legal 5.4pt
+        # footnote, but the exporter's fit floor is min(block size, READABLE) so it
+        # draws the block at its own (small) size — exporter-parity floors do not
+        # report it as too_small.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("注释", page=0, x0=0, y0=0, x1=60, y1=8, size=5.4)]],
+            blocks=["注释"], block_pages=[0])
+        s.out_doc = {0: {"text": "Notes"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        kinds = {i["kind"] for i in tools["check_layout"](0)["issues"]}
+        self.assertNotIn("too_small", kinds)
+
+    def test_check_layout_wrapped_table_cell_not_too_small(self):
+        # A scanned grid cell that legitimately wraps below the 6pt readability
+        # floor but above the exporter's 3pt hard floor is a physical-limits case,
+        # not a defect — the old check flagged every such cell as too_small.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("长期负债", page=0, x0=0, y0=0, x1=45, y1=10,
+                                size=9, in_table=True, fit_width=45.0, fit_height=9.0)]],
+            blocks=["长期负债"], block_pages=[0])
+        s.out_doc = {0: {"text": "Long-term liabilities"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        kinds = {i["kind"] for i in tools["check_layout"](0)["issues"]}
+        self.assertNotIn("too_small", kinds)
+
+    def test_check_layout_ignores_other_column_blocks(self):
+        # Regression (fix 4): on a two-column page the sibling at the same y on the
+        # OTHER column must not be the "next block" (no x-overlap) — the old code
+        # measured the gap to the nearest block on the whole page and flag-ged the
+        # left-column paragraph as crowding.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("The board reviewed the strategic options", page=0,
+                                x0=20, y0=0, x1=150, y1=12, size=10),
+                    pdfio.Block("右栏标题", page=0, x0=200, y0=11, x1=280, y1=23, size=10)]],
+            blocks=["The board reviewed the strategic options", "右栏标题"],
+            block_pages=[0])
+        s.out_doc = {0: {"text": "The board reviewed the strategic options at length "
+                                 "during the year was not yet public"},
+                     1: {"text": "Right column"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        kinds = {i["kind"] for i in tools["check_layout"](0)["issues"]}
+        self.assertNotIn("crowding", kinds)
+
+    def test_check_layout_skips_vertical_labels(self):
+        # An org-chart label is rotated by the exporter, so the horizontal fit
+        # rules do not apply: a 8×30 label read vertically must never be measured
+        # through the wrap path (per-character 5pt shards) or flagged.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("党政办公室", page=0, x0=0, y0=0, x1=8, y1=30,
+                                size=10, single_line=True)]],
+            blocks=["党政办公室"], block_pages=[0])
+        s.out_doc = {0: {"text": "Party and government office"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        self.assertEqual([], tools["check_layout"](0)["issues"])
+
 
     def test_translate_retries_on_transient_error(self):
         class _FlakyEngine:

@@ -90,6 +90,35 @@ class WorkerSignalTest(_WorkerTestBase):
         self.assertTrue(out.exists())
         self.assertIn("MOCK:", out.read_text("utf-8"))
 
+    def test_successful_pdf_run_records_last_pdf_for_preview(self):
+        # Regression: after a PDF export the preview's "译文" side must be able to
+        # render the real output; the worker records the exported PDF path so the
+        # main window can keep it (the worker reference is dropped in ``_cleanup``).
+        src = build_sample_pdf(self.tmp / "sample.pdf", pages=1)
+        out = self.tmp / "out.pdf"
+        with MockServer() as server:
+            worker = TranslateWorker(
+                str(src), self._model(server.endpoint), "Chinese",
+                "translated_pdf", str(out),
+            )
+            self._run(worker)
+        self.assertTrue(out.exists())
+        self.assertEqual(str(out), worker._last_pdf)
+        self.assertEqual("translated_pdf", worker._output_type)
+
+    def test_markdown_run_leaves_last_pdf_none(self):
+        # A non-PDF output has nothing to render in the preview's "译文" side.
+        src = build_sample_pdf(self.tmp / "sample.pdf", pages=1)
+        out = self.tmp / "out.md"
+        with MockServer() as server:
+            worker = TranslateWorker(
+                str(src), self._model(server.endpoint), "Chinese",
+                "markdown", str(out),
+            )
+            self._run(worker)
+        self.assertTrue(out.exists())
+        self.assertIsNone(worker._last_pdf)
+
 
 class WorkerFailureReportingTest(_WorkerTestBase):
     """A run that could not really translate must say so, not report success."""
@@ -176,9 +205,10 @@ class AgentModeWiringTest(_WorkerTestBase):
             endpoint="http://127.0.0.1:9/v1/chat/completions", model="qwen", vision=True))
         captured: dict = {}
         handler = object()
+        tasks: list[str] = []
 
         def fake_run_page_visual(state, page, _model, **kw):
-            captured["task"] = kw.get("task")
+            tasks.append(kw.get("task"))
             captured["preview_handler"] = kw.get("preview_handler")
             state.out_doc = {0: {"text": "Hello from agent"}}
             return state
@@ -199,11 +229,12 @@ class AgentModeWiringTest(_WorkerTestBase):
                                    side_effect=fake_run_page_visual):
                 with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
                     events = self._run(worker)
-        # The agent path ran once, handed the preview_handler through, and the
-        # resulting out_doc fed the export (not the deterministic engine).
+        # The agent path handed the preview_handler through, ran the translate task
+        # AND the M4 review pass (a separate '复核' task), and the resulting
+        # out_doc fed the export (not the deterministic engine).
         self.assertEqual(handler, captured["preview_handler"])
-        self.assertIn("翻译成 English", captured["task"])
-        self.assertIn("set_text", captured["task"])
+        self.assertTrue(any("翻译成 English" in t and "set_text" in t for t in tasks), tasks)
+        self.assertTrue(any("复核" in t for t in tasks), tasks)   # M4 AI self-check ran
         self.assertIn("Hello from agent", Path(out).read_text("utf-8"))
         self.assertIn("finished", events)
         self.assertTrue(any("已启用 AI 编排" in m for m in logs), logs)
@@ -362,6 +393,46 @@ class OverlayApplyTest(_WorkerTestBase):
         self.assertEqual(["finished", "stopped"], events)
         # The source text survives (nothing was blanked).
         self.assertIn("Page 1 heading text.", out.read_text("utf-8"))
+
+    def test_re_export_applies_overlay_without_translation(self):
+        # "重新导出": re-write the last committed translation with the current
+        # overlay edits — no extraction-only re-translation, just export.  The edited
+        # block must win over what the last run produced.
+        src = build_sample_pdf(self.tmp / "re.pdf", pages=1)
+        out = self.tmp / "re.txt"
+        doc = pdfio.extract_document_text(str(src), ocr=False, log=lambda m: None)
+        last = list(doc.blocks)   # pretend the last run echoed source text
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "Chinese",
+            "plain_text", str(out),
+            overlay={0: {"text": "重新导出的编辑"}},
+            re_export=True, last_translated=last,
+        )
+        logs: list[str] = []
+        worker.log.connect(logs.append)
+        events = self._run(worker)
+        self.assertEqual(["finished", "stopped"], events)
+        text = out.read_text("utf-8")
+        self.assertIn("重新导出的编辑", text)
+        self.assertIn("已应用 1 处", "\n".join(logs))
+
+    def test_re_export_with_no_last_translation_errors(self):
+        # Re-export needs a previous committed translation; otherwise it must report
+        # an error rather than silently doing nothing.
+        src = build_sample_pdf(self.tmp / "re2.pdf", pages=1)
+        out = self.tmp / "re2.txt"
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "Chinese",
+            "plain_text", str(out),
+            re_export=True,
+        )
+        events: list[str] = []
+        worker.finished.connect(lambda _p: events.append("finished"))
+        worker.error.connect(lambda _m: events.append("error"))
+        worker.stopped.connect(lambda: events.append("stopped"))
+        worker.run()
+        self.assertEqual(["error", "stopped"], events)
+        self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":

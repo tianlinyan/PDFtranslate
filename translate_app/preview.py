@@ -11,11 +11,17 @@ from __future__ import annotations
 
 import threading
 
-from PyQt6.QtCore import QObject, QPointF, QRect, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QBuffer, QIODevice, QObject, QPointF, QRect, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget,
 )
+
+#: Default size the preview window opens at.  Every popup resets to this size, and
+#: the window is placed immediately left of the main window (its right edge abuts
+#: the main window's left edge) — see :meth:`PreviewWindow.place_left_of`.
+_PREVIEW_DEFAULT_W = 680
+_PREVIEW_DEFAULT_H = 900
 
 
 def crop_region(png: bytes, rect, dpi: int = 72) -> bytes:
@@ -49,30 +55,35 @@ def scale_rect(rect, disp_x: float, disp_y: float, disp_w: float, disp_h: float,
 
 
 class SelectionCanvas(QWidget):
-    """Displays a preview image; zoomable/pannable; rubber-band a region at fit zoom."""
-
-    regionChanged = pyqtSignal(object)   # image-space rect (list) or None
+    """Displays a preview image; zoomable (wheel/buttons); right-click draws a stroke."""
 
     def __init__(self) -> None:
         super().__init__()
         self._pixmap: QPixmap | None = None
-        self._start = None
-        self._rect: QRect | None = None
         self._zoom = 1.0            # multiplier over the fit-to-window scale
         self._pan = QPointF(0, 0)   # pan offset (display px), 0 = centred
-        self._dragging = None       # "pan" | "select" (or None)
-        self._pan_start = QPointF(0, 0)
-        self._pan_base = QPointF(0, 0)
+        # Right-button freehand annotation strokes, in IMAGE space so they stay glued
+        # to the page when the user zooms.  ``_active_ink`` is the stroke being drawn
+        # right now; ``_strokes`` are the finished ones (accumulated markup, cleared
+        # when a new page/side is shown).  Left-click region selection is removed.
+        self._strokes: list[list[QPointF]] = []
+        self._active_ink: list[QPointF] | None = None
         self.setMinimumSize(500, 400)
 
     # -- pixmap / geometry ---------------------------------------------------
-    def set_image(self, pixmap: QPixmap) -> None:
+    def set_image(self, pixmap: QPixmap, keep_view: bool = False) -> None:
+        # ``keep_view`` preserves the zoom/pan when the new image has the same
+        # dimensions (prev/next page of the same render — the user stays zoomed in
+        # where they were) and resets otherwise (a fresh popup, the other side).
+        same = (keep_view and self._pixmap is not None
+                and pixmap.width() == self._pixmap.width()
+                and pixmap.height() == self._pixmap.height())
         self._pixmap = pixmap
-        self._start = None
-        self._rect = None
-        self._zoom = 1.0
-        self._pan = QPointF(0, 0)
-        self._dragging = None
+        self._strokes = []
+        self._active_ink = None
+        if not same:
+            self._zoom = 1.0
+            self._pan = QPointF(0, 0)
         self.update()
 
     def set_zoom(self, factor: float | None) -> None:
@@ -118,15 +129,26 @@ class SelectionCanvas(QWidget):
         y = base.center().y() - h / 2 + self._pan.y()
         return QRectF(x, y, w, h)
 
-    def _image_rect(self, display_rect: QRect) -> list[float] | None:
-        if self._pixmap is None or display_rect.width() <= 0 or display_rect.height() <= 0:
-            return None
+    def _to_image_pos(self, pos: QPointF) -> QPointF:
+        """Map a display point to image space (so a freehand stroke sticks to the page)."""
         v = self._view_rect()
-        rect = [float(display_rect.x()), float(display_rect.y()),
-                float(display_rect.x() + display_rect.width()),
-                float(display_rect.y() + display_rect.height())]
-        return scale_rect(rect, v.x(), v.y(), v.width(), v.height(),
-                          self._pixmap.width(), self._pixmap.height())
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        if v.width() <= 0 or v.height() <= 0 or pw <= 0 or ph <= 0:
+            return QPointF(0, 0)
+        return QPointF((pos.x() - v.x()) / v.width() * pw,
+                       (pos.y() - v.y()) / v.height() * ph)
+
+    def _from_image_pos(self, ip: QPointF) -> QPointF:
+        v = self._view_rect()
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        if pw <= 0 or ph <= 0:
+            return QPointF(0, 0)
+        return QPointF(ip.x() / pw * v.width() + v.x(),
+                       ip.y() / ph * v.height() + v.y())
+
+    def _ink_contains(self, pos: QPointF) -> bool:
+        """True when ``pos`` (display) is over the displayed image area."""
+        return self._pixmap is not None and self._view_rect().contains(pos)
 
     def resizeEvent(self, _ev) -> None:  # noqa: N802
         self.update()
@@ -138,53 +160,49 @@ class SelectionCanvas(QWidget):
         p.fillRect(self.rect(), QColor(255, 255, 255))
         if self._pixmap is not None:
             p.drawPixmap(self._view_rect().toRect(), self._pixmap)
-            if self._rect is not None and self._zoom <= 1.0:
-                p.setPen(QPen(QColor(255, 0, 0), 2))
-                p.drawRect(self._rect)
+            # Freehand right-button annotations (image space → display space, so they
+            # stay glued to the page through zoom).  Semi-transparent red.
+            if self._strokes or self._active_ink:
+                pen = QPen(QColor(255, 0, 0, 200), 2)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                for stroke in list(self._strokes) + ([self._active_ink]
+                                                     if self._active_ink else []):
+                    if not stroke:
+                        continue
+                    pts = QPolygonF(self._from_image_pos(ip) for ip in stroke)
+                    if pts.count() > 1:
+                        p.drawPolyline(pts)
         p.end()
 
     # -- mouse ---------------------------------------------------------------
     def mousePressEvent(self, ev) -> None:  # noqa: N802
-        if ev.button() != Qt.MouseButton.LeftButton or self._pixmap is None:
+        if self._pixmap is None:
             return
-        if self._zoom > 1.0:
-            # Zoomed in: drag pans; region-selection only at fit zoom.
-            self._dragging = "pan"
-            self._pan_start = ev.position().toPoint()
-            self._pan_base = QPointF(self._pan)
-        else:
-            self._dragging = None
-            self._start = ev.position().toPoint()
-            self._rect = QRect(self._start, self._start)
-            self.regionChanged.emit(None)
-        self.update()
+        if ev.button() == Qt.MouseButton.RightButton:
+            # Freehand annotation: hold right + drag to draw a stroke over the image.
+            if self._ink_contains(ev.position()):
+                self._active_ink = [self._to_image_pos(ev.position())]
+                self.update()
 
     def mouseMoveEvent(self, ev) -> None:  # noqa: N802
-        if self._dragging == "pan":
-            pos = ev.position().toPoint()
-            self._pan = QPointF(
-                self._pan_base.x() + (pos.x() - self._pan_start.x()),
-                self._pan_base.y() + (pos.y() - self._pan_start.y()),
-            )
-            self.update()
-        elif self._start is not None:
-            self._rect = QRect(self._start, ev.position().toPoint()).normalized()
+        if self._active_ink is not None:
+            # Freehand stroke being drawn (right button held): append the point.
+            self._active_ink.append(self._to_image_pos(ev.position()))
             self.update()
 
     def mouseReleaseEvent(self, ev) -> None:  # noqa: N802
-        if self._dragging == "pan":
-            self._dragging = None
-            self.update()
-        elif self._start is not None and self._pixmap is not None:
-            self._start = None
-            if self._rect is not None:
-                self.regionChanged.emit(self._image_rect(self._rect.normalized()))
+        if self._active_ink is not None:
+            # Finish the freehand stroke; keep it as markup on this page.
+            self._strokes.append(self._active_ink)
+            self._active_ink = None
             self.update()
 
-    def clear_selection(self) -> None:
-        self._start = None
-        self._rect = None
-        self.regionChanged.emit(None)
+    def clear_ink(self) -> None:
+        """Erase all freehand right-button strokes on the current page."""
+        self._strokes = []
+        self._active_ink = None
         self.update()
 
 
@@ -211,9 +229,8 @@ class PreviewWindow(QWidget):
         self._dpi = 200.0
 
         self.canvas = SelectionCanvas()
-        self.canvas.regionChanged.connect(self._on_region)
 
-        hint = QLabel("按住左键在图上框选区域，点「发送」把框内内容发给 AI（滚轮缩放）。")
+        hint = QLabel("右键拖动画任意线；点「发送」把整页图片（含标注）发给 AI（滚轮缩放）。")
         hint.setWordWrap(True)
 
         # --- zoom controls ---
@@ -257,11 +274,11 @@ class PreviewWindow(QWidget):
         self._send_btn = QPushButton("发送")
         self._send_btn.setEnabled(False)
         self._send_btn.clicked.connect(self._send)
-        clear_btn = QPushButton("清除")
-        clear_btn.clicked.connect(self.canvas.clear_selection)
+        clear_ink_btn = QPushButton("清除标注")
+        clear_ink_btn.clicked.connect(self.canvas.clear_ink)
         send_row = QHBoxLayout()
         send_row.addStretch()
-        send_row.addWidget(clear_btn)
+        send_row.addWidget(clear_ink_btn)
         send_row.addWidget(self._send_btn)
 
         layout = QVBoxLayout(self)
@@ -270,17 +287,62 @@ class PreviewWindow(QWidget):
         layout.addLayout(zoom_row)
         layout.addLayout(nav_row)
         layout.addLayout(send_row)
-        self.resize(900, 1150)
+        self.resize(_PREVIEW_DEFAULT_W, _PREVIEW_DEFAULT_H)
 
-    def show_png(self, png: bytes) -> None:
-        """Display a page PNG and reset the selection."""
+    def show_png(self, png: bytes, reset_geometry: bool = True) -> None:
+        """Display a page PNG; reset the selection and (by default) the size/zoom.
+
+        A fresh popup resets to the default size and fit view; an in-place refresh
+        (prev/next/jump inside the window, ``reset_geometry=False``) keeps the user's
+        resized window and zoom so flipping pages does not throw them back to the
+        default view.
+        """
         self._png = png
         qimg = QImage.fromData(png)
-        self.canvas.set_image(QPixmap.fromImage(qimg))
+        self.canvas.set_image(QPixmap.fromImage(qimg), keep_view=not reset_geometry)
         self._selected = None
-        self._send_btn.setEnabled(False)
+        # No region selection anymore — the page itself is what gets sent.
+        self._send_btn.setEnabled(True)
+        if reset_geometry:
+            # Every popup resets to the default size (the user may have resized it).
+            self.resize(_PREVIEW_DEFAULT_W, _PREVIEW_DEFAULT_H)
         self.show()
         self.raise_()
+
+    @staticmethod
+    def _virtual_desktop() -> QRect:
+        """The union of all screens' geometries (a spanning multi-monitor desktop)."""
+        geo = QRect()
+        for scr in QGuiApplication.screens():
+            geo = geo.united(scr.geometry())
+        return geo
+
+    def place_left_of(self, anchor: QRect) -> None:
+        """Place this window so its right edge abuts the left edge of ``anchor``.
+
+        ``anchor`` is the geometry of the window to sit next to (e.g. the main
+        window's ``frameGeometry()``).  The preview is **vertically centred** on the
+        anchor (its 1/2-height aligns with the anchor's 1/2-height), so it sits
+        raised/centred on screen rather than pinned to the asset's top.  The window
+        is clamped inside the virtual desktop on BOTH axes — the old placement only
+        clamped x ≥ 0 and never touched y — and when there is no room on the left
+        (the anchor already hugs the left screen edge) the preview is placed to the
+        RIGHT of the anchor instead of sailing off-screen.
+        """
+        win = self.frameGeometry()
+        w = win.width() or self.width()
+        h = win.height() or self.height()
+        desktop = self._virtual_desktop()
+        x = anchor.left() - w
+        y = anchor.top() + (anchor.height() - h) // 2   # vertical-centre on the anchor
+        if x < desktop.left():          # no room on the left → sit on the right
+            x = anchor.right() + 1
+        # Clamp both axes inside the virtual desktop (never partially off-screen).
+        max_x = desktop.left() + max(0, desktop.width() - w)
+        max_y = desktop.top() + max(0, desktop.height() - h)
+        x = min(max(x, desktop.left()), max_x)
+        y = min(max(y, desktop.top()), max_y)
+        self.move(x, y)
 
     def set_page_info(self, current: int, total: int) -> None:
         """Show the current page / total for the navigation controls."""
@@ -300,21 +362,70 @@ class PreviewWindow(QWidget):
             return
         self._request_page(n - 1)
 
-    def _on_region(self, rect) -> None:
-        self._selected = rect
-        self._send_btn.setEnabled(rect is not None)
-
     def _send(self) -> None:
-        if self._png is None or not self._selected:
+        if self._png is None:
             return
-        cropped = crop_region(self._png, self._selected)
+        # No region selection anymore — send the whole page (with any annotations).
+        img = QImage.fromData(self._png, "PNG")
+        if img.isNull():
+            return
+        rect = self._selected or [0.0, 0.0, float(img.width()), float(img.height())]
+        # Include the freehand right-button marker strokes drawn on the page, so the
+        # image handed to the AI carries the user's annotations too.
+        strokes = self._ink_strokes()
+        if strokes:
+            cropped = self._crop_with_ink(self._png, rect, strokes)
+        else:
+            cropped = crop_region(self._png, rect)
         if not cropped:
             return
-        # Convert the framed region from image pixels to PDF points (the block
-        # coordinate space) so ``apply_annotation`` can match it to a block.
+        # Convert the region from image pixels to PDF points (the block coordinate
+        # space) so ``apply_annotation`` can match it to a block.
         s = 72.0 / self._dpi
-        pdf_rect = [float(v) * s for v in self._selected]
+        pdf_rect = [float(v) * s for v in rect]
         self.sendRequested.emit(cropped, pdf_rect)
+
+    def _ink_strokes(self) -> list[list[QPointF]]:
+        """All freehand strokes (finished + any in-progress) in image-pixel coords."""
+        strokes = list(self.canvas._strokes)
+        if self.canvas._active_ink:
+            strokes.append(self.canvas._active_ink)
+        return strokes
+
+    def _crop_with_ink(self, png: bytes, rect, strokes: list[list[QPointF]]) -> bytes:
+        """Crop ``rect`` (image px) from ``png`` and draw the marker strokes onto it.
+
+        Strokes are (image-pixel) point lists; they are shifted by the crop origin and
+        clipped to the crop, so the sent image carries the user's hand-drawn lines.
+        """
+        img = QImage.fromData(png, "PNG")
+        if img.isNull():
+            return crop_region(png, rect)
+        x0 = max(0, min(img.width(), float(rect[0])))
+        y0 = max(0, min(img.height(), float(rect[1])))
+        x1 = max(x0, min(img.width(), float(rect[2])))
+        y1 = max(y0, min(img.height(), float(rect[3])))
+        if x1 - x0 <= 0 or y1 - y0 <= 0:
+            return crop_region(png, rect)
+        cropped = img.copy(int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+        p = QPainter(cropped)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(255, 0, 0, 200), 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        for stroke in strokes:
+            pts = [QPointF(ip.x() - x0, ip.y() - y0) for ip in stroke if ip is not None]
+            poly = QPolygonF(pts)
+            if poly.count() > 1:
+                p.drawPolyline(poly)
+        p.end()
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        cropped.save(buf, "PNG")
+        data = bytes(buf.data())
+        buf.close()
+        return data
 
 
 class PreviewBridge(QObject):
@@ -331,6 +442,9 @@ class PreviewBridge(QObject):
     """
 
     showPreview = pyqtSignal(int, str)   # page, what
+    #: Thread-safe channel for the chat AI's ``re_export`` tool: emitted from the
+    #: chat worker thread, queued to the GUI where it triggers the re-export.
+    reExportRequested = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None, timeout: float = 120.0) -> None:
         super().__init__(parent)

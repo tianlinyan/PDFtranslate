@@ -28,7 +28,7 @@ def _vertical(text, page, y0):
 
 
 def _mixed_doc():
-    """One page each: normal / scan / chart / table / uncertain."""
+    """One page each: normal / scan / chart / text-layer-table→normal / uncertain."""
     normal = _blk("总资产", page=0, x0=0, y0=0, x1=60, y1=10)
     scan = _blk("扫描页文字", page=1, x0=0, y0=0, x1=60, y1=10, ocr=True)
     chart = [_vertical("董事会", 2, 50), _vertical("监事会", 2, 90), _vertical("经理层", 2, 130)]
@@ -67,7 +67,7 @@ class DocInfoTriageTest(unittest.TestCase):
                                  _vertical("经理层", 0, 130)]),
         )
         self.assertEqual(
-            pdfio.PAGE_TABLE,
+            pdfio.PAGE_NORMAL,   # a non-scanned (text-layer) table is a normal page now
             pdfio.classify_page([_blk("a", in_table=True), _blk("b", in_table=True),
                                  _blk("c", in_table=True)]),
         )
@@ -78,13 +78,14 @@ class DocInfoTriageTest(unittest.TestCase):
         self.assertEqual(5, info["pages"])
         self.assertEqual("样表", info["title"])
         self.assertEqual("zh", info["language"])
-        self.assertEqual(1, info["text_pages"])
+        # The text-layer table page is now a *normal* page, not a special table page.
+        self.assertEqual(2, info["text_pages"])
         self.assertEqual(1, info["scan_pages"])
         self.assertEqual(1, info["chart_pages"])
-        self.assertEqual(1, info["table_pages"])
+        self.assertEqual(0, info["table_pages"])
         self.assertEqual(1, info["uncertain_pages"])
-        self.assertEqual(4, info["special_pages"])   # scan+chart+table+uncertain
-        self.assertEqual(["normal", "scan", "chart", "table", "uncertain"], info["kinds"])
+        self.assertEqual(3, info["special_pages"])   # scan+chart+uncertain (no table)
+        self.assertEqual(["normal", "scan", "chart", "normal", "uncertain"], info["kinds"])
 
 
 def _small_special_doc():
@@ -112,6 +113,8 @@ class DocumentSessionTest(unittest.TestCase):
         calls: list[int] = []
 
         def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                return st   # the M4 review pass is separate; this test checks the translate phase
             calls.append(page)
             st.out_doc = st.out_doc or {}
             st.out_doc[page] = {"text": f"T{page}"}
@@ -120,9 +123,9 @@ class DocumentSessionTest(unittest.TestCase):
         state, session = self._session(doc, fake_translate)
         session.run()
 
-        # Only the normal page (index 0) was translated, and exactly once.
-        self.assertEqual([0], calls)
-        # Special pages are NOT translated here (deferred to SPECIAL_PAGES phase).
+        # Both normal pages (index 0 and the text-layer table page 3) were translated
+        # in the normal phase; the special pages (scan/chart/uncertain) were not.
+        self.assertEqual([0, 3], calls)
         self.assertNotIn("T1", [str(v.get("text")) for v in (state.out_doc or {}).values()])
         # Phase reached DONE.
         self.assertEqual(PHASE_DONE, state.phase)
@@ -132,10 +135,10 @@ class DocumentSessionTest(unittest.TestCase):
         self.assertEqual("normal", state.triage[0].kind)
         self.assertEqual("scan", state.triage[1].kind)
         self.assertEqual("chart", state.triage[2].kind)
-        self.assertEqual("table", state.triage[3].kind)
+        self.assertEqual("normal", state.triage[3].kind)   # non-scanned table → normal
         self.assertEqual("uncertain", state.triage[4].kind)
-        # Special pages flagged needs_user + a decision marker.
-        for i in (1, 2, 3, 4):
+        # Only the special pages are flagged needs_user + a decision marker.
+        for i in (1, 2, 4):
             self.assertEqual(agent.STATUS_NEEDS_USER, state.page(i).status)
             self.assertTrue(state.triage[i].decided)
 
@@ -173,6 +176,8 @@ class DocumentSessionTest(unittest.TestCase):
         shows: list[tuple] = []
 
         def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                return st   # skip the separate M4 review pass in this phase test
             calls.append(page)
             st.out_doc = st.out_doc or {}
             st.out_doc[page] = {"text": f"T{page}"}
@@ -205,6 +210,8 @@ class DocumentSessionTest(unittest.TestCase):
         calls: list[int] = []
 
         def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                return st   # skip the separate M4 review pass in this phase test
             calls.append(page)
             st.out_doc = st.out_doc or {}
             st.out_doc[page] = {"text": f"T{page}"}
@@ -219,6 +226,90 @@ class DocumentSessionTest(unittest.TestCase):
         # The ask op is recorded but NOT user-confirmed (no channel answered).
         ask_op = next(op for op in state.ops if op.tool == "ask_user")
         self.assertFalse(ask_op.user_confirmed)
+
+    def test_review_phase_ai_self_check_then_export(self):
+        doc = _mixed_doc()
+        review_pages: list[int] = []
+        answers: list[tuple] = []
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                review_pages.append(page)
+                return st
+            st.out_doc = st.out_doc or {}
+            st.out_doc[page] = {"text": f"T{page}"}
+            return st
+
+        def answer_handler(question, options, target):
+            answers.append(target)
+            return {"value": "AI 自检" if target == "review_mode" else "导出", "target": target}
+
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=fake_translate, answer_handler=answer_handler)
+        session.run()
+        # Mode asked; AI self-check re-read only the TRANSLATED pages (0, 3) and
+        # skipped the special pages the user chose to keep/skip (1, 2, 4).
+        self.assertEqual("ai", state.review_mode)
+        self.assertEqual([0, 3], review_pages)
+        self.assertIn("review_mode", answers)
+        self.assertIn("export", answers)
+        self.assertEqual(PHASE_DONE, state.phase)
+
+    def test_review_phase_user_mode_skips_ai_and_can_continue(self):
+        doc = _mixed_doc()
+        review_pages: list[int] = []
+        answers: list[tuple] = []
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                review_pages.append(page)
+                return st
+            st.out_doc = st.out_doc or {}
+            st.out_doc[page] = {"text": f"T{page}"}
+            return st
+
+        def answer_handler(question, options, target):
+            answers.append(target)
+            return {"value": "我手动检查" if target == "review_mode" else "继续检查", "target": target}
+
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=fake_translate, answer_handler=answer_handler)
+        session.run()
+        # User mode: no AI self-check ran; the export confirm answered "继续检查".
+        self.assertEqual("user", state.review_mode)
+        self.assertEqual([], review_pages)
+        self.assertEqual(PHASE_DONE, state.phase)
+
+    def test_special_page_translate_failure_marks_needs_user(self):
+        doc = _small_special_doc()
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                return st   # the separate M4 review pass
+            if page == 1:
+                raise RuntimeError("boom")   # the special scan page fails to translate
+            st.out_doc = st.out_doc or {}
+            st.out_doc[page] = {"text": f"T{page}"}
+            return st
+
+        def answer_handler(question, options, target):
+            return {"value": "OCR并翻译", "target": target}
+
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=fake_translate, answer_handler=answer_handler)
+        session.run()
+        # The failed special page is NOT silently marked done; it is flagged needs_user.
+        self.assertEqual(agent.STATUS_NEEDS_USER, state.page(1).status)
+        self.assertTrue(any("翻译失败" in i for i in state.page(1).issues))
+        # The normal page 0 was still translated.
+        self.assertEqual("T0", state.out_doc[0]["text"])
+        self.assertEqual(PHASE_DONE, state.phase)
 
 
 class NearestBlockTest(unittest.TestCase):
