@@ -41,6 +41,9 @@ _EXAMPLE_OUTPUTS: dict[str, tuple[str, str]] = {
     "french": ("Cliquez sur \u201cOK\u201d pour continuer.", "Enregistrez le fichier avant de quitter."),
     "german": ("Klicken Sie auf \u201cOK\u201d, um fortzufahren.", "Speichern Sie die Datei, bevor Sie beenden."),
     "italian": ("Fare clic su \u201cOK\u201d per continuare.", "Salvare il file prima di uscire."),
+    "russian": ("Нажмите \u201cOK\u201d, чтобы продолжить.", "Сохраните файл перед выходом."),
+    "japanese": ("「OK」を押して続行します。", "終了する前にファイルを保存してください。"),
+    "korean": ("“확인”을 누르세요.", "종료하기 전에 파일을 저장하세요."),
 }
 
 

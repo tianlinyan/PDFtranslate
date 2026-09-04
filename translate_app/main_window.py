@@ -50,6 +50,9 @@ LANGUAGES = [
     ("Français（法语）", "French"),
     ("Deutsch（德语）", "German"),
     ("Italiano（意大利语）", "Italian"),
+    ("Русский（俄语）", "Russian"),
+    ("日本語（日语）", "Japanese"),
+    ("한국어（韩语）", "Korean"),
 ]
 
 _DEFAULT_LANG = "简体中文（中文）"

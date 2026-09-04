@@ -1092,5 +1092,29 @@ class ReviewPageTaskPromptTest(unittest.TestCase):
         self.assertIn("不要修改任何译文", task)
 
 
+class TranslationPromptScriptTest(unittest.TestCase):
+    """Russian / Japanese / Korean are now target languages."""
+
+    def test_is_cjk_language_classes_scripts(self):
+        from translate_app import prompts
+
+        self.assertTrue(prompts._is_cjk_language("Japanese"))
+        self.assertTrue(prompts._is_cjk_language("Korean"))
+        self.assertTrue(prompts._is_cjk_language("Simplified Chinese"))
+        self.assertFalse(prompts._is_cjk_language("Russian"))   # Cyrillic, not CJK
+
+    def test_example_output_in_target_script(self):
+        import re
+        from translate_app import prompts
+
+        # The batch-translation example output must be in the target script, so a
+        # Russian / Japanese / Korean translation is anchored to that script, not English.
+        for lang, marker in (("Russian", "й"), ("Japanese", "押"), ("Korean", "저장")):
+            p = prompts.translation_system_prompt(lang)
+            m = re.search(r"Output:\n\[1\]\n(.+?)\n\[2\]\n(.+)\Z", p, re.S)
+            self.assertIsNotNone(m, lang)
+            self.assertIn(marker, m.group(1) + (m.group(2) or ""), lang)
+
+
 if __name__ == "__main__":
     unittest.main()
