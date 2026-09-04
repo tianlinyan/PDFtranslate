@@ -48,6 +48,23 @@ class DocContext:
         #: show the *real* current translation (not just the chat's protected edits),
         #: which stops the AI from re-editing blocks that are already translated.
         self._last_translated: list[str] | None = None
+        #: A title/settings snapshot for the interaction AI (``get_settings``): the
+        #: current source / language / output type / model / ... The GUI thread keeps
+        #: it up to date (``MainWindow._refresh_chat_settings``); a chat worker reads it
+        #: from the same object with the same lock, so the AI never touches Qt widgets.
+        self._settings: dict[str, Any] = {}
+
+    # -- settings snapshot ----------------------------------------------------
+    def set_settings(self, **kwargs: Any) -> None:
+        """Update the AI settings snapshot (``None`` values are kept so the AI can
+        tell "not set" apart from "absent")."""
+        with self._lock:
+            self._settings.update(kwargs)
+
+    def get_settings(self) -> dict[str, Any]:
+        """A shallow copy of the current AI settings snapshot."""
+        with self._lock:
+            return dict(self._settings)
 
     # -- source ---------------------------------------------------------------
     def set_source(self, src_path: str | None, *, lang: str = "", ocr: bool = False) -> None:

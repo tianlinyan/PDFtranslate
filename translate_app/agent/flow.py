@@ -209,6 +209,7 @@ import json
 
 from .. import prompts
 from .. import translator as _tr
+from .flow_steps import FlowCancelled, STANDARD_FLOWS, run_flow
 
 
 def _image_url(png: bytes) -> str:
@@ -555,6 +556,215 @@ def _is_latin_prose(text: Any) -> bool:
     return len(_LATIN_WORD_RE.findall(t)) >= 3
 
 
+# --------------------------------------------------------------------------
+# Deterministic audit engine.
+#
+# The four-area review checks live here as module-level functions over a
+# ``WorkflowState`` (single source of truth), shared by the bound ``check_*``
+# tools in ``make_page_executors`` AND by ``DocumentSession`` — so the review
+# loop can run a deterministic audit *before/after* an ``AgentStep`` without
+# going through the agent loop.  Previously the audit lived only inside the
+# per-page closures, so the review pass relied on the model "remembering" to run
+# all four checks (the source of false green).
+# --------------------------------------------------------------------------
+
+#: The review-check names, in the order the audit runs them.
+_AUDIT_DEFAULT_CHECKS = ("layout", "residual", "missing", "numbers", "table")
+
+#: How many audit→fix→re-audit rounds a single page may take before the review
+#: loop gives up (fail-closed to the best translation so far) and moves on.
+REVIEW_MAX_ATTEMPTS = 3
+
+
+def _audit_blocks(state, page):
+    """``(blocks, flat_offset)`` for ``page`` (``None`` = whole doc)."""
+    src = state.src_doc
+    if src is None or not getattr(src, "pages", None):
+        return [], 0
+    if page is None:
+        return [b for pg in src.pages for b in pg], 0
+    if not (0 <= page < len(src.pages)):
+        return [], 0
+    offset = sum(len(pg) for pg in src.pages[:page])
+    return src.pages[page], offset
+
+
+def _audit_read(state, idx):
+    """The translated text for flat index ``idx`` (``""`` when none)."""
+    out = state.out_doc or {}
+    return str((out.get(idx) or {}).get("text", ""))
+
+
+def _audit_protected(state, block):
+    """True when a block must stay byte-identical (engine-skipped or numeric cell)."""
+    from .. import pdfio as _pdfio
+    return (not _tr._needs_translation(str(block.text))
+            or _pdfio._is_numeric_cell(str(block.text)))
+
+
+def _check_residual(state, page=None):
+    """Untranslated content left on ``page`` (``None`` = whole doc)."""
+    blocks, offset = _audit_blocks(state, page)
+    cjk_target = prompts._is_cjk_language(state.lang)
+    out = []
+    for i, b in enumerate(blocks):
+        if b.is_chart or _audit_protected(state, b):
+            continue
+        idx = offset + i
+        t = _audit_read(state, idx)
+        if not t.strip():
+            out.append({"index": idx, "text": str(b.text), "reason": "empty"})
+        elif cjk_target:
+            if _is_latin_prose(t):
+                out.append({"index": idx, "text": str(b.text), "reason": "residual_latin"})
+        elif _has_cjk(t):
+            out.append({"index": idx, "text": str(b.text), "reason": "residual_cjk"})
+    return {"residual": out, "page": page}
+
+
+def _check_missing(state, page=None):
+    blocks, offset = _audit_blocks(state, page)
+    out = []
+    for i, b in enumerate(blocks):
+        if _audit_protected(state, b):
+            continue
+        idx = offset + i
+        if str(b.text).strip() and not _audit_read(state, idx).strip():
+            out.append({"index": idx, "text": str(b.text)})
+    return {"missing": out, "page": page}
+
+
+def _check_numbers(state, page=None):
+    """Number fidelity: are the page's numerals preserved in the translation?"""
+    blocks, offset = _audit_blocks(state, page)
+    out = []
+    for i, b in enumerate(blocks):
+        idx = offset + i
+        t = _audit_read(state, idx)
+        if not t.strip():
+            continue   # untranslated → handled by check_missing, not number fidelity
+        src = _number_signature(str(b.text))
+        trans = _number_signature(t)
+        missing = list((src - trans).elements())
+        extra = list((trans - src).elements())
+        if missing or extra:
+            out.append({"index": idx, "source": str(b.text), "translation": t,
+                        "missing": missing, "extra": extra})
+    return {"numbers": out, "page": page}
+
+
+def _check_table(state, page=None):
+    """Table / text completeness for ``page`` (``None`` = whole doc)."""
+    blocks, offset = _audit_blocks(state, page)
+    cells: list[tuple[int, str]] = []
+    texts: list[tuple[int, str]] = []
+    for i, b in enumerate(blocks):
+        if _audit_protected(state, b) or getattr(b, "is_chart", False):
+            continue
+        idx = offset + i
+        (cells if getattr(b, "in_table", False) else texts).append((idx, str(b.text)))
+
+    def _empty(cands: list[tuple[int, str]]) -> list[int]:
+        return [idx for idx, _ in cands if not _audit_read(state, idx).strip()]
+
+    empty_cells = _empty(cells)
+    empty_text = _empty(texts)
+    return {
+        "page": page,
+        "source_cells": len(cells),
+        "translated_cells": len(cells) - len(empty_cells),
+        "empty_cells": empty_cells,
+        "empty_text_count": len(empty_text),
+        "empty_text": empty_text,
+        "complete": not empty_cells and not empty_text,
+    }
+
+
+def _check_layout(state, page=None):
+    """Structure / layout integrity for ``page`` using the exporter's own fit rules."""
+    from .. import pdfio as _pdfio
+    blocks, offset = _audit_blocks(state, page)
+    font = _pdfio._CJK_FONT
+    issues: list[dict[str, Any]] = []
+    for i, b in enumerate(blocks):
+        if _audit_protected(state, b) or _pdfio._is_vertical_label(b):
+            continue
+        idx = offset + i
+        t = _audit_read(state, idx)
+        if not t.strip():
+            continue
+        try:
+            lines, fs = _pdfio._fit_block(b, font, t)
+        except Exception:  # noqa: BLE001 — a block we cannot measure is skipped
+            continue
+        in_table = bool(getattr(b, "in_table", False))
+        leading = _pdfio._line_leading(font, in_table=in_table, n_lines=len(lines))
+        height = _pdfio._wrapped_height(font, lines, fs, leading)
+        box_h = max(0.5, b.y1 - b.y0)
+        start_fs = max(5.0, min(b.size, _pdfio._MAX_FONT))
+        floor = (_pdfio._MIN_TABLE_FLOOR if in_table
+                 else min(start_fs, _pdfio._MIN_READABLE))
+        if fs + 1e-9 < floor:
+            issues.append({"index": idx, "kind": "too_small",
+                           "detail": f"译文字号 {fs:.2f}pt 低于可读下限 {floor:.2f}pt"})
+        if height > box_h + 2.0:
+            issues.append({"index": idx, "kind": "overflow",
+                           "detail": f"译文高度 {height:.1f}pt 超过自身框 {box_h:.1f}pt"})
+        below = [nb for nb in blocks
+                 if nb is not b and nb.y0 >= b.y1 - 0.5
+                 and nb.x0 < b.x1 and nb.x1 > b.x0]
+        if below:
+            gap = min(nb.y0 for nb in below) - b.y1
+            if height > box_h + gap + 2.0:
+                issues.append({"index": idx, "kind": "crowding",
+                               "detail": f"译文高 {height:.1f}pt 会压入下一块（剩余 {gap:.1f}pt）"})
+    return {"page": page, "count": len(issues), "issues": issues[:60],
+            "truncated": len(issues) > 60}
+
+
+#: name → check function (the audit aggregator fans out over this).
+_AUDIT_CHECKS = {
+    "layout": _check_layout,
+    "residual": _check_residual,
+    "missing": _check_missing,
+    "numbers": _check_numbers,
+    "table": _check_table,
+}
+
+
+def _audit_normalize(name: str, res: dict) -> tuple[list[dict], bool]:
+    """Convert one check result into ``(issues, is_clean)`` with a ``check`` tag."""
+    if name == "table":
+        if not res.get("complete"):
+            return ([{"check": name, "empty_cells": res.get("empty_cells", []),
+                      "empty_text": res.get("empty_text", []),
+                      "source_cells": res.get("source_cells", 0),
+                      "translated_cells": res.get("translated_cells", 0),
+                      "complete": False}], False)
+        return [], True
+    key = {"layout": "issues", "residual": "residual", "missing": "missing",
+           "numbers": "numbers"}[name]
+    items = res.get(key, [])
+    return [{"check": name, **item} for item in items], not items
+
+
+def audit_page(state, page=None, checks=None) -> dict[str, Any]:
+    """Run a deterministic multi-check audit over ``state``.
+
+    ``checks`` is a subset of ``_AUDIT_DEFAULT_CHECKS`` (default all).  Returns
+    ``{"page", "checks_requested", "checks", "issues", "clean"}`` where ``issues``
+    is a flat, ``check``-tagged list suitable both for machine gating (``clean``)
+    and for injecting into ``prompts.review_page_task`` as concrete findings.
+    """
+    names = [n for n in (checks or _AUDIT_DEFAULT_CHECKS) if n in _AUDIT_CHECKS]
+    all_issues: list[dict] = []
+    per_check: dict[str, Any] = {}
+    for name in names:
+        issues, _clean = _audit_normalize(name, _AUDIT_CHECKS[name](state, page))
+        per_check[name] = {"clean": not issues, "count": len(issues)}
+        all_issues.extend(issues)
+    return {"page": page, "checks_requested": names, "checks": per_check,
+            "issues": all_issues, "clean": not all_issues}
 
 
 def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] | None = None,
@@ -589,18 +799,6 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         if state.src_doc is None:
             return []
         return [b for page in state.src_doc.pages for b in page]
-
-    def _page_range(page: int | None):
-        """``(blocks, flat_offset, count)`` for ``page`` (or the whole doc for ``None``)."""
-        src = state.src_doc
-        if src is None:
-            return [], 0, 0
-        if page is None:
-            return _flat_blocks(), 0, len(_flat_blocks())
-        if not (0 <= page < len(src.pages)):
-            return [], 0, 0
-        offset = sum(len(pg) for pg in src.pages[:page])
-        return src.pages[page], offset, len(src.pages[page])
 
     def _block(index: int):
         blocks = _flat_blocks()
@@ -749,182 +947,28 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         return {"ok": True, "page": int(page), "what": what or "translation",
                 "image": png or b""}
 
-    def _verbatim(b) -> bool:
-        """True for a block the engine never sends for translation (pure number /
-        code / symbol) — it is kept byte-identical by design."""
-        return not _tr._needs_translation(str(b.text))
-
-    def _protected(b) -> bool:
-        """True for a block that must stay byte-identical: the engine skips it
-        (``_verbatim``) **or** the write gate refuses to rewrite it
-        (``pdfio._is_numeric_cell``).
-
-        The audit checks skip these so the review loop never tries to "fix" a figure
-        it is forbidden to change — the old checks used only the engine predicate, so
-        a numeric cell could be reported "missing / residual" indefinitely.
-        """
-        return _verbatim(b) or pdfio._is_numeric_cell(str(b.text))
-
     def check_residual(page: int | None = None):
-        """Untranslated content left on ``page`` (``None`` = whole doc).
-
-        A block with no translation at all is ``empty``.  For a Latin target a
-        remaining CJK run is residual; for a CJK target the mirror is untranslated
-        Latin *prose* (``_is_latin_prose`` — codes / units / acronyms legitimately
-        stay Latin).  Whether the target is a CJK language is decided by *identity*
-        (``prompts._is_cjk_language``), never by scanning the language name for CJK
-        glyphs: the default Chinese target is ASCII ("Simplified Chinese"), and a
-        glyph scan would judge it Latin-only and flag every Chinese translation as
-        residual — the review loop then burns its budget fixing a clean page.
-        """
-        blocks, offset, _ = _page_range(page)
-        cjk_target = prompts._is_cjk_language(state.lang)
-        out = []
-        for i, b in enumerate(blocks):
-            if b.is_chart or _protected(b):
-                continue
-            idx = offset + i
-            t = _read(idx)
-            if not t.strip():
-                out.append({"index": idx, "text": str(b.text), "reason": "empty"})
-            elif cjk_target:
-                if _is_latin_prose(t):
-                    out.append({"index": idx, "text": str(b.text), "reason": "residual_latin"})
-            elif _has_cjk(t):
-                out.append({"index": idx, "text": str(b.text), "reason": "residual_cjk"})
-        return {"residual": out, "page": page}
+        """Untranslated content left on ``page`` (``None`` = whole doc)."""
+        return _check_residual(state, page)
 
     def check_missing(page: int | None = None):
-        blocks, offset, _ = _page_range(page)
-        out = []
-        for i, b in enumerate(blocks):
-            if _protected(b):
-                continue
-            idx = offset + i
-            if str(b.text).strip() and not _read(idx).strip():
-                out.append({"index": idx, "text": str(b.text)})
-        return {"missing": out, "page": page}
+        return _check_missing(state, page)
 
     def check_numbers(page: int | None = None):
-        """Number fidelity: are the page's numerals preserved in the translation?
-
-        A translation may re-format thousands separators / decimals, but the *value*
-        must match the source.  Returns every block whose canonical number set
-        differs (``missing`` = in source but not in translation; ``extra`` = invented).
-        Numeric-only blocks are kept verbatim, so they pass trivially; a block the
-        AI wrongly rewrote is exactly what this flags.
-        """
-        blocks, offset, _ = _page_range(page)
-        out = []
-        for i, b in enumerate(blocks):
-            idx = offset + i
-            t = _read(idx)
-            if not t.strip():
-                continue   # untranslated → handled by check_missing, not number fidelity
-            src = _number_signature(str(b.text))
-            trans = _number_signature(t)
-            missing = list((src - trans).elements())
-            extra = list((trans - src).elements())
-            if missing or extra:
-                out.append({"index": idx, "source": str(b.text), "translation": t,
-                            "missing": missing, "extra": extra})
-        return {"numbers": out, "page": page}
+        """Number fidelity: are the page's numerals preserved in the translation?"""
+        return _check_numbers(state, page)
 
     def check_table(page: int | None = None):
-        """Table / text completeness for ``page`` (``None`` = whole doc).
-
-        Lists the translatable table cells and ordinary text blocks that still have
-        no translation, and reports whether everything is complete.  Verbatim and
-        chart blocks are excluded (they are preserved, not translated).
-        """
-        blocks, offset, _ = _page_range(page)
-        cells: list[tuple[int, str]] = []
-        texts: list[tuple[int, str]] = []
-        for i, b in enumerate(blocks):
-            if _protected(b) or getattr(b, "is_chart", False):
-                continue
-            idx = offset + i
-            (cells if getattr(b, "in_table", False) else texts).append((idx, str(b.text)))
-
-        def _empty(cands: list[tuple[int, str]]) -> list[int]:
-            return [idx for idx, _ in cands if not _read(idx).strip()]
-
-        empty_cells = _empty(cells)
-        empty_text = _empty(texts)
-        return {
-            "page": page,
-            "source_cells": len(cells),
-            "translated_cells": len(cells) - len(empty_cells),
-            "empty_cells": empty_cells,
-            "empty_text_count": len(empty_text),
-            "empty_text": empty_text,
-            "complete": not empty_cells and not empty_text,
-        }
+        """Table / text completeness for ``page`` (``None`` = whole doc)."""
+        return _check_table(state, page)
 
     def check_layout(page: int | None = None):
-        """Structure / layout integrity for ``page`` using the exporter's own fit rules.
+        """Structure / layout integrity for ``page`` using the exporter's own fit rules."""
+        return _check_layout(state, page)
 
-        One ``pdfio._fit_block`` per block (the height is derived from its result —
-        the exporter is *never* run twice for the same block) with
-        ``pdfio._line_leading``, so the measured height matches what the export
-        actually draws.  Flags a translated block that is (a) below the exporter's
-        own floor, (b) drawn past its own box (``overflow``), or (c) tall enough to
-        cover the next block on the same column (``crowding``).
-
-        ``too_small`` uses *exporter-parity* floors — table cells ``_MIN_TABLE_FLOOR``
-        (a scanned row band is the limit), prose ``min(start size, _MIN_READABLE)`` —
-        so a legally small source (a 5.4pt footnote) or a scanned cell that
-        legitimately wraps small is never flagged; only a fit below what the exporter
-        can ever produce is a real defect.  ``crowding`` measures the gap on the SAME
-        COLUMN only (blocks must x-overlap): on a two-column page the paired column's
-        blocks sit at the same y and must not count — the columns are independent and
-        the exporter never covers one with the other.  Overflow and crowding are
-        reported independently (one block can genuinely be both).  Vertical labels
-        are rotated by the exporter (``_draw_vertical_label``) and do not follow the
-        horizontal fit rules, so they are skipped here.  Protected blocks are not
-        translated and never change their footprint.
-        """
-        blocks, offset, _ = _page_range(page)
-        font = pdfio._CJK_FONT
-        issues: list[dict[str, Any]] = []
-        for i, b in enumerate(blocks):
-            if _protected(b) or pdfio._is_vertical_label(b):
-                continue
-            idx = offset + i
-            t = _read(idx)
-            if not t.strip():
-                continue
-            try:
-                lines, fs = pdfio._fit_block(b, font, t)
-            except Exception:  # noqa: BLE001 — a block we cannot measure is skipped
-                continue
-            in_table = bool(getattr(b, "in_table", False))
-            leading = pdfio._line_leading(font, in_table=in_table, n_lines=len(lines))
-            height = pdfio._wrapped_height(font, lines, fs, leading)
-            box_h = max(0.5, b.y1 - b.y0)
-            start_fs = max(5.0, min(b.size, pdfio._MAX_FONT))
-            floor = pdfio._MIN_TABLE_FLOOR if in_table else min(start_fs, pdfio._MIN_READABLE)
-            if fs + 1e-9 < floor:
-                issues.append({"index": idx, "kind": "too_small",
-                               "detail": f"译文字号 {fs:.2f}pt 低于可读下限 {floor:.2f}pt"})
-            if height > box_h + 2.0:
-                issues.append({"index": idx, "kind": "overflow",
-                               "detail": f"译文高度 {height:.1f}pt 超过自身框 {box_h:.1f}pt"})
-            # Only blocks on the same column (x-overlapping) are the "next" block:
-            # a two-column page has sibling blocks at the same y on the other column.
-            # Crowding is about covering a REAL next block — when nothing sits below
-            # (last block of the page), the ``overflow`` flag already covers the
-            # "too tall" case, and a fake 2×box gap would only add noise.
-            below = [nb for nb in blocks
-                     if nb is not b and nb.y0 >= b.y1 - 0.5
-                     and nb.x0 < b.x1 and nb.x1 > b.x0]
-            if below:
-                gap = min(nb.y0 for nb in below) - b.y1
-                if height > box_h + gap + 2.0:
-                    issues.append({"index": idx, "kind": "crowding",
-                                   "detail": f"译文高 {height:.1f}pt 会压入下一块（剩余 {gap:.1f}pt）"})
-        return {"page": page, "count": len(issues), "issues": issues[:60],
-                "truncated": len(issues) > 60}
+    def audit_tool(page: int | None = None, checks: list[str] | None = None):
+        """Deterministic multi-check audit (aggregates the ``check_*`` results)."""
+        return audit_page(state, page, checks)
 
     def preview_page(page: int, what: str = "translation", region=None, **_kw):
         if preview_handler is None:
@@ -964,6 +1008,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         "check_numbers": check_numbers,
         "check_table": check_table,
         "check_layout": check_layout,
+        "audit_page": audit_tool,
         "render_page": render_page,
         "preview_page": preview_page,
         "ask_user": ask_user,
@@ -1062,6 +1107,7 @@ class DocumentSession:
         answer_handler: Callable[..., Any] | None = None,
         show_preview: Callable[[int, str], None] | None = None,
         render_handler: Callable[[int, str], bytes | None] | None = None,
+        audit: Callable[..., dict[str, Any]] | None = None,
         max_steps_per_page: int = 24,
     ) -> None:
         self.state = state
@@ -1075,6 +1121,10 @@ class DocumentSession:
         self.answer_handler = answer_handler
         self.show_preview = show_preview
         self.render_handler = render_handler
+        #: M4 review gate: ``audit(page[, checks]) -> findings`` runs the deterministic
+        #: check before/after an AgentStep.  Defaults to ``audit_page`` over the live
+        #: state; a test injects a fake to control which pages flow to the AI fix pass.
+        self.audit = audit or (lambda page=None, checks=None: audit_page(self.state, page, checks))
         self.max_steps_per_page = max_steps_per_page
 
     def run(self) -> WorkflowState:
@@ -1109,6 +1159,27 @@ class DocumentSession:
         )
         self.progress(0, d.pages, "预处理")
 
+    def _page_agent(self, page: int):
+        """Bind one page's agent channel (``translate_page``) for a flow's AgentStep.
+
+        ``run_flow`` calls ``run_agent(task=..., page=..., max_steps=...)``; this wires
+        it to the phase handler (normally ``run_page_visual``) with the session's
+        channels, and converts the pipeline's cancellation control signal into
+        ``FlowCancelled`` so it propagates (not swallowed by the flow's fail-closed
+        ``except``).
+        """
+        def run_agent(*, task, page, max_steps=None, image=False):
+            try:
+                return self.translate_page(
+                    self.state, page, self.model, task=task,
+                    max_steps=max_steps or self.max_steps_per_page, log=self.log,
+                    preview_handler=self.preview_handler, answer_handler=self.answer_handler,
+                    cancel=self.cancel, render_handler=self.render_handler,
+                )
+            except _tr.TranslationCancelled:
+                raise FlowCancelled()
+        return run_agent
+
     def _translate_normal(self) -> None:
         normal = [i for i, t in self.state.triage.items() if t.kind == "normal"]
         total = len(normal)
@@ -1117,21 +1188,23 @@ class DocumentSession:
                 raise _tr.TranslationCancelled()
             ps = self.state.page(i)
             ps.status = STATUS_IN_PROGRESS
-            task = prompts.page_task(i, self.state.lang)
             try:
-                self.translate_page(
-                    self.state, i, self.model, task=task, log=self.log,
-                    preview_handler=self.preview_handler, answer_handler=self.answer_handler,
-                    max_steps=self.max_steps_per_page, cancel=self.cancel,
-                    render_handler=self.render_handler,
-                )
-                ps.status = STATUS_DONE
-            except _tr.TranslationCancelled:
-                raise
+                rs = run_flow(STANDARD_FLOWS["translate_page"],
+                              run_agent=self._page_agent(i), cancel=self.cancel,
+                              params={"page": i, "lang": self.state.lang})
+            except FlowCancelled:
+                raise _tr.TranslationCancelled()
             except Exception as exc:  # noqa: BLE001 — fail-closed per page
                 ps.status = STATUS_NEEDS_USER
                 ps.issues.append(f"翻译失败：{type(exc).__name__}")
                 self.log(f"  第 {i + 1} 页翻译失败：{type(exc).__name__}: {exc}（保留原文）。")
+            else:
+                if rs.ok:
+                    ps.status = STATUS_DONE
+                else:
+                    ps.status = STATUS_NEEDS_USER
+                    ps.issues.append(f"翻译失败：{rs.error}")
+                    self.log(f"  第 {i + 1} 页翻译失败：{rs.error}（保留原文）。")
             self.progress(done, total, "翻译正常页")
         if not total:
             self.log("  未发现正常文本页，跳过批量翻译。")
@@ -1217,20 +1290,19 @@ class DocumentSession:
         than silently ``done`` when the translation actually failed (fail-closed to
         the source text).
         """
-        task = prompts.page_task(page_index, self.state.lang, kind=kind)
         try:
-            self.translate_page(
-                self.state, page_index, self.model, task=task, log=self.log,
-                preview_handler=self.preview_handler, answer_handler=self.answer_handler,
-                max_steps=self.max_steps_per_page, cancel=self.cancel,
-                render_handler=self.render_handler,
-            )
-            return True
-        except _tr.TranslationCancelled:
-            raise
+            rs = run_flow(STANDARD_FLOWS["translate_page"],
+                          run_agent=self._page_agent(page_index), cancel=self.cancel,
+                          params={"page": page_index, "lang": self.state.lang, "kind": kind})
+        except FlowCancelled:
+            raise _tr.TranslationCancelled()
         except Exception as exc:  # noqa: BLE001 — fail-closed to source
             self.log(f"  第 {page_index + 1} 页翻译失败：{type(exc).__name__}: {exc}（保留原文）。")
             return False
+        if rs.ok:
+            return True
+        self.log(f"  第 {page_index + 1} 页翻译失败：{rs.error}（保留原文）。")
+        return False
 
     def _completed(self) -> None:
         d = self.state.doc_info
@@ -1284,13 +1356,22 @@ class DocumentSession:
             self.log("  [复核] 用户选择继续检查：可在侧边栏/预览继续，然后重新导出。")
 
     def _ai_self_check(self) -> None:
-        """M4 AI_SELFCHECK: re-read each page, find and fix issues via the agent loop.
+        """M4 AI_SELFCHECK: deterministic audit first, then fix findings via the agent.
 
         Only pages that were actually translated are re-checked.  Pages the user chose
         to keep / skip (``triage.decision`` in keep/skip) carry the source text verbatim
         — there is no AI translation to review there, and re-checking them would
         (wrongly) try to translate the intentionally-kept original.  Honouring the
         user's manual choice, those pages are skipped.
+
+        A page is first audited deterministically (``self.audit``); if it is already
+        clean by the four review criteria, the page is done without spending the AI's
+        budget.  Otherwise the findings are injected as concrete data into the agent
+        task (``prompts.review_page_task(..., findings=...)``) so the model fixes
+        exactly what was reported, then the page is re-audited — the loop repeats up to
+        ``REVIEW_MAX_ATTEMPTS`` until the audit comes back clean (fail-closed to keep the
+        best translation).  This removes the old "model must remember to run every check"
+        failure mode.
         """
         kept = {i for i, t in self.state.triage.items()
                 if t.decided and t.decision in ("keep", "skip")}
@@ -1301,21 +1382,31 @@ class DocumentSession:
             return
         if kept:
             self.log(f"  [复核] AI 自检：跳过 {len(kept)} 页用户选择保留/跳过（{sorted(kept)}）。")
-        self.log(f"  [复核] AI 自检：逐页回读并修正（共 {total} 页）。")
+        self.log(f"  [复核] AI 自检：先对 {total} 页做确定性审计，再对有问题页逐页修正。")
         for done, i in enumerate(pages, start=1):
             if self.cancel():
                 raise _tr.TranslationCancelled()
-            task = prompts.review_page_task(i)
             try:
-                self.translate_page(
-                    self.state, i, self.model, task=task, log=self.log,
-                    preview_handler=self.preview_handler, answer_handler=self.answer_handler,
-                    max_steps=self.max_steps_per_page, cancel=self.cancel,
-                    render_handler=self.render_handler,
+                rs = run_flow(
+                    STANDARD_FLOWS["self_check_page"],
+                    tools={"audit_page": lambda page=None, checks=None: self.audit(page, checks)},
+                    run_agent=self._page_agent(i), cancel=self.cancel,
+                    params={"page": i, "checks": None, "auto_fix": True,
+                            "max_iter": REVIEW_MAX_ATTEMPTS},
                 )
-            except _tr.TranslationCancelled:
-                raise
+            except FlowCancelled:
+                raise _tr.TranslationCancelled()
             except Exception as exc:  # noqa: BLE001 — a failed review is not fatal
                 self.log(f"  第 {i + 1} 页自检失败：{type(exc).__name__}: {exc}（保留译文）。")
+                self.state.page(i).issues.append("已复核")
+                self.progress(done, total, "复核")
+                continue
+            audit = rs.result.get("audit_page", {})
+            if audit.get("clean", True):
+                self.log(f"  第 {i + 1} 页复核通过。")
+                self.state.page(i).issues.append("已复核")
+            else:
+                n = len(audit.get("issues", []))
+                self.log(f"  第 {i + 1} 页仍有 {n} 处问题（达到复核上限）。")
+                self.state.page(i).issues.append(f"已复核（仍 {n} 处问题）")
             self.progress(done, total, "复核")
-            self.state.page(i).issues.append("已复核")

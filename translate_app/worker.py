@@ -75,6 +75,7 @@ class TranslateWorker(QObject):
         overlay: dict[int, dict] | None = None,
         re_export: bool = False,
         last_translated: list[str] | None = None,
+        requirements: list[str] | None = None,
     ):
         super().__init__()
         self._source = source_path
@@ -98,6 +99,9 @@ class TranslateWorker(QObject):
         self._re_export = re_export
         if re_export and last_translated:
             self._last_translated = list(last_translated)
+        #: User requirements seeded into the agent at start (from the "开始翻译+要求"
+        #: chat entry).  ``add_user_requirement`` appends more live, during a run.
+        self._requirements: list[str] = list(requirements or [])
         #: The PDF this run exported (set only for a PDF output type).  The preview
         #: window's "译文" side renders from THIS after the run — the exported
         #: translation — while a live run shows the in-progress translation (below).
@@ -436,6 +440,7 @@ class TranslateWorker(QObject):
         from . import agent as agent_mod
 
         state = agent_mod.WorkflowState(src_path=self._source, lang=self._lang)
+        state.requirements.extend(self._requirements)
         state.src_doc = doc
         self._agent_state = state
 

@@ -274,27 +274,71 @@ def review_export_question() -> tuple[str, list[str]]:
     return ("复核完成。是否导出？", ["导出", "继续检查"])
 
 
-def review_page_task(page_index: int) -> str:
-    """M4 AI_SELFCHECK: the per-page task that re-reads the translation and fixes issues.
+def review_page_task(page_index: int, *, findings: dict | None = None,
+                     auto_fix: bool = True) -> str:
+    """M4 AI_SELFCHECK: the per-page task that fixes audit findings in place.
 
-    The agent first loads the page into context (``read_page`` + ``render_page``),
-    then runs a deterministic four-area audit — structure/layout, missing
-    translation, number fidelity, and table/text completeness — and fixes what it
-    finds (``set_text`` / ``retranslate_block`` / ``apply_annotation``).  It may only
-    end once every check that applies to the page returns clean.
+    ``findings`` is the JSON structure from ``audit_page`` (``{"issues": [...],
+    "clean": bool, ...}``) — a **deterministic** audit run *before* this step.  It is
+    injected as concrete data so the model fixes exactly the reported problems
+    instead of re-running the four checks itself (which used to be the source of
+    "false green": a model that forgot one check area silently passed the page).
+    ``auto_fix=False`` makes this a read-only re-check (report only, no edits).
+
+    The agent loads the page (``read_page`` + ``render_page``), fixes each finding
+    (``set_text`` / ``retranslate_block`` / ``apply_annotation``) and may only finish
+    once the audit is clean.  Numeric / code blocks stay verbatim — they are
+    protected, not "missing".
     """
     n = page_index + 1
-    return (
-        f"这是文档第 {n} 页（页号 {page_index}，从 0 起）的【复核】。先 read_page({page_index}) + render_page({page_index}) "
-        "拿到本页原文与译文，再逐项核对、就地修正：\n"
+    lines = [
+        f"这是文档第 {n} 页（页号 {page_index}，从 0 起）的【复核】。"
+        f"先 read_page({page_index}) + render_page({page_index}) 拿到本页原文与译文，再逐项核对、就地修正。",
+    ]
+    if findings:
+        issue_lines: list[str] = []
+        for iss in findings.get("issues", []):
+            check = str(iss.get("check", ""))
+            idx = iss.get("index", "?")
+            if check == "layout":
+                issue_lines.append(
+                    f"- layout/{iss.get('kind', '')} 块#{idx}：{iss.get('detail', '')}")
+            elif check == "numbers":
+                issue_lines.append(
+                    f"- numbers 块#{idx}：源 {iss.get('source', '')!r} → 译文 "
+                    f"{iss.get('translation', '')!r}（missing={iss.get('missing')}, "
+                    f"extra={iss.get('extra')}）")
+            elif check == "residual":
+                issue_lines.append(
+                    f"- residual 块#{idx}（{iss.get('reason', '')}）：『{iss.get('text', '')}』")
+            elif check == "missing":
+                issue_lines.append(f"- missing 块#{idx}：源『{iss.get('text', '')}』未译")
+            elif check == "table":
+                issue_lines.append(
+                    f"- table：单元格缺 {iss.get('empty_cells')}，文本缺 {iss.get('empty_text')}")
+            else:
+                issue_lines.append(f"- {check} 块#{idx}：{iss}")
+        if issue_lines:
+            lines.append("已由确定性审计发现以下问题，请逐条核对并修正：")
+            lines.append("\n".join(issue_lines))
+        else:
+            lines.append("（确定性审计未发现可列问题。）")
+    lines.append(
         "① 版面 check_layout：有无被压得过小、溢出自身框、压入同列下一块。\n"
         "② 漏译 check_residual + check_missing：只有**应翻译而未翻译**的普通文本块才算问题；"
         "纯数字/金额/单位/代码块是刻意保留的原文，**不属于漏译**。\n"
         "③ 数字 check_numbers：与原文**按值**一致（千分位/小数/单位拆分等格式差异不算问题）。\n"
-        "④ 完整性 check_table：表格单元格与普通文本块都齐全、无空缺。\n"
-        "修正：set_text 写入已知译文；retranslate_block 只返回译文、需再 set_text 写入；apply_annotation 按用户框选改动。\n"
-        "**必须**让本页适用的上述检查都无问题才结束，否则继续修正，不得提前结束。"
+        "④ 完整性 check_table：表格单元格与普通文本块都齐全、无空缺。"
     )
+    if auto_fix:
+        lines.append(
+            "修正：set_text 写入已知译文；retranslate_block 只返回译文、需再 set_text 写入；"
+            "apply_annotation 按用户框选改动。\n"
+            "**必须**让本页适用的上述检查都无问题才结束，否则继续修正，不得提前结束。"
+        )
+    else:
+        lines.append("（本次为**只读复核**：只报告问题，不要修改任何译文。）")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +364,13 @@ def chat_tool_hint() -> str:
         "**用户要最新译文 → 直接调 re_export 重新导出**（用当前修改重新生成，秒级、不重译）。"
         "只在确需文档信息、或用户明确要求改动/导出时调用；纯闲聊不要用。"
         "若 re_export 不可用（还没翻译过/没加载源文件），提示用户点主界面的「重新导出」按钮，"
-        "**不要说自己没有导出功能**——应用有「重新导出」。"
+        "**不要说自己没有导出功能**——应用有「重新导出」。\n"
+        "**用户要「开始翻译」（或“翻译这个/帮我翻译”+要求）→ 这是入口**："
+        "① 先 get_settings 看当前设置（源文件名/目标语言/输出格式/模型）；"
+        "② 若用户要求改语言/格式，先 set_setting 改；"
+        "③ 把用户的具体要求（如“第3页公司名翻成Bank”、“只翻第2-5页”）作为 requirement 传给 run_translate，"
+        "**不要自己复述“即将开始”而不启动**；"
+        "④ 运行中需要用户决定时 AI 会提问。若没选源文件/模型不可用，提示用户先选好再试。"
     )
 
 
@@ -355,6 +405,7 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "check_numbers": "核对某页译文的数字/金额是否与原文**按值**一致：源里的数值被删或改错才报告（千分位/小数/单位拆分等格式差异不算；中文【序数→数字】如 二→2 不算），返回不一致的块",
     "check_table": "检查某页表格单元格与普通文本块的完整性：源可译单元格数 vs 已译数、空/缺失单元格、遗漏文本块",
     "check_layout": "仿照导出器重新测量某页译文的版面：看是否低于可读下限、溢出自身框、压入同列下一块（两栏页只与同栏比较）",
+    "audit_page": "对某页一次性跑指定的确定性审计并合并结果：返回 {checks_requested, checks, issues, clean}（issues 是带 check 标签的列单项，供你逐条修正）；checks 可传子集（如 ['numbers','table']），默认全五类。只读复核（不修任何东西）时把 clean 当作本轮是否达标",
     "render_page": "把当前处理到该页的译文渲染成 PNG 供视觉自检（检查溢出/越线/密度）",
     "preview_page": "在预览窗口显示指定页面（供用户查看），可聚焦某区域/块",
     "ask_user": "向用户提问并等待回答（关键决策/歧义/术语确认）",
@@ -363,6 +414,7 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
 #: The interaction-chat tool descriptions (``chat_tools.py``), keyed by tool name.
 CHAT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_doc_info": "返回当前 PDF 的信息：页数/标题/语言/文本页/扫描页/图表页/块数/每页类型（表格页恒为 0）。",
+    "get_settings": "返回当前应用设置快照：源文件名、目标语言、输出格式键与显示名、输出路径、模型名称/id、是否 OCR/智能编排。开始翻译前先看它确认设置。",
     "classify_page": "判定某页类型：normal/scan/chart/uncertain。",
     "read_page": "读取某页的原始文本块与当前译文，含扁平块索引（供 set_block_text 使用）与布局元数据。",
     "goto_page": "在预览窗口显示指定页（原文/译文侧）。",
@@ -370,4 +422,6 @@ CHAT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "delete_block_text": "移除某块的 AI 编辑，恢复为未被覆盖的译文。",
     "apply_annotation": "按预览中用户框选的区域改写/删除对应块（用 read_page 拿到的 bbox）。",
     "re_export": "用当前已加载 PDF 上一次的成功译文，重新导出（应用本次对话/标注里已有的修改；不重新翻译、秒级）。",
+    "run_translate": "用**当前设置**开始翻译（把用户的具体要求作为 requirement 传入，会随运行注入到 AI 编排层）。控制权交给翻译流水线，完成在主窗口日志/进度提示。",
+    "set_setting": "修改翻译设置项（key 为 target_language 或 output_type，value 为语言名/输出格式键 translated_pdf|bilingual_pdf|markdown|plain_text），下次运行生效。",
 }

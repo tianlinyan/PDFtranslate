@@ -445,6 +445,11 @@ class PreviewBridge(QObject):
     #: Thread-safe channel for the chat AI's ``re_export`` tool: emitted from the
     #: chat worker thread, queued to the GUI where it triggers the re-export.
     reExportRequested = pyqtSignal()
+    #: Thread-safe channels for the chat AI's translate-entry tools: emitted from
+    #: the chat worker thread, queued to the GUI where they trigger the pipeline
+    #: start (with an optional user requirement) / a setting change.
+    translateRequested = pyqtSignal(str)        # requirement
+    setSettingRequested = pyqtSignal(str, object)  # key, value
 
     def __init__(self, parent: QObject | None = None, timeout: float = 120.0) -> None:
         super().__init__(parent)

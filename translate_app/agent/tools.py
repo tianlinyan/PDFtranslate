@@ -130,6 +130,13 @@ AGENT_TOOLS: list[ToolDef] = [
           returns="{source_cells, translated_cells, empty_cells, empty_text, complete}"),
     _tool("check_layout", {"page": {"type": "integer"}}, ["page"], CAT_VERIFY,
           returns="版面问题块 [{index, kind, detail}]"),
+    _tool("audit_page",
+          {"page": {"type": "integer"},
+           "checks": {"type": "array", "items": {"type": "string"},
+                      "description": "要跑的检查子集：layout/residual/missing/numbers/table（默认全部）"}},
+          ["page"], CAT_VERIFY,
+          returns="{checks_requested, checks, issues, clean}——issues 为带 check 标签的列单项，"
+                  "clean 为本轮是否无问题"),
     # --- D. 交互 / 预览（供用户查看，不修改文档）-------------------------------
     _tool("preview_page",
           {"page": {"type": "integer", "description": "页号（0 起）"},

@@ -161,6 +161,9 @@ class MainWindow(QWidget):
         #: until the next chat send, so it is sent to the AI together with the user's
         #: typed text.  Cleared after it is consumed.
         self._pending_image: bytes | None = None
+        #: True once the window's controls are fully built; guards ``_refresh_chat_settings``
+        #: from running during ``__init__`` (before the model/type combos exist).
+        self._settings_ready = False
         #: Right-shifts the window once on first show so the preview (docked to the
         #: left) has room.  Set in ``showEvent`` the first time.
         self._geometry_set = False
@@ -249,6 +252,9 @@ class MainWindow(QWidget):
             if saved_type in type_keys:
                 idx = type_keys.index(saved_type)
         self._type_combo.setCurrentIndex(idx)
+        # Keep the AI settings snapshot in sync when the model / output type change.
+        self._model_combo.currentIndexChanged.connect(lambda _i: self._refresh_chat_settings())
+        self._type_combo.currentIndexChanged.connect(lambda _i: self._refresh_chat_settings())
 
         # --- Output path ---
         self._path_edit = QLineEdit()
@@ -285,7 +291,12 @@ class MainWindow(QWidget):
 
         # --- Buttons ---
         self._start_btn = QPushButton("开始翻译")
-        self._start_btn.clicked.connect(self._start)
+        self._start_btn.setToolTip(
+            "等价于在侧栏输入「开始翻译」并发送：AI 读取当前设置后启动翻译。"
+        )
+        # The button drives the AI entry (the chat AI reads settings and calls
+        # ``run_translate``), so the action shows as a user message in the sidebar.
+        self._start_btn.clicked.connect(self._start_via_chat)
         self._cancel_btn = QPushButton("取消")
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.clicked.connect(self._cancel)
@@ -312,6 +323,11 @@ class MainWindow(QWidget):
         # The chat AI's ``re_export`` tool triggers the same re-export on the GUI
         # thread (the tool runs on the chat worker thread).
         self.preview_bridge.reExportRequested.connect(self._re_export)
+        # The chat AI's translate-entry tools (``run_translate`` / ``set_setting``)
+        # also run on the chat worker thread; the bridge queues them to the GUI where
+        # they start the pipeline / change a setting.
+        self.preview_bridge.translateRequested.connect(self._start)
+        self.preview_bridge.setSettingRequested.connect(self._on_chat_set_setting)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -346,6 +362,8 @@ class MainWindow(QWidget):
             log=self._chat_log.log.emit,
             show_preview=self.preview_bridge.showPreview.emit,
             re_export=self.preview_bridge.reExportRequested.emit,
+            start_translate=self.preview_bridge.translateRequested.emit,
+            set_setting=self.preview_bridge.setSettingRequested.emit,
         )
         self._chat_worker.moveToThread(self._chat_thread)
         self._chat_worker.ask_requested.connect(self._chat_worker.ask)
@@ -375,6 +393,9 @@ class MainWindow(QWidget):
         # ``show=False``: the greeting is a hidden prompt — the AI still receives and
         # replies, but the "你好" is not echoed as a sidebar user bubble.
         self.agent_sidebar.send_message(prompts.CHAT_GREETING, show=False)
+        # Controls are built; start keeping the AI ``get_settings`` snapshot current.
+        self._settings_ready = True
+        self._refresh_chat_settings()
 
     def showEvent(self, event) -> None:  # noqa: N802
         """On first show, shift the window 200px right of its default position.
@@ -417,6 +438,7 @@ class MainWindow(QWidget):
             lang=self._target_language(),
             ocr=bool(target),
         )
+        self._refresh_chat_settings()
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -660,7 +682,55 @@ class MainWindow(QWidget):
                 return m
         return self.models[0] if self.models else None
 
-    def _start(self) -> None:
+    def _refresh_chat_settings(self) -> None:
+        """Keep the AI ``get_settings`` snapshot current (source/lang/format/model)."""
+        if not self._settings_ready:
+            return
+        model = self._selected_model()
+        key = self._type_combo.currentData()
+        _label, _ext = OUTPUT_TYPES[key]
+        self.doc_ctx.set_settings(
+            source=self._source,
+            source_name=Path(self._source).name if self._source else None,
+            target_language=self._target_language(),
+            output_type=key,
+            output_label=OUTPUT_TYPES[key][0],
+            output_path=self._path_edit.text().strip() or self._default_output_path(),
+            model=model.name if model else None,
+            model_id=model.id if model else None,
+            ocr=True,
+            agent_mode=True,
+        )
+
+    def _on_chat_set_setting(self, key: str, value: str) -> None:
+        """Apply a chat AI ``set_setting`` (target_language / output_type) on the GUI."""
+        key, value = str(key or ""), str(value or "")
+        if key == "target_language":
+            self._lang_combo.setCurrentText(value)   # typed value wins (see resolve_language)
+        elif key == "output_type":
+            idx = self._type_combo.findData(value)
+            if idx >= 0:
+                self._type_combo.setCurrentIndex(idx)
+        # Reflect any change into the doc context + settings snapshot immediately.
+        self._refresh_doc_ctx()
+
+    def _start_via_chat(self) -> None:
+        """Behave exactly like the user typing & sending "开始翻译" in the sidebar.
+
+        The button no longer starts the pipeline directly — it drives the AI entry
+        (``get_settings`` → ``set_setting`` → ``run_translate``), so the whole flow is
+        AI-centric and the action is recorded in the sidebar conversation.
+        """
+        self.agent_sidebar.send_message("开始翻译")
+
+    def _start(self, requirement: str = "") -> None:
+        """Start the translation pipeline (the "开始翻译" entry, button or AI tool).
+
+        ``requirement`` is an optional user requirement supplied by the AI's
+        ``run_translate`` tool; it is seeded into the run's workflow state so the
+        translation agent sees it from the first decision.
+        """
+        requirement = str(requirement or "").strip()
         if self._thread is not None:
             return
         if not self._source or not Path(self._source).exists():
@@ -715,6 +785,7 @@ class MainWindow(QWidget):
             show_preview=self.preview_bridge.show_page,
             agent_mode=True,
             overlay=self.doc_ctx.overlay(),
+            requirements=[requirement] if requirement else None,
         ))
 
     def _launch_worker(self, worker: TranslateWorker) -> None:

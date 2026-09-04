@@ -46,6 +46,7 @@ def _tool(name: str, properties: dict[str, dict], required: list[str]) -> dict[s
 #: context (no draw / page / verify tools yet).
 CHAT_TOOL_SPECS: list[dict[str, Any]] = [
     _tool("get_doc_info", {}, []),
+    _tool("get_settings", {}, []),
     _tool("classify_page",
           {"page": {"type": "integer", "description": "页号（0 起）"}}, ["page"]),
     _tool("read_page",
@@ -70,6 +71,16 @@ CHAT_TOOL_SPECS: list[dict[str, Any]] = [
            "action": {"type": "string", "enum": ["set", "delete"], "default": "set"}},
           ["page", "bbox"]),
     _tool("re_export", {}, []),
+    _tool("run_translate",
+          {"requirement": {"type": "string",
+                           "description": "用户的具体要求（可选，如\"第3页公司名翻成Bank\"），会随运行注入 AI 编排层"}},
+          []),
+    _tool("set_setting",
+          {"key": {"type": "string", "enum": ["target_language", "output_type"],
+                   "description": "要改的设置项：target_language（目标语言名）或 output_type（输出格式键）"},
+           "value": {"type": "string",
+                     "description": "语言名（如 French）；output_type 取 translated_pdf / bilingual_pdf / markdown / plain_text"}},
+          ["key", "value"]),
 ]
 
 
@@ -82,6 +93,8 @@ def chat_openai_tools(names: list[str] | None = None) -> list[dict[str, Any]]:
 
 def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = None,
                     re_export: Callable[[], None] | None = None,
+                    start_translate: Callable[[str], None] | None = None,
+                    set_setting: Callable[[str, str], None] | None = None,
                     log: Callable[[str], None] | None = None) -> dict[str, Callable]:
     """Bind the chat tools to a live :class:`DocContext` (``ctx``).
 
@@ -110,6 +123,13 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         if doc is None:
             return {"error": "没有已加载的 PDF。"}
         return pdfio.get_doc_info(doc)
+
+    def get_settings() -> dict[str, Any]:
+        """The current run settings snapshot (source / language / output / model)."""
+        s = ctx.get_settings()
+        if not s:
+            return {"ok": False, "error": "尚未初始化翻译设置。", "settings": {}}
+        return {"ok": True, **s}
 
     def classify_page(page: int) -> dict[str, Any]:
         doc = ctx.ensure_doc()
@@ -198,8 +218,32 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         return {"ok": True, "message": "已触发重新导出（后台执行，完成会在主窗口日志/进度提示）。"}
 
+    def run_translate(requirement: str = ""):
+        """Start the translation pipeline with the current settings (the AI entry)."""
+        if start_translate is None:
+            return {"ok": False, "error": "开始翻译通道未接线"}
+        try:
+            start_translate(str(requirement or ""))
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": True, "message": "已触发开始翻译（按当前设置后台执行；完成会在主窗口日志/进度提示）。"}
+
+    def set_setting_tool(key: str, value: str):
+        """Change a run setting (target_language / output_type) before starting."""
+        if set_setting is None:
+            return {"ok": False, "error": "设置通道未接线"}
+        k = str(key or "").strip()
+        if k not in ("target_language", "output_type"):
+            return {"ok": False, "error": f"未知设置项：{k!r}"}
+        try:
+            set_setting(k, str(value or ""))
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": True, "key": k, "value": str(value or "")}
+
     return {
         "get_doc_info": get_doc_info,
+        "get_settings": get_settings,
         "classify_page": classify_page,
         "read_page": read_page,
         "goto_page": goto_page,
@@ -207,4 +251,6 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         "delete_block_text": delete_block_text,
         "apply_annotation": apply_annotation,
         "re_export": _re_export,
+        "run_translate": run_translate,
+        "set_setting": set_setting_tool,
     }

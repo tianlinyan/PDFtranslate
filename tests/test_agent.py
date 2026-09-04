@@ -573,6 +573,50 @@ class PageExecutorsTest(unittest.TestCase):
             self.assertEqual("verify", t.category, n)
             self.assertFalse(t.destructive, n)
 
+    def test_audit_page_tool_registered_and_bound(self):
+        # ``audit_page`` is the module-level aggregator: advertised in the registry
+        # AND bound in ``make_page_executors`` (so the agent can both see and call it).
+        t = agent.by_name("audit_page")
+        self.assertIsNotNone(t)
+        self.assertEqual("verify", t.category)
+        self.assertFalse(t.destructive)
+        tools = agent.make_page_executors(self._state(), _dummy_model())
+        self.assertIn("audit_page", tools)
+
+    def test_audit_page_reports_missing_and_skips_protected(self):
+        s = self._state()
+        tools = agent.make_page_executors(s, _dummy_model())
+        # Nothing translated yet → the two text labels are missing/residual; the
+        # numeric cell (flat index 1) is protected and must never be reported.
+        res = tools["audit_page"](0)
+        self.assertFalse(res["clean"])
+        kinds = {iss["check"] for iss in res["issues"]}
+        self.assertIn("missing", kinds)
+        self.assertIn("residual", kinds)
+        reported_idx = [iss.get("index") for iss in res["issues"] if "index" in iss]
+        self.assertNotIn(1, reported_idx)
+
+    def test_audit_page_subset_checks(self):
+        s = self._state()
+        tools = agent.make_page_executors(s, _dummy_model())
+        s.out_doc = {0: {"text": "Total assets"}, 2: {"text": "Total liabilities"}}
+        res = tools["audit_page"](0, checks=["numbers", "table"])
+        self.assertEqual(["numbers", "table"], res["checks_requested"])
+        self.assertTrue(res["clean"])
+
+    def test_audit_page_flags_number_discrepancy(self):
+        # A translation that drops a digit is flagged by the aggregate audit.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("2023 年营收 3.14 亿元", page=0, x0=0, y0=0,
+                                x1=100, y1=10)]],
+            blocks=["2023 年营收 3.14 亿元"], block_pages=[0])
+        s.out_doc = {0: {"text": "In 2023 revenue was 3.1 hundred million yuan"}}
+        res = agent.audit_page(s, 0, checks=["numbers"])
+        self.assertFalse(res["clean"])
+        self.assertTrue(any(iss["check"] == "numbers" and iss.get("missing")
+                            for iss in res["issues"]), res)
+
     def test_check_numbers_detects_altered_number(self):
         # A translation that drops/alters a digit must be flagged.
         s = agent.WorkflowState("a.pdf", "English")
@@ -1014,6 +1058,38 @@ class FeedbackTest(unittest.TestCase):
         self.assertNotIn('"image"', tool_msgs[0]["content"])
         user = [m for m in msgs if m.get("role") == "user"][-1]
         self.assertTrue(any(p.get("type") == "image_url" for p in user["content"]))
+
+
+class ReviewPageTaskPromptTest(unittest.TestCase):
+    """The M4 review task is now parameterized: findings injected + read-only mode."""
+
+    def test_default_still_mentions_review_and_fix_tools(self):
+        from translate_app import prompts
+
+        task = prompts.review_page_task(2)
+        self.assertIn("复核", task)
+        self.assertIn("set_text", task)
+        self.assertIn("retranslate_block", task)
+
+    def test_findings_are_injected_as_concrete_data(self):
+        from translate_app import prompts
+
+        findings = {"page": 2, "checks_requested": ["numbers"], "checks": {},
+                    "issues": [{"check": "numbers", "index": 7, "source": "3.14 亿元",
+                                "translation": "3.1 billion yuan",
+                                "missing": ["4"], "extra": []}], "clean": False}
+        task = prompts.review_page_task(2, findings=findings)
+        self.assertIn("复核", task)
+        self.assertIn("块#7", task)
+        self.assertIn("3.14", task)
+        self.assertIn("missing=['4']", task)
+
+    def test_auto_fix_false_is_read_only(self):
+        from translate_app import prompts
+
+        task = prompts.review_page_task(1, auto_fix=False)
+        self.assertIn("只读复核", task)
+        self.assertIn("不要修改任何译文", task)
 
 
 if __name__ == "__main__":

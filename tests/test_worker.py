@@ -196,9 +196,14 @@ class AgentModeWiringTest(_WorkerTestBase):
     def test_agent_mode_routes_to_agent_and_passes_preview_handler(self):
         src = build_sample_pdf(self.tmp / "agent.pdf", pages=1)
         out = self.tmp / "out.txt"
+        # The source carries a figure that the fake translation drops, so the M4
+        # deterministic audit finds a real finding on the page → the AI fix pass runs
+        # (a separate '复核' task).  A truly-clean page would be skipped by the audit
+        # gate (see ``DocumentSession._ai_self_check``).
         doc = pdfio.DocumentText(
-            pages=[[pdfio.Block(text="你好", page=0, x0=40, y0=40, x1=120, y1=60, size=10.0)]],
-            blocks=["你好"], block_pages=[0], title="agent",
+            pages=[[pdfio.Block(text="你好 3.14 亿元", page=0, x0=40, y0=40,
+                                x1=120, y1=60, size=10.0)]],
+            blocks=["你好 3.14 亿元"], block_pages=[0], title="agent",
         )
         model = ModelConfig.from_dict(dict(
             id="v", name="v", type="llama-server",
@@ -238,6 +243,44 @@ class AgentModeWiringTest(_WorkerTestBase):
         self.assertIn("Hello from agent", Path(out).read_text("utf-8"))
         self.assertIn("finished", events)
         self.assertTrue(any("已启用 AI 编排" in m for m in logs), logs)
+
+    def test_requirements_seeded_into_agent_state(self):
+        # The "开始翻译+要求" entry seeds a requirement into the agent's workflow
+        # state, so the translation agent sees it from the first decision.
+        src = build_sample_pdf(self.tmp / "req.pdf", pages=1)
+        out = self.tmp / "out.txt"
+        doc = pdfio.DocumentText(
+            pages=[[pdfio.Block(text="你好 3.14 亿元", page=0, x0=40, y0=40,
+                                x1=120, y1=60, size=10.0)]],
+            blocks=["你好 3.14 亿元"], block_pages=[0], title="req",
+        )
+        model = ModelConfig.from_dict(dict(
+            id="v", name="v", type="llama-server",
+            endpoint="http://127.0.0.1:9/v1/chat/completions", model="qwen", vision=True))
+        seen_reqs: list = []
+
+        def fake_run_page_visual(state, page, _model, **kw):
+            seen_reqs.append(list(state.requirements))
+            state.out_doc = {0: {"text": "Hello from agent"}}
+            return state
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                raise AssertionError("deterministic engine must not run in agent mode")
+
+        worker = TranslateWorker(str(src), model, "English", "plain_text", str(out),
+                                 agent_mode=True,
+                                 requirements=["把第3页公司名翻成Bank"])
+        with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
+            with mock.patch.object(agent_module, "run_page_visual",
+                                   side_effect=fake_run_page_visual):
+                with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
+                    self._run(worker)
+        self.assertTrue(seen_reqs)
+        self.assertIn("把第3页公司名翻成Bank", seen_reqs[0])
 
     def test_non_vision_model_falls_back_to_deterministic(self):
         # agent_mode on but the model has no vision → the deterministic pipeline runs.

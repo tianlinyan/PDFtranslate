@@ -231,6 +231,7 @@ class DocumentSessionTest(unittest.TestCase):
         doc = _mixed_doc()
         review_pages: list[int] = []
         answers: list[tuple] = []
+        audit_calls: dict[int, int] = {}
 
         def fake_translate(st, page, _model, *, task, **kw):
             if "复核" in str(task):
@@ -244,17 +245,65 @@ class DocumentSessionTest(unittest.TestCase):
             answers.append(target)
             return {"value": "AI 自检" if target == "review_mode" else "导出", "target": target}
 
+        # M4 review gate: the deterministic audit runs first; a page that is clean is
+        # done WITHOUT the AI fix pass.  The fake reports an issue on the first audit
+        # (so the agent runs to fix it) and clean afterwards (so the loop ends).
+        def fake_audit(page, checks=None):
+            audit_calls[page] = audit_calls.get(page, 0) + 1
+            clean = audit_calls[page] > 1
+            return {"page": page, "checks_requested": list(checks or []), "checks": {},
+                    "issues": [] if clean else [{"check": "residual", "index": page,
+                                                 "text": "x", "reason": "empty"}],
+                    "clean": clean}
+
         state = agent.WorkflowState(src_path="a.pdf", lang="English")
         state.src_doc = doc
         session = DocumentSession(state, doc, model=object(), log=lambda m: None,
-                                  translate_page=fake_translate, answer_handler=answer_handler)
+                                  translate_page=fake_translate, answer_handler=answer_handler,
+                                  audit=fake_audit)
         session.run()
         # Mode asked; AI self-check re-read only the TRANSLATED pages (0, 3) and
         # skipped the special pages the user chose to keep/skip (1, 2, 4).
         self.assertEqual("ai", state.review_mode)
         self.assertEqual([0, 3], review_pages)
+        # Each translated page was audited (found an issue) then re-audited (clean).
+        self.assertEqual({0: 2, 3: 2}, audit_calls)
         self.assertIn("review_mode", answers)
         self.assertIn("export", answers)
+        self.assertEqual(PHASE_DONE, state.phase)
+
+    def test_review_phase_clean_page_is_skipped(self):
+        # M4: a page already clean by the deterministic audit must NOT go to the AI
+        # fix pass — the review gate saves the model budget on already-clean pages.
+        doc = _mixed_doc()
+        review_pages: list[int] = []
+        answers: list[tuple] = []
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                review_pages.append(page)
+                return st
+            st.out_doc = st.out_doc or {}
+            st.out_doc[page] = {"text": f"T{page}"}
+            return st
+
+        def answer_handler(question, options, target):
+            answers.append(target)
+            return {"value": "AI 自检" if target == "review_mode" else "导出", "target": target}
+
+        def fake_audit(page, checks=None):   # every page is already clean
+            return {"page": page, "checks_requested": list(checks or []), "checks": {},
+                    "issues": [], "clean": True}
+
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=fake_translate, answer_handler=answer_handler,
+                                  audit=fake_audit)
+        session.run()
+        # No page had findings → the AI fix pass never ran for any translated page.
+        self.assertEqual("ai", state.review_mode)
+        self.assertEqual([], review_pages)
         self.assertEqual(PHASE_DONE, state.phase)
 
     def test_review_phase_user_mode_skips_ai_and_can_continue(self):

@@ -88,8 +88,9 @@ class ChatToolsTest(_CtxTest):
 
     def test_tools_expose_expected_set(self):
         self.assertEqual({
-            "get_doc_info", "classify_page", "read_page", "goto_page",
+            "get_doc_info", "get_settings", "classify_page", "read_page", "goto_page",
             "set_block_text", "delete_block_text", "apply_annotation", "re_export",
+            "run_translate", "set_setting",
         }, self._tool_names())
 
     def test_get_doc_info(self):
@@ -187,6 +188,51 @@ class ChatToolsTest(_CtxTest):
         res = tools["re_export"]()
         self.assertTrue(res["ok"])
         self.assertEqual([1], calls)
+
+    def test_get_settings_returns_snapshot(self):
+        self.ctx.set_settings(source="a.pdf", target_language="English",
+                              output_type="bilingual_pdf", output_label="双语 PDF",
+                              model="qwen")
+        res = self.tools["get_settings"]()
+        self.assertTrue(res["ok"])
+        self.assertEqual("a.pdf", res["source"])
+        self.assertEqual("English", res["target_language"])
+        self.assertEqual("bilingual_pdf", res["output_type"])
+        self.assertEqual("qwen", res["model"])
+
+    def test_get_settings_empty_snapshot_fail_closed(self):
+        tools = chat_tools.make_chat_tools(DocContext())
+        res = tools["get_settings"]()
+        self.assertFalse(res["ok"])
+        self.assertIn("error", res)
+
+    def test_run_translate_requires_channel(self):
+        res = self.tools["run_translate"]()
+        self.assertFalse(res["ok"])
+        self.assertIn("开始翻译通道", res["error"])
+
+    def test_run_translate_calls_channel_with_requirement(self):
+        calls: list = []
+        tools = chat_tools.make_chat_tools(self.ctx,
+                                           start_translate=lambda req: calls.append(req))
+        res = tools["run_translate"]("第3页公司名翻成Bank")
+        self.assertTrue(res["ok"])
+        self.assertEqual(["第3页公司名翻成Bank"], calls)
+
+    def test_set_setting_validates_and_calls_channel(self):
+        calls: list = []
+        tools = chat_tools.make_chat_tools(self.ctx,
+                                           set_setting=lambda k, v: calls.append((k, v)))
+        self.assertTrue(tools["set_setting"]("target_language", "French")["ok"])
+        self.assertEqual([("target_language", "French")], calls)
+        bad = tools["set_setting"]("nope", "x")
+        self.assertFalse(bad["ok"])
+        self.assertIn("未知设置项", bad["error"])
+
+    def test_set_setting_requires_channel(self):
+        res = self.tools["set_setting"]("target_language", "French")
+        self.assertFalse(res["ok"])
+        self.assertIn("设置通道", res["error"])
 
     def test_classify_page_ok(self):
         res = self.tools["classify_page"](0)

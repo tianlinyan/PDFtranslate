@@ -175,17 +175,23 @@ class ChatWorker(QObject):
     def __init__(self, log: Callable[[str], None] | None = None,
                  ctx: Any | None = None,
                  show_preview: Callable[[int, str], None] | None = None,
-                 re_export: Callable[[], None] | None = None) -> None:
+                 re_export: Callable[[], None] | None = None,
+                 start_translate: Callable[[str], None] | None = None,
+                 set_setting: Callable[[str, str], None] | None = None) -> None:
         super().__init__()
         self._log = log or (lambda m: None)
         self._session: ChatSession | None = None
         #: Optional persistent document context (``DocContext``) whose tools the
         #: interaction model may call.  ``show_preview`` is a thread-safe channel to
         #: open a preview page; ``re_export`` re-exports the last translation with the
-        #: current edits — the GUI wires both to bridges so they run on the GUI thread.
+        #: current edits; ``start_translate`` / ``set_setting`` drive the translate
+        #: entry (start the pipeline / change a setting).  The GUI wires these to
+        #: bridges so they run on the GUI thread.
         self._ctx = ctx
         self._show_preview = show_preview
         self._re_export = re_export
+        self._start_translate = start_translate
+        self._set_setting = set_setting
 
     def _ensure_session(self, model: ModelConfig) -> ChatSession:
         if self._session is None or self._session.model is not model:
@@ -207,6 +213,7 @@ class ChatWorker(QObject):
 
         tools_map = make_chat_tools(
             self._ctx, show_preview=self._show_preview, re_export=self._re_export,
+            start_translate=self._start_translate, set_setting=self._set_setting,
         )
 
         def executor(name: str, args: dict[str, Any]) -> Any:
