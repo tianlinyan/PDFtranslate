@@ -26,8 +26,6 @@ PHASE_PREPROCESS = "preprocess"
 PHASE_TRANSLATE_NORMAL = "translate_normal"
 PHASE_SPECIAL_PAGES = "special_pages"
 PHASE_COMPLETED = "completed"
-PHASE_REVIEW = "review"
-PHASE_EXPORT = "export"
 PHASE_DONE = "done"
 
 
@@ -35,11 +33,7 @@ PHASE_DONE = "done"
 class Budget:
     """Bounded recursion budget for a run (fail-closed beyond these limits)."""
     max_steps: int = 200          # max total tool calls
-    max_passes: int = 6           # max passes (rounds) per page
-    cost_cap: float = 30.0        # rough cost budget (arbitrary units)
     used_steps: int = 0
-    used_passes: int = 0
-    cost: float = 0.0
 
     def remaining_steps(self) -> int:
         return max(0, self.max_steps - self.used_steps)
@@ -73,7 +67,7 @@ class Op:
 class Goal:
     """One item on the controller's todo queue."""
 
-    kind: str                     # e.g. "translate", "verify_number", "check_residual"
+    kind: str                     # e.g. "translate", "check_residual"
     page: int | None = None
     status: str = STATUS_PENDING
     note: str = ""
@@ -177,9 +171,7 @@ class WorkflowState:
     doc_info: DocInfo | None = None                  # preprocess summary
     triage: dict[int, PageTriage] = field(default_factory=dict)   # per-page kind
     current_page: int = 0                            # preview navigation pointer
-    annotations: list[dict[str, Any]] = field(default_factory=list)  # user marks
     summary: str = ""                                # pipeline summary
-    review_mode: str = ""                            # "ai" | "user"
 
     def page(self, index: int) -> PageState:
         """The ``PageState`` for ``index``, created on first access."""

@@ -44,6 +44,22 @@ _EXAMPLE_OUTPUTS: dict[str, tuple[str, str]] = {
 }
 
 
+def _is_cjk_language(language: str) -> bool:
+    """True when the target is a CJK-script language.
+
+    The model-facing language name may be ASCII ("Simplified Chinese", "Japanese"),
+    so script detection must be by language *identity*, not by scanning the ASCII
+    name for CJK glyphs.  Otherwise the default Chinese target ("Simplified Chinese")
+    would be treated as Latin-only and wrongly get the Chinese-name-romanization
+    rule prepended to a Chinese translation.
+    """
+    lc = language.strip().casefold()
+    return any(s in lc for s in (
+        "simplified chinese", "traditional chinese", "chinese", "japanese",
+        "korean", "zh", "ja", "ko", "中文", "简体中文", "繁体中文", "日本語", "한국어", "漢語",
+    ))
+
+
 def translation_system_prompt(language: str, glossary: dict[str, str] | None = None) -> str:
     """The system prompt for translating a numbered batch of blocks into ``language``.
 
@@ -52,7 +68,8 @@ def translation_system_prompt(language: str, glossary: dict[str, str] | None = N
     as they are and the numbering conventions carry over directly.  ``glossary``
     (source → target) is appended so the model honours the document's own terms.
     """
-    latin = not any("一" <= c <= "鿿" for c in language)
+    cjk_target = _is_cjk_language(language)
+    latin = not cjk_target
     lc = language.strip().casefold()
     is_english = latin and lc == "english"
     prompt = (
@@ -107,7 +124,11 @@ def translation_system_prompt(language: str, glossary: dict[str, str] | None = N
         "any preamble.\n"
         "- Output ONLY the numbered translations, nothing else.\n"
     )
-    out1, out2 = _EXAMPLE_OUTPUTS.get(lc, _EXAMPLE_OUTPUTS["simplified chinese"])
+    # Fall back to a target-script-appropriate example: a CJK target uses a Chinese
+    # result (so the model is anchored to Chinese), a Latin target uses an
+    # English-style one (never a Chinese result for a Spanish/French/… target).
+    fallback = "simplified chinese" if cjk_target else "english"
+    out1, out2 = _EXAMPLE_OUTPUTS.get(lc, _EXAMPLE_OUTPUTS[fallback])
     inp1, inp2 = _EXAMPLE_INPUT
     prompt += (
         "Example:\n"
@@ -220,41 +241,25 @@ CHAT_GREETING = "你好"
 # ---------------------------------------------------------------------------
 
 #: The translation-agent tool descriptions (``agent/tools.py``), keyed by tool name.
+#: Only tools that are actually bound AND have a real effect on the pipeline/output
+#: are exposed (see ``agent/flow.py`` ``run_page_visual``); dead/broken tools are
+#: kept out so the model never sees a tool that does nothing.
 AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "read_page": "读取指定页的文本块与布局元数据",
-    "render_region": "把某页的指定区域渲染成 PNG 供视觉观察",
     "get_layout": "提取某页的行/列聚类、二维网格与单元格跨度",
     "get_doc_info": "返回原文件信息：页数/标题/语言/文本页/扫描页/图表页/表格页/块数",
     "classify_page": "判定某页类型：normal/scan/chart/table/uncertain",
     "translate_block": "把某一块文本翻译成目标语言（走缓存+编号协议）",
-    "retranslate_block": "强制重译某块（绕过缓存，常用于残中/空缺修正）",
-    "rewrite_block": "改写某块译文的措辞（面向用户预览）",
+    "retranslate_block": "强制重译某文本（绕过缓存，常用于残中/空缺修正）",
     "set_text": "把某块文本直接置为指定值（数字/代码块会被拒绝）",
     "apply_annotation": "按预览中用户框选的区域改写/删除对应块（M6）",
-    "apply_terminology": "为某源词设定统一的术语译文（后续按术语翻译）",
-    "delete_block": "删除译文中某一块（输出侧，自由；原文不受影响）",
-    "create_block": "在译文某位置创建一块文本（自由；不修改原文）",
-    "move_block": "把译文块移到新位置/重排（自由）",
-    "draw_table": "绘制一张干净 N×M 表格（含表头合并）",
-    "draw_block": "在指定块的位置绘制其译文",
-    "set_font": "设置某块的渲染字号（夹逼到可读下限/上限）",
-    "set_align": "设置某块的水平对齐方式",
-    "merge_cells": "把表格某格跨列/跨行合并",
-    "grid_rule": "画一条表格线/分隔线",
-    "cover_region": "用不透明白块覆盖输出页某区域（盖扫描字/杂讯）",
-    "erase_text_layer": "删除**输出页**某区域的文本层（保留图片/线条）",
-    "drop_element": "移除**输出页**上的某元素（签字区/水印/照片）",
-    "classify_block": "判断一个文本块应保留原文（组织架构/架构图节点标签、报表/科目代码、手写签字）"
-                     "还是翻译成目标语言",
+    "apply_terminology": "为某源词设定统一的术语译文（会并入本页翻译所用的术语表）",
+    "delete_block": "移除某块的译文覆盖，恢复为保留原文（不再翻译该块）",
     "check_residual": "检查某页是否有残留中文/漏译的块",
     "check_missing": "检查某页是否有源有译文空的块（内容缺失）",
-    "qa_render": "读回成品页找渲染问题（溢出/越线/压叠/字过小）",
-    "audit": "汇总全文档差异报告（数字/术语/编号/残留）",
+    "render_page": "把当前处理到该页的译文渲染成 PNG 供视觉自检（检查溢出/越线/密度）",
     "preview_page": "在预览窗口显示指定页面（供用户查看），可聚焦某区域/块",
     "ask_user": "向用户提问并等待回答（关键决策/歧义/术语确认）",
-    "delete_page": "删除译文中某一页（输出侧，自由；源页不受影响）",
-    "create_page": "在译文某处创建/插入一页（自由）",
-    "move_page": "把译文页移动到新位置（重排页序，自由）",
 }
 
 #: The interaction-chat tool descriptions (``chat_tools.py``), keyed by tool name.

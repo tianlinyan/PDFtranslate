@@ -63,7 +63,7 @@ class ChatSession:
         :data:`_MAX_TOOL_ROUNDS`, until it returns plain content.
         """
         self.history.append({"role": "user", "content": message})
-        for _ in range(_MAX_TOOL_ROUNDS + 1):
+        for _ in range(_MAX_TOOL_ROUNDS):
             resp = self._call(tools=tools)
             msg = resp.choices[0].message
             tcs = getattr(msg, "tool_calls", None)
@@ -100,8 +100,17 @@ class ChatSession:
                     "tool_call_id": tc.id,
                     "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
-        # The model kept calling tools past the cap: return the last assistant text
-        # (or a hint) instead of looping forever.
+        # The model kept calling tools past the cap: give it one last chance to
+        # answer plainly (no more tool calls) instead of looping forever — but
+        # if that call fails too, fall back to the last assistant text.
+        try:
+            resp = self._call(tools=None)
+            content = (getattr(resp.choices[0].message, "content", None) or "").strip()
+            if content:
+                self.history.append({"role": "assistant", "content": content})
+                return content
+        except Exception:  # noqa: BLE001 — degrade to the last assistant text
+            pass
         last = next(
             (m["content"] for m in reversed(self.history)
              if m.get("role") == "assistant" and m.get("content")),

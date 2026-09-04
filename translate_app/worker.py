@@ -148,7 +148,6 @@ class TranslateWorker(QObject):
             # cells) is removed — those are decided by the AI orchestrator at
             # runtime.  ``keep_original`` starts empty; the agent determines what
             # to keep.  In the deterministic fallback every block is translated.
-            target_is_cjk = any("一" <= c <= "鿿" for c in self._lang)
             keep_original: set[int] = set()
 
             translate_started = time.monotonic()
@@ -339,6 +338,35 @@ class TranslateWorker(QObject):
         finally:
             doc.close()
 
+    def _render_source_page(self, page: int) -> bytes | None:
+        """Render the raw source page ``page`` to a PNG (``None`` if unusable)."""
+        import pymupdf as fitz
+
+        try:
+            doc = fitz.open(str(self._source))
+            try:
+                if not (0 <= page < doc.page_count):
+                    return None
+                return pdfio._render_page_png(doc[page], dpi=200)
+            finally:
+                doc.close()
+        except Exception:  # noqa: BLE001 — a bad page must not crash the agent loop
+            return None
+
+    def render_page_for_agent(self, page: int, what: str = "translation") -> bytes | None:
+        """Hand the agent's ``render_page`` tool a PNG of the in-progress page.
+
+        ``what="translation"`` returns the in-place translation render (redacted +
+        redrawn) when the page has translated blocks, otherwise the source page.
+        ``what="source"`` renders the original.  Returns ``None`` when unusable.
+        """
+        what = (what or "translation").strip().lower()
+        if what == "translation":
+            png = self.render_translation(int(page))
+            if png:
+                return png
+        return self._render_source_page(int(page))
+
     def _run_agent(self, doc: pdfio.DocumentText, keep_original: set[int]):
         """v0.3.0: drive translation through the AI-orchestration loop per page.
 
@@ -368,6 +396,7 @@ class TranslateWorker(QObject):
                 preview_handler=self.preview_handler,
                 answer_handler=self.answer_handler,
                 show_preview=self._show_preview,
+                render_handler=self.render_page_for_agent,
                 max_steps_per_page=24,
             ).run()
         finally:

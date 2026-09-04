@@ -1,6 +1,6 @@
 # PDFtranslate
 
-> 当前版本：**v0.3.1**（版本号定义于 `translate_app/__init__.py` 的 `__version__`）
+> 当前版本：**v0.3.2**（版本号定义于 `translate_app/__init__.py` 的 `__version__`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
 即可把文档翻译成指定语言并保存为双语 PDF、原位翻译 PDF、Markdown 或纯文本。

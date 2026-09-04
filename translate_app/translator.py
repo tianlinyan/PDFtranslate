@@ -21,7 +21,6 @@ Key behaviours
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -496,6 +495,7 @@ class TranslationEngine:
         resume: bool = True,
         retry_delays: Sequence[float] = _TRANSIENT_RETRY_DELAYS,
         keep_original: set[int] | None = None,
+        extra_glossary: dict[str, str] | None = None,
     ) -> TranslationResult:
         """Translate ``blocks`` into ``target_language``.
 
@@ -519,10 +519,17 @@ class TranslationEngine:
         skip = {i for i, b in enumerate(blocks) if not _needs_translation(b)} | keep
 
         # A glossary.json next to the document pins the terminology; its content
-        # takes part in the cache key so adding one always takes effect.
-        glossary = _load_glossary(doc_path, log) if doc_path is not None else {}
-        if glossary:
-            log(f"  已加载 {len(glossary)} 条术语表：{doc_path.parent / 'glossary.json'}")
+        # takes part in the cache key so adding one always takes effect.  An
+        # ``extra_glossary`` (e.g. the AI's ``apply_terminology`` choices) is merged
+        # on top so inline terminology overrides the on-disk terms for this run.
+        disk = _load_glossary(doc_path, log) if doc_path is not None else {}
+        glossary = dict(disk)
+        if extra_glossary:
+            glossary = {**disk, **{str(k): str(v) for k, v in extra_glossary.items() if str(k).strip()}}
+        if disk:
+            log(f"  已加载 {len(disk)} 条术语表：{doc_path.parent / 'glossary.json'}")
+        if extra_glossary:
+            log(f"  并合并 {len(extra_glossary)} 条 AI/对话术语。")
 
         # Load the on-disk cache so repeated runs are cheap.
         cache: dict[str, str] = {}
@@ -545,8 +552,12 @@ class TranslationEngine:
             )
 
         # Progress starts at the count already present in the cache plus the
-        # blocks skipped outright, so the bar reflects genuinely *done* work.
-        done = sum(1 for b in blocks if _block_hash(b) in cache) + len(skip)
+        # blocks skipped outright (keep / non-translatable), so the bar reflects
+        # genuinely *done* work.  Skipped blocks must not also count via the
+        # cached-sum (a keep block that happens to be cached would be double
+        # counted and the bar could over-report > 100%).
+        done = (sum(1 for i, b in enumerate(blocks)
+                    if i not in skip and _block_hash(b) in cache) + len(skip))
         progress(done, n)
 
         # A cache write may fail (read-only home, sandbox, full disk).  That
@@ -742,115 +753,6 @@ def _write_cache(path: Path, cache: dict[str, str]) -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
-def _image_data_url(png: bytes) -> str:
-    """Encode a PNG as a ``data:image/png;base64,`` URL for the chat API."""
-    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
-
-
-def _extract_json_object(content: str) -> dict | None:
-    """Pull the outer ``{ ... }`` out of a model reply and decode it.
-
-    The reply often wraps the object in prose or markdown fences, so the whole
-    reply is scanned for the outermost brace pair.  Anything malformed returns
-    ``None`` (the caller treats it as an empty / no-op result).
-    """
-    if not content:
-        return None
-    start = content.find("{")
-    if start < 0:
-        return None
-    end = content.rfind("}")
-    if end <= start:
-        return None
-    try:
-        data = json.loads(content[start:end + 1])
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _vision_call(client, model: str, prompt: str, images: list[bytes],
-                 temperature: float = 0.0) -> str:
-    """Send ``prompt`` plus ``images`` to the model and return the assistant text."""
-    content: list[dict] = [{"type": "text", "text": prompt}]
-    content.extend(
-        {"type": "image_url", "image_url": {"url": _image_data_url(img)}}
-        for img in images
-    )
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": content}],
-        temperature=temperature,
-    )
-    return getattr(resp.choices[0].message, "content", None) or ""
-
-
-#: Lead-in for the block-classification reviewer.  ``@@CANDIDATES@@`` is replaced
-#: with the numbered candidate list before the call (the JSON braces in the
-#: output spec would collide with ``str.format``, so a plain replace is used).
-_REVIEW_CLASSIFY_PROMPT = (
-    "这是原图页面。下面是程序判定为「组织结构图/架构图节点标签，应保留原文不翻译」的候选块。"
-    "请结合原图判断每一块真的是节点标签（应保留），还是其实是**应该翻译**的标题/正文/图表说明。\n\n"
-    "候选块：\n"
-    "@@CANDIDATES@@\n\n"
-    "只输出一个 JSON 对象，用 index 对应上面的编号：\n"
-    "{\"classifications\": [{\"index\": 0, "
-    "\"kind\": \"keep_chart_node|keep_verbatim|signature|translate_heading|translate_prose\", "
-    "\"confidence\": 0.9, \"message\": \"一句话说明\"}]}\n"
-    "kind 说明：keep_chart_node/keep_verbatim=节点或整体保留；signature=手写签字；"
-    "translate_heading/translate_prose=应翻译的标题/正文。只列出你有把握的块；没有则用空数组。"
-    "不要输出除此 JSON 之外的文字。"
-)
-
-
-#: ``kind`` values that mean a candidate block should actually be translated.
-_REVIEW_KIND_TRANSLATE = frozenset(("translate_heading", "translate_prose"))
-
-
-def _parse_classify(content: str) -> dict:
-    """Parse a block-classification reply into ``{"classifications": [...]}``."""
-    data = _extract_json_object(content)
-    if data is None:
-        return {}
-    raw = data.get("classifications")
-    return {
-        "classifications": [
-            c for c in (raw if isinstance(raw, list) else []) if isinstance(c, dict)
-        ]
-    }
-
-
-def make_classify_review_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
-) -> Callable[[int, bytes, Sequence[tuple]], dict] | None:
-    """Return a block-classification callback for ``model`` (or ``None`` if disabled).
-
-    Signature ``(page_index, original_png, candidates) -> dict``, where
-    ``candidates`` is ``[(flat_index, bbox, text), ...]``.  It invoices the model
-    to say whether each rule-kept candidate is really a structural label (keep)
-    or actually translatable content, returning ``{"classifications": [...]}``.
-    Best-effort: any failure returns ``{}``, so the caller keeps the rule's
-    decision unchanged (safe).
-    """
-    if not model.vision:
-        return None
-    client = OpenAI(**model.client_kwargs())
-
-    def _classify(page_index: int, original_png: bytes, candidates: Sequence[tuple]) -> dict:
-        try:
-            lines = [
-                f"[{idx}] bbox=({b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}) text={str(text)[:40]!r}"
-                for idx, b, text in candidates
-            ]
-            prompt = _REVIEW_CLASSIFY_PROMPT.replace("@@CANDIDATES@@", "\n".join(lines))
-            content = _vision_call(client, model.model, prompt, [original_png])
-            return _parse_classify(content)
-        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
-            if log:
-                log(f"  第 {page_index + 1} 页保留复核失败：{type(exc).__name__}: {exc}")
-            return {}
-
-    return _classify
 
 
 #: Direct re-translation of a single block, used by the QA→correction pass so a
@@ -880,11 +782,20 @@ def make_retranslate_fn(
     def _retranslate(text: str, lang: str) -> str:
         try:
             prompt = _RETRANSLATE_PROMPT.format(lang=lang, text=text)
-            resp = client.chat.completions.create(
-                model=model.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-            )
+            kwargs: dict = {
+                "model": model.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+            }
+            # Mirror ``_request_locked`` so llama.cpp-style endpoints that need
+            # ``reasoning_effort`` still work (otherwise this silently returns 500
+            # and the "force retranslate" tool degrades to a source echo).
+            if model.max_tokens is not None:
+                kwargs["max_tokens"] = model.max_tokens
+            body_params = model.request_params()
+            if body_params:
+                kwargs["extra_body"] = body_params
+            resp = client.chat.completions.create(**kwargs)
             content = getattr(resp.choices[0].message, "content", None) or ""
             out = str(content).strip()
             return out if out else text
@@ -896,96 +807,4 @@ def make_retranslate_fn(
     return _retranslate
 
 
-#: OpenAI ``tools`` schema for the block-classification judgment tool, used by
-#: the tool-use POC.  The model calls it per ambiguous block; the deterministic
-#: caller applies the decision (release / keep) rather than letting the model
-#: draw the table.
-_CLASSIFY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "classify_block",
-        # Description is prompt text, authored centrally (see ``prompts``).
-        "description": prompts.AGENT_TOOL_DESCRIPTIONS["classify_block"],
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "index": {"type": "integer", "description": "输入块列表中的序号"},
-                "text": {"type": "string", "description": "块文本"},
-                "action": {"type": "string",
-                           "enum": ["keep", "translate", "signature"],
-                           "description": "keep=保留原文；translate=翻译；signature=手写签字"},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "reason": {"type": "string", "description": "一句话理由"},
-            },
-            "required": ["index", "text", "action"],
-        },
-    },
-}
-
-
-def _parse_classify_tool_calls(msg) -> list[dict]:
-    """Turn the model's ``classify_block`` tool_calls into decision dicts.
-
-    Each entry is ``{"index", "text", "action", "confidence", "reason"}``; a
-    malformed / non-``classify_block`` call is dropped so a noisy reply degrades
-    to an empty decision list rather than crashing the caller.
-    """
-    out: list[dict] = []
-    tcs = getattr(msg, "tool_calls", None)
-    if not tcs:
-        return out
-    for tc in tcs:
-        fn = getattr(tc, "function", None)
-        if getattr(fn, "name", None) != "classify_block":
-            continue
-        args = getattr(fn, "arguments", None)
-        try:
-            data = json.loads(args) if args else {}
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        data.setdefault("confidence", 0.5)
-        out.append(data)
-    return out
-
-
-def make_classify_tool_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
-) -> Callable[[Sequence[str]], list[dict]] | None:
-    """Return a tool-use block-classification callback, or ``None`` if disabled.
-
-    Signature ``(blocks) -> [decision, ...]``: it sends the list of ambiguous
-    block texts to ``classify_block`` (OpenAI ``tools``) and parses the returned
-    ``tool_calls`` into decisions.  Since the model reasons before emitting a
-    tool call, a generous ``max_tokens`` is used.  Best-effort — any failure
-    returns ``[]`` so the caller falls back to the rule-based decision.
-    """
-    if not model.vision:
-        return None
-    client = OpenAI(**model.client_kwargs())
-
-    def _classify(blocks: Sequence[str]) -> list[dict]:
-        items = "\n".join(f"[{i}] {str(b)[:60]!r}" for i, b in enumerate(blocks))
-        prompt = (
-            "请判断下列每个文本块应保留原文（组织架构/架构图节点标签、报表/科目代码、手写签字）"
-            "还是翻译成目标语言，逐一调用 classify_block：\n" + items
-        )
-        try:
-            resp = client.chat.completions.create(
-                model=model.model, temperature=0.0, max_tokens=4096,
-                tools=[_CLASSIFY_TOOL], tool_choice="auto",
-                messages=[{"role": "user", "content": prompt}],
-            )
-            msg = resp.choices[0].message
-            decisions = _parse_classify_tool_calls(msg)
-            if not decisions and log:
-                log("  分类工具未返回 tool_call：" + str(getattr(msg, "content", "")))
-            return decisions
-        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
-            if log:
-                log(f"  分类工具调用失败：{type(exc).__name__}: {exc}")
-            return []
-
-    return _classify
 

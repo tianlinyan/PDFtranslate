@@ -107,7 +107,13 @@ class FlowAgent:
                          f"translated={len(p.translated)} issues={p.issues}")
         if self.last_result is not None:
             r = self.last_result
-            lines.append(f"last={r.op_tool} ok={r.ok} result={r.result} error={r.error}")
+            # Only report tool + success (and any error) here — the full result is
+            # already in the ``tool`` message, so re-dumping it (or any image bytes)
+            # into the observation would bloat the context each step.
+            line = f"last={r.op_tool} ok={r.ok}"
+            if r.error:
+                line += f" error={r.error}"
+            lines.append(line)
         return "\n".join(lines)
 
     def _call(self, name: str, args: dict) -> AgentResult:
@@ -123,7 +129,10 @@ class FlowAgent:
 
     def _apply(self, dec: Decision, res: AgentResult) -> None:
         self.state.record_op(dec.tool, args=dec.arguments, reason=dec.summary or "agent")
-        self.state.log.append(f"{dec.tool} -> ok={res.ok} {res.error or res.result}")
+        # Log the tool + outcome concisely; never dump the raw result (it may hold
+        # a huge block list or image bytes) into the audit log.
+        self.state.log.append(
+            f"{dec.tool} -> ok={res.ok} {res.error or _summarize_result(res.result)}")
         self.log(f"  [{dec.tool}] ok={res.ok}{' ' + res.error if res.error else ''}")
 
     def step(self) -> Decision:
@@ -176,11 +185,12 @@ def run_agent_run(
 ) -> WorkflowState:
     """Convenience wrapper: build a ``FlowAgent`` and run it on ``state``.
 
-    ``tools`` / ``decide`` are required for a real run (the LLM).  Kept optional
-    here so ``run_agent_run(state)`` can still express the intent; a caller that
-    omits them must set them via the returned agent otherwise the loop does
-    nothing (empty tools → every call is ``unknown tool``).
+    ``tools`` / ``decide`` are required for a real run (the LLM).  ``decide`` must
+    not be ``None`` — the loop would otherwise crash on the first step asking the
+    model to decide.
     """
+    if decide is None:
+        raise ValueError("run_agent_run requires a ``decide`` callable (the LLM).")
     agent = FlowAgent(state, tools or {}, decide, log=log, max_steps=max_steps,
                       answer_handler=answer_handler, cancel_fn=cancel_fn)
     return agent.run(max_rounds=max_rounds)
@@ -199,6 +209,36 @@ from .. import translator as _tr
 
 def _image_url(png: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+def _result_for_message(result: Any) -> Any:
+    """A JSON-serialisable copy of a tool result, with image/bytes payloads stripped.
+
+    Images are fed to the model *only* as ``image_url`` (see ``make_llm_decide``);
+    dumping the raw PNG bytes into the text ``tool`` message would bloat the context
+    enormously.  Recursively drops ``image`` keys and replaces any ``bytes`` value
+    with a short placeholder.
+    """
+    if isinstance(result, dict):
+        return {k: _result_for_message(v) for k, v in result.items()
+                if k != "image" and not isinstance(v, (bytes, bytearray))}
+    if isinstance(result, (list, tuple)):
+        return [_result_for_message(v) for v in result]
+    if isinstance(result, (bytes, bytearray)):
+        return f"<bytes {len(result)}>"
+    return result
+
+
+def _summarize_result(result: Any, limit: int = 120) -> str:
+    """A short textual summary of a tool result (for the ``WorkflowState`` log).
+
+    Never serialises full blobs / images into the audit log — that is pure memory
+    + log bloat.  Truncates to ``limit`` characters with a note when longer.
+    """
+    s = json.dumps(_result_for_message(result), ensure_ascii=False, default=str)
+    if len(s) > limit:
+        return s[:limit] + f"…<{len(s)} chars>"
+    return s
 
 
 #: The agent's interaction rules live in ``translate_app.prompts`` (``agent_interaction_rules``)
@@ -233,9 +273,8 @@ def make_llm_decide(model, *, task: str, image_provider=None,
     tool calls yields ``Decision(action="done")``.
 
     ``tool_names`` filters the advertised ``tools`` array to only the tools that
-    are actually bound in the loop — otherwise the model sees schemas (e.g.
-    ``draw_table`` / ``verify_number``) that have no callable and every call to
-    them comes back ``unknown tool``.
+    are actually bound in the loop — a schema for a tool with no bound callable
+    would make every call to it come back ``unknown tool``.
     """
     if not getattr(model, "vision", False):
         return None
@@ -256,7 +295,8 @@ def make_llm_decide(model, *, task: str, image_provider=None,
                     "role": "tool",
                     "tool_call_id": pending_call_id,
                     "content": json.dumps(
-                        {"ok": last_result.ok, "result": last_result.result,
+                        {"ok": last_result.ok,
+                         "result": _result_for_message(last_result.result),
                          "error": last_result.error},
                         ensure_ascii=False, default=str),
                 })
@@ -342,7 +382,7 @@ def make_source_tools(state: WorkflowState, *, src_path=None) -> dict[str, Calla
     """
     src_path = src_path or state.src_path
 
-    def read_page(page: int) -> dict[str, Any]:
+    def read_page(page: int, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
         src = state.src_doc
         if src is None or not (0 <= page < len(src.pages)):
             return {"page": page, "blocks": []}
@@ -350,18 +390,28 @@ def make_source_tools(state: WorkflowState, *, src_path=None) -> dict[str, Calla
         # blocks by a *flat, document-global* index (``state.out_doc`` keys), so
         # the model must be told that same flat index here — a per-page local
         # index would silently address a different block once page > 0.  ``page``
-        # is carried along only as context.
-        offset = sum(len(p) for p in src.pages[:page])
-        return {"page": page, "blocks": [
-            {"index": offset + i, "text": b.text, "bbox": [b.x0, b.y0, b.x1, b.y1],
-             "in_table": bool(getattr(b, "in_table", False)),
-             "is_chart": bool(getattr(b, "is_chart", False))}
-            for i, b in enumerate(src.pages[page])
-        ]}
+        # is carried along only as context.  ``offset``/``limit`` let the model page
+        # through a huge page without one massive tool message (bounded feedback).
+        base = sum(len(p) for p in src.pages[:page])
+        blocks = src.pages[page]
+        total = len(blocks)
+        start = max(0, int(offset or 0))
+        end = total if limit is None else min(total, start + max(1, int(limit)))
+        return {"page": page, "total": total,
+                "offset": start, "limit": end - start,
+                "truncated": end < total,
+                "blocks": [
+                    {"index": base + i, "text": b.text, "bbox": [b.x0, b.y0, b.x1, b.y1],
+                     "in_table": bool(getattr(b, "in_table", False)),
+                     "is_chart": bool(getattr(b, "is_chart", False))}
+                    for i, b in enumerate(blocks[start:end])
+                ]}
 
     def get_layout(page: int) -> dict[str, Any]:
         src = state.src_doc
-        blocks = [] if src is None else src.pages[page]
+        if src is None or not (0 <= page < len(src.pages)):
+            return {"rows": 0, "cols": 0, "grid": []}
+        blocks = src.pages[page]
         # Coarse reading-order grid: rows by y-centre cluster, columns by x.
         rows: list[list] = []
         for b in blocks:
@@ -411,7 +461,8 @@ def _target_is_cjk(state: WorkflowState) -> bool:
 def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] | None = None,
                         preview_handler: Callable[..., bytes] | None = None,
                         answer_handler: Callable[..., Any] | None = None,
-                        cancel: Callable[[], bool] | None = None) -> dict[str, Callable]:
+                        cancel: Callable[[], bool] | None = None,
+                        render_handler: Callable[[int, str], bytes | None] | None = None) -> dict[str, Callable]:
     """Bound deterministic content / verify / draw tools that operate on ``out_doc``.
 
     These are the agent's *hands* for a single page (the source is read-only via
@@ -439,6 +490,18 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         if state.src_doc is None:
             return []
         return [b for page in state.src_doc.pages for b in page]
+
+    def _page_range(page: int | None):
+        """``(blocks, flat_offset, count)`` for ``page`` (or the whole doc for ``None``)."""
+        src = state.src_doc
+        if src is None:
+            return [], 0, 0
+        if page is None:
+            return _flat_blocks(), 0, len(_flat_blocks())
+        if not (0 <= page < len(src.pages)):
+            return [], 0, 0
+        offset = sum(len(pg) for pg in src.pages[:page])
+        return src.pages[page], offset, len(src.pages[page])
 
     def _block(index: int):
         blocks = _flat_blocks()
@@ -473,7 +536,9 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
             try:
                 result = engine.translate_blocks([source], lang, log=log,
                                                  cancel=cancel,
-                                                 doc_path=Path(state.src_path))
+                                                 doc_path=Path(state.src_path),
+                                                 extra_glossary=(
+                                                     state.user_decisions.get("terminology") or {}))
             except Exception as exc:  # noqa: BLE001 — retry, then keep source
                 if i < attempts - 1:
                     time.sleep(0.5 * (i + 1))
@@ -554,71 +619,55 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         return {"ok": True, "page": page, "index": flat, "action": action,
                 "text": _read(flat)}
 
-    def create_block(page: int, index: int, text: str, bbox=None):
-        _write(index, text)
-        return {"ok": True, "index": index}
-
-    def move_block(page: int, index: int, to_index: int):
-        o = _out()
-        if index in o:
-            entry = o.pop(index)
-            o[to_index] = entry
-            return {"ok": True, "index": to_index}
-        return {"ok": False, "error": f"no translation for index {index}"}
-
     def retranslate_block(text: str, target_lang: str | None = None):
         if retranslate is None:
             return {"ok": False, "error": "重译不可用（非视觉模型）"}
         return {"ok": True, "text": retranslate(str(text), target_lang or state.lang)}
 
-    def rewrite_block(index: int, text: str | None = None, instruction: str = ""):
-        b = _block(index)
-        if b is None:
-            return {"ok": False, "error": f"bad index {index}"}
-        src = str(text) if text is not None else str(b.text)
-        if pdfio._is_numeric_cell(str(b.text)):
-            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
-        new = _translate(src, state.lang)
-        _write(index, new)
-        return {"ok": True, "index": index, "text": new}
-
     def apply_terminology(source: str, target: str):
         state.user_decisions.setdefault("terminology", {})[str(source)] = str(target)
         return {"ok": True}
 
-    def set_font(page: int, index: int, size: float):
-        try:
-            size = float(size)
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "size 不是数字"}
-        size = max(6.0, min(40.0, size))
-        _out().setdefault(index, {})["size"] = size
-        return {"ok": True, "size": size}
+    def render_page(page: int, what: str = "translation"):
+        """Render the in-progress page so the model can visually self-check.
 
-    def set_align(page: int, index: int, align: str):
-        if align not in ("left", "center", "right"):
-            return {"ok": False, "error": "bad align"}
-        _out().setdefault(index, {})["align"] = align
-        return {"ok": True, "align": align}
+        ``what="translation"`` renders the current in-place translation for ``page``
+        (redacting original text the agent has translated); ``what="source"`` renders
+        the original.  Falls back to the source page when there is no translation yet
+        (or no render channel).  The PNG is returned as the tool ``image`` and fed
+        back as a fresh visual observation by ``make_llm_decide``.
+        """
+        if render_handler is None:
+            return {"ok": False, "error": "渲染通道未接线"}
+        try:
+            png = render_handler(int(page), str(what or "translation"))
+        except Exception as exc:  # noqa: BLE001 — fail-closed
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": True, "page": int(page), "what": what or "translation",
+                "image": png or b""}
 
     def check_residual(page: int | None = None):
+        blocks, offset, _ = _page_range(page)
         out = []
-        for idx, b in enumerate(_flat_blocks()):
+        for i, b in enumerate(blocks):
             if b.is_chart:
                 continue
+            idx = offset + i
             t = _read(idx)
             if not t.strip():
                 out.append({"index": idx, "text": str(b.text), "reason": "empty"})
             elif not _target_is_cjk(state) and _has_cjk(t):
                 out.append({"index": idx, "text": str(b.text), "reason": "residual_cjk"})
-        return {"residual": out}
+        return {"residual": out, "page": page}
 
     def check_missing(page: int | None = None):
+        blocks, offset, _ = _page_range(page)
         out = []
-        for idx, b in enumerate(_flat_blocks()):
+        for i, b in enumerate(blocks):
+            idx = offset + i
             if str(b.text).strip() and not _read(idx).strip():
                 out.append({"index": idx, "text": str(b.text)})
-        return {"missing": out}
+        return {"missing": out, "page": page}
 
     def preview_page(page: int, what: str = "translation", region=None, **_kw):
         if preview_handler is None:
@@ -649,17 +698,13 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
     return {
         "translate_block": translate_block,
         "retranslate_block": retranslate_block,
-        "rewrite_block": rewrite_block,
         "set_text": set_text,
         "delete_block": delete_block,
-        "create_block": create_block,
-        "move_block": move_block,
         "apply_annotation": apply_annotation,
         "apply_terminology": apply_terminology,
-        "set_font": set_font,
-        "set_align": set_align,
         "check_residual": check_residual,
         "check_missing": check_missing,
+        "render_page": render_page,
         "preview_page": preview_page,
         "ask_user": ask_user,
     }
@@ -671,7 +716,8 @@ def run_page_visual(state: WorkflowState, page_index: int, model,
                     max_steps: int | None = None, max_rounds: int | None = None,
                     src_path=None, preview_handler: Callable[..., bytes] | None = None,
                     answer_handler: Callable[[str, list[str], str], Any] | None = None,
-                    cancel: Callable[[], bool] | None = None) -> WorkflowState:
+                    cancel: Callable[[], bool] | None = None,
+                    render_handler: Callable[[int, str], bytes | None] | None = None) -> WorkflowState:
     """Run the AI-orchestrated loop on a single page (the visual closed loop).
 
     Renders the source page once, hands it to a real-LLM ``decide`` (image +
@@ -696,8 +742,6 @@ def run_page_visual(state: WorkflowState, page_index: int, model,
     # otherwise ``used_steps`` accumulates and every page after the first starts
     # already exhausted and does nothing.
     state.budget.used_steps = 0
-    state.budget.used_passes = 0
-    state.budget.cost = 0.0
 
     def image_provider(_s: WorkflowState) -> bytes:
         try:
@@ -715,7 +759,8 @@ def run_page_visual(state: WorkflowState, page_index: int, model,
     all_tools.update(make_page_executors(state, model, log=log,
                                          preview_handler=preview_handler,
                                          answer_handler=answer_handler,
-                                         cancel=cancel))
+                                         cancel=cancel,
+                                         render_handler=render_handler))
     if tools:
         all_tools.update(tools)
     decide = make_llm_decide(model, task=task,
@@ -756,6 +801,7 @@ class DocumentSession:
         preview_handler: Callable[..., Any] | None = None,
         answer_handler: Callable[..., Any] | None = None,
         show_preview: Callable[[int, str], None] | None = None,
+        render_handler: Callable[[int, str], bytes | None] | None = None,
         max_steps_per_page: int = 24,
     ) -> None:
         self.state = state
@@ -768,6 +814,7 @@ class DocumentSession:
         self.preview_handler = preview_handler
         self.answer_handler = answer_handler
         self.show_preview = show_preview
+        self.render_handler = render_handler
         self.max_steps_per_page = max_steps_per_page
 
     def run(self) -> WorkflowState:
@@ -814,6 +861,7 @@ class DocumentSession:
                     self.state, i, self.model, task=task, log=self.log,
                     preview_handler=self.preview_handler, answer_handler=self.answer_handler,
                     max_steps=self.max_steps_per_page, cancel=self.cancel,
+                    render_handler=self.render_handler,
                 )
                 ps.status = STATUS_DONE
             except _tr.TranslationCancelled:
@@ -857,12 +905,16 @@ class DocumentSession:
                 user_confirmed=self.answer_handler is not None,
             )
             if decision == "translate":
-                self._translate_special_page(i, kind)
-                ps.status = STATUS_DONE
-                self.state.record_op(
-                    tool="translate_block", args={"page": i}, target=f"page:{i}",
-                    reason=f"特殊页 {kind} 按用户意见翻译", user_confirmed=True,
-                )
+                ok = self._translate_special_page(i, kind)
+                if ok:
+                    ps.status = STATUS_DONE
+                    self.state.record_op(
+                        tool="translate_block", args={"page": i}, target=f"page:{i}",
+                        reason=f"特殊页 {kind} 按用户意见翻译", user_confirmed=True,
+                    )
+                else:
+                    ps.status = STATUS_NEEDS_USER
+                    ps.issues.append(f"特殊页（{kind}）翻译失败，保留原文。")
             else:
                 ps.status = STATUS_NEEDS_USER   # keep / skip → left as the source
         self.log(f"  [特殊页] 全部 {len(special)} 页处理完毕。")
@@ -896,18 +948,27 @@ class DocumentSession:
         self.log(f"  特殊页问答返回未识别值 {value!r}，按保留原文处理。")
         return "keep"
 
-    def _translate_special_page(self, page_index: int, kind: str) -> None:
+    def _translate_special_page(self, page_index: int, kind: str) -> bool:
+        """Translate a special page; return ``True`` on success (or ``False`` on failure/cancel).
+
+        Returns success so ``_special_pages`` can mark the page ``needs_user`` rather
+        than silently ``done`` when the translation actually failed (fail-closed to
+        the source text).
+        """
         task = prompts.page_task(page_index, self.state.lang, kind=kind)
         try:
             self.translate_page(
                 self.state, page_index, self.model, task=task, log=self.log,
                 preview_handler=self.preview_handler, answer_handler=self.answer_handler,
                 max_steps=self.max_steps_per_page, cancel=self.cancel,
+                render_handler=self.render_handler,
             )
+            return True
         except _tr.TranslationCancelled:
             raise
         except Exception as exc:  # noqa: BLE001 — fail-closed to source
             self.log(f"  第 {page_index + 1} 页翻译失败：{type(exc).__name__}: {exc}（保留原文）。")
+            return False
 
     def _completed(self) -> None:
         d = self.state.doc_info

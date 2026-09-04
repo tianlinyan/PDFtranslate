@@ -317,14 +317,6 @@ class PreviewWindow(QWidget):
         self.sendRequested.emit(cropped, pdf_rect)
 
 
-def make_preview_window(send_handler=None, title: str = "预览") -> PreviewWindow:
-    """Build a ``PreviewWindow``; ``send_handler(cropped_png, pdf_rect)`` routes the send."""
-    win = PreviewWindow(title=title)
-    if send_handler is not None:
-        win.sendRequested.connect(send_handler)
-    return win
-
-
 class PreviewBridge(QObject):
     """Worker ↔ GUI channel for the preview round-trip.
 

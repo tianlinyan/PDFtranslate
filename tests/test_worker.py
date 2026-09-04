@@ -161,15 +161,6 @@ class FormatDurationTest(unittest.TestCase):
         self.assertEqual("1 小时 01 分 01 秒", format_duration(3661))
 
 
-def _verify_sentinel(_i, _png, _figures):
-    """Stand-in for ``make_verify_number_tool_fn``'s returned verifier."""
-    return []
-
-
-def _empty_render_review(_i, _o, _r):
-    return {"issues": [], "adjustments": []}
-
-
 class AgentModeWiringTest(_WorkerTestBase):
     """v0.3.0 default: ``agent_mode`` routes translation through the agent loop."""
 
@@ -299,6 +290,19 @@ class WorkerAgentPreviewTest(_WorkerTestBase):
         )
         worker._agent_state = None
         self.assertIsNone(worker.render_translation(0))
+
+    def test_render_page_for_agent_falls_back_to_source(self):
+        # The ``render_page`` tool returns a PNG even when there is no agent run /
+        # no translation yet (falls back to the raw source page).
+        src = build_sample_pdf(self.tmp / "sample.pdf", pages=1)
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "English",
+            "translated_pdf", str(self.tmp / "out.pdf"),
+        )
+        worker._agent_state = None
+        png = worker.render_page_for_agent(0, "translation")
+        self.assertIsNotNone(png)
+        self.assertEqual(b"\x89PNG", png[:4])
 
 
 class OverlayApplyTest(_WorkerTestBase):

@@ -68,14 +68,6 @@ class DocContext:
                 self._last_translated = None
                 self._loaded_path = src_path
 
-    def set_lang(self, lang: str) -> None:
-        with self._lock:
-            self.lang = lang
-
-    def clear_overlay(self) -> None:
-        with self._lock:
-            self._overlay = {}
-
     # -- last run's translation (so the chat reads the real current output) ----
     def set_last_translated(self, translated: list[str] | None) -> None:
         with self._lock:
@@ -86,7 +78,7 @@ class DocContext:
             return list(self._last_translated) if self._last_translated is not None else None
 
     # -- read-only document ---------------------------------------------------
-    def ensure_doc(self, *, extract: bool = True) -> Any:
+    def ensure_doc(self) -> Any:
         """Return the extracted source document (``None`` if no source / extraction failed).
 
         The document is extracted lazily on first use and cached.  Extraction may be
@@ -101,8 +93,6 @@ class DocContext:
                 return None
             if self._src_doc is not None:
                 return self._src_doc
-            if not extract:
-                return None
             src_path = self.src_path
             ocr = self.ocr
         self._log("  首次需要文档内容，正在提取（含 OCR 时可能较慢）…")

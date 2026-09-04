@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import threading
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QHBoxLayout,

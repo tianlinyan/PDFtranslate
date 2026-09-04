@@ -79,16 +79,17 @@ class AgentToolsTest(unittest.TestCase):
             self.assertIsInstance(params.get("required"), list)
 
     def test_existing_judgment_tools_registered(self):
+        # ``classify_block`` is a standalone classifier (via ``make_agent_tools``),
+        # not part of the per-page ``AGENT_TOOLS`` registry that ``run_page_visual``
+        # advertises; ``retranslate_block`` remains a registry tool.
         names = [t.name for t in agent.AGENT_TOOLS]
-        for n in ("classify_block", "retranslate_block"):
-            self.assertIn(n, names)
-        cb = agent.by_name("classify_block")
-        self.assertIsNotNone(cb)
-        self.assertIn("action", cb.parameters.get("properties", {}))
+        self.assertIn("retranslate_block", names)
+        self.assertNotIn("classify_block", names)
+        self.assertIsNotNone(agent.by_name("retranslate_block"))
 
     def test_source_read_tools_are_readonly(self):
         # The original is protected: read/observe tools only read it (target source).
-        for n in ("read_page", "render_region", "get_layout", "classify_block"):
+        for n in ("read_page", "get_layout", "get_doc_info", "classify_page", "render_page"):
             t = agent.by_name(n)
             self.assertIsNotNone(t, n)
             self.assertEqual("source", t.target, n)
@@ -96,9 +97,8 @@ class AgentToolsTest(unittest.TestCase):
     def test_write_tools_target_output_and_are_free(self):
         # The translation is fully editable (no confirmation); the original is
         # never a write target.
-        write = ("set_text", "rewrite_block", "delete_block", "create_block", "move_block",
-                 "cover_region", "erase_text_layer", "drop_element",
-                 "delete_page", "create_page", "move_page")
+        write = ("set_text", "delete_block", "apply_annotation", "apply_terminology",
+                 "translate_block", "retranslate_block")
         for n in write:
             t = agent.by_name(n)
             self.assertIsNotNone(t, n)
@@ -111,14 +111,19 @@ class AgentToolsTest(unittest.TestCase):
         for t in agent.AGENT_TOOLS:
             self.assertFalse(t.destructive, t.name)
 
-    def test_page_and_block_tools_registered(self):
+    def test_block_edits_target_output_page_tools_absent(self):
+        # Only the effective block-edit tools are exposed; the layout / page-level ops
+        # (font/align/create/move block, page create/delete/move, draw/erase) are not
+        # wired to the renderer and are deliberately absent so the model never sees a
+        # tool that silently does nothing.
         names = [t.name for t in agent.AGENT_TOOLS]
-        for n in ("delete_page", "create_page", "move_page",
-                  "delete_block", "create_block", "move_block"):
-            self.assertIn(n, names)
-        self.assertIn("page", agent.by_name("delete_page").parameters["required"])
-        self.assertIn("at", agent.by_name("create_page").parameters["required"])
-        self.assertEqual("output", agent.by_name("delete_page").target)
+        self.assertIn("delete_block", names)
+        self.assertEqual("output", agent.by_name("delete_block").target)
+        for n in ("delete_page", "create_page", "move_page", "create_block", "move_block",
+                  "set_font", "set_align", "draw_table", "merge_cells", "grid_rule",
+                  "cover_region", "erase_text_layer", "drop_element", "qa_render",
+                  "render_region", "audit"):
+            self.assertNotIn(n, names)
 
     def test_preview_tool_is_interactive_and_never_destructive(self):
         # A user "让我看看译文第 3 页" → the controller calls ``preview_page``; it
@@ -132,30 +137,10 @@ class AgentToolsTest(unittest.TestCase):
         self.assertIn("what", schema["properties"])
 
     def test_tool_filtering_by_name(self):
-        names = ["read_page", "classify_block"]
+        names = ["read_page", "delete_block"]
         tools = agent.agent_openai_tools(names=names)
         self.assertEqual(2, len(tools))
-        self.assertEqual({"read_page", "classify_block"}, {t["function"]["name"] for t in tools})
-
-    def test_make_agent_tools_none_for_non_vision(self):
-        model = ModelConfig.from_dict(dict(
-            id="x", name="x", type="llama-server", endpoint="http://127.0.0.1:9", model="m"))
-        self.assertEqual({}, agent.make_agent_tools(model))
-
-    def test_make_agent_tools_binds_vision_tools(self):
-        # Patch the OpenAI client so no network / real client is built at bind time.
-        class _FakeOpenAI:
-            def __init__(self, **_kwargs):
-                pass
-
-        model = ModelConfig.from_dict(dict(
-            id="v", name="v", type="llama-server",
-            endpoint="http://127.0.0.1:9/v1/chat/completions", model="qwen", vision=True))
-        with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
-            tools = agent.make_agent_tools(model)
-        for n in ("classify_block", "retranslate_block"):
-            self.assertIn(n, tools)
-            self.assertTrue(callable(tools[n]), n)
+        self.assertEqual({"read_page", "delete_block"}, {t["function"]["name"] for t in tools})
 
 
 def _scripted(decisions):
@@ -510,12 +495,6 @@ class PageExecutorsTest(unittest.TestCase):
         residual = tools["check_residual"]()
         self.assertTrue(any(r["index"] == 2 for r in residual["residual"]), residual)
 
-    def test_set_font_clamps(self):
-        s = self._state()
-        tools = agent.make_page_executors(s, _dummy_model())
-        self.assertEqual(40.0, tools["set_font"](0, 0, 999.0)["size"])
-        self.assertEqual(6.0, tools["set_font"](0, 1, 0.5)["size"])
-
     def test_translate_retries_on_transient_error(self):
         class _FlakyEngine:
             def __init__(self, model):
@@ -551,6 +530,27 @@ class PageExecutorsTest(unittest.TestCase):
         self.assertEqual({"page": 0, "what": "source", "region": None}, got)
         self.assertEqual(b"PNG", res["image"])
         self.assertEqual([0, 0, 10, 10], res["rect"])
+
+    def test_render_page_invokes_render_handler_and_returns_image(self):
+        s = self._state()
+        got: dict = {}
+
+        def render(page, what):
+            got.update(page=page, what=what)
+            return b"PNG"
+
+        tools = agent.make_page_executors(s, _dummy_model(), render_handler=render)
+        res = tools["render_page"](0, "translation")
+        self.assertTrue(res["ok"])
+        self.assertEqual({"page": 0, "what": "translation"}, got)
+        self.assertEqual(b"PNG", res["image"])
+
+    def test_render_page_no_handler_fails_closed(self):
+        s = self._state()
+        tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["render_page"](0)
+        self.assertFalse(res["ok"])
+        self.assertIn("渲染通道", res["error"])
 
     def test_preview_page_accepts_raw_png_from_handler(self):
         s = self._state()
@@ -671,6 +671,68 @@ class MultipageAndFlatIndexTest(unittest.TestCase):
                             cancel_fn=lambda: len(calls) >= 2)
         self.assertEqual(2, len(calls))
         self.assertEqual(2, s.budget.used_steps)
+
+
+class FeedbackTest(unittest.TestCase):
+    """The model-won't-be-overwhelmed feedback channel (concise text + images only)."""
+
+    def test_observe_reports_tool_status_without_dumping_result(self):
+        from translate_app.agent import flow as af
+
+        s = agent.WorkflowState("a.pdf", "English")
+        agent_flow = af.FlowAgent(s, {}, lambda *_a: agent.Decision(action="done"))
+        agent_flow.last_result = agent.AgentResult(
+            ok=True, op_tool="read_page",
+            result={"page": 0, "blocks": [{"index": 0, "text": "x"*400, "bbox": [0, 0, 1, 1]}]})
+        obs = agent_flow.observe()
+        self.assertNotIn("result=", obs)
+        self.assertIn("last=read_page ok=True", obs)
+
+    def test_result_for_message_strips_image_and_bytes(self):
+        from translate_app.agent import flow as af
+
+        r = af._result_for_message({"ok": True, "page": 0, "image": b"PNG", "bytes": b"xx"})
+        self.assertNotIn("image", r)
+        self.assertNotIn("bytes", r)
+        self.assertEqual(b"", r.get("bytes", b""))
+
+    def test_summarize_result_truncates_and_strips(self):
+        from translate_app.agent import flow as af
+
+        s = af._summarize_result({"ok": True, "block": "y"*1000, "image": b"PNG"})
+        self.assertNotIn("image", s)
+        self.assertLess(len(s), 200)
+        self.assertIn("…", s)
+
+    def test_llm_decide_tool_message_strips_image(self):
+        # A tool result carrying image bytes must NOT dump them into the text
+        # ``tool`` message — the image is injected only as an ``image_url``.
+        from translate_app.agent import flow as af
+
+        s = agent.WorkflowState("a.pdf", "English")
+        seen: list = []
+        queue = [
+            _FakeResp(_FakeMsg(content="", tool_calls=[
+                _FakeToolCall("render_page", '{"page": 0}')])),
+            _FakeResp(_FakeMsg(content="done")),
+        ]
+        client = _FakeClient(queue, seen)
+        with mock.patch.object(translator, "OpenAI", lambda **_k: client):
+            decide = af.make_llm_decide(_vision_model(), task="t",
+                                        tool_names=["render_page"])
+            d1 = decide("obs1", s, None)
+            self.assertEqual("render_page", d1.tool)
+            d2 = decide("obs2", s, agent.AgentResult(
+                ok=True, op_tool="render_page",
+                result={"ok": True, "page": 0, "image": b"PNG"}))
+            self.assertEqual("done", d2.summary)
+        msgs = seen[1]["messages"]
+        tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+        self.assertTrue(tool_msgs)
+        self.assertNotIn("PNG", tool_msgs[0]["content"])
+        self.assertNotIn('"image"', tool_msgs[0]["content"])
+        user = [m for m in msgs if m.get("role") == "user"][-1]
+        self.assertTrue(any(p.get("type") == "image_url" for p in user["content"]))
 
 
 if __name__ == "__main__":

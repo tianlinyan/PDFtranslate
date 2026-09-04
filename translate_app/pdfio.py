@@ -25,7 +25,7 @@ import re
 import statistics
 import tempfile
 import threading
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import pymupdf as fitz
 
@@ -285,8 +285,14 @@ def extract_document_text(
     ocr_cache_path: Path | None = None
     ocr_cache_warned = False
     if ocr:
-        ocr_cache_path = _ocr_cache_path(path)
-        ocr_cache = _load_ocr_cache(ocr_cache_path)
+        try:
+            ocr_cache_path = _ocr_cache_path(path)
+            ocr_cache = _load_ocr_cache(ocr_cache_path)
+        except Exception:
+            # The main ``finally`` only starts below, so close the document here
+            # rather than leaking the open file handle on a cache failure.
+            doc.close()
+            raise
     try:
         for page_index in range(doc.page_count):
             page = doc[page_index]
@@ -1114,23 +1120,8 @@ def _log_number_fixes(log, page_index: int, count: int, examples: list[str]) -> 
     )
 
 
-#: DPI the original page / reconstruction is rendered at for the whole-page review.
-_REVIEW_DPI = 150
-
-#: A plain (ungrouped) amount a reviewer may return, not in comma-grouped form.
-_AMOUNT_PLAIN_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?[%％]?\s*$")
-
-#: A short structured identifier mixing CJK with digits / letters / separators —
-#: a statement / subject code (会企01表-1), a model or sheet number, a row code.
-#: These are exact tokens that OCR tends to misread, so the reviewer's re-read is
-#: adopted (unlike a clean amount, which is never overwritten).
-_CODE_TOKEN_RE = re.compile(
-    r"^[\u4e00-\u9fffA-Za-z0-9][\u4e00-\u9fffA-Za-z0-9\-－（）()、\s]{0,15}$"
-)
-
-
-def _render_page_png(page, dpi: int = _REVIEW_DPI) -> bytes:
-    """Render ``page`` to a PNG (the original scan the reviewer must compare)."""
+def _render_page_png(page, dpi: int = 200) -> bytes:
+    """Render ``page`` to a PNG (used by the agent's ``render_page`` / preview)."""
     return page.get_pixmap(dpi=dpi).tobytes("png")
 
 
@@ -2686,11 +2677,6 @@ def _compute_table_layout(tables, mapping, blocks, trans, font):
             grid.append(("v", x, new_top0, new_bot_last))
         bboxes.append(fitz.Rect(left, t["bbox"].y0, right, t["bbox"].y1))
     return shifts, new_bottoms, grid, bboxes
-
-
-def _has_ocr_grid(blocks: Sequence[Block]) -> bool:
-    """True when ``blocks`` contain a reconstructed OCR table grid."""
-    return bool(_reconstruct_ocr_tables(blocks))
 
 
 def save_translated_pdf(

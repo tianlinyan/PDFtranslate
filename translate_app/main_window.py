@@ -119,7 +119,7 @@ def parse_preview_command(text: str):
     if not t:
         return None
     what = None
-    if "译文" in t or "translation" in t.lower():
+    if "译文" in t or "翻译" in t or "translation" in t.lower():
         what = "translation"
     elif "原文" in t or "源文" in t or "source" in t.lower():
         what = "source"
@@ -166,6 +166,7 @@ class MainWindow(QWidget):
         # progress bar / stage (a cancelled run leaves the bar spinning).
         self._run_ok = False
         self._cancelled_by_user = False
+        self._errored = False
 
         #: Persistent document context shared with the interaction chat.  Its log is
         #: routed through a thread-safe signal bridge (extraction may run on the chat
@@ -493,12 +494,16 @@ class MainWindow(QWidget):
             return False
         kind, page, what = cmd
         target_what = what or self._preview_current_what
+        total = self._page_count()
         if kind == "prev":
-            self._show_preview(self._preview_current_page - 1, target_what)
+            page = max(0, self._preview_current_page - 1)
         elif kind == "next":
-            self._show_preview(self._preview_current_page + 1, target_what)
+            page = min(total - 1, self._preview_current_page + 1)
         else:  # goto
-            self._show_preview(page, target_what)
+            page = max(0, min(total - 1, page))
+        if self._worker is not None:
+            self._worker.set_current_page(page)
+        self._show_preview(page, target_what)
         return True
 
     def _render_source_preview(self, page: int) -> bytes:
@@ -571,6 +576,7 @@ class MainWindow(QWidget):
 
         self._run_ok = False
         self._cancelled_by_user = False
+        self._errored = False
         # Clear the log *before* saving prefs so a prefs-save warning is not
         # wiped out.
         self._log.clear()
@@ -717,6 +723,7 @@ class MainWindow(QWidget):
         # Settle the progress bar (it may be stuck in the busy state) and mark
         # the run failed so ``_cleanup`` keeps this state instead of resetting
         # it.
+        self._errored = True
         self._settle_progress(0, "发生错误")
         self._append_log(msg)
         # Show only the headline in the dialog (the log keeps the full detail).
@@ -747,12 +754,14 @@ class MainWindow(QWidget):
             self._thread = None
         # A cancelled run emits neither ``finished`` nor ``error``, so nothing
         # else settles the progress bar — stop the busy bar and restore a ready
-        # stage.  Successful / failed runs keep the state their slot set.
-        if not self._run_ok and self._progress.maximum() == 0:
+        # stage.  Successful runs keep ``完成``; failed runs were already settled
+        # to ``发生错误`` by ``_on_error`` (so we must not override that).
+        if not self._run_ok and not self._errored:
             stage = "已取消" if self._cancelled_by_user else "就绪"
             self._settle_progress(0, stage)
         self._run_ok = False
         self._cancelled_by_user = False
+        self._errored = False
         self._start_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
 

@@ -751,6 +751,21 @@ class GlossaryTest(unittest.TestCase):
         system = server.last_body["messages"][0]["content"]
         self.assertIn("total assets", system)
 
+    def test_extra_glossary_merges_into_the_request(self):
+        # The AI's ``apply_terminology`` choices (passed as ``extra_glossary``) merge
+        # on top of the on-disk terms and reach the translation prompt.
+        with MockServer() as server:
+            logs: list[str] = []
+            engine = self._engine(server)
+            engine.translate_blocks(
+                ["请你翻译这段话。"], "English",
+                doc_path=self.doc, log=logs.append,
+                extra_glossary={"营业收入": "operating revenue"},
+            )
+        self.assertTrue(any("AI/对话术语" in m for m in logs), logs)
+        system = server.last_body["messages"][0]["content"]
+        self.assertIn("operating revenue", system)
+
     def test_missing_or_malformed_glossary_is_tolerated(self):
         # A non-object glossary.json warns and is ignored — silently skipping it
         # would make the user believe their terms apply when they do not.
