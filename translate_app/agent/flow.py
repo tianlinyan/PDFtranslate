@@ -1398,7 +1398,15 @@ class DocumentSession:
                 raise _tr.TranslationCancelled()
             except Exception as exc:  # noqa: BLE001 — a failed review is not fatal
                 self.log(f"  第 {i + 1} 页自检失败：{type(exc).__name__}: {exc}（保留译文）。")
-                self.state.page(i).issues.append("已复核")
+                self.state.page(i).issues.append(f"自检失败：{type(exc).__name__}")
+                self.progress(done, total, "复核")
+                continue
+            # ``run_flow`` fail-closed: a non-``ok`` result (e.g. the audit tool itself
+            # failed) must NOT be treated as "clean" — that would silently pass a page
+            # whose review never actually ran.
+            if not rs.ok:
+                self.log(f"  第 {i + 1} 页自检未完成：{rs.error}（保留译文）。")
+                self.state.page(i).issues.append(f"自检未完成：{rs.error}")
                 self.progress(done, total, "复核")
                 continue
             audit = rs.result.get("audit_page", {})

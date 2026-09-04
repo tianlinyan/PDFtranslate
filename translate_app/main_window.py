@@ -688,7 +688,8 @@ class MainWindow(QWidget):
             return
         model = self._selected_model()
         key = self._type_combo.currentData()
-        _label, _ext = OUTPUT_TYPES[key]
+        if key not in OUTPUT_TYPES:
+            key = list(OUTPUT_TYPES)[0]   # a defensive fallback (combo is always populated)
         self.doc_ctx.set_settings(
             source=self._source,
             source_name=Path(self._source).name if self._source else None,

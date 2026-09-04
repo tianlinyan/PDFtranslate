@@ -23,6 +23,9 @@ from typing import Any, Callable
 
 from . import prompts
 
+#: Valid ``output_type`` values for ``set_setting`` (mirrors ``worker.OUTPUT_TYPES``).
+_OUTPUT_TYPE_KEYS = frozenset({"translated_pdf", "bilingual_pdf", "markdown", "plain_text"})
+
 
 def _tool(name: str, properties: dict[str, dict], required: list[str]) -> dict[str, Any]:
     # The tool's ``description`` is prompt text, authored centrally in
@@ -219,7 +222,14 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         return {"ok": True, "message": "已触发重新导出（后台执行，完成会在主窗口日志/进度提示）。"}
 
     def run_translate(requirement: str = ""):
-        """Start the translation pipeline with the current settings (the AI entry)."""
+        """Start the translation pipeline with the current settings (the AI entry).
+
+        A missing source is a hard precondition (the chat worker is only handed tools
+        when a PDF is loaded, but the model may still call this); fail-closed clearly
+        instead of reporting success while nothing starts.
+        """
+        if not ctx.has_source():
+            return {"ok": False, "error": "请先选择一个 PDF 源文件（点「打开 PDF…」或拖入窗口）。"}
         if start_translate is None:
             return {"ok": False, "error": "开始翻译通道未接线"}
         try:
@@ -235,8 +245,11 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         k = str(key or "").strip()
         if k not in ("target_language", "output_type"):
             return {"ok": False, "error": f"未知设置项：{k!r}"}
+        v = str(value or "").strip()
+        if k == "output_type" and v not in _OUTPUT_TYPE_KEYS:
+            return {"ok": False, "error": f"未知输出格式：{v!r}（可选 " + " / ".join(sorted(_OUTPUT_TYPE_KEYS)) + "）"}
         try:
-            set_setting(k, str(value or ""))
+            set_setting(k, v)
         except Exception as exc:  # noqa: BLE001 — fail-closed
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         return {"ok": True, "key": k, "value": str(value or "")}

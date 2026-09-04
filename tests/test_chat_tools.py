@@ -211,6 +211,14 @@ class ChatToolsTest(_CtxTest):
         self.assertFalse(res["ok"])
         self.assertIn("开始翻译通道", res["error"])
 
+    def test_run_translate_requires_source(self):
+        # No source PDF loaded → the tool must fail-closed, not report success while
+        # nothing actually starts.
+        tools = chat_tools.make_chat_tools(DocContext(), start_translate=lambda _r: None)
+        res = tools["run_translate"]()
+        self.assertFalse(res["ok"])
+        self.assertIn("源文件", res["error"])
+
     def test_run_translate_calls_channel_with_requirement(self):
         calls: list = []
         tools = chat_tools.make_chat_tools(self.ctx,
@@ -228,6 +236,11 @@ class ChatToolsTest(_CtxTest):
         bad = tools["set_setting"]("nope", "x")
         self.assertFalse(bad["ok"])
         self.assertIn("未知设置项", bad["error"])
+        # An invalid output_type value is likewise rejected (not silently "success").
+        bad_otype = tools["set_setting"]("output_type", "docx")
+        self.assertFalse(bad_otype["ok"])
+        self.assertIn("未知输出格式", bad_otype["error"])
+        self.assertTrue(tools["set_setting"]("output_type", "bilingual_pdf")["ok"])
 
     def test_set_setting_requires_channel(self):
         res = self.tools["set_setting"]("target_language", "French")

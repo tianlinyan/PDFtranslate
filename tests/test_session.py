@@ -306,6 +306,39 @@ class DocumentSessionTest(unittest.TestCase):
         self.assertEqual([], review_pages)
         self.assertEqual(PHASE_DONE, state.phase)
 
+    def test_review_phase_audit_failure_is_not_clean(self):
+        # A page whose deterministic audit itself *errored* must NOT be silently marked
+        # clean/已复核 — that would pass a page whose review never actually ran.
+        doc = _mixed_doc()
+        answers: list[tuple] = []
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                return st
+            st.out_doc = st.out_doc or {}
+            st.out_doc[page] = {"text": f"T{page}"}
+            return st
+
+        def answer_handler(question, options, target):
+            answers.append(target)
+            return {"value": "AI 自检" if target == "review_mode" else "导出", "target": target}
+
+        def fake_audit(page, checks=None):
+            raise RuntimeError("audit boom")
+
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=fake_translate, answer_handler=answer_handler,
+                                  audit=fake_audit)
+        session.run()
+        self.assertEqual("ai", state.review_mode)
+        for i in (0, 3):   # the translated pages
+            self.assertTrue(
+                any("自检未完成" in x or "自检失败" in x for x in state.page(i).issues),
+                i)
+            self.assertFalse(any(x == "已复核" for x in state.page(i).issues), i)
+
     def test_review_phase_user_mode_skips_ai_and_can_continue(self):
         doc = _mixed_doc()
         review_pages: list[int] = []
