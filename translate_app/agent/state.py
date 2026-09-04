@@ -20,11 +20,20 @@ STATUS_IN_PROGRESS = "in_progress"
 STATUS_DONE = "done"
 STATUS_NEEDS_USER = "needs_user"
 
+#: ``WorkflowState.phase`` — the interactive session state machine.
+PHASE_IDLE = "idle"
+PHASE_PREPROCESS = "preprocess"
+PHASE_TRANSLATE_NORMAL = "translate_normal"
+PHASE_SPECIAL_PAGES = "special_pages"
+PHASE_COMPLETED = "completed"
+PHASE_REVIEW = "review"
+PHASE_EXPORT = "export"
+PHASE_DONE = "done"
+
 
 @dataclass
 class Budget:
     """Bounded recursion budget for a run (fail-closed beyond these limits)."""
-
     max_steps: int = 200          # max total tool calls
     max_passes: int = 6           # max passes (rounds) per page
     cost_cap: float = 30.0        # rough cost budget (arbitrary units)
@@ -91,6 +100,53 @@ class PageState:
 
 
 @dataclass
+class DocInfo:
+    """The source document summary produced by the preprocess phase.
+
+    Mirrors the dict from :func:`pdfio.get_doc_info` so the session can carry it
+    as a typed object.
+    """
+
+    pages: int
+    title: str = ""
+    language: str = "unknown"
+    text_pages: int = 0
+    scan_pages: int = 0
+    chart_pages: int = 0
+    table_pages: int = 0
+    uncertain_pages: int = 0
+    special_pages: int = 0
+    block_count: int = 0
+    kinds: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "DocInfo":
+        return cls(
+            pages=int(d.get("pages", 0)),
+            title=str(d.get("title", "")),
+            language=str(d.get("language", "unknown")),
+            text_pages=int(d.get("text_pages", 0)),
+            scan_pages=int(d.get("scan_pages", 0)),
+            chart_pages=int(d.get("chart_pages", 0)),
+            table_pages=int(d.get("table_pages", 0)),
+            uncertain_pages=int(d.get("uncertain_pages", 0)),
+            special_pages=int(d.get("special_pages", 0)),
+            block_count=int(d.get("block_count", 0)),
+            kinds=list(d.get("kinds", []) or []),
+        )
+
+
+@dataclass
+class PageTriage:
+    """One page's triage verdict (kind) plus whether the user decided it."""
+
+    page: int
+    kind: str = "normal"
+    decided: bool = False
+    decision: str = ""
+
+
+@dataclass
 class WorkflowState:
     """All state for one AI-orchestrated translation run.
 
@@ -116,6 +172,14 @@ class WorkflowState:
     budget: Budget = field(default_factory=Budget)
     pending_question: dict[str, Any] | None = None   # surfaced ask to the GUI
     log: list[str] = field(default_factory=list)
+    #: Interactive-session fields (see docs/0.3.1-交互式翻译流程设计.md).
+    phase: str = PHASE_IDLE                          # SessionPhase
+    doc_info: DocInfo | None = None                  # preprocess summary
+    triage: dict[int, PageTriage] = field(default_factory=dict)   # per-page kind
+    current_page: int = 0                            # preview navigation pointer
+    annotations: list[dict[str, Any]] = field(default_factory=list)  # user marks
+    summary: str = ""                                # pipeline summary
+    review_mode: str = ""                            # "ai" | "user"
 
     def page(self, index: int) -> PageState:
         """The ``PageState`` for ``index``, created on first access."""

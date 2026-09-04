@@ -46,6 +46,17 @@ class ModelConfig:
     #: the original page and the reconstruction are sent to it, and its text
     #: corrections and layout hints are applied / surfaced (geometry untouched).
     vision: bool = False
+    #: Sampling temperature for the **AI interaction** / agent orchestration
+    #: ``decide`` calls.  This is a *separate* parameter set from the translation
+    #: request parameters above: a translation wants a low, deterministic
+    #: temperature (``model.temperature``), while the orchestrator that plans tool
+    #: calls benefits from a little exploration and a bit more reasoning.
+    #: ``models.json`` may override per model via ``interaction_temperature``.
+    interaction_temperature: float = 0.6
+    #: ``reasoning_effort`` sent to the agent's ``decide`` calls (via ``extra_body``),
+    #: defaulting to ``"medium"``.  ``models.json`` may override per model via
+    #: ``interaction_reasoning_effort``.
+    interaction_reasoning_effort: str | None = "medium"
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -74,6 +85,12 @@ class ModelConfig:
             concurrency=int(item.get("concurrency") or 1),
             batch_size=int(item.get("batch_size") or 4000),
             vision=bool(item.get("vision", False)),
+            interaction_temperature=(
+                float(item["interaction_temperature"])
+                if item.get("interaction_temperature") not in (None, "")
+                else 0.6
+            ),
+            interaction_reasoning_effort=(item.get("interaction_reasoning_effort") or "medium"),
             extra={k: v for k, v in item.items() if k not in cls._KNOWN_FIELDS},
         )
 
@@ -92,6 +109,8 @@ class ModelConfig:
         "concurrency",
         "batch_size",
         "vision",
+        "interaction_temperature",
+        "interaction_reasoning_effort",
     }
 
     def request_params(self) -> dict[str, Any]:
@@ -107,6 +126,20 @@ class ModelConfig:
             params["reasoning_effort"] = self.reasoning_effort
         if self.tools_choice:
             params["tool_choice"] = self.tools_choice
+        return params
+
+    def interaction_request_params(self) -> dict[str, Any]:
+        """Per-request body parameters for the **AI interaction** (agent) calls.
+
+        Kept separate from :meth:`request_params` so the agent orchestrator can
+        reason / sample differently than the deterministic translation pass — e.g.
+        the same llama.cpp endpoint needs ``reasoning_effort`` supplied for the
+        agent's ``decide`` calls too, and the interaction temperature is higher so
+        the model explores a little instead of being pinned to greedy 0.0.
+        """
+        params: dict[str, Any] = {}
+        if self.interaction_reasoning_effort:
+            params["reasoning_effort"] = self.interaction_reasoning_effort
         return params
 
     def _resolved_api_key(self) -> str | None:

@@ -83,6 +83,28 @@ class SettingsTest(unittest.TestCase):
         self.assertNotIn("concurrency", m2.extra)
         self.assertNotIn("batch_size", m2.extra)
 
+    def test_interaction_params_defaults_and_override(self):
+        # The AI-interaction (agent) config is a *separate* set from translation:
+        # it defaults to reasoning_effort=medium / temperature=0.6 so the
+        # orchestrator explores a little, while translation keeps models.json's
+        # own (lower, deterministic) values.
+        m = ModelConfig.from_dict({"id": "m", "endpoint": "http://x/v1", "model": "mod"})
+        self.assertEqual(0.6, m.interaction_temperature)
+        self.assertEqual("medium", m.interaction_reasoning_effort)
+        self.assertEqual({"reasoning_effort": "medium"}, m.interaction_request_params())
+        self.assertEqual({}, m.request_params())   # translation sends nothing unless set
+
+        m2 = ModelConfig.from_dict({
+            "id": "m", "endpoint": "http://x/v1", "model": "mod",
+            "interaction_temperature": 0.9, "interaction_reasoning_effort": "high",
+        })
+        self.assertEqual(0.9, m2.interaction_temperature)
+        self.assertEqual("high", m2.interaction_reasoning_effort)
+        self.assertEqual({"reasoning_effort": "high"}, m2.interaction_request_params())
+        # Known interaction keys do not leak into ``extra``.
+        self.assertNotIn("interaction_temperature", m2.extra)
+        self.assertNotIn("interaction_reasoning_effort", m2.extra)
+
     def test_client_kwargs_default_timeout(self):
         m = ModelConfig(id="m", name="m", type="openai",
                         endpoint="http://x/v1", model="mod")

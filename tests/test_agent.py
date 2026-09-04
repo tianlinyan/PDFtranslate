@@ -80,16 +80,15 @@ class AgentToolsTest(unittest.TestCase):
 
     def test_existing_judgment_tools_registered(self):
         names = [t.name for t in agent.AGENT_TOOLS]
-        for n in ("classify_block", "detect_table_merge", "verify_number", "retranslate_block"):
+        for n in ("classify_block", "retranslate_block"):
             self.assertIn(n, names)
-        vn = agent.by_name("verify_number")
-        self.assertIsNotNone(vn)
-        self.assertIn("is_correct", vn.parameters.get("properties", {}))
+        cb = agent.by_name("classify_block")
+        self.assertIsNotNone(cb)
+        self.assertIn("action", cb.parameters.get("properties", {}))
 
     def test_source_read_tools_are_readonly(self):
         # The original is protected: read/observe tools only read it (target source).
-        for n in ("read_page", "render_region", "get_layout",
-                  "classify_block", "detect_table_merge", "verify_number"):
+        for n in ("read_page", "render_region", "get_layout", "classify_block"):
             t = agent.by_name(n)
             self.assertIsNotNone(t, n)
             self.assertEqual("source", t.target, n)
@@ -133,10 +132,10 @@ class AgentToolsTest(unittest.TestCase):
         self.assertIn("what", schema["properties"])
 
     def test_tool_filtering_by_name(self):
-        names = ["read_page", "verify_number"]
+        names = ["read_page", "classify_block"]
         tools = agent.agent_openai_tools(names=names)
         self.assertEqual(2, len(tools))
-        self.assertEqual({"read_page", "verify_number"}, {t["function"]["name"] for t in tools})
+        self.assertEqual({"read_page", "classify_block"}, {t["function"]["name"] for t in tools})
 
     def test_make_agent_tools_none_for_non_vision(self):
         model = ModelConfig.from_dict(dict(
@@ -154,7 +153,7 @@ class AgentToolsTest(unittest.TestCase):
             endpoint="http://127.0.0.1:9/v1/chat/completions", model="qwen", vision=True))
         with mock.patch.object(translator, "OpenAI", _FakeOpenAI):
             tools = agent.make_agent_tools(model)
-        for n in ("classify_block", "detect_table_merge", "verify_number", "retranslate_block"):
+        for n in ("classify_block", "retranslate_block"):
             self.assertIn(n, tools)
             self.assertTrue(callable(tools[n]), n)
 
@@ -191,13 +190,13 @@ class FlowAgentTest(unittest.TestCase):
             calls.append(("classify_block", index))
             return {"action": "translate", "confidence": 0.9}
 
-        def verify_number(index, value):
-            calls.append(("verify_number", index))
-            return {"is_correct": True}
+        def translate_block(index, text, target_lang):
+            calls.append(("translate_block", index))
+            return {"ok": True, "translated": "Total assets"}
 
         return {"read_page": read_page,
                 "classify_block": classify_block,
-                "verify_number": verify_number}
+                "translate_block": translate_block}
 
     def test_scripted_calls_run_in_order_and_mutate_state(self):
         s = self._state()
@@ -206,15 +205,15 @@ class FlowAgentTest(unittest.TestCase):
             agent.Decision(action="call", tool="read_page", arguments={"page": 0}),
             agent.Decision(action="call", tool="classify_block",
                            arguments={"index": 0, "text": "总资产"}),
-            agent.Decision(action="call", tool="verify_number",
-                           arguments={"index": 0, "value": "32,613,779.11"}),
+            agent.Decision(action="call", tool="translate_block",
+                           arguments={"index": 0, "text": "总资产", "target_lang": "English"}),
             agent.Decision(action="done", summary="page done"),
         ])
         agent.run_agent_run(s, self._tools(calls), decide)
         # Tool calls in the scripted order.
-        self.assertEqual([("read_page", 0), ("classify_block", 0), ("verify_number", 0)], calls)
+        self.assertEqual([("read_page", 0), ("classify_block", 0), ("translate_block", 0)], calls)
         # Provenance recorded, budget advanced, last action is done (no pending question).
-        self.assertEqual(["read_page", "classify_block", "verify_number"],
+        self.assertEqual(["read_page", "classify_block", "translate_block"],
                          [op.tool for op in s.ops])
         self.assertEqual(3, s.budget.used_steps)
         self.assertEqual({"page": 0}, s.ops[0].args)
@@ -360,6 +359,33 @@ class LlmDecideAndPageLoopTest(unittest.TestCase):
         roles = [m["role"] for m in seen[1]["messages"]]
         self.assertIn("assistant", roles)   # the tool_call was echoed back
         self.assertIn("tool", roles)        # the result was fed back
+
+    def test_llm_decide_uses_translation_params(self):
+        # ``decide`` is TRANSLATION-side (by definition only the text chat is
+        # interaction-side), so it uses the model's translation temperature and
+        # ``reasoning_effort`` (models.json) — NOT ``interaction_*``.
+        seen: list = []
+        queue = [
+            _FakeResp(_FakeMsg(content="", tool_calls=[_FakeToolCall("read_page", '{"page":0}')])),
+        ]
+        client = _FakeClient(queue, seen)
+        model = ModelConfig.from_dict(dict(
+            id="v", name="v", type="llama-server",
+            endpoint="http://127.0.0.1:9/v1/chat/completions", model="qwen",
+            vision=True, temperature=0.3, reasoning_effort="low",
+            interaction_temperature=0.9, interaction_reasoning_effort="high",
+        ))
+        with mock.patch.object(translator, "OpenAI", lambda **_k: client):
+            decide = agent.make_llm_decide(model, task="t",
+                                           image_provider=lambda _s: b"")
+        s = agent.WorkflowState("a.pdf", "English")
+        s.page(0)
+        decide("obs", s)
+        kw = seen[0]
+        # Translation-side params, not the interaction overrides.
+        self.assertEqual(0.3, kw["temperature"])
+        self.assertEqual({"reasoning_effort": "low"}, kw["extra_body"])
+        self.assertEqual("auto", kw["tool_choice"])
 
     def test_make_source_tools_read_page_is_read_only(self):
         s = agent.WorkflowState("a.pdf", "English")
@@ -562,6 +588,89 @@ class PageExecutorsTest(unittest.TestCase):
         res = tools["ask_user"]("q")
         self.assertFalse(res["ok"])
         self.assertIn("问答通道未接线", res["error"])
+
+
+class MultipageAndFlatIndexTest(unittest.TestCase):
+    """Regressions for the multi-page agent loop (budget + index + tool surface)."""
+
+    class _AlwaysReadPageCompletions:
+        def __init__(self, seen):
+            self.seen = seen
+
+        def create(self, **kwargs):
+            self.seen.append(kwargs)
+            return _FakeResp(_FakeMsg(content="",
+                                      tool_calls=[_FakeToolCall("read_page", '{"page":0}')]))
+
+    class _AlwaysReadPageClient:
+        def __init__(self, seen):
+            self.chat = type("_Chat", (),
+                             {"completions": MultipageAndFlatIndexTest._AlwaysReadPageCompletions(seen)})()
+
+    def _two_page_state(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[
+                [pdfio.Block("A", page=0, x0=0, y0=0, x1=10, y1=10),
+                 pdfio.Block("B", page=0, x0=0, y0=20, x1=10, y1=30)],
+                [pdfio.Block("C", page=1, x0=0, y0=0, x1=10, y1=10)],
+            ],
+            blocks=["A", "B", "C"], block_pages=[0, 0, 1])
+        return s
+
+    def test_per_page_budget_is_reset_across_pages(self):
+        # Regression: the worker drives *every* page through the same WorkflowState,
+        # but the budget counters used to accumulate — so page 2 started already
+        # exhausted and never ran.  Each ``run_page_visual`` must reset them.
+        seen: list = []
+        state = self._two_page_state()   # one shared state, two pages (as the worker)
+
+        def make_client():
+            return self._AlwaysReadPageClient(seen)
+
+        with mock.patch.object(translator, "OpenAI", lambda **_k: make_client()):
+            for page in (0, 1):
+                agent.run_page_visual(state, page, _vision_model(),
+                                      task="t", max_steps=2)
+        # Page 0 and page 1 each made 2 read_page calls (fresh budget each).
+        self.assertEqual(2, state.budget.used_steps)
+        self.assertEqual(4, len(state.ops))
+        # The model was only offered tools that are actually bound — the judgment /
+        # draw tools (verify_number / draw_table / cover_region) must not surface.
+        for kw in seen:
+            names = [f["function"]["name"] for f in kw["tools"]]
+            self.assertIn("read_page", names)
+            self.assertIn("translate_block", names)
+            self.assertNotIn("verify_number", names)
+            self.assertNotIn("draw_table", names)
+
+    def test_read_page_reports_flat_global_index(self):
+        # Regression: read_page used to report a *per-page local* index, which
+        # silently addresses a different block once page > 0 (the write tools all
+        # key on the flat document index).
+        s = self._two_page_state()
+        tools = agent.make_source_tools(s)
+        page1 = tools["read_page"](1)
+        self.assertEqual(1, len(page1["blocks"]))
+        self.assertEqual("C", page1["blocks"][0]["text"])
+        self.assertEqual(2, page1["blocks"][0]["index"])   # offset 2 (page 0 had 2 blocks)
+
+    def test_cancel_fn_stops_the_loop(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.todo.append(agent.Goal(kind="page", page=0))
+        calls: list = []
+
+        def decide(*_a):
+            return agent.Decision(action="call", tool="read_page", arguments={"page": 0})
+
+        def read_page(page):
+            calls.append(page)
+            return {"blocks": []}
+
+        agent.run_agent_run(s, {"read_page": read_page}, decide, max_steps=100,
+                            cancel_fn=lambda: len(calls) >= 2)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(2, s.budget.used_steps)
 
 
 if __name__ == "__main__":

@@ -161,350 +161,13 @@ class FormatDurationTest(unittest.TestCase):
         self.assertEqual("1 小时 01 分 01 秒", format_duration(3661))
 
 
-class CorrectResidualBlocksTest(unittest.TestCase):
-    """QC → correction: re-translate residual / empty blocks on flagged pages."""
-
-    def _doc(self, block_pages, blocks=None):
-        class _Doc:
-            pass
-        d = _Doc()
-        d.block_pages = block_pages
-        d.blocks = blocks if blocks is not None else [f"s{i}" for i in range(len(block_pages))]
-        return d
-
-    def test_corrects_residual_and_empty_keeps_clean(self):
-        doc = self._doc([0, 0, 1, 1])
-        result = TranslationResult(
-            blocks=["a", "b", "c", "d"],
-            translated=["未翻译", "Good", "中文残留", ""],
-        )
-        retranslate = lambda _t, _l: "Retranslated"
-        # page 1 (indices 2,3) flagged; index 1 is clean; index 3 is empty.
-        n = worker_module._correct_residual_blocks(
-            doc, result, keep=set(), target_is_cjk=False,
-            flagged={1}, lang="English", retranslate=retranslate, log=None,
-        )
-        self.assertEqual(n, 2)                          # index 2 (中文残留) + index 3 (empty)
-        self.assertEqual(result.translated[2], "Retranslated")
-        self.assertEqual(result.translated[3], "Retranslated")
-        self.assertEqual(result.translated[1], "Good")  # clean block untouched
-        self.assertEqual(result.translated[0], "未翻译")  # page 0 not flagged
-
-    def test_respects_keep_and_cjk_target(self):
-        doc = self._doc([0])
-        result = TranslationResult(blocks=["a"], translated=["保留"])
-        retranslate = lambda _t, _l: "KeptChinese"
-        # Kept (name/chart) block, and a CJK target: neither is corrected.
-        n = worker_module._correct_residual_blocks(
-            doc, result, keep={0}, target_is_cjk=True,
-            flagged={0}, lang="English", retranslate=retranslate, log=None,
-        )
-        self.assertEqual(n, 0)
-        self.assertEqual(result.translated[0], "保留")
-
-    def test_release_kept_blocks_via_tool(self):
-        class _Doc:
-            pass
-        doc = _Doc()
-        doc.pages = [[
-            pdfio.Block(text="董事会", page=0, x0=0, y0=0, x1=30, y1=30, is_chart=True),
-            pdfio.Block(text="二、公司组织架构图", page=0, x0=0, y0=40, x1=30, y1=50, is_chart=True),
-            pdfio.Block(text="正文", page=0, x0=0, y0=60, x1=100, y1=70, is_chart=False),
-        ]]
-        keep = {0, 1, 2}
-        # Tool judges index 0 keep, index 1 translate (conf 0.95).  Block 2 is
-        # not a chart node, so it is not a candidate (stays kept).
-        classify_fn = lambda _texts: [
-            {"index": 0, "action": "keep", "confidence": 0.9},
-            {"index": 1, "action": "translate", "confidence": 0.95},
-        ]
-        released = worker_module._release_kept_blocks_via_tool(doc, keep, classify_fn, 0.7, None)
-        self.assertEqual(released, {1})
-
-    def test_release_kept_blocks_via_tool_low_conf_not_released(self):
-        class _Doc:
-            pass
-        doc = _Doc()
-        doc.pages = [[pdfio.Block(text="二、公司组织架构图", page=0, x0=0, y0=40,
-                                  x1=30, y1=50, is_chart=True)]]
-        keep = {0}
-        classify_fn = lambda _texts: [
-            {"index": 0, "action": "translate", "confidence": 0.4},
-        ]
-        released = worker_module._release_kept_blocks_via_tool(doc, keep, classify_fn, 0.7, None)
-        self.assertEqual(released, set())
-
-
-class KeepOriginalDirectionTest(_WorkerTestBase):
-    """Name cells stay source only for a CJK target; Latin targets romanize.
-
-    A ``姓名`` column keeps its original text so Chinese names survive in a
-    Chinese document — but in an English output the kept Chinese names would be
-    mixed-language leftovers, so there they must be handed to the model (whose
-    prompt rule romanizes them with a consistent spelling).  The block flags
-    themselves come from ``pdfio._mark_name_column`` (covered by the pdfio
-    tests); here the worker's direction gate is the unit under test, so the
-    extraction is stubbed with one name block already flagged.
-    """
-
-    def _run_capture(self, lang: str) -> tuple[dict, list[str]]:
-        name_block = pdfio.Block(
-            text="汪建法", page=0, x0=60, y0=120, x1=100, y1=135,
-            size=9.0, keep_original=True,
-        )
-        doc = pdfio.DocumentText(
-            pages=[[pdfio.Block(text="姓名", page=0, x0=60, y0=100, x1=100, y1=115, size=9.0), name_block]],
-            blocks=["姓名", "汪建法", "Body text to translate."],
-            block_pages=[0, 0, 0],
-            title="names",
-        )
-        captured: dict = {}
-
-        class _StubEngine:
-            def __init__(self, _model):
-                pass
-
-            def translate_blocks(self, blocks, _target, **kwargs):
-                captured["keep"] = kwargs.get("keep_original")
-                captured["lang"] = _target
-                return TranslationResult(
-                    blocks=list(blocks),
-                    translated=[f"MOCK:{b}" for b in blocks],
-                )
-
-        logs: list[str] = []
-        worker = TranslateWorker(
-            str(self.tmp / "names.pdf"),
-            self._model("http://127.0.0.1:9/v1"), lang,
-            "plain_text", str(self.tmp / f"out_{lang}.txt"),
-        )
-        worker.log.connect(logs.append)
-        with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
-            with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
-                self._run(worker)
-        return captured, logs
-
-    def test_name_cells_kept_for_cjk_target(self):
-        captured, logs = self._run_capture("简体中文")
-        self.assertEqual("简体中文", captured["lang"])
-        self.assertEqual({1}, captured["keep"])
-        self.assertTrue(any("保留原文" in m for m in logs), logs)
-
-    def test_name_cells_romanized_for_latin_target(self):
-        captured, logs = self._run_capture("English")
-        self.assertEqual("English", captured["lang"])
-        self.assertEqual(set(), captured["keep"])
-        self.assertTrue(any("罗马化" in m for m in logs), logs)
-
-
-class ChartNodeDirectionTest(_WorkerTestBase):
-    """Org-chart / architecture-diagram node labels are never translated.
-
-    Unlike a ``姓名`` name cell (kept only for a CJK target), a diagram's box
-    label is structural: it must survive a language switch, so the worker feeds
-    it into ``keep_original`` for both a CJK and a Latin target.
-    """
-
-    def _run_capture(self, lang: str) -> tuple[dict, list[str]]:
-        chart_block = pdfio.Block(
-            text="党群工作部", page=0, x0=50, y0=50, x1=57.4, y1=79.5,
-            size=24.0, align="center", bold=False, is_chart=True,
-        )
-        doc = pdfio.DocumentText(
-            pages=[[chart_block, pdfio.Block(text="标题", page=0, x0=60, y0=20, x1=150, y1=35, size=12.0)]],
-            blocks=["党群工作部", "标题"],
-            block_pages=[0, 0],
-            title="chart",
-        )
-        captured: dict = {}
-
-        class _StubEngine:
-            def __init__(self, _model):
-                pass
-
-            def translate_blocks(self, blocks, _target, **kwargs):
-                captured["keep"] = kwargs.get("keep_original")
-                return TranslationResult(
-                    blocks=list(blocks),
-                    translated=[f"MOCK:{b}" for b in blocks],
-                )
-
-        logs: list[str] = []
-        worker = TranslateWorker(
-            str(self.tmp / "chart.pdf"),
-            self._model("http://127.0.0.1:9/v1"), lang,
-            "plain_text", str(self.tmp / f"out_{lang}.txt"),
-        )
-        worker.log.connect(logs.append)
-        with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
-            with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
-                self._run(worker)
-        return captured, logs
-
-    def test_chart_nodes_kept_for_cjk_target(self):
-        captured, _logs = self._run_capture("简体中文")
-        self.assertEqual({0}, captured["keep"])
-
-    def test_chart_nodes_kept_for_latin_target(self):
-        # A Western target still keeps the diagram's Chinese node labels — they
-        # are structural, not prose, so they must not be romanized.
-        captured, logs = self._run_capture("English")
-        self.assertEqual({0}, captured["keep"])
-        self.assertTrue(any("组织结构图/架构图节点" in m for m in logs), logs)
-
-
 def _verify_sentinel(_i, _png, _figures):
     """Stand-in for ``make_verify_number_tool_fn``'s returned verifier."""
     return []
 
 
-class VerifyNumberWiringTest(_WorkerTestBase):
-    """The worker hands the OCR-number verifier into ``extract_document_text``.
-
-    Only an OCR-enabled run wires a verifier; ``verify_fn`` stays ``None`` when
-    OCR is off.  ``make_verify_number_tool_fn`` itself is already covered in
-    ``test_translator``, so here it is stubbed to a sentinel so the wiring (not
-    the tool construction) is the unit under test.
-    """
-
-    def _run_capture(self, ocr: bool):
-        doc = pdfio.DocumentText(
-            pages=[[pdfio.Block(text="Body text to translate.", page=0,
-                                x0=60, y0=60, x1=200, y1=80, size=10.0)]],
-            blocks=["Body text to translate."],
-            block_pages=[0],
-            title="verify",
-        )
-
-        class _StubEngine:
-            def __init__(self, _model):
-                pass
-
-            def translate_blocks(self, blocks, _target, **kwargs):
-                return TranslationResult(
-                    blocks=list(blocks),
-                    translated=[f"MOCK:{b}" for b in blocks],
-                )
-
-        captured: dict = {}
-        logs: list[str] = []
-
-        def _fake_extract(source, **kwargs):
-            captured["verify_fn"] = kwargs.get("verify_fn")
-            captured["review_fn"] = kwargs.get("review_fn")
-            return doc
-
-        worker = TranslateWorker(
-            str(self.tmp / "verify.pdf"),
-            self._model("http://127.0.0.1:9/v1"), "简体中文",
-            "plain_text", str(self.tmp / "out.txt"), ocr=ocr,
-        )
-        worker.log.connect(logs.append)
-        with mock.patch.object(worker_module, "make_verify_number_tool_fn",
-                               return_value=_verify_sentinel):
-            with mock.patch.object(worker_module, "make_review_fn", return_value=None):
-                with mock.patch.object(pdfio, "extract_document_text",
-                                       side_effect=_fake_extract):
-                    with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
-                        self._run(worker)
-        return captured["verify_fn"]
-
-    def test_ocr_run_wires_verifier(self):
-        self.assertIs(_verify_sentinel, self._run_capture(ocr=True))
-
-    def test_non_ocr_run_leaves_verifier_none(self):
-        self.assertIsNone(self._run_capture(ocr=False))
-
-
 def _empty_render_review(_i, _o, _r):
     return {"issues": [], "adjustments": []}
-
-
-class RenderQaAdjustmentWiringTest(_WorkerTestBase):
-    """The worker collects the QA's adjustments and applies them before re-export."""
-
-    def _fixture(self, block):
-        doc = pdfio.DocumentText(
-            pages=[[block]],
-            blocks=[block.text],
-            block_pages=[0],
-            title="adj",
-        )
-
-        class _StubEngine:
-            def __init__(self, _model):
-                pass
-
-            def translate_blocks(self, blocks, _target, **kwargs):
-                return TranslationResult(
-                    blocks=list(blocks),
-                    translated=[f"MOCK:{b}" for b in blocks],
-                )
-
-        return doc, _StubEngine
-
-    def test_worker_applies_render_adjustments_then_reexports(self):
-        src = build_sample_pdf(self.tmp / "adj.pdf", pages=1)
-        out = self.tmp / "out.pdf"
-        block = pdfio.Block(text="Body text.", page=0, x0=60, y0=60,
-                            x1=200, y1=80, size=9.0, single_line=True)
-        doc, stub = self._fixture(block)
-        # A font-size adjustment targeting the block (bbox in render-pixel space).
-        z = pdfio._REVIEW_DPI / 72.0
-        adj_bbox = [60 * z, 60 * z, 200 * z, 80 * z]
-
-        def fake_review_rendered_pages(_src, _out, _review_fn, _log, adjustments=None):
-            assert adjustments is not None
-            adjustments.append({
-                "kind": "font_size", "page": 0, "bbox": adj_bbox,
-                "size": 12.0, "confidence": 0.9,
-            })
-            return set()          # no flagged pages → no retranslate path
-
-        logs: list[str] = []
-        worker = TranslateWorker(
-            str(src), self._model("http://127.0.0.1:9/v1"), "简体中文",
-            "translated_pdf", str(out), render_qa=True,
-        )
-        worker.log.connect(logs.append)
-        with mock.patch.object(worker_module, "make_rendered_review_fn",
-                               return_value=_empty_render_review):
-            with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
-                with mock.patch.object(pdfio, "review_rendered_pages",
-                                       side_effect=fake_review_rendered_pages):
-                    with mock.patch.object(worker_module, "TranslationEngine", stub):
-                        events = self._run(worker)
-        # The adjustment was applied (block.font target raised, clamped) and the
-        # run re-exported the PDF instead of failing.
-        self.assertEqual(12.0, block.size)
-        self.assertIn("finished", events)
-        self.assertIn("stopped", events)
-        self.assertTrue(any("质检修正" in m for m in logs), logs)
-
-    def test_worker_no_adjustments_skips_apply(self):
-        src = build_sample_pdf(self.tmp / "adj2.pdf", pages=1)
-        out = self.tmp / "out2.pdf"
-        block = pdfio.Block(text="Body text.", page=0, x0=60, y0=60,
-                            x1=200, y1=80, size=9.0, single_line=True)
-        doc, stub = self._fixture(block)
-
-        with mock.patch.object(worker_module, "make_rendered_review_fn",
-                               return_value=_empty_render_review):
-            with mock.patch.object(pdfio, "extract_document_text", return_value=doc):
-                with mock.patch.object(pdfio, "review_rendered_pages",
-                                       side_effect=lambda *_a, **_k: set()):
-                    with mock.patch.object(pdfio, "apply_render_adjustments",
-                                           wraps=pdfio.apply_render_adjustments) as apply_mock:
-                        with mock.patch.object(worker_module, "TranslationEngine", stub):
-                            worker = TranslateWorker(
-                                str(src), self._model("http://127.0.0.1:9/v1"), "简体中文",
-                                "translated_pdf", str(out), render_qa=True,
-                            )
-                            events = self._run(worker)
-        # No adjustments collected → the executor is never called.
-        apply_mock.assert_not_called()
-        self.assertEqual(9.0, block.size)
-        self.assertIn("finished", events)
 
 
 class AgentModeWiringTest(_WorkerTestBase):
@@ -577,6 +240,124 @@ class AgentModeWiringTest(_WorkerTestBase):
         self.assertTrue(ran.get("translated"))
         self.assertIn("MOCK:", Path(out).read_text("utf-8"))
         self.assertIn("finished", events)
+
+
+class WorkerAgentPreviewTest(_WorkerTestBase):
+    """The agent-state helpers surfaced to the GUI (translation preview + sidebar msg)."""
+
+    def test_add_user_requirement_appends_to_agent_state(self):
+        worker = TranslateWorker(
+            str(self.tmp / "x.pdf"), self._model("http://127.0.0.1:9/v1"),
+            "English", "plain_text", str(self.tmp / "out.txt"),
+        )
+        state = agent_module.WorkflowState(src_path="x.pdf", lang="English")
+        worker._agent_state = state
+        worker.add_user_requirement("保留英文货币单位")
+        self.assertEqual(["保留英文货币单位"], state.requirements)
+        # A blank message is a no-op (never appends an empty requirement).
+        worker.add_user_requirement("   ")
+        self.assertEqual(["保留英文货币单位"], state.requirements)
+        # No active agent run -> no-op, and the message still lands in the log.
+        logs: list[str] = []
+        worker.log.connect(logs.append)
+        worker._agent_state = None
+        worker.add_user_requirement("x")
+        self.assertIsNone(worker._agent_state)
+
+    def test_render_translation_overlays_translated_blocks(self):
+        src = build_sample_pdf(self.tmp / "sample.pdf", pages=1)
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "English",
+            "translated_pdf", str(self.tmp / "out.pdf"),
+        )
+        state = agent_module.WorkflowState(src_path=str(src), lang="English")
+        state.src_doc = pdfio.DocumentText(
+            pages=[[
+                pdfio.Block("Page 1 heading text.", page=0, x0=72, y0=74, x1=420, y1=88, size=12.0),
+                pdfio.Block("This is a sample body paragraph to translate.", page=0,
+                            x0=72, y0=114, x1=460, y1=128, size=12.0),
+            ]],
+            blocks=["Page 1 heading text.", "This is a sample body paragraph to translate."],
+            block_pages=[0, 0],
+        )
+        state.out_doc = {
+            0: {"text": "Page 1 heading translated."},
+            1: {"text": "This body paragraph is translated."},
+        }
+        worker._agent_state = state
+        png = worker.render_translation(0)
+        self.assertIsNotNone(png)
+        self.assertGreater(len(png), 100)   # a real, non-trivial PNG
+        # PNG magic bytes.
+        self.assertEqual(b"\x89PNG", png[:4])
+
+    def test_render_translation_none_when_no_agent_state(self):
+        src = build_sample_pdf(self.tmp / "sample.pdf", pages=1)
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "English",
+            "translated_pdf", str(self.tmp / "out.pdf"),
+        )
+        worker._agent_state = None
+        self.assertIsNone(worker.render_translation(0))
+
+
+class OverlayApplyTest(_WorkerTestBase):
+    """The protected chat/manual overlay always wins over what the run produced."""
+
+    def test_overlay_overrides_export(self):
+        src = build_sample_pdf(self.tmp / "ov.pdf", pages=1)
+        out = self.tmp / "out.txt"
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                return TranslationResult(
+                    blocks=list(blocks),
+                    translated=list(blocks),
+                )
+
+        logs: list[str] = []
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "Chinese",
+            "plain_text", str(out),
+            overlay={0: {"text": "被保护的译文"}},
+        )
+        worker.log.connect(logs.append)
+        with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
+            events = self._run(worker)
+        self.assertEqual(["finished", "stopped"], events)
+        text = out.read_text("utf-8")
+        # The protected edit replaced the run's translation of block 0.
+        self.assertIn("被保护的译文", text)
+        self.assertIn("已应用 1 处", "\n".join(logs))
+
+    def test_blank_overlay_entry_is_skipped(self):
+        # A blank / whitespace overlay text must never wipe content to nothing.
+        src = build_sample_pdf(self.tmp / "ov2.pdf", pages=1)
+        out = self.tmp / "out2.txt"
+
+        class _StubEngine:
+            def __init__(self, _model):
+                pass
+
+            def translate_blocks(self, blocks, _target, **kwargs):
+                return TranslationResult(
+                    blocks=list(blocks),
+                    translated=list(blocks),
+                )
+
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "Chinese",
+            "plain_text", str(out),
+            overlay={0: {"text": "   "}},
+        )
+        with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
+            events = self._run(worker)
+        self.assertEqual(["finished", "stopped"], events)
+        # The source text survives (nothing was blanked).
+        self.assertIn("Page 1 heading text.", out.read_text("utf-8"))
 
 
 if __name__ == "__main__":

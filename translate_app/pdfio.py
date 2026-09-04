@@ -120,6 +120,128 @@ class DocumentText:
         return len(self.pages)
 
 
+#: Page kinds the AI-interaction session triages a page into.
+PAGE_NORMAL = "normal"
+PAGE_SCAN = "scan"
+PAGE_CHART = "chart"
+PAGE_TABLE = "table"
+PAGE_UNCERTAIN = "uncertain"
+
+#: A page is treated as a *chart* (org / architecture diagram) when at least this
+#: many narrow-tall node boxes are present (the strong diagram signature).
+_CHART_NODE_MIN = 3
+#: A page is treated as a *table* when this fraction of its blocks are table cells.
+_TABLE_PAGE_RATIO = 0.5
+
+
+def detect_language(texts: Sequence[str]) -> str:
+    """Heuristically guess the document language: ``"zh"`` / ``"en"`` / ``"mixed"``.
+
+    Counts CJK ideographs vs ASCII letters across the blocks.  A document with
+    only CJK is ``zh``; only Latin is ``en``; a substantial mixture (a report with
+    Chinese prose and English table headers) is ``mixed``.  No letters → ``unknown``.
+    """
+    cjk = latin = 0
+    for t in texts:
+        for ch in str(t):
+            if "\u4e00" <= ch <= "\u9fff":
+                cjk += 1
+            elif ch.isascii() and ch.isalpha():
+                latin += 1
+    if cjk == 0 and latin == 0:
+        return "unknown"
+    if cjk >= latin:
+        return "zh"
+    if latin >= cjk * 5:
+        return "en"
+    return "mixed"
+
+
+def classify_page(blocks: Sequence[Block]) -> str:
+    """Classify one page as ``normal`` / ``scan`` / ``chart`` / ``table`` / ``uncertain``.
+
+    Deterministic, block-flag based (no model call):
+    * ``scan`` — every block came from OCR (``Block.ocr``) i.e. a scanned raster page.
+    * ``table`` — most blocks are ruled-table cells (``Block.in_table``).
+    * ``chart`` — at least ``_CHART_NODE_MIN`` narrow-tall node boxes
+      (``_is_vertical_label``), the org-chart / architecture-diagram signature.
+    * ``uncertain`` — mixed OCR + text, or ambiguous (very few blocks).
+    * ``normal`` — everything else.
+    """
+    if not blocks:
+        return PAGE_UNCERTAIN
+    n = len(blocks)
+    n_ocr = sum(1 for b in blocks if getattr(b, "ocr", False))
+    n_table = sum(1 for b in blocks if getattr(b, "in_table", False))
+    n_vertical = sum(1 for b in blocks if _is_vertical_label(b))
+    if n_ocr == n:
+        return PAGE_SCAN
+    if n_table >= max(3, int(n * _TABLE_PAGE_RATIO)):
+        return PAGE_TABLE
+    if n_vertical >= _CHART_NODE_MIN:
+        return PAGE_CHART
+    # A mixed OCR + text page (or a genuinely ambiguous one) is flagged for the
+    # user; a pure-text page — even with a single block — is normal.
+    if 0 < n_ocr < n:
+        return PAGE_UNCERTAIN
+    return PAGE_NORMAL
+
+
+def get_doc_info(doc: "DocumentText") -> dict[str, Any]:
+    """Summarise a ``DocumentText`` for the AI-interaction session.
+
+    Returns page count, language guess, per-page kinds, and counts of
+    text / scan / chart / table / special pages (used by ``get_doc_info`` tool and
+    the preprocess phase).  Never touches the model — purely deterministic.
+    """
+    kinds = [classify_page(p) for p in doc.pages]
+    text_pages = sum(1 for k in kinds if k == PAGE_NORMAL)
+    chart_pages = sum(1 for k in kinds if k == PAGE_CHART)
+    table_pages = sum(1 for k in kinds if k == PAGE_TABLE)
+    uncertain_pages = sum(1 for k in kinds if k == PAGE_UNCERTAIN)
+    scan_pages = doc.ocr_count
+    return {
+        "pages": doc.page_count,
+        "title": doc.title,
+        "language": detect_language(doc.blocks),
+        "text_pages": text_pages,
+        "scan_pages": scan_pages,
+        "chart_pages": chart_pages,
+        "table_pages": table_pages,
+        "uncertain_pages": uncertain_pages,
+        "special_pages": chart_pages + table_pages + uncertain_pages + scan_pages,
+        "block_count": len(doc.blocks),
+        "kinds": kinds,
+    }
+
+
+def nearest_block(blocks: Sequence["Block"], bbox) -> "Block | None":
+    """The block whose centre falls in ``bbox`` (PDF points); nearest if several overlap.
+
+    Used by the M6 ``apply_annotation`` tool: a user-drawn region on the preview is
+    matched back to the source block it points at, so the AI can edit that block.
+    Returns ``None`` when the region matches no block (e.g. it is empty scan space).
+    """
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        r = fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    except (TypeError, ValueError):
+        return None
+    cx = (r.x0 + r.x1) / 2.0
+    cy = (r.y0 + r.y1) / 2.0
+    best: Block | None = None
+    best_d = 1e18
+    for b in blocks:
+        bcx = (b.x0 + b.x1) / 2.0
+        bcy = (b.y0 + b.y1) / 2.0
+        if r.x0 - 6.0 <= bcx <= r.x1 + 6.0 and r.y0 - 6.0 <= bcy <= r.y1 + 6.0:
+            d = abs(bcx - cx) + abs(bcy - cy)
+            if d < best_d:
+                best_d, best = d, b
+    return best
+
+
 def extract_document_text(
     path: str | Path,
     title: str | None = None,
@@ -127,8 +249,6 @@ def extract_document_text(
     ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
     cancel: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
-    review_fn: Callable[[int, bytes, bytes], dict] | None = None,
-    verify_fn: Callable[[int, bytes, Sequence[dict]], list[dict]] | None = None,
 ) -> DocumentText:
     """Extract text blocks from ``path`` in reading order.
 
@@ -158,14 +278,6 @@ def extract_document_text(
     written after every page, so a cancelled run keeps what it already did.
     ``cancel`` is polled per page (raising :class:`TranslationCancelled`), and
     ``log`` receives per-page OCR progress.
-
-    ``review_fn`` (optional) is a vision *whole-page reviewer*: after an OCR'd
-    page is rebuilt it is called ``(page_index, original_png, reconstruction_png)
-    -> dict``.  It may return ``text_fixes`` (applied conservatively: a figure
-    cell is corrected only when OCR's value is empty/unreadable, geometry is
-    never touched) and ``structure_flags`` (only surfaced through ``log``).
-    The review result is baked into the OCR cache (the cache key carries a
-    review marker), so a re-run needs no model call.
     """
     doc = fitz.open(str(path))
     result = DocumentText(title=title or Path(path).stem)
@@ -173,7 +285,7 @@ def extract_document_text(
     ocr_cache_path: Path | None = None
     ocr_cache_warned = False
     if ocr:
-        ocr_cache_path = _ocr_cache_path(path, review=review_fn is not None)
+        ocr_cache_path = _ocr_cache_path(path)
         ocr_cache = _load_ocr_cache(ocr_cache_path)
     try:
         for page_index in range(doc.page_count):
@@ -220,29 +332,6 @@ def extract_document_text(
                             page_index, page, ocr_fn, cancel, log
                         )
                         if page_blocks:
-                            if review_fn is not None:
-                                page_blocks = _apply_page_review(
-                                    page, page_blocks, review_fn, page_index, log
-                                )
-                            # OCR-number verification (vision tool-use): ask the
-                            # model to re-read the figures it plausibly misread and
-                            # correct them in place, so the value is right before
-                            # translation.  Applied only to freshly OCR'd pages
-                            # (the corrected blocks are then baked into the cache).
-                            if verify_fn is not None:
-                                figures = [
-                                    {"index": bi, "value": b.text}
-                                    for bi, b in enumerate(page_blocks)
-                                    if _is_numeric_cell(b.text)
-                                    and any(ch in b.text for ch in ",.％%")
-                                ]
-                                if figures:
-                                    decisions = verify_fn(
-                                        page_index, _render_page_png(page), figures
-                                    )
-                                    fixed = _apply_number_fixes(page_blocks, decisions)
-                                    if fixed and log:
-                                        log(f"  第 {page_index + 1} 页：数字核验修正 {fixed} 处。")
                             ocr_cache[page_index] = [
                                 _block_to_dict(b) for b in page_blocks
                             ]
@@ -259,7 +348,6 @@ def extract_document_text(
                                         f"重跑将重新 OCR：{ocr_cache_path}"
                                     )
                 if page_blocks:
-                    _flag_chart_nodes(page_blocks)
                     for b in page_blocks:
                         result.blocks.append(b.text)
                         result.block_pages.append(page_index)
@@ -308,7 +396,6 @@ def extract_document_text(
             for block in page_blocks:
                 result.blocks.append(block.text)
                 result.block_pages.append(page_index)
-            _flag_chart_nodes(page_blocks)
             result.pages.append(page_blocks)
     finally:
         doc.close()
@@ -436,35 +523,6 @@ def _normalize_number(text: str) -> str:
     return str(text)
 
 
-def _apply_number_fixes(page_blocks: Sequence[Block], decisions: Sequence[dict]) -> int:
-    """Apply ``verify_number`` corrections to the OCR block texts in place.
-
-    Only a decision that says the figure is *wrong* (``is_correct`` false) and
-    offers a non-empty ``corrected`` value is applied; the value is re-normalized
-    (the OCR-normalization routine still guards the digit sequence) and only
-    replaces the block text when it actually differs.  Returns the count fixed.
-    """
-    fixed = 0
-    for d in decisions:
-        if not isinstance(d, dict) or d.get("is_correct", True):
-            continue
-        corrected = str(d.get("corrected", "")).strip()
-        if not corrected:
-            continue
-        try:
-            idx = int(d.get("index", -1))
-        except (TypeError, ValueError):
-            continue
-        if not (0 <= idx < len(page_blocks)):
-            continue
-        blk = page_blocks[idx]
-        norm = _normalize_number(corrected)
-        if norm and norm != blk.text:
-            blk.text = norm
-            fixed += 1
-    return fixed
-
-
 def _get_ocr_engine():
     """Return a shared RapidOCR engine, or ``None`` if unavailable (degrade).
 
@@ -571,15 +629,13 @@ def _ocr_cache_dir() -> Path:
 _OCR_CACHE_VERSION = 5
 
 
-def _ocr_cache_path(doc_path: str | Path, review: bool = False) -> Path:
+def _ocr_cache_path(doc_path: str | Path) -> Path:
     """Cache file for a document's OCR results.
 
     The key includes the file's mtime and size, not just its path: reusing OCR
     results from a *replaced or edited* PDF would silently translate stale
-    content.  ``review`` (the whole-page AI review) changes the cached blocks,
-    so it is folded into the key and never shares a cache with plain OCR.
-    (The translation cache needs no such stamp — it looks blocks up by content
-    hash.)
+    content.  (The translation cache needs no such stamp — it looks blocks up by
+    content hash.)
     """
     p = Path(doc_path)
     try:
@@ -587,8 +643,7 @@ def _ocr_cache_path(doc_path: str | Path, review: bool = False) -> Path:
         stamp = f"|{int(st.st_mtime)}|{st.st_size}"
     except OSError:
         stamp = ""
-    mode = "|review" if review else ""
-    h = hashlib.sha1(f"{p.resolve()}{stamp}{mode}".encode("utf-8")).hexdigest()[:16]
+    h = hashlib.sha1(f"{p.resolve()}{stamp}".encode("utf-8")).hexdigest()[:16]
     return _ocr_cache_dir() / f"ocr_v{_OCR_CACHE_VERSION}_{h}.json"
 
 
@@ -991,42 +1046,6 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
     return blocks, tables
 
 
-def _drop_signature_items(
-    items: list[tuple], page_height: float | None,
-    log: Callable[[str], None] | None, page_index: int,
-) -> list[tuple]:
-    """Remove handwriting-signature OCR items so the scan image is kept as-is.
-
-    A handwritten 签字 on a scanned statement (the ``法定代表人：`` /
-    ``会计机构负责人：`` rows at the form's bottom) comes through RapidOCR as an
-    item whose box spans the whole brush stroke — several times taller than the
-    ~9pt print rows — and whose text is a name (letters, no digits).  Keeping it
-    means the translation passes a pinyin romanization drawn over the area, and
-    the exporter's white cover rect hides the actual handwriting on top of it.
-    A signature is identity, not content: drop the item, nothing is translated
-    and the scan's signature stays visible.
-    """
-    if not items or page_height is None:
-        return items
-    med = statistics.median(max(0.001, it[3] - it[0]) for it in items)
-    kept: list[tuple] = []
-    dropped = 0
-    for it in items:
-        y0, _x0, _x1, y1, text = it
-        h = y1 - y0
-        if h >= max(15.0, 2.5 * med) and (y0 + y1) / 2.0 >= 0.7 * page_height:
-            if any(ch.isalpha() for ch in text) and not re.search(r"\d", text):
-                dropped += 1
-                continue
-        kept.append(it)
-    if dropped and log:
-        log(
-            f"  第 {page_index + 1} 页：检测到 {dropped} 处手写体签字，"
-            "已保留扫描原样（不翻译、不覆盖）。"
-        )
-    return kept
-
-
 def _synthesize_ocr_blocks(
     results: Sequence[tuple[list, str]], page_index: int,
     log: Callable[[str], None] | None = None,
@@ -1062,7 +1081,6 @@ def _synthesize_ocr_blocks(
         items.append((min(ys), min(xs), max(xs), max(ys), normalized))
     if not items:
         return []
-    items = _drop_signature_items(items, page_height, log, page_index)
     grid_blocks, _grid_tables = _reconstruct_ocr_grid(items)
     if grid_blocks:
         for b in grid_blocks:
@@ -1111,554 +1129,11 @@ _CODE_TOKEN_RE = re.compile(
 )
 
 
-def _looks_like_code_token(text: str) -> bool:
-    """True when ``text`` is a short structured code (CJK + digits), not prose.
-
-    A statement / subject / sheet code is short, mostly digits with at most a few
-    CJK characters (会企01表-1, 科目1001).  A document title with a year (2025年年度
-    报告) or a prose label is deliberately excluded so the reviewer's reading is
-    only adopted for genuine identifiers, not headings.
-    """
-    t = str(text).strip()
-    if not (1 <= len(t) <= 16) or not any(c.isdigit() for c in t):
-        return False
-    cjk = sum(1 for c in t if "\u4e00" <= c <= "\u9fff")
-    if cjk > 4:
-        return False
-    return bool(_CODE_TOKEN_RE.match(t))
-
-
-def _looks_like_amount(text: str) -> bool:
-    """True when ``text`` reads like a figure (grouped or plain)."""
-    t = str(text).strip()
-    return _is_numeric_cell(t) or bool(_AMOUNT_PLAIN_RE.match(t))
-
-
 def _render_page_png(page, dpi: int = _REVIEW_DPI) -> bytes:
     """Render ``page`` to a PNG (the original scan the reviewer must compare)."""
     return page.get_pixmap(dpi=dpi).tobytes("png")
 
 
-def _render_reconstruction(blocks: Sequence[Block], width: float, height: float,
-                           dpi: int = _REVIEW_DPI) -> bytes:
-    """Render the rebuilt blocks as a page (boxes + text) for the reviewer."""
-    doc = fitz.open()
-    page = doc.new_page(width=width, height=height)
-    tw = fitz.TextWriter(page.rect)
-    for b in blocks:
-        r = fitz.Rect(b.x0, b.y0, b.x1, b.y1)
-        page.draw_rect(r, color=(0.3, 0.3, 0.9), width=0.4)
-        if b.text:
-            fs = min(max(4.0, b.size), 12.0)
-            tw.append(fitz.Point(b.x0, r.y0 + r.height / 2.0), b.text,
-                      font=_CJK_FONT, fontsize=fs)
-    tw.write_text(page)
-    out = page.get_pixmap(dpi=dpi).tobytes("png")
-    doc.close()
-    return out
-
-
-#: Hard cap on the number of pages the rendered-output QA reviews, so a
-#: pathological document cannot trigger an unbounded run of extra model calls.
-_RENDER_QA_MAX_PAGES = 60
-
-#: Minimum confidence for a rendered-QA issue to be reported (lower-confidence
-#: guesses are likely wrong and would flood the log with false positives).
-_QA_CONFIDENCE_MIN = 0.6
-
-#: QA issue kinds that are *correctable* (the worker applies a deterministic
-#: fix and re-exports).  ``残余中文``/``内容缺失`` re-translate and refill the
-#: offending cell; ``字过小``/``译文需替换`` drive the structured adjustments
-#: (``apply_render_adjustments``: a font-size target / a replacement text).  The
-#: other kinds (overlap / broken label) are layout hints only — surfaced but not
-#: auto-fixed.
-_CORRECTABLE_QA_KINDS = frozenset(("残余中文", "内容缺失", "字过小", "译文需替换"))
-
-
-def review_rendered_pages(
-    src_path: str | Path,
-    out_path: str | Path,
-    review_fn: Callable[[int, bytes, bytes], dict] | None,
-    log: Callable[[str], None] | None = None,
-    page_limit: int = _RENDER_QA_MAX_PAGES,
-    adjustments: list | None = None,
-) -> set[int]:
-    """Run a rendered-output QA on the exported PDF and return flagged pages.
-
-    Each output page is rendered and compared with the corresponding source page
-    by ``review_fn`` (created for a vision-capable model — see
-    ``translator.make_rendered_review_fn``); the issues it returns are surfaced
-    through ``log``.  This never modifies the export and never aborts — any
-    reviewer error is a no-op.
-
-    ``adjustments`` (optionally a list the caller owns) is filled with the
-    *structured* fix proposals from the review (``kind`` ``text`` / ``font_size``
-    plus a ``bbox``/``text``/``size``), each tagged with its ``page`` index, so
-    the caller can apply them deterministically (``apply_render_adjustments``).
-    They are only the review's suggestion — applying is bounded and may drop them.
-
-    Returns the set of page indices that reported a *correctable* issue
-    (``残余中文`` / ``内容缺失`` / ``字过小`` / ``译文需替换``) at or above the
-    confidence floor, so the caller can re-translate those cells and re-export.
-    Layout-only hints are not returned.
-    """
-    if review_fn is None:
-        return set()
-    flagged: set[int] = set()
-    src = fitz.open(str(src_path))
-    try:
-        out = fitz.open(str(out_path))
-        try:
-            n = min(src.page_count, out.page_count, page_limit)
-            for i in range(n):
-                try:
-                    original = _render_page_png(src[i])
-                    rendered = _render_page_png(out[i])
-                    result = review_fn(i, original, rendered)
-                except Exception:  # noqa: BLE001 — fail-closed, never abort
-                    continue
-                if adjustments is not None:
-                    for a in _collect_render_adjustments(result, i):
-                        adjustments.append(a)
-                if _report_render_issues(i, result, log):
-                    flagged.add(i)
-        finally:
-            out.close()
-    finally:
-        src.close()
-    return flagged
-
-
-#: ``kind`` values an adjustment may carry; the executor applies only these.
-_RENDER_ADJUST_KINDS = frozenset(("text", "font_size"))
-
-
-def _collect_render_adjustments(result, page_index: int) -> list[dict]:
-    """Pull the validated, page-tagged adjustment proposals out of a QA reply."""
-    if not isinstance(result, dict):
-        return []
-    raw = result.get("adjustments")
-    if not isinstance(raw, list):
-        return []
-    out: list[dict] = []
-    for a in raw:
-        if not isinstance(a, dict):
-            continue
-        kind = str(a.get("kind", "")).strip()
-        if kind not in _RENDER_ADJUST_KINDS:
-            continue
-        bbox = a.get("bbox")
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            continue
-        try:
-            conf = float(a.get("confidence", 1.0))
-        except (TypeError, ValueError):
-            conf = 1.0
-        if conf < _QA_CONFIDENCE_MIN:
-            continue
-        adj = dict(a)
-        adj["page"] = page_index
-        out.append(adj)
-    return out
-
-
-def _flat_index_of(doc, block: Block) -> int | None:
-    """The flat index of ``block`` in ``doc`` (matching ``doc.blocks`` order)."""
-    idx = 0
-    for page in doc.pages:
-        for b in page:
-            if b is block:
-                return idx
-            idx += 1
-    return None
-
-
-def apply_render_adjustments(
-    doc,
-    translated: list[str],
-    adjustments: Sequence[dict],
-    keep_original: set[int],
-    log: Callable[[str], None] | None = None,
-) -> int:
-    """Apply the QA's structured fixes to the block model, bounded.
-
-    Only two kinds are actionable and both are bounded so a bad guess can never
-    corrupt the output:
-
-    - ``text`` (``{page, bbox, text}``): replace the translation of the block
-      under ``bbox`` with ``text``.  Skipped for kept / chart blocks, empty
-      replacements, or a replacement identical to the current text.
-    - ``font_size`` (``{page, bbox, size}``): set that block's render font to
-      ``size``, clamped to ``[_MIN_TABLE_READABLE, _MAX_FONT]`` — this only
-      changes the *target* the deterministic fitter starts from, so the actual
-      drawn size is still bounded by the fitter (it shrinks to fit and never
-      drops below the readability floor).
-
-    ``bbox`` is in the rendered page's image pixels (``_REVIEW_DPI``); it is
-    converted to PDF points and matched to the nearest source block.  Returns the
-    number of adjustments actually applied.
-    """
-    if not adjustments or translated is None:
-        return 0
-    zoom = _REVIEW_DPI / 72.0
-    applied = 0
-    for adj in adjustments:
-        if not isinstance(adj, dict):
-            continue
-        try:
-            conf = float(adj.get("confidence", 1.0))
-        except (TypeError, ValueError):
-            conf = 1.0
-        if conf < _QA_CONFIDENCE_MIN:
-            continue
-        page_i = adj.get("page")
-        if not isinstance(page_i, int) or not (0 <= page_i < len(doc.pages)):
-            continue
-        kind = adj.get("kind")
-        if kind not in _RENDER_ADJUST_KINDS:
-            continue
-        bbox = adj.get("bbox")
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            continue
-        bbox_pt = [float(v) / zoom for v in bbox]
-        block = _nearest_review_block(doc.pages[page_i], bbox_pt)
-        if block is None:
-            continue
-        flat = _flat_index_of(doc, block)
-        if flat is None or flat >= len(translated):
-            continue
-        if flat in keep_original or getattr(block, "is_chart", False):
-            continue
-        if kind == "text":
-            new = str(adj.get("text", "")).strip()
-            if not new:
-                continue
-            cur = str(translated[flat])
-            if new == cur:
-                continue
-            translated[flat] = new
-            applied += 1
-            if log:
-                log(f"    [修正] 块 {flat + 1} 译文已替换：{cur[:18]!r} -> {new[:18]!r}")
-        else:  # font_size
-            try:
-                size = float(adj.get("size"))
-            except (TypeError, ValueError):
-                continue
-            if size <= 0:
-                continue
-            size = max(_MIN_TABLE_READABLE, min(_MAX_FONT, size))
-            old_size = float(block.size)
-            if abs(size - old_size) < 0.05:
-                continue
-            block.size = size
-            applied += 1
-            if log:
-                log(f"    [修正] 块 {flat + 1} 字体目标设为 {size:.1f}pt（原 {old_size:.1f}pt）")
-    return applied
-
-
-def _report_render_issues(page_index: int, result, log) -> set[str]:
-    """Surface one page's report-only render-QA issues.
-
-    Returns the set of *correctable* kinds found (e.g. ``残余中文``), so the
-    caller can decide whether to re-translate the page.
-    """
-    if not isinstance(result, dict):
-        return set()
-    issues = result.get("issues")
-    if not isinstance(issues, list):
-        return set()
-    found: set[str] = set()
-    shown = 0
-    for it in issues:
-        if not isinstance(it, dict):
-            continue
-        msg = str(it.get("message", "")).strip()
-        if not msg:
-            continue
-        try:
-            conf = float(it.get("confidence", 1.0))
-        except (TypeError, ValueError):
-            conf = 1.0
-        if conf < _QA_CONFIDENCE_MIN:
-            continue
-        kind = str(it.get("kind", "问题")).strip() or "问题"
-        if kind in _CORRECTABLE_QA_KINDS:
-            found.add(kind)
-        log(f"  [渲染校验] 第 {page_index + 1} 页 {kind}: {msg}")
-        shown += 1
-    if shown:
-        log(f"  [渲染校验] 第 {page_index + 1} 页共 {shown} 处待确认。")
-    return found
-
-
-#: Block-classifier ``kind`` values that mean "this should be translated", so a
-#: rule-kept (chart-node) block may be released from the keep set.
-_CLASSIFY_TRANSLATE_KINDS = frozenset(("translate_heading", "translate_prose"))
-
-
-def classify_keep_blocks(
-    src_path: str | Path,
-    pages: Sequence[Sequence[Block]],
-    classify_fn: Callable[[int, bytes, Sequence[tuple]], dict] | None,
-    keep_original: set[int],
-    log: Callable[[str], None] | None = None,
-    conf_min: float = 0.75,
-) -> set[int]:
-    """Ask the model to confirm each rule-kept chart node is really kept.
-
-    The rule-based ``is_chart`` detection can misjudge a compact heading (e.g.
-    ``二、公司组织架构图``, a wide-flat box) as a diagram node and keep it
-    untranslated.  A vision-capable model that sees the source page can flag such
-    a block as translatable content.  This pass **only releases** — it never adds
-    a block to the keep set, and only when the model is confident enough.  It
-    returns the flat indices to remove from ``keep_original``; any classifier
-    error is a no-op (the rule's decision stays).
-    """
-    if classify_fn is None or not keep_original:
-        return set()
-    src = fitz.open(str(src_path))
-    released: set[int] = set()
-    try:
-        flat = 0
-        for page_index, page_blocks in enumerate(pages):
-            n_page = len(page_blocks)
-            candidates = [
-                (flat + i, (b.x0, b.y0, b.x1, b.y1), b.text)
-                for i, b in enumerate(page_blocks)
-                if (flat + i) in keep_original and getattr(b, "is_chart", False)
-            ]
-            if candidates and page_index < src.page_count:
-                try:
-                    original = _render_page_png(src[page_index])
-                    result = classify_fn(page_index, original, candidates)
-                except Exception:  # noqa: BLE001 — fail-closed, never abort
-                    flat += n_page
-                    continue
-                by_idx = {
-                    c["index"]: c for c in result.get("classifications", [])
-                    if isinstance(c, dict)
-                }
-                for idx, _bbox, text in candidates:
-                    c = by_idx.get(idx)
-                    if not c or str(c.get("kind", "")) not in _CLASSIFY_TRANSLATE_KINDS:
-                        continue
-                    try:
-                        conf = float(c.get("confidence", 0.0))
-                    except (TypeError, ValueError):
-                        continue
-                    if conf >= conf_min:
-                        released.add(idx)
-                        if log:
-                            log(
-                                f"  [保留复核] 第 {page_index + 1} 页块「{str(text)[:16]}」"
-                                f"判定为应翻译（{c.get('kind')} @{conf:.2f}），已从保留集合释放。"
-                            )
-            flat += n_page
-    finally:
-        src.close()
-    return released
-
-
-def _nearest_review_block(blocks: Sequence[Block], bbox) -> Block | None:
-    """The block whose centre falls inside ``bbox`` (nearest, if several overlap)."""
-    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-        return None
-    rect = fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
-    cx = (rect.x0 + rect.x1) / 2.0
-    cy = (rect.y0 + rect.y1) / 2.0
-    best: Block | None = None
-    best_d = 1e9
-    for b in blocks:
-        bcx = (b.x0 + b.x1) / 2.0
-        bcy = (b.y0 + b.y1) / 2.0
-        if rect.x0 - 6.0 <= bcx <= rect.x1 + 6.0 and rect.y0 - 6.0 <= bcy <= rect.y1 + 6.0:
-            d = abs(bcx - cx) + abs(bcy - cy)
-            if d < best_d:
-                best_d, best = d, b
-    return best
-
-
-def _apply_review_fix(block: Block, text: str, page_index: int, log) -> bool:
-    """Apply one reviewer text fix, conservatively.
-
-    A *figure* block is corrected only when OCR left it empty or unreadable (it
-    does not read as a clean amount); a clean OCR amount is never overwritten —
-    a conflicting reading is surfaced instead of silently resolved.  A *code
-    token* (a statement / subject / sheet number, e.g. 会企01表-1) is adopted when
-    the reviewer offers a code-shaped reading (the AI saw the original and these
-    are exact identifiers OCR misreads).  A non-figure block is filled only when
-    OCR found nothing.  Returns True if text changed.
-    """
-    cur = str(block.text).strip()
-    cand = _normalize_number(str(text).strip())
-    if _is_number_atom(cur):
-        if not cur:
-            if _looks_like_amount(cand):
-                block.text = cand
-                return True
-            return False
-        if _looks_like_amount(cur):
-            if _looks_like_amount(cand) and cand != _normalize_number(cur) and log:
-                log(
-                    f"  第 {page_index + 1} 页：AI 认为「{cur}」应为「{cand}」，"
-                    "已保留 OCR 原文，请人工复核。"
-                )
-            return False
-        if _looks_like_amount(cand):
-            block.text = cand
-            return True
-        return False
-    if _looks_like_code_token(cur):
-        # A structured identifier: exact, error-prone — adopt the reviewer's
-        # reading when it is itself a code-shaped token.
-        if _looks_like_code_token(cand) and cand != cur:
-            block.text = cand
-            return True
-        return False
-    if not cur and str(text).strip():
-        block.text = str(text).strip()
-        return True
-    return False
-
-
-#: Minimum confidence a reviewer must give a ``merge_cells`` action before it is
-#: auto-applied; below this it is only surfaced as a hint.
-_MERGE_CONFIDENCE_MIN = 0.7
-
-#: Max gap (points) between two blocks for them to be considered adjacent.
-_MERGE_GAP = 6.0
-
-
-def _blocks_adjacent(a: Block, b: Block) -> bool:
-    """True when ``a`` and ``b`` are neighbouring (share a row or column and a
-    small gap) — a plausible "one cell was split into two" fix."""
-    # Horizontal candidate: same row (y ranges within a small gap) and adjacent
-    # or overlapping in x.
-    same_row = not (a.y1 < b.y0 - _MERGE_GAP or b.y1 < a.y0 - _MERGE_GAP)
-    if same_row and max(a.x0 - b.x1, b.x0 - a.x1) <= _MERGE_GAP:
-        return True
-    # Vertical candidate: same column and adjacent or overlapping in y.
-    same_col = not (a.x1 < b.x0 - _MERGE_GAP or b.x1 < a.x0 - _MERGE_GAP)
-    if same_col and max(a.y0 - b.y1, b.y0 - a.y1) <= _MERGE_GAP:
-        return True
-    return False
-
-
-def _merge_block(a: Block, b: Block) -> Block:
-    """Combine two adjacent blocks into one: bbox = union, text joined."""
-    text = _join_fragments(a.text, b.text)
-    base = a if a.text.strip() else b
-    return replace(
-        base,
-        text=text,
-        x0=round(min(a.x0, b.x0), 2), y0=round(min(a.y0, b.y0), 2),
-        x1=round(max(a.x1, b.x1), 2), y1=round(max(a.y1, b.y1), 2),
-    )
-
-
-def _merge_flagged_blocks(blocks: list[Block], flag: dict, page_index: int, log) -> bool:
-    """Auto-apply a reviewer ``merge_cells`` action, conservatively.
-
-    The geometry of the merged block comes from the union of the two OCR blocks
-    (the AI supplies only the *topology* — which two cells are one).  The merge
-    is rejected when it is not confident enough, when either block is a figure
-    (merging numbers would scramble two values), when the two are not adjacent,
-    or when either cannot be located.  On success the merged block replaces the
-    first and the second is dropped (order preserved); ``blocks`` is mutated.
-    """
-    cells = flag.get("cells")
-    if not isinstance(cells, (list, tuple)) or len(cells) != 2:
-        return False
-    try:
-        conf = float(flag.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        return False
-    if conf < _MERGE_CONFIDENCE_MIN:
-        return False
-    zoom = _REVIEW_DPI / 72.0
-    targets: list[Block | None] = []
-    for cell in cells:
-        if not isinstance(cell, (list, tuple)) or len(cell) != 4:
-            return False
-        bbox_pt = [float(v) / zoom for v in cell]
-        targets.append(_nearest_review_block(blocks, bbox_pt))
-    a, b = targets[0], targets[1]
-    if a is None or b is None or a is b:
-        return False
-    if _is_number_atom(a.text) or _is_number_atom(b.text):
-        return False
-    if not _blocks_adjacent(a, b):
-        return False
-    merged = _merge_block(a, b)
-    blocks[:] = [merged if blk is a else blk for blk in blocks if blk is not b]
-    if log:
-        log(
-            f"  第 {page_index + 1} 页：已自动合并两个拆分格"
-            f"「{a.text.strip()} + {b.text.strip()}」。"
-        )
-    return True
-
-
-def _apply_page_review(
-    page, blocks: Sequence[Block], review_fn, page_index: int,
-    log: Callable[[str], None] | None,
-) -> list[Block]:
-    """Send the original page + reconstruction to ``review_fn`` and refine.
-
-    Only text is ever touched, and only conservatively (:func:`_apply_review_fix`).
-    A layout flag with ``action == "merge_cells"`` is *auto-applied* when it is
-    confident enough and passes the adjacency / non-figure validation
-    (:func:`_merge_flagged_blocks`); every other structure flag — and any merge
-    that fails the checks — is surfaced through ``log`` as a hint.  Geometry is
-    only ever recomputed from the OCR blocks, never from the AI's own
-    coordinates.  A reviewer error is a no-op.
-    """
-    if review_fn is None or not blocks:
-        return list(blocks)
-    try:
-        original = _render_page_png(page)
-        recon = _render_reconstruction(blocks, page.rect.width, page.rect.height)
-        result = review_fn(page_index, original, recon)
-    except Exception as exc:  # noqa: BLE001 — best-effort, never abort
-        if log:
-            log(f"  第 {page_index + 1} 页整页审查失败：{type(exc).__name__}: {exc}")
-        return list(blocks)
-    if not isinstance(result, dict):
-        return list(blocks)
-    out = list(blocks)
-    # The model reports a fix's box in image pixels (it sees the rendered PNG);
-    # the blocks live in PDF points, so convert before matching.
-    zoom = _REVIEW_DPI / 72.0
-    n_fixed = 0
-    for fix in result.get("text_fixes") or []:
-        if not isinstance(fix, dict):
-            continue
-        text = fix.get("text")
-        bbox = fix.get("bbox")
-        if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            continue
-        bbox_pt = [float(v) / zoom for v in bbox]
-        target = _nearest_review_block(out, bbox_pt)
-        if target is not None and _apply_review_fix(target, str(text), page_index, log):
-            n_fixed += 1
-    n_merged = 0
-    for flag in result.get("structure_flags") or []:
-        if not isinstance(flag, dict):
-            continue
-        if flag.get("action") == "merge_cells" and _merge_flagged_blocks(
-            out, flag, page_index, log
-        ):
-            n_merged += 1
-            continue
-        if flag.get("message") and log:
-            log(f"  第 {page_index + 1} 页布局提示：{flag['message']}")
-    if n_fixed and log:
-        log(f"  第 {page_index + 1} 页整页审查：采纳 {n_fixed} 处文字修正。")
-    if n_merged and log:
-        log(f"  第 {page_index + 1} 页整页审查：自动合并 {n_merged} 处。")
-    return out
 
 
 def _needs_ocr(page) -> bool:
@@ -1778,9 +1253,7 @@ _CN_ORDINAL_RE = re.compile(
     r"|[" + _CN_DIGITS + r"]{1,3}[、．]"                  # 一、 十二、
     r")"
 )
-#: A table column header that marks a column of personal names.  Cells in such a
-#: column keep their original (Chinese) text instead of being transliterated.
-_NAME_COLUMN_RE = re.compile(r"^\s*(?:姓名|name)\s*$", re.IGNORECASE)
+
 
 
 #: Characters that make a block worth translating: a letter, a digit or a CJK
@@ -2171,32 +1644,6 @@ def _group_to_block(
     return Block(text=text, page=page_index, x0=x0, y0=y0, x1=x1, y1=y1, color=color, **meta)
 
 
-def _mark_name_column(blocks: list[Block]) -> None:
-    """Flag cells of a ``姓名 / Name`` table column with ``keep_original``.
-
-    Personal names should stay in the source language (a model would otherwise
-    transliterate them), so every data cell under a column headed "姓名" keeps
-    its original text.  Columns are clustered by x-centre; the topmost cell of a
-    column is its header.
-    """
-    if len(blocks) < 2:
-        return
-    cols: list[list[Block]] = []
-    for b in sorted(blocks, key=lambda b: (b.x0 + b.x1) / 2):
-        cx = (b.x0 + b.x1) / 2
-        for col in cols:
-            if abs(cx - (col[0].x0 + col[0].x1) / 2) < 20.0:
-                col.append(b)
-                break
-        else:
-            cols.append([b])
-    for col in cols:
-        col.sort(key=lambda b: b.y0)
-        if _NAME_COLUMN_RE.match(col[0].text.strip()):
-            for b in col[1:]:
-                b.keep_original = True
-
-
 #: Horizontal gutter (points) kept between a table cell's text and its ruled
 #: borders.  The one-line fit shrinks the font to *fill* the cell width, so
 #: without a gutter the text sits flush against the borders (two long header
@@ -2355,7 +1802,6 @@ def _build_table_blocks(
                         in_table=False, **meta,
                     )
                 )
-    _mark_name_column(blocks)
     return blocks
 
 
@@ -2766,104 +2212,6 @@ def _is_vertical_label(block: Block) -> bool:
     w = block.x1 - block.x0
     h = block.y1 - block.y0
     return h >= 2.0 * w and w <= 30.0 and h >= 22.0
-
-
-#: Strong (narrow-tall) node boxes a page must hold before it is treated as an
-#: org chart / architecture diagram.  A lone narrow box is a rotated side note,
-#: not a diagram; a handful clustered together is a chart.  The narrow-tall box
-#: is the *unambiguous* diagram signature; the weaker square nodes only join the
-#: flagging once a page already shows this signature.
-_CHART_STRONG_MIN = 3
-#: Minimum total node boxes (strong + square) on a page for it to be a diagram.
-#: With at least one strong box, a page whose remaining nodes are compact
-#: squares is still a chart.
-_CHART_NODE_MIN = 3
-#: A compact square node is a short single-line label in a small box — it must
-#: be neither a full-width text line nor a multi-line paragraph.
-_CHART_SQUARE_MAX_W = 150.0
-_CHART_SQUARE_MAX_H = 50.0
-#: Node labels are short (a few characters); anything that long is prose.
-_CHART_NODE_MAX_CHARS = 12
-
-#: A block whose text begins with a section / enumeration marker (一、二、…、十、
-#: （一）（二）…、第X节/章/条) is a heading, not a diagram node.  Org-chart node
-#: labels are organisational units (董事会 / 委员会 / 分行 / 部门), never numbered
-#: sections — so on a chart page such a *compact* heading (e.g. 二、公司组织架构图,
-#: a wide-flat box that matches the square-node shape but must still translate)
-#: is excluded from the loose square-node match.
-_SECTION_START_RE = re.compile(
-    r"^\s*(?:[一二三四五六七八九十]{1,3}[、．]"
-    r"|[（(][一二三四五六七八九十]{1,3}[)）]"
-    r"|第[一二三四五六七八九十0-9]+[章节条篇节])"
-)
-
-
-def _is_narrow_tall_box(block: Block) -> bool:
-    """True for a narrow-tall vertical-label box (a strong diagram signature).
-
-    Only the box shape is checked, not ``single_line``: a rotated run reports a
-    tall bbox in the text layer (so ``single_line`` is false) while a label
-    stacked into a narrow column reports a bbox across several lines — both are
-    nodes, and both extraction paths present a narrow-tall bbox.
-    """
-    if block.in_table or "\n" in block.text:
-        return False
-    w = block.x1 - block.x0
-    h = block.y1 - block.y0
-    return h >= 2.0 * w and w <= 30.0 and h >= 22.0
-
-
-def _is_chart_node(block: Block) -> bool:
-    """True for an org-chart / architecture-diagram *node label* box.
-
-    A node is either a narrow-tall vertical box (the strong, unambiguous
-    signature) or a compact roughly-square box holding a short single-line
-    label — an architecture diagram also draws its nodes as small square boxes.
-    Table cells are excluded (a ruled cell can be narrow too, but it is a value,
-    not a diagram node).  The square variant is deliberately stricter (single
-    line, short text, small box) so a normal page's headings/list items are not
-    mistaken for nodes on their own; on a chart page the cluster confirms them.
-    """
-    if _is_narrow_tall_box(block):
-        return True
-    if block.in_table or "\n" in block.text or not block.single_line:
-        return False
-    w = block.x1 - block.x0
-    h = block.y1 - block.y0
-    return (
-        len(block.text.strip()) <= _CHART_NODE_MAX_CHARS
-        and w <= _CHART_SQUARE_MAX_W and h <= _CHART_SQUARE_MAX_H
-        and not _SECTION_START_RE.match(block.text.strip())
-    )
-
-
-def _is_org_chart_page(blocks: Sequence[Block]) -> bool:
-    """True when ``blocks`` form an org chart / architecture diagram.
-
-    A page is a diagram when it shows at least one narrow-tall box (the strong
-    chart signature) together with a cluster of node boxes — which may be the
-    remaining narrow-tall boxes or compact square nodes.  A lone narrow box is
-    a rotated side note, not a diagram.  Only the node labels of a diagram are
-    structural — translating them mangles the diagram — so their text is kept
-    verbatim (``is_chart``) while surrounding prose/headings still translate.
-    """
-    strong = sum(1 for b in blocks if _is_narrow_tall_box(b))
-    total = sum(1 for b in blocks if _is_chart_node(b))
-    return strong >= 1 and total >= _CHART_NODE_MIN
-
-
-def _flag_chart_nodes(blocks: Sequence[Block]) -> None:
-    """Mark the node labels of an org chart / architecture diagram ``is_chart``.
-
-    Called per page after its blocks are collected: when the page is a diagram,
-    every node box (narrow-tall *or* compact square) is flagged so it is never
-    translated and exports as the source text.  A non-diagram page is untouched.
-    """
-    if not _is_org_chart_page(blocks):
-        return
-    for b in blocks:
-        if _is_chart_node(b):
-            b.is_chart = True
 
 
 def _draw_vertical_label(page: fitz.Page, font, block: Block, text: str) -> None:
@@ -3345,227 +2693,12 @@ def _has_ocr_grid(blocks: Sequence[Block]) -> bool:
     return bool(_reconstruct_ocr_tables(blocks))
 
 
-def _draw_ocr_grid_page(
-    page: "fitz.Page",
-    blocks: Sequence[Block],
-    trans: Sequence[str],
-    font,
-) -> None:
-    """Regenerate a scanned table page as a clean table.
-
-    ``page`` is already a *blank* page of the source's size.  The OCR blocks are
-    clustered into rows / columns; each row is then expanded to fit its longest
-    translated cell (the OCR row height fits the short Chinese source, but the
-    English translation is usually longer), the grid rules are drawn at the
-    expanded boundaries, then each cell's translation on top.  Nothing from the
-    original raster — the scan background, stamps, photos or handwriting
-    (signatures are dropped earlier in extraction) — is copied.
-    """
-    ocr = [(b, t) for b, t in zip(blocks, trans)
-           if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)]
-    if len(ocr) < 4:
-        return
-    # items carry a trailing index so a row/column cluster can be mapped back to
-    # its block (the clustering helpers only read the first five fields).
-    items = [(b.y0, b.x0, b.x1, b.y1, b.text, i) for i, (b, _t) in enumerate(ocr)]
-    rows = _cluster_ocr_rows(items)
-    cols = _cluster_ocr_columns(items)
-    if len(rows) < 2 or len(cols) < 2:
-        return
-    rows_sorted = sorted(rows, key=lambda r: min(it[0] for it in r))
-    cols_sorted = sorted(cols, key=lambda c: min(it[1] for it in c))
-
-    # Expand each row to fit its longest translated cell, then lay the rows out
-    # top-to-bottom (a taller row pushes the ones below it down).
-    row_tops: list[float] = []
-    row_bots: list[float] = []
-    cur = min(it[0] for it in rows_sorted[0])
-    for r in rows_sorted:
-        orig_h = max(it[3] for it in r) - min(it[0] for it in r)
-        need = orig_h
-        for it in r:
-            b, t = ocr[it[5]]
-            need = max(need, _measure_block_height(b, font, t))
-        row_tops.append(cur)
-        cur += max(orig_h, need)
-        row_bots.append(cur)
-
-    # Column boundaries: one line per gap between the (left-to-right) columns,
-    # plus the outer left / right edges.
-    xs = [round(min(it[1] for it in cols_sorted[0]), 0)]
-    for a, b_ in zip(cols_sorted, cols_sorted[1:]):
-        xs.append(round((max(it[2] for it in a) + min(it[1] for it in b_)) / 2, 0))
-    xs.append(round(max(it[2] for it in cols_sorted[-1]), 0))
-    xs = sorted(set(xs))
-    left, right = xs[0], xs[-1]
-    top, bot = row_tops[0], row_bots[-1]
-
-    # Draw the grid rules at the (expanded) row boundaries and the column gaps.
-    for y in set(round(v, 1) for v in row_tops + [bot]):
-        page.draw_line(fitz.Point(left, y), fitz.Point(right, y), color=(0, 0, 0), width=0.5)
-    for x in xs:
-        page.draw_line(fitz.Point(x, top), fitz.Point(x, bot), color=(0, 0, 0), width=0.5)
-
-    # Draw each cell's translation, top-anchored in its own expanded row band
-    # (the column gap keeps the label from spilling into the next column).
-    for b, t in ocr:
-        _draw_translated_block(page, font, b, t)
-
-
-#: Base font size for a rebuilt (AI) table cell, before the wrap shrinks it.
-_AI_TABLE_FONT = 7.0
-#: Left/right inset (pt) inside each rebuilt table cell, so the text sits clear
-#: of the grid rules instead of touching the column borders.
-_AI_TABLE_PAD = 4.0
-#: Minimum row height (pt) for a rebuilt table's empty / numeric rows.
-_AI_TABLE_MIN_ROW = 11.0
-#: Page margin (pt) used when drawing a rebuilt table.
-_AI_TABLE_MARGIN = 36.0
-
-
-def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font,
-                   merges: Sequence[dict] | None = None) -> None:
-    """Draw a clean, regular N x M table from a translated 2D grid.
-
-    ``rows`` is the rebuilt grid (one list per table row).  Columns are sized by
-    content (the AI's relative widths, else the widest cell); each row is grown to
-    fit its tallest cell.  ``merges`` (from ``detect_table_merge``) gives explicit
-    spanning headers — the top-left cell is centred across its colspan and the
-    internal rules are omitted for the spanned rows; without it a top-two-row
-    heuristic is used.
-    """
-    n_rows = len(rows)
-    n_cols = max(len(r) for r in rows) if rows else 0
-    if n_rows < 1 or n_cols < 1:
-        return
-
-    # Content-based column widths: a column gets more width when its cells are
-    # wider (long labels), and stays narrow when they are short (figures, line
-    # numbers).
-    base = rect.width / n_cols
-    weights = []
-    for j in range(n_cols):
-        w = 0.0
-        for r in rows:
-            cell = str(r[j]) if j < len(r) else ""
-            if cell.strip():
-                w = max(w, font.text_length(cell, fontsize=_AI_TABLE_FONT))
-        weights.append(max(base * 0.35, min(w, rect.width * 0.33)))
-    tot_w = sum(weights)
-    col_widths = [rect.width * w / tot_w for w in weights] if tot_w > 0 else [base] * n_cols
-
-    xs = [rect.x0 + sum(col_widths[:j]) for j in range(n_cols + 1)]
-
-    # Merged spans: explicit ``merges`` (from detect_table_merge) win; otherwise a
-    # top-two-row heuristic (a non-empty cell followed by consecutive empties).
-    # ``merged[i]`` = {col: colspan} for the top-left of a column span in row i;
-    # ``rowspan_internal`` = row -> set of internal column-boundary indices to omit
-    # (covers colspan of a merge that spans several rows).
-    merged: dict[int, dict[int, int]] = {}
-    rowspan_internal: dict[int, set[int]] = {}
-    if merges:
-        for m in (merges if isinstance(merges, list) else []):
-            if not isinstance(m, dict):
-                continue
-            try:
-                r = int(m.get("r", 0)); c = int(m.get("c", 0))
-                rs = int(m.get("rowspan", 1)); cs = int(m.get("colspan", 1))
-            except (TypeError, ValueError):
-                continue
-            if rs >= 1 and cs >= 1 and 0 <= r < n_rows and 0 <= c < n_cols \
-                    and c + cs <= n_cols:
-                merged.setdefault(r, {})[c] = cs
-                for rr in range(r, min(n_rows, r + rs)):
-                    rowspan_internal.setdefault(rr, set()).update(range(c + 1, c + cs))
-    else:
-        for i, r in enumerate(rows[:2]):
-            spans: dict[int, int] = {}
-            j = 0
-            while j < n_cols:
-                if str(r[j]).strip():
-                    k = j + 1
-                    while k < n_cols and not str(r[k]).strip():
-                        k += 1
-                    if k - j > 1:
-                        spans[j] = k - j
-                    j = k
-                else:
-                    j += 1
-            merged[i] = spans
-            rowspan_internal[i] = {k for j, s in spans.items() for k in range(j + 1, j + s)}
-
-    def cell_block(j: int, top: float, h: float, text: str) -> Block:
-        w = col_widths[j]
-        return Block(
-            text="", page=0, x0=xs[j] + _AI_TABLE_PAD, y0=top,
-            x1=xs[j] + w - _AI_TABLE_PAD, y1=top + h,
-            size=_AI_TABLE_FONT, align="right" if _is_numeric_cell(text) else "left",
-            single_line=False, in_table=False,
-        )
-
-    def cell_height(cell: str, j: int) -> float:
-        if not str(cell).strip():
-            return 0.0
-        width = max(1.0, col_widths[j] - 2 * _AI_TABLE_PAD)
-        lines = _wrap(font, str(cell), width, _AI_TABLE_FONT)
-        return _wrapped_height(font, lines, _AI_TABLE_FONT, _LOOSE_LEADING)
-
-    # Row heights: grow each row to fit its tallest cell (keep a minimum).
-    row_hs = [max(_AI_TABLE_MIN_ROW, max((cell_height(c, j) for j, c in enumerate(r)), default=0.0))
-              for r in rows]
-    # If the table overflows the page, shrink the base font proportionally.
-    total = sum(row_hs)
-    if total > rect.height:
-        factor = rect.height / total
-        for i, h in enumerate(row_hs):
-            row_hs[i] = max(_AI_TABLE_MIN_ROW * 0.6, h * factor)
-
-    y = rect.y0
-    for i, r in enumerate(rows):
-        h = row_hs[i]
-        spans = merged.get(i, {})
-        for j, cell in enumerate(r):
-            text = str(cell)
-            if j in spans:
-                s = spans[j]
-                cb = Block(
-                    text="", page=0, x0=xs[j] + _AI_TABLE_PAD, y0=y,
-                    x1=xs[j + s] - _AI_TABLE_PAD, y1=y + h,
-                    size=_AI_TABLE_FONT, align="center", single_line=False, in_table=False,
-                )
-            else:
-                cb = cell_block(j, y, h, text)
-            _draw_translated_block(page, font, cb, text)
-        y += h
-    # Horizontal rules.
-    yy = rect.y0
-    for h in row_hs:
-        page.draw_line(fitz.Point(rect.x0, yy), fitz.Point(rect.x1, yy), color=(0, 0, 0), width=0.5)
-        yy += h
-    page.draw_line(fitz.Point(rect.x0, yy), fitz.Point(rect.x1, yy), color=(0, 0, 0), width=0.5)
-    # Vertical rules, drawn per row so a merged header's internal boundary is
-    # omitted for that row while the data rows below keep it.
-    yy = rect.y0
-    for i, h in enumerate(row_hs):
-        internal: set[int] = set(rowspan_internal.get(i, set()))
-        for j, s in merged.get(i, {}).items():
-            internal.update(range(j + 1, j + s))
-        for k in range(n_cols + 1):
-            if k in internal:
-                continue
-            page.draw_line(fitz.Point(xs[k], yy), fitz.Point(xs[k], yy + h), color=(0, 0, 0), width=0.5)
-        yy += h
-
-
 def save_translated_pdf(
     src_path: str | Path,
     pages: Sequence[Sequence[Block]],
     per_page: Sequence[Sequence[str]],
     out_path: str | Path,
     lang: str,
-    redraw_ocr: bool = False,
-    table_rebuild_fn: Callable[[int, bytes], Sequence[Sequence[str]] | None] | None = None,
-    merge_tool_fn: Callable[[int, bytes, Sequence[Sequence[str]]], list[dict]] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> None:
     """Create a layout-preserving translation PDF.
@@ -3574,18 +2707,6 @@ def save_translated_pdf(
     vector graphics in their exact places), while the original text is redacted
     and replaced by the translated text at the same positions.  This is the
     ``仅译文 / translation in place`` output.
-
-    With ``redraw_ocr``, a scanned (OCR-reconstructed) table page is instead
-    regenerated as a *clean* page: a blank page carrying only the table's grid
-    rules and the translated cells, with the raster background, stamps and
-    handwriting explicitly ignored (signatures are already dropped at
-    extraction).  Non-OCR / non-table pages keep the in-place behaviour.
-
-    ``table_rebuild_fn`` is the AI-table rebuild callback (see
-    ``translator.make_table_rebuild_fn``): when ``redraw_ocr`` is on and it is
-    provided, an OCR table page is drawn from a model-derived translated 2D grid
-    (clean, regular N x M table) instead of the geometric OCR-frame redraw; any
-    failure / implausible grid falls back to the geometric redraw.
     """
     src = fitz.open(str(src_path))
     out_doc = fitz.open()
@@ -3599,47 +2720,6 @@ def save_translated_pdf(
             if m == 0:
                 out_doc.insert_pdf(src, from_page=i, to_page=i)
                 continue
-
-            # Clean redraw of an OCR table page: start from a blank page, draw
-            # only the reconstructed grid rules + translated cells, and ignore
-            # the scan's raster background / stamps / handwriting.  Handle only
-            # genuine *tables* — a diagram page (org chart) has node labels, not
-            # data cells, so it is left on the in-place path.
-            if redraw_ocr:
-                table_blocks = [
-                    b for b in blocks
-                    if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)
-                ]
-                if len(table_blocks) >= 4 and _reconstruct_ocr_tables(table_blocks):
-                    page = out_doc.new_page(width=src[i].rect.width, height=src[i].rect.height)
-                    rebuilt = None
-                    if table_rebuild_fn is not None:
-                        if log:
-                            log(f"  正在 AI 表格重建：第 {i + 1} 页…")
-                        try:
-                            rebuilt = table_rebuild_fn(i, _render_page_png(src[i]))
-                        except Exception:  # noqa: BLE001 — fail-closed
-                            rebuilt = None
-                    if rebuilt:
-                        if log:
-                            log(f"  AI 表格重建完成（第 {i + 1} 页，{len(rebuilt)} 行）。")
-                        rect = fitz.Rect(
-                            _AI_TABLE_MARGIN, _AI_TABLE_MARGIN,
-                            src[i].rect.width - _AI_TABLE_MARGIN,
-                            src[i].rect.height - _AI_TABLE_MARGIN,
-                        )
-                        merges = None
-                        if merge_tool_fn is not None:
-                            try:
-                                merges = merge_tool_fn(i, _render_page_png(src[i]), rebuilt)
-                            except Exception:  # noqa: BLE001 — fail-closed
-                                merges = None
-                        _draw_ai_table(page, rebuilt, rect, font, merges=merges)
-                    else:
-                        if log:
-                            log(f"  第 {i + 1} 页 AI 表格重建不可用，回退几何重绘。")
-                        _draw_ocr_grid_page(page, blocks, trans, font)
-                    continue
 
             out_doc.insert_pdf(src, from_page=i, to_page=i)
             page = out_doc[-1]

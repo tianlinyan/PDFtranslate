@@ -43,6 +43,7 @@ from openai import (
     PermissionDeniedError,
 )
 
+from . import prompts
 from .settings import ModelConfig
 
 #: Matches one ``[n]`` block in a model reply.  The block content may span
@@ -86,16 +87,7 @@ _LETTERS_RE = re.compile(r"[^\W\d_]")
 #: back to the example whose output is in Chinese (the default target).  The
 #: *input* lines of the example stay in English for every target — they only
 #: illustrate the numbered pair format, and keeping them fixed avoids nudging a
-#: translation into the input language.
-_EXAMPLE_INPUT = ("Press OK to continue.", "Save the file before exiting.")
-_EXAMPLE_OUTPUTS: dict[str, tuple[str, str]] = {
-    "simplified chinese": ("点击“确定”继续。", "退出前请保存文件。"),
-    "english": ("Click \u201cOK\u201d to continue.", "Save the file before exiting."),
-    "spanish": ("Pulse \u201cAceptar\u201d para continuar.", "Guarde el archivo antes de salir."),
-    "french": ("Cliquez sur \u201cOK\u201d pour continuer.", "Enregistrez le fichier avant de quitter."),
-    "german": ("Klicken Sie auf \u201cOK\u201d, um fortzufahren.", "Speichern Sie die Datei, bevor Sie beenden."),
-    "italian": ("Fare clic su \u201cOK\u201d per continuare.", "Salvare il file prima di uscire."),
-}
+#: translation into the input language.  (These live in ``translate_app.prompts``.)
 
 ProgressFn = Callable[[int, int], None]
 LogFn = Callable[[str], None]
@@ -285,93 +277,10 @@ class TranslationEngine:
 
     @staticmethod
     def _system_prompt(language: str, glossary: dict[str, str] | None = None) -> str:
-        # The name / numbering rules only apply to a Latin-script target (an
-        # English translation of a Chinese annual report): for a CJK target the
-        # source names stay as they are and the numbering conventions carry
-        # over directly.
-        latin = not any("一" <= c <= "鿿" for c in language)
-        lc = language.strip().casefold()
-        is_english = latin and lc == "english"
-        prompt = (
-            "You are a professional document translator. Translate every numbered "
-            f"block below into {language}. Output the whole translation in "
-            f"{language} only — never in English or any other language.\n"
-            "Rules:\n"
-            "- Keep the original meaning, tone and paragraph structure.\n"
-            "- Keep the translation similar in length to the source and word it "
-            "concisely, so it fits the original document layout.\n"
-            "- Keep numbers, units, URLs, codes and product names as in the "
-            "source: never reformat thousands separators, decimals or figures. "
-            "Keep the original unit but express its name in the target language "
-            "— for example translate 万元 as \"ten thousand yuan\" in English, or "
-            "\"diez mil yuanes\" in Spanish — so the numeric value itself never "
-            "changes.\n"
-            "- Keep section numbers and note references in the document's own "
-            "numbering style and default to ARABIC digits: Chinese listing "
-            "numerals (一、二、三) and Chinese note markers （一）（二）（三十三） render as "
-            "1., 2., 3. and (1), (2), (33); 第4条 / 第二节 render as 'Article 4' / "
-            "'Section 2'; Arabic digits stay Arabic. Use Roman numerals (I., II., "
-            "(III)) only when the source literally uses Roman numerals (Ⅰ. Ⅱ. or I. "
-            "II.). Do not renumber or invent a different style.\n"
-            "- Keep official statement and report codes as they are: do not "
-            "transliterate a code like a statement number; use the standard "
-        )
-        if is_english:
-            prompt += (
-                "English name (e.g. \"Consolidated Statement of Cash Flows\") with "
-                "its original code.\n"
-            )
-        else:
-            prompt += (
-                "name in the target language (never the English name: render "
-                "\"Consolidated Statement of Cash Flows\" as \"Estado consolidado "
-                "de flujos de efectivo\" in Spanish) with its original code.\n"
-            )
-        if latin:
-            prompt += (
-                "- Romanize Chinese personal names with the standard pinyin "
-                "spelling, given name first and family name last (e.g. 王晓东 "
-                "-> \"Xiaodong Wang\"), and use the same spelling for a person "
-                "throughout the document; a personal-name cell must never stay "
-                "in Chinese.\n"
-            )
-        prompt += (
-            "- If a block is already entirely in the target language, output it "
-            "unchanged.\n"
-            "- Preserve numbering exactly: reply as '[n] translated text' per "
-            "block, in the same order.\n"
-            "- Do not merge or split blocks, and do not add explanations, notes or "
-            "any preamble.\n"
-            "- Output ONLY the numbered translations, nothing else.\n"
-        )
-        # The example's *output* must be in the target language: the previous
-        # version always showed a Chinese result, which anchored a Spanish or
-        # French target to Chinese (and, for models that translate via English,
-        # to English).  Input lines stay in English for every target — they only
-        # demonstrate the numbered-pair format.
-        out1, out2 = _EXAMPLE_OUTPUTS.get(lc, _EXAMPLE_OUTPUTS["simplified chinese"])
-        inp1, inp2 = _EXAMPLE_INPUT
-        prompt += (
-            "Example:\n"
-            "Input:\n"
-            "[1]\n"
-            f"{inp1}\n"
-            "[2]\n"
-            f"{inp2}\n"
-            "Output:\n"
-            "[1]\n"
-            f"{out1}\n"
-            "[2]\n"
-            f"{out2}\n\n"
-            "Do not write anything except the numbered translations."
-        )
-        if glossary:
-            entries = "\n".join(f"- {src}: {dst}" for src, dst in glossary.items())
-            prompt += (
-                f"\n\nGlossary: use these translations without change when the "
-                f"matching source term appears:\n{entries}"
-            )
-        return prompt
+        # All translation prompt text lives in ``translate_app.prompts`` so it is
+        # easy to review/tune without hunting through the engine.  Kept as a thin
+        # wrapper for tests that call ``TranslationEngine._system_prompt`` directly.
+        return prompts.translation_system_prompt(language, glossary)
 
     def _request_locked(self, prompt: str, system: str) -> str:
         """Issue one chat-completions request and return the assistant text."""
@@ -756,14 +665,13 @@ class TranslationEngine:
                         progress(done, n)
             finally:
                 watchdog_stop.set()
-                # The watchdog only closes the client on cancel/abort; close it
-                # on the normal path too.  The engine is short-lived (one per
-                # run), so an unclosed client would leak its connection pool
-                # until the process hard-exits.
-                try:
-                    self.client.close()
-                except Exception:  # noqa: BLE001 — best effort
-                    pass
+                # The engine's client is deliberately NOT closed here: the agent
+                # layer reuses ONE engine across many ``translate_blocks`` calls
+                # in a page, and closing the client after every batch made the
+                # 2nd+ call fail with "Connection error" (a closed httpx client
+                # is unusable — see test_reusable_engine).  The watchdog still
+                # closes it on cancel/abort; otherwise the process hard-exits
+                # (os._exit), so an idle connection pool is bounded and harmless.
 
         # Fill the output from the (now fully populated) cache.  Keep-original
         # blocks stay the source text (their translations were never requested).
@@ -834,32 +742,6 @@ def _write_cache(path: Path, cache: dict[str, str]) -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
-#: Prompt for the whole-page review.  The model sees the original scan and the
-#: OCR reconstruction side by side; it reports text it got wrong (with the box)
-#: and layout/structure problems.  A "split one cell into two" is reported as a
-#: machine-readable ``merge_cells`` action that the caller may auto-apply.
-_REVIEW_PROMPT = (
-    "这是同一页的两张图。第一张是原图/扫描件，第二张是 OCR 识别后重建的图"
-    "（每个框为识别到的文本块，蓝框为格子）。请对比两张图，找出 OCR 重建中的问题，"
-    "只输出一个 JSON 对象：\n"
-    "{\n"
-    "  \"text_fixes\": [{\"bbox\": [x0, y0, x1, y1], \"text\": \"正确的文字/数字\"}],\n"
-    "  \"structure_flags\": [\n"
-    "    {\"action\": \"merge_cells\", \"cells\": [[x0,y0,x1,y1],[x0,y0,x1,y1]], \"confidence\": 0.9,"
-    " \"message\": \"一句话说明\"},\n"
-    "    {\"message\": \"只提示不处理的问题描述\"}\n"
-    "  ]\n"
-    "}\n"
-    "规则：bbox 用**图片像素坐标**（x 范围为 0..图片宽，y 范围为 0..图片高）；"
-    "text_fixes 只列 OCR 读错或漏读的文字/数字（若读对了就不要列）。"
-    "**特别注意**：报表/科目/附注编号（如 会企01表-1、会企02表、附注编号、行次数字）是"
-    "精确标识，OCR 极易把数字或汉字读错；请用 text_fixes 给出与原文一致的正确编号。"
-    "structure_flags：若某格/单元格被错误拆成两格、本应是一格，用 action=merge_cells"
-    " 给出两格的 bbox、置信度(0~1)和一句话说明；其它布局问题只用 message 一句话说明"
-    "（不要给 action）。没有则用空数组。不要输出除此 JSON 之外的文字。"
-)
-
-
 def _image_data_url(png: bytes) -> str:
     """Encode a PNG as a ``data:image/png;base64,`` URL for the chat API."""
     return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
@@ -901,164 +783,6 @@ def _vision_call(client, model: str, prompt: str, images: list[bytes],
         temperature=temperature,
     )
     return getattr(resp.choices[0].message, "content", None) or ""
-
-
-def _parse_review(content: str) -> dict:
-    """Parse a reviewer reply into ``{"text_fixes": [...], "structure_flags": [...]}``.
-
-    The model is asked for one JSON object; the reply often wraps it in prose or
-    markdown fences, so the outer ``{ ... }`` is extracted and decoded (see
-    :func:`_extract_json_object`).  Any malformed reply degrades to an empty
-    review (a no-op for the caller).
-    """
-    data = _extract_json_object(content)
-    if data is None:
-        return {}
-    return {
-        "text_fixes": data.get("text_fixes") if isinstance(data.get("text_fixes"), list) else [],
-        "structure_flags": data.get("structure_flags") if isinstance(data.get("structure_flags"), list) else [],
-    }
-
-
-def make_review_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
-) -> Callable[[int, bytes, bytes], dict] | None:
-    """Return a whole-page review callback for ``model``, or ``None`` if disabled.
-
-    A ``models.json`` entry declares ``vision: true`` (``ModelConfig.vision``).
-    The callback has the injectable ``review_fn`` signature
-    ``(page_index, original_png, reconstruction_png) -> dict``: it sends both
-    images to the model and parses the structured review.  Best-effort — any
-    failure returns ``{}`` so the caller keeps the OCR result unchanged.
-    """
-    if not model.vision:
-        return None
-    client = OpenAI(**model.client_kwargs())
-
-    def _review(page_index: int, original_png: bytes, recon_png: bytes) -> dict:
-        try:
-            content = _vision_call(
-                client, model.model, _REVIEW_PROMPT, [original_png, recon_png]
-            )
-            return _parse_review(content)
-        except Exception as exc:  # noqa: BLE001 — best-effort review
-            if log:
-                log(f"  第 {page_index + 1} 页整页审查失败：{type(exc).__name__}: {exc}")
-            return {}
-
-    return _review
-
-
-#: Prompt for the rendered-output QA.  The model sees the original page and the
-#: FINAL rendered translation page and reports what a reader would notice.  This
-#: is *report-only*: nothing here is auto-applied, and a failure is a no-op.
-_REVIEW_RENDER_PROMPT = (
-    "这是同一页的两张图。第一张是原文/扫描件，第二张是该页翻译后的最终渲染图。"
-    "请对比两张图，检查译文渲染中的问题，只输出一个 JSON 对象：\n"
-    "{\n"
-    "  \"issues\": [\n"
-    "    {\"kind\": \"残余中文|内容缺失|原文压叠|文本越线|字过小|标签断行|编号不符|译文需替换\","
-    " \"message\": \"一句话说明\", \"confidence\": 0.9}\n"
-    "  ],\n"
-    "  \"adjustments\": [\n"
-    "    {\"kind\": \"text\", \"bbox\": [x0,y0,x1,y1], \"text\": \"替代译文\", \"confidence\": 0.9},\n"
-    "    {\"kind\": \"font_size\", \"bbox\": [x0,y0,x1,y1], \"size\": 8.0, \"confidence\": 0.9}\n"
-    "  ]\n"
-    "}\n"
-    "规则：\n"
-    "- 残余中文：译文页仍出现未翻译的中文（按规则保留的报表/科目编号、人名、手写签字除外）。\n"
-    "- 内容缺失：源页有实质内容但译文页对应位置为空。\n"
-    "- 原文压叠 / 文本越线：译文文字压到相邻元素，或跨过表格线/框边界。\n"
-    "- 字过小：字体大小小于可读下限。\n"
-    "- 标签断行：本应整行的标签被不合理切断。\n"
-    "- 编号不符：报表/科目/附注编号与原文不一致。\n"
-    "- 译文需替换：译文措辞有误/漏译，需要直接换成更准确的一句。\n"
-    "adjustments 是可执行的修改指令，只在确信、有具体目标时给出：bbox 用第二张渲染图的像素坐标"
-    "（x0,y0 左上、x1,y1 右下，近似即可）；kind=text 带替代译文 text；kind=font_size 带目标字号 size。"
-    "不要对按规则保留的块（报表/科目编号、人名、手写签字、图表节点）给 adjustment。"
-    "只在确有问题时列 issue/adjustment；没有问题则两者都用空数组。不要输出除此 JSON 之外的文字。"
-)
-
-
-#: Possible ``kind`` values the render QA may emit (so parsers can whitelist).
-_RENDER_ISSUE_KINDS = frozenset(
-    ("残余中文", "内容缺失", "原文压叠", "文本越线", "字过小", "标签断行", "编号不符", "译文需替换")
-)
-
-#: Possible ``kind`` values a render-QA *adjustment* may carry.  Only these are
-#: ever applied by the caller's deterministic executor (see ``apply_render_adjustments``).
-_RENDER_ADJUST_KINDS = frozenset(("text", "font_size"))
-
-
-def _parse_render_issues(content: str) -> dict:
-    """Parse a render-QA reply into ``{"issues": [...]}`` (empty on malformed)."""
-    data = _extract_json_object(content)
-    if data is None:
-        return {}
-    raw = data.get("issues")
-    issues = [
-        it for it in (raw if isinstance(raw, list) else [])
-        if isinstance(it, dict) and str(it.get("message", "")).strip()
-    ]
-    return {"issues": issues}
-
-
-def _parse_render_adjustments(content: str) -> list[dict]:
-    """Parse a render-QA reply into a validated ``adjustments`` list.
-
-    Each adjustment is a dict meant for :func:`pdfio.apply_render_adjustments`:
-    ``{kind, bbox, text?, size?, confidence?}``.  Entries with an unknown kind or
-    a malformed ``bbox`` are dropped; the executor applies further bounds.
-    """
-    data = _extract_json_object(content)
-    if data is None:
-        return []
-    raw = data.get("adjustments")
-    if not isinstance(raw, list):
-        return []
-    out: list[dict] = []
-    for a in raw:
-        if not isinstance(a, dict):
-            continue
-        kind = str(a.get("kind", "")).strip()
-        if kind not in _RENDER_ADJUST_KINDS:
-            continue
-        bbox = a.get("bbox")
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            continue
-        out.append(a)
-    return out
-
-
-def make_rendered_review_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
-) -> Callable[[int, bytes, bytes], dict] | None:
-    """Return a rendered-output QA callback for ``model``, or ``None`` if disabled.
-
-    Signature ``(page_index, original_png, rendered_png) -> dict``; it sends the
-    original page and the FINAL rendered translation page to the model and parses
-    a report-only issue list.  Best-effort — any failure returns ``{}`` so the
-    caller keeps the exported file untouched.
-    """
-    if not model.vision:
-        return None
-    client = OpenAI(**model.client_kwargs())
-
-    def _review(page_index: int, original_png: bytes, rendered_png: bytes) -> dict:
-        try:
-            content = _vision_call(
-                client, model.model, _REVIEW_RENDER_PROMPT,
-                [original_png, rendered_png],
-            )
-            issues = _parse_render_issues(content).get("issues", [])
-            adjustments = _parse_render_adjustments(content)
-            return {"issues": issues, "adjustments": adjustments}
-        except Exception as exc:  # noqa: BLE001 — report-only, never abort
-            if log:
-                log(f"  第 {page_index + 1} 页译文校验失败：{type(exc).__name__}: {exc}")
-            return {}
-
-    return _review
 
 
 #: Lead-in for the block-classification reviewer.  ``@@CANDIDATES@@`` is replaced
@@ -1129,92 +853,6 @@ def make_classify_review_fn(
     return _classify
 
 
-#: Prompt for the whole-table rebuild.  The model sees the scanned statement
-#: page and returns the table as a translated 2D grid, keeping the original row
-#: / column structure so we can draw a *clean*, regular table — instead of
-#: reconstructing it from noisy OCR boxes (which over-fragments rows).
-_REVIEW_TABLE_PROMPT = (
-    "这是原图中的一张财务报表（扫描件）。请把整张表的内容提取并**翻译成 @@TARGET_LANG@@**"
-    "（目标语言：@@TARGET_LANG@@），输出一个 JSON 二维数组，**保持原表的行数、列数和单元格结构**：\n"
-    "{\"rows\": [[\"第1行第1格\", \"第1行第2格\", ...], [\"第2行第1格\", ...]]}\n"
-    "规则：\n"
-    "- **每个单元格都必须用 @@TARGET_LANG@@ 书写，绝不能把原文（中文）原样照抄进译文**。"
-    "只有本身就是数字/代码的项（报表/科目代码如会企01表-1、行次数字、单位）保持原样；"
-    "其余全部翻译成语目标语言。若某个单元格的原文已经是目标语言则按原文输出。\n"
-    "- 逐格对应原表的行/列。跨列/跨行合并的单元格（如二级表头 2025年度 → 合并/母公司）"
-    "只写一次：内容放在它覆盖区域的**第一个**格子，同一行/列被它覆盖的其余格子留空；"
-    "子表头（合并/母公司）另起一行。不要在每个子列重复表头。\n"
-    "- 数字一律用**阿拉伯数字**：中文序数/编号"
-    "（一、二、三、（三十三））转成 1、2、3、(33)；仅当原文**字面用罗马数字**"
-    "（Ⅰ、Ⅱ、I. II.）时才保留罗马数字。单位、报表/科目代码（会企01表-1、行次数字）保持原样。\n"
-    "- 表头行放数组第一行，数据行依次往下；没有内容的格子用空字符串占位。\n"
-    "- 忽略表格之外的非文本内容（手写签字、印章、水印、照片）。\n"
-    "不要输出除此 JSON 之外的文字。"
-)
-
-
-#: Sanity cap on a rebuilt table, so a model that "hallucinates" a giant grid is
-#: rejected and the caller falls back to the geometric redraw.
-_TABLE_REBUILD_MAX_ROWS = 200
-_TABLE_REBUILD_MAX_COLS = 40
-
-
-def _parse_table_grid(content: str) -> list[list[str]] | None:
-    """Parse a table-rebuild reply into a padded 2D grid, or ``None`` if invalid.
-
-    Each row is a list of cell strings; rows shorter than the widest are padded
-    with empty strings so the grid is rectangular.  Returns ``None`` for anything
-    malformed or implausible, so the caller falls back rather than drawing junk.
-    """
-    data = _extract_json_object(content)
-    if data is None:
-        return None
-    raw = data.get("rows")
-    if not isinstance(raw, list) or not raw:
-        return None
-    grid: list[list[str]] = []
-    for r in raw:
-        if not isinstance(r, list):
-            continue
-        grid.append([str(c) for c in r])
-    if not grid:
-        return None
-    n_cols = max(len(r) for r in grid)
-    if len(grid) > _TABLE_REBUILD_MAX_ROWS or n_cols > _TABLE_REBUILD_MAX_COLS or n_cols == 0:
-        return None
-    return [r + [""] * (n_cols - len(r)) for r in grid]
-
-
-def make_table_rebuild_fn(
-    model: ModelConfig, target_lang: str, log: Callable[[str], None] | None = None
-) -> Callable[[int, bytes], list[list[str]] | None] | None:
-    """Return a whole-table rebuild callback for ``model``, or ``None`` if disabled.
-
-    Signature ``(page_index, original_png) -> list[list[str]] | None``: it sends the
-    original scanned table page to a vision model, which returns the table as a
-    translated 2D grid (row/column structure preserved).  ``target_lang`` is baked
-    into the prompt so the model actually knows what language to translate into
-    (a prompt that says "translate into the target language" without naming it
-    leaves the model guessing and it tends to echo the source Chinese).  Best-effort
-    — any failure or implausible result returns ``None`` so the caller falls back.
-    """
-    if not model.vision:
-        return None
-    client = OpenAI(**model.client_kwargs())
-    prompt = _REVIEW_TABLE_PROMPT.replace("@@TARGET_LANG@@", str(target_lang))
-
-    def _rebuild(page_index: int, original_png: bytes) -> list[list[str]] | None:
-        try:
-            content = _vision_call(client, model.model, prompt, [original_png])
-            return _parse_table_grid(content)
-        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
-            if log:
-                log(f"  第 {page_index + 1} 页表格重建失败：{type(exc).__name__}: {exc}")
-            return None
-
-    return _rebuild
-
-
 #: Direct re-translation of a single block, used by the QA→correction pass so a
 #: residual-Chinese or empty cell is re-translated *without* hitting the cache
 #: (which would return the same stale value).  The model is told to output only
@@ -1266,8 +904,8 @@ _CLASSIFY_TOOL = {
     "type": "function",
     "function": {
         "name": "classify_block",
-        "description": "判断一个文本块应保留原文（组织架构/架构图节点标签、报表/科目代码、手写签字）"
-                         "还是翻译成目标语言",
+        # Description is prompt text, authored centrally (see ``prompts``).
+        "description": prompts.AGENT_TOOL_DESCRIPTIONS["classify_block"],
         "parameters": {
             "type": "object",
             "properties": {
@@ -1351,178 +989,3 @@ def make_classify_tool_fn(
 
     return _classify
 
-
-#: OpenAI ``tools`` schema for the table-merge judgment tool: the model looks at
-#: the scanned table and calls it per spanning header cell (e.g. the 2025年度
-#: header spans the 合并/母公司 sub-columns), so the rebuilt table can draw a
-#: proper two-level header.
-_MERGE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "detect_table_merge",
-        "description": "标注原表中需要跨列/跨行合并的单元格（如二级表头 2025年度 跨 合并/母公司）",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "row": {"type": "integer", "description": "合并单元格左上角行号（0 起）"},
-                "col": {"type": "integer", "description": "合并单元格左上角列号（0 起）"},
-                "rowspan": {"type": "integer", "description": "跨行数（≥1）"},
-                "colspan": {"type": "integer", "description": "跨列数（≥1）"},
-                "reason": {"type": "string"},
-            },
-            "required": ["row", "col", "rowspan", "colspan"],
-        },
-    },
-}
-
-
-def _parse_merge_tool_calls(msg) -> list[dict]:
-    """Extract ``detect_table_merge`` tool_calls into ``[{row,col,rowspan,colspan}]``."""
-    out: list[dict] = []
-    tcs = getattr(msg, "tool_calls", None)
-    if not tcs:
-        return out
-    for tc in tcs:
-        fn = getattr(tc, "function", None)
-        if getattr(fn, "name", None) != "detect_table_merge":
-            continue
-        args = getattr(fn, "arguments", None)
-        try:
-            data = json.loads(args) if args else {}
-        except Exception:
-            continue
-        if isinstance(data, dict):
-            out.append(data)
-    return out
-
-
-def make_merge_tool_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
-) -> Callable[[int, bytes, Sequence[Sequence[str]]], list[dict]] | None:
-    """Return a tool-use table-merge detector, or ``None`` if disabled.
-
-    Signature ``(page_index, original_png, grid) -> [{row,col,rowspan,colspan}, ...]``:
-    it sends the scanned table page + the OCR grid to ``detect_table_merge`` and
-    parses the returned merges.  Best-effort — any failure returns ``[]`` so the
-    caller draws without explicit merges.
-    """
-    if not model.vision:
-        return None
-    client = OpenAI(**model.client_kwargs())
-
-    def _merges(page_index: int, original_png: bytes, grid: Sequence[Sequence[str]]) -> list[dict]:
-        g = "\n".join(f"[{i}] " + " | ".join(str(c) for c in row) for i, row in enumerate(grid))
-        prompt = (
-            "这是原图中的表格。请标注需要跨列/跨行合并的单元格（如二级表头：2025年度 跨 合并/母公司 "
-            "两列、表头跨两行），逐一调用 detect_table_merge。表格内容如下：\n" + g
-        )
-        try:
-            resp = client.chat.completions.create(
-                model=model.model, temperature=0.0, max_tokens=4096,
-                tools=[_MERGE_TOOL], tool_choice="auto",
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": _image_data_url(original_png)}},
-                ]}],
-            )
-            msg = resp.choices[0].message
-            merges = _parse_merge_tool_calls(msg)
-            if not merges and log:
-                log("  detect_table_merge 未返回 tool_call：" + str(getattr(msg, "content", "")))
-            return merges
-        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
-            if log:
-                log(f"  合并检测失败：{type(exc).__name__}: {exc}")
-            return []
-
-    return _merges
-
-
-#: OpenAI ``tools`` schema for the OCR-number verification tool.  The model is
-#: given the scanned table page and the OCR'd figure values; it calls
-#: ``verify_number`` per figure the OCR plausibly misread (RapidOCR often gets
-#: thousands separators / decimal points wrong), so the caller can correct the
-#: value deterministically before translation.
-_VERIFY_NUMBER_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "verify_number",
-        "description": "核查一个 OCR 识别的数字是否与扫描原件一致，读错时给出正确值",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "index": {"type": "integer", "description": "输入数字列表中的序号"},
-                "value": {"type": "string", "description": "OCR 识别的值"},
-                "is_correct": {"type": "boolean", "description": "true=与原件一致"},
-                "corrected": {"type": "string", "description": "正确值（若读错）"},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "reason": {"type": "string"},
-            },
-            "required": ["index", "value", "is_correct"],
-        },
-    },
-}
-
-
-def _parse_verify_tool_calls(msg) -> list[dict]:
-    """Extract ``verify_number`` tool_calls into decision dicts."""
-    out: list[dict] = []
-    tcs = getattr(msg, "tool_calls", None)
-    if not tcs:
-        return out
-    for tc in tcs:
-        fn = getattr(tc, "function", None)
-        if getattr(fn, "name", None) != "verify_number":
-            continue
-        args = getattr(fn, "arguments", None)
-        try:
-            data = json.loads(args) if args else {}
-        except Exception:
-            continue
-        if isinstance(data, dict):
-            data.setdefault("is_correct", True)
-            out.append(data)
-    return out
-
-
-def make_verify_number_tool_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
-) -> Callable[[int, bytes, Sequence[dict]], list[dict]] | None:
-    """Return a tool-use OCR-number verifier, or ``None`` if disabled.
-
-    Signature ``(page_index, original_png, figures) -> [decision, ...]``:
-    ``figures`` is ``[{"index": i, "value": "3,702,726,474.45"}, ...]``.  It sends
-    the scanned page + the figure values to ``verify_number`` and parses the
-    returned corrections.  Best-effort — any failure returns ``[]``.
-    """
-    if not model.vision:
-        return None
-    client = OpenAI(**model.client_kwargs())
-
-    def _verify(page_index: int, original_png: bytes, figures: Sequence[dict]) -> list[dict]:
-        items = "\n".join(f"[{f.get('index')}] {f.get('value')}" for f in figures)
-        prompt = (
-            "这是原图（扫描件）中的数字。请逐个核查下列 OCR 识别的数字是否与原件一致，"
-            "对**读错**的调用 verify_number 并给出 corrected（只有读错/不确定时才调用，"
-            "读对的就不要调）：\n" + items
-        )
-        try:
-            resp = client.chat.completions.create(
-                model=model.model, temperature=0.0, max_tokens=4096,
-                tools=[_VERIFY_NUMBER_TOOL], tool_choice="auto",
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": _image_data_url(original_png)}},
-                ]}],
-            )
-            msg = resp.choices[0].message
-            decisions = _parse_verify_tool_calls(msg)
-            if not decisions and log:
-                log("  verify_number 未返回 tool_call：" + str(getattr(msg, "content", "")))
-            return decisions
-        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
-            if log:
-                log(f"  数字核验失败：{type(exc).__name__}: {exc}")
-            return []
-
-    return _verify

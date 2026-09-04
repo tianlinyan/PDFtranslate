@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import unittest
 
-from translate_app.main_window import LANGUAGES, resolve_language
+from translate_app.main_window import LANGUAGES, parse_preview_command, resolve_language
 
 
 class ResolveLanguageTest(unittest.TestCase):
@@ -32,6 +32,30 @@ class ResolveLanguageTest(unittest.TestCase):
     def test_empty_input_falls_back_to_the_first_language(self):
         self.assertEqual(LANGUAGES[0][1], resolve_language(""))
         self.assertEqual(LANGUAGES[0][1], resolve_language("   "))
+
+
+class ParsePreviewCommandTest(unittest.TestCase):
+    """M5: sidebar preview-navigation commands are recognised."""
+
+    def test_next_prev(self):
+        self.assertEqual(("next", None, None), parse_preview_command("下一页"))
+        self.assertEqual(("prev", None, None), parse_preview_command("上一页"))
+
+    def test_goto_page(self):
+        self.assertEqual(("goto", 2, None), parse_preview_command("第 3 页"))
+        self.assertEqual(("goto", 2, None), parse_preview_command("显示第 3 页"))
+        self.assertEqual(("goto", 0, None), parse_preview_command("第 1 页"))
+
+    def test_goto_with_side_and_chinese_numeral(self):
+        self.assertEqual(("goto", 2, "translation"), parse_preview_command("打开译文第三页"))
+        self.assertEqual(("goto", 2, "translation"), parse_preview_command("预览译文第三页"))
+        self.assertEqual(("goto", 1, "source"), parse_preview_command("预览原文第二页"))
+        self.assertEqual(("goto", 12, "translation"), parse_preview_command("预览译文第十三页"))
+
+    def test_not_a_navigation_command(self):
+        self.assertIsNone(parse_preview_command("把第 3 页公司名换成 Bank"))
+        self.assertIsNone(parse_preview_command(""))
+        self.assertIsNone(parse_preview_command("   "))
 
 
 if __name__ == "__main__":

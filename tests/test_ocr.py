@@ -198,22 +198,19 @@ class OcrPlumbingTest(unittest.TestCase):
         )
         self.assertEqual(["a b c"], [b.text for b in blocks])
 
-    def test_signature_items_are_dropped_and_logged(self):
-        # A handwriting signature (the 法定代表人 row of a scanned statement) is
-        # a tall, name-only OCR box in the page's bottom band.  It must NOT
-        # become a block: the model would romanize it and the white cover rect
-        # would hide the real signature — a signature is identity, not content.
-        # Print rows stay; a tall bottom-band item that has digits is a figure,
-        # not a signature, so it stays too.
+    def test_signature_items_are_kept_as_blocks(self):
+        # v0.3.0: the handwritten-signature *auto-drop* is removed — the AI agent
+        # decides at runtime.  A tall name-only box now stays a block (the model
+        # may classify it as signature/keep); no "手写体签字" drop log is emitted.
         logs: list[str] = []
         blocks = pdfio._synthesize_ocr_blocks(
             [
                 ([[2.0, 100.0], [30.0, 100.0], [30.0, 109.0], [2.0, 109.0]], "项目"),
                 ([[2.0, 120.0], [30.0, 120.0], [30.0, 129.0], [2.0, 129.0]], "资产"),
                 ([[2.0, 140.0], [30.0, 140.0], [30.0, 149.0], [2.0, 149.0]], "利润"),
-                # handwritten 小波: 40pt tall, bottom band of the 800pt page
+                # handwritten 小波: 40pt tall, bottom band of the 800pt page — kept
                 ([[120.0, 700.0], [260.0, 700.0], [260.0, 740.0], [120.0, 740.0]], "小波"),
-                # tall bottom-band item WITH digits: a figure, not a signature
+                # tall bottom-band item WITH digits: a figure, also kept
                 ([[300.0, 690.0], [380.0, 690.0], [380.0, 715.0], [300.0, 715.0]],
                  "V001"),
             ],
@@ -222,11 +219,9 @@ class OcrPlumbingTest(unittest.TestCase):
         texts = [b.text for b in blocks]
         self.assertIn("项目", texts)
         self.assertIn("资产", texts)
-        self.assertNotIn("小波", texts)
+        self.assertIn("小波", texts)
         self.assertIn("V001", texts)
-        self.assertEqual(
-            1, len([m for m in logs if "手写体签字" in m]), logs
-        )
+        self.assertEqual([], [m for m in logs if "手写体签字" in m], logs)
 
     def test_needs_ocr_detects_image_and_drawing_pages(self):
         self.assertTrue(pdfio._needs_ocr(_FakePage(images=["x"])))

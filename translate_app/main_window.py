@@ -8,12 +8,12 @@ PDF / Markdown / plain text) and can be opened from the window.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread
-from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QCloseEvent, QTextCursor
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -33,6 +33,9 @@ from . import pdfio
 from . import preview
 from . import sidebar
 from .about_dialog import AboutDialog
+from .chat import ChatWorker
+from .doc_context import DocContext
+from . import prompts
 from .settings import ModelConfig, load_models, load_prefs, save_prefs
 from .translator import clear_translation_cache
 from .worker import OUTPUT_TYPES, TranslateWorker
@@ -74,6 +77,76 @@ def resolve_language(text: str) -> str:
     return typed or LANGUAGES[0][1]
 
 
+#: Chinese digit chars for parsing page numbers like 第三页.
+_CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+              "七": 7, "八": 8, "九": 9, "十": 10, "百": 100}
+
+
+def _cn_to_int(s: str) -> int | None:
+    """Convert a page-number token (Arabic or Chinese) to an int, or None."""
+    s = s.strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    # 十 / 十一 / 二十 / 三十 … 九十九 (enough for document page numbers).
+    if s == "十":
+        return 10
+    if "十" in s:
+        tens_s, _, ones_s = s.partition("十")
+        tens = 1 if tens_s == "" else sum(_CN_DIGITS.get(c, 0) for c in tens_s)
+        ones = sum(_CN_DIGITS.get(c, 0) for c in ones_s) if ones_s else 0
+        return tens * 10 + ones
+    vals = [_CN_DIGITS.get(c) for c in s]
+    if all(v is not None for v in vals):
+        return sum(vals)
+    return None
+
+
+def parse_preview_command(text: str):
+    """M5: parse a preview-navigation command from the sidebar.
+
+    Returns ``("goto", page_0based, what)`` / ``("prev", None, what)`` /
+    ``("next", None, what)``, or ``None`` (not a navigation command).  ``what`` is
+    ``"source"`` / ``"translation"`` when the command says 原文/译文, else ``None``
+    (keep the current side).  Recognises WHOLE commands only — a content request
+    that merely mentions 第 N 页 (e.g. "把第 3 页公司名换成 Bank") is left to the
+    agent:
+      上一页 / 下一页 / 第 N 页 / 显示第 N 页 / 打开[译文|原文]第 N 页 /
+      预览[译文|原文]第 N 页
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    what = None
+    if "译文" in t or "translation" in t.lower():
+        what = "translation"
+    elif "原文" in t or "源文" in t or "source" in t.lower():
+        what = "source"
+    m = re.fullmatch(
+        r"(?:打开|预览|显示|去|看)?(?:译文|原文|翻译|源文)?"
+        r"第\s*([0-9一二三四五六七八九十百]+)\s*页", t,
+    )
+    if m:
+        page = _cn_to_int(m.group(1))
+        if page is not None:
+            return ("goto", page - 1, what)
+    if re.fullmatch(r"(?:打开|预览|显示|看)?(?:译文|原文)?(上一页|下一页)", t):
+        kind = "next" if "下一页" in t else "prev"
+        return (kind, None, what)
+    return None
+
+
+class _LogBridge(QObject):
+    """Thread-safe log channel: emitting from any thread is marshalled to the GUI.
+
+    The chat worker thread may log (e.g. during lazy document extraction); emitting
+    this signal from there dispatches to the connected slot on the GUI thread via a
+    queued connection, so Qt widgets are never touched off the main thread.
+    """
+
+    log = pyqtSignal(str)
+
 
 class MainWindow(QWidget):
     """The translation tool's main window."""
@@ -85,10 +158,21 @@ class MainWindow(QWidget):
         self._worker: TranslateWorker | None = None
         self._last_output: str | None = None
         self._models_error = ""
+        #: The last page + side (source/translation) shown in the preview window; the
+        #: "预览" button reopens at this page/side instead of always page 0 / source.
+        self._preview_current_page = 0
+        self._preview_current_what = "source"
         # Run outcome, used by ``_cleanup`` to decide whether to reset the
         # progress bar / stage (a cancelled run leaves the bar spinning).
         self._run_ok = False
         self._cancelled_by_user = False
+
+        #: Persistent document context shared with the interaction chat.  Its log is
+        #: routed through a thread-safe signal bridge (extraction may run on the chat
+        #: worker thread, so it must never touch Qt widgets directly).
+        self._chat_log = _LogBridge()
+        self._chat_log.log.connect(self._append_log)
+        self.doc_ctx = DocContext(log=self._chat_log.log.emit)
 
         self.setWindowTitle(f"{__app_name__} — AI 翻译 v{__version__}")
         self.resize(620, 560)
@@ -126,6 +210,8 @@ class MainWindow(QWidget):
         for label, code in LANGUAGES:
             self._lang_combo.addItem(label, code)
         self._lang_combo.setCurrentText(prefs.get("language", _DEFAULT_LANG))
+        # Keep the chat's document context in sync with the language the user typed.
+        self._lang_combo.editTextChanged.connect(lambda _t: self._refresh_doc_ctx())
 
         # --- Output type ---
         self._type_combo = QComboBox()
@@ -163,45 +249,9 @@ class MainWindow(QWidget):
         form.addRow("输出格式", self._type_combo)
         form.addRow("保存到", path_row)
 
-        # --- OCR (scanned pages) ---
-        # OCR 语言自动跟随原文（RapidOCR 内置中英文自动识别模型），无需手动选择。
-        self._ocr_check = QCheckBox("启用 OCR（识别扫描 PDF 中的文本）")
-        self._ocr_check.setChecked(bool(prefs.get("ocr", True)))
-        ocr_row = QHBoxLayout()
-        ocr_row.addWidget(self._ocr_check)
-        ocr_row.addStretch()
-        form.addRow("识别扫描页", ocr_row)
-
-        # --- Rendered-output QA ---
-        # 渲染校验：生成译文 PDF 后用视觉模型「读回」译文页，报告残留中文/重叠/越线等
-        # 问题（只报告不改文件）。默认开启；PDF 输出且模型支持视觉时才生效。
-        self._render_qa_check = QCheckBox("渲染校验（读回译文 PDF，报告残留/重叠/越线等问题）")
-        self._render_qa_check.setChecked(bool(prefs.get("render_qa", True)))
-        qa_row = QHBoxLayout()
-        qa_row.addWidget(self._render_qa_check)
-        qa_row.addStretch()
-        form.addRow("译文质检", qa_row)
-
-        # --- AI table rebuild ---
-        # 扫描(OCR)表格页默认沿用原扫描底图、把译文叠上去。勾选后由视觉模型数行列并重建一张
-        # 干净的规整表格（忽略扫描底图、印章、手写签字等非文本内容）；模型不可用/读不好时
-        # 回退到几何重绘。
-        self._ai_table_check = QCheckBox("AI 表格重建（由视觉模型数行列，重建干净表格，忽略扫描底图/印章/签字）")
-        self._ai_table_check.setChecked(bool(prefs.get("ai_table_rebuild", False)))
-        ai_row = QHBoxLayout()
-        ai_row.addWidget(self._ai_table_check)
-        ai_row.addStretch()
-        form.addRow("扫描表格", ai_row)
-
-        # --- v0.3.0 AI orchestration (default on) ---
-        # 默认由 AI 编排（agent 视觉闭环）驱动翻译；关闭则回退到确定性批次流水线。仅当模型
-        # 支持视觉且勾选时生效。
-        self._agent_check = QCheckBox("AI 编排（默认：由 agent 视觉闭环驱动全流程翻译；关=确定性流水线）")
-        self._agent_check.setChecked(bool(prefs.get("agent_mode", True)))
-        agent_row = QHBoxLayout()
-        agent_row.addWidget(self._agent_check)
-        agent_row.addStretch()
-        form.addRow("智能编排", agent_row)
+        # --- 智能编排 + 扫描页识别：已交由 AI 自动处理，不再提供开关 ---
+        # v0.3 起默认由 agent 视觉闭环驱动全流程翻译；扫描页自动触发 OCR（按页无文本层才识别），
+        # 具体翻译/保留由 agent 与特殊页协商决定，因此主界面不再暴露这两个选项。
 
         # --- Progress + log ---
         self._progress = QProgressBar()
@@ -229,7 +279,9 @@ class MainWindow(QWidget):
         self._about_btn = QPushButton("关于")
         self._about_btn.clicked.connect(self._show_about)
         self._preview_btn = QPushButton("预览")
-        self._preview_btn.clicked.connect(lambda: self._show_preview(0, "source"))
+        self._preview_btn.clicked.connect(
+            lambda: self._show_preview(self._preview_current_page, self._preview_current_what)
+        )
 
         # Worker ↔ GUI channel for the AI preview round-trip: the agent may open a
         # preview and wait for the user to frame a region and send it back.
@@ -250,9 +302,29 @@ class MainWindow(QWidget):
         # worker↔GUI channels: agent asks (AnswerBridge) and preview (PreviewBridge).
         self.answer_bridge = sidebar.AnswerBridge(self)
         self.agent_sidebar = sidebar.SidebarChat()
+        # Special-page / agent questions surface in the SIDEBAR (buttons), never as a
+        # modal dialog — a modal would cover the preview the user is looking at.
         self.answer_bridge.showQuestion.connect(self.agent_sidebar.show_question)
         self.agent_sidebar.answerChosen.connect(self.answer_bridge.answer)
         self.agent_sidebar.userMessage.connect(self._on_user_message)
+
+        # --- Persistent AI chat (free-text conversation with the interaction model) ---
+        # Runs on its own thread so a reply never blocks the GUI.  Model is captured
+        # on the GUI thread (``_selected_model``) and passed to the worker via the queued
+        # signal, so the worker never touches Qt widgets.
+        self._chat_thread = QThread(self)
+        # ``ctx`` lets the interaction model call the chat tools (read/navigate/edit
+        # the document); ``show_preview`` is the thread-safe bridge to open a page.
+        self._chat_worker = ChatWorker(
+            ctx=self.doc_ctx,
+            log=self._chat_log.log.emit,
+            show_preview=self.preview_bridge.showPreview.emit,
+        )
+        self._chat_worker.moveToThread(self._chat_thread)
+        self._chat_worker.ask_requested.connect(self._chat_worker.ask)
+        self._chat_worker.reply_ready.connect(self._on_chat_reply)
+        self._chat_worker.error.connect(self._on_chat_error)
+        self._chat_thread.start()
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -271,6 +343,10 @@ class MainWindow(QWidget):
                 self, "模型配置", f"models.json 加载失败：\n{self._models_error}"
             )
 
+        # On startup, proactively say hi to the AI so the conversation is open and the
+        # user sees the assistant respond using the configured interaction model.
+        self.agent_sidebar.send_message(prompts.CHAT_GREETING)
+
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
@@ -278,9 +354,28 @@ class MainWindow(QWidget):
         """Set the source PDF (e.g. from the command line)."""
         self._source = path
         self._src_edit.setText(path)
+        # Point the chat's document context at the new file (keeps any prefs lang/ocr).
+        self._refresh_doc_ctx(path)
 
     def current_source(self) -> str | None:
         return self._source
+
+    def _refresh_doc_ctx(self, src_path: str | None = None) -> None:
+        """Point the chat's ``DocContext`` at the current source + latest lang/ocr.
+
+        Called whenever the source or target language changes so the chat tools read
+        the right document.  Clearing the source keeps the context but drops the
+        document/overlay (a fresh file starts clean).  OCR is always on (scanned pages
+        are identified by the AI), so the chat can read scanned pages too.  Guarded
+        because the language combo's ``editTextChanged`` may fire before the full
+        window is built during ``__init__``.
+        """
+        target = src_path if src_path is not None else self._source
+        self.doc_ctx.set_source(
+            target or None,
+            lang=self._target_language(),
+            ocr=bool(target),
+        )
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -306,8 +401,31 @@ class MainWindow(QWidget):
             self.set_source_path(path)
 
     def _on_user_message(self, text: str) -> None:
-        """A message from the sidebar; route it to the agent (chat channel)."""
-        self._append_log(f"[AI对话] {text}")
+        """A sidebar message; route it to the agent WITHOUT echoing it in the main log.
+
+        The conversation lives only in the sidebar; the main window shows the flow
+        status + AI tool/operation logs, not the chat text.
+        """
+        # M5 preview-navigation commands drive the preview window directly.
+        if self._maybe_preview_command(text):
+            return
+        # Best-effort: inject the free-text requirement into the running agent so
+        # its next decision sees it (a no-op if no agent run is active).
+        if self._worker is not None and text.strip():
+            self._worker.add_user_requirement(text)
+        # Persistent chat: ask the interaction model on the background thread.  The
+        # model is captured here (GUI thread) and passed over, so the worker never
+        # touches Qt widgets.
+        model = self._selected_model()
+        if model is not None:
+            self._chat_worker.ask_requested.emit(text, model)
+
+    def _on_chat_reply(self, reply: str) -> None:
+        """The interaction model answered; show it only in the sidebar."""
+        self.agent_sidebar.add_message("ai", reply)
+
+    def _on_chat_error(self, err: str) -> None:
+        self.agent_sidebar.add_message("ai", f"（对话失败：{err}）")
 
     def _show_preview(self, page: int, what: str = "source") -> None:
         """Open the preview window for ``page``; framed sends go to the bridge."""
@@ -316,17 +434,17 @@ class MainWindow(QWidget):
             return
         import pymupdf as fitz
 
-        try:
-            doc = fitz.open(str(self._source))
-            try:
-                if not (0 <= page < doc.page_count):
-                    png = b""
-                else:
-                    png = pdfio._render_page_png(doc[page], dpi=150)
-            finally:
-                doc.close()
-        except Exception:  # noqa: BLE001
-            png = b""
+        if what == "translation" and self._worker is not None:
+            # During an AI-orchestrated run, render the in-progress translation for
+            # this page (redact + redraw the blocks already translated).  The worker
+            # is blocked in the preview round trip, so this reads its state safely.
+            trans = self._worker.render_translation(page)
+            if trans:
+                png = trans
+            else:
+                png = self._render_source_preview(page)
+        else:
+            png = self._render_source_preview(page)
         if not png:
             QMessageBox.warning(self, "预览", "无法渲染该页。")
             return
@@ -334,9 +452,69 @@ class MainWindow(QWidget):
         if win is None:
             win = preview.PreviewWindow()
             win.sendRequested.connect(self.preview_bridge.on_region)
+            win.pageChanged.connect(self._on_preview_page_changed)
             self._preview_win = win
-        win.setWindowTitle("预览（原文）" if what == "source" else "预览（译文）")
+        # Remember the page + side so a later re-open (the "预览" button) shows the
+        # same page and the same source/translation as the AI's command, instead of
+        # always page 0 / source.
+        self._preview_current_page = page
+        self._preview_current_what = what
+        win.set_page_info(page, self._page_count())
+        prefix = "预览（原文）" if what == "source" else "预览（译文）"
+        win.setWindowTitle(f"{prefix} · 第 {page + 1} 页")
         win.show_png(png)
+
+    def _page_count(self) -> int:
+        """The source PDF page count (1 if unavailable)."""
+        import pymupdf as fitz
+
+        try:
+            doc = fitz.open(str(self._source))
+            try:
+                return doc.page_count
+            finally:
+                doc.close()
+        except Exception:  # noqa: BLE001
+            return 1
+
+    def _on_preview_page_changed(self, page: int) -> None:
+        """A navigation request from the preview window (prev/next/jump)."""
+        if self._worker is not None:
+            self._worker.set_current_page(page)
+        self._show_preview(page, self._preview_current_what)
+
+    def _maybe_preview_command(self, text: str) -> bool:
+        """Route M5 preview-navigation commands; returns True if handled.
+
+        The command is NOT also fed to the agent as a requirement.
+        """
+        cmd = parse_preview_command(text)
+        if cmd is None:
+            return False
+        kind, page, what = cmd
+        target_what = what or self._preview_current_what
+        if kind == "prev":
+            self._show_preview(self._preview_current_page - 1, target_what)
+        elif kind == "next":
+            self._show_preview(self._preview_current_page + 1, target_what)
+        else:  # goto
+            self._show_preview(page, target_what)
+        return True
+
+    def _render_source_preview(self, page: int) -> bytes:
+        """Render the source page ``page`` to a PNG (``b""`` if unusable)."""
+        import pymupdf as fitz
+
+        try:
+            doc = fitz.open(str(self._source))
+            try:
+                if not (0 <= page < doc.page_count):
+                    return b""
+                return pdfio._render_page_png(doc[page], dpi=200)
+            finally:
+                doc.close()
+        except Exception:  # noqa: BLE001
+            return b""
 
     def _browse_output(self) -> None:
         key = self._type_combo.currentData()
@@ -374,6 +552,9 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "翻译", "请先选择一个 PDF 源文件。")
             self._browse_source()
             return
+        # Keep the chat's document context in sync before handing the worker its
+        # protected overlay (the overlay is the source of the chat's edits).
+        self._refresh_doc_ctx()
 
         model = self._selected_model()
         if model is None:
@@ -412,12 +593,12 @@ class MainWindow(QWidget):
             str(lang),
             key,
             out_path,
-            ocr=self._ocr_check.isChecked(),
-            render_qa=self._render_qa_check.isChecked(),
-            ai_table_rebuild=self._ai_table_check.isChecked(),
+            ocr=True,
             preview_handler=self.preview_bridge.get_region,
             answer_handler=self.answer_bridge.ask,
-            agent_mode=self._agent_check.isChecked(),
+            show_preview=self.preview_bridge.show_page,
+            agent_mode=True,
+            overlay=self.doc_ctx.overlay(),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -450,10 +631,6 @@ class MainWindow(QWidget):
                     "model_id": model_id,
                     "language": language,
                     "output_type": output_key,
-                    "ocr": self._ocr_check.isChecked(),
-                    "render_qa": self._render_qa_check.isChecked(),
-                    "ai_table_rebuild": self._ai_table_check.isChecked(),
-                    "agent_mode": self._agent_check.isChecked(),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )
@@ -517,6 +694,9 @@ class MainWindow(QWidget):
 
     def _append_log(self, msg: str) -> None:
         self._log.appendPlainText(msg)
+        # Keep the newest line visible: move the cursor to the end and scroll.
+        self._log.moveCursor(QTextCursor.MoveOperation.End)
+        self._log.ensureCursorVisible()
 
     def _on_finished(self, out_path: str) -> None:
         self._run_ok = True
@@ -527,6 +707,11 @@ class MainWindow(QWidget):
         self._stage.setText("完成")
         self._open_btn.setEnabled(True)
         self._append_log(f"翻译完成，已保存：{out_path}")
+        # Feed the chat's document context the final translation so the AI reads the
+        # real current output (not just the protected chat edits).
+        worker = self._worker
+        if worker is not None and getattr(worker, "_last_translated", None):
+            self.doc_ctx.set_last_translated(worker._last_translated)
 
     def _on_error(self, msg: str) -> None:
         # Settle the progress bar (it may be stuck in the busy state) and mark
@@ -599,6 +784,11 @@ class MainWindow(QWidget):
             # Force-kill the background worker thread, then reap it from the OS.
             self._thread.terminate()
             self._thread.wait(5000)
+        # Stop the chat worker thread so there is no "QThread destroyed while
+        # running" noise just before the hard exit below.
+        if self._chat_thread is not None and self._chat_thread.isRunning():
+            self._chat_thread.quit()
+            self._chat_thread.wait(2000)
         # ``terminate`` only kills the Qt worker thread.  The translation
         # pipeline may have left non-daemon ``ThreadPoolExecutor`` / HTTP
         # threads running; a normal close would hang the interpreter joining

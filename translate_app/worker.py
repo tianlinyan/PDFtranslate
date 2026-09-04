@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
@@ -20,14 +21,6 @@ from .translator import (
     TranslationCancelled,
     TranslationEngine,
     TranslationResult,
-    make_classify_review_fn,
-    make_classify_tool_fn,
-    make_merge_tool_fn,
-    make_rendered_review_fn,
-    make_retranslate_fn,
-    make_review_fn,
-    make_table_rebuild_fn,
-    make_verify_number_tool_fn,
 )
 
 #: Output formats offered by the translation dialog.
@@ -53,96 +46,6 @@ def format_duration(seconds: float) -> str:
     return f"{minutes} 分 {secs:02d} 秒"
 
 
-def _contains_cjk(text: str) -> bool:
-    """True when ``text`` still carries CJK ideographs (a residual Chinese leak)."""
-    return any("一" <= c <= "鿿" for c in text)
-
-
-#: Minimum confidence for the ``classify_block`` tool to release a rule-kept
-#: block for translation (only a confident judgement overrides the rule).
-_KEEP_CONF_MIN = 0.7
-
-
-def _release_kept_blocks_via_tool(
-    doc, keep_original: set[int], classify_fn, conf_min: float, log
-) -> set[int]:
-    """Release rule-kept chart-node blocks the tool confidently says to translate.
-
-    The tool-use ``classify_block`` is given the *text* of each kept chart-node
-    block (no page image needed); a block it judges ``translate`` at or above
-    ``conf_min`` is removed from ``keep_original``.  Only releases (never keeps
-    more), and a block not judged is left to the rule.
-    """
-    if classify_fn is None or not keep_original:
-        return set()
-    candidates: list[tuple[int, str]] = []
-    flat = 0
-    for page_blocks in doc.pages:
-        for b in page_blocks:
-            if flat in keep_original and getattr(b, "is_chart", False):
-                candidates.append((flat, b.text))
-            flat += 1
-    if not candidates:
-        return set()
-    decisions = classify_fn([t for _i, t in candidates])
-    released: set[int] = set()
-    for d in decisions:
-        try:
-            idx = int(d.get("index", -1))
-            conf = float(d.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            continue
-        if not (0 <= idx < len(candidates)):
-            continue
-        if d.get("action") == "translate" and conf >= conf_min:
-            flat_idx = candidates[idx][0]
-            released.add(flat_idx)
-            if log:
-                log(
-                    f"  [保留复核] 块「{candidates[idx][1][:16]}」判定为应翻译"
-                    f"（@{conf:.2f}），已从保留集合释放。"
-                )
-    return released
-
-
-def _correct_residual_blocks(
-    doc,
-    result,
-    keep: set[int],
-    target_is_cjk: bool,
-    flagged: set[int],
-    lang: str,
-    retranslate,
-    log,
-) -> int:
-    """Re-translate residual / empty blocks on QC-flagged pages.
-
-    A block is "residual" when, for a non-CJK target, its translation still
-    contains Chinese, or when it came back empty (missing content).  Only those
-    are re-translated; kept blocks (names / chart nodes) are never touched, and
-    a block that already translated cleanly is left as-is.  Returns the count
-    corrected.  Best-effort — a re-translation failure keeps the original text.
-    """
-    corrected = 0
-    for bi, page in enumerate(doc.block_pages):
-        if page not in flagged:
-            continue
-        if bi in keep:
-            continue  # intentionally kept (name column / chart node)
-        txt = str(result.translated[bi])
-        residual = (not txt.strip()) or (not target_is_cjk and _contains_cjk(txt))
-        if not residual:
-            continue
-        new = retranslate(doc.blocks[bi], lang)
-        new = str(new or "").strip()
-        if new and new != txt:
-            result.translated[bi] = new
-            corrected += 1
-            if log:
-                log(f"    [修正] 块 {bi + 1} 已重译：{txt[:18]!r} -> {new[:18]!r}")
-    return corrected
-
-
 class TranslateWorker(QObject):
     """Translates the text of a PDF and writes it to a file."""
 
@@ -165,11 +68,11 @@ class TranslateWorker(QObject):
         output_type: str,
         output_path: str,
         ocr: bool = False,
-        render_qa: bool = True,
-        ai_table_rebuild: bool = False,
         preview_handler=None,
         answer_handler=None,
+        show_preview=None,
         agent_mode: bool = True,
+        overlay: dict[int, dict] | None = None,
     ):
         super().__init__()
         self._source = source_path
@@ -178,31 +81,37 @@ class TranslateWorker(QObject):
         self._output_type = output_type
         self._output_path = output_path
         self._ocr = ocr
+        #: The persistent, protected translation overlay (from the interaction
+        #: chat's ``DocContext``): flat block index → ``{"text": ...}``.  Applied on
+        #: top of whatever the run produced, so a chat/AI edit always wins at export.
+        self._overlay: dict[int, dict] = dict(overlay or {})
+        #: The run's final aligned translation (flat index → text), after the overlay
+        #: is applied.  ``MainWindow`` reads this after a successful run to update the
+        #: chat's ``DocContext`` so the chat sees the real current translation.
+        self._last_translated: list[str] | None = None
         # ``preview_handler`` (e.g. ``preview.PreviewBridge.get_region``) is the
         # worker↔GUI channel the v0.3.0 agent uses to show a page and receive a
         # user-framed region back (see ``agent.run_page_visual``).
         self.preview_handler = preview_handler
         # worker↔GUI channel for the agent's questions (see ``agent.run_page_visual``).
         self.answer_handler = answer_handler
+        # worker↔GUI channel for a *non-blocking* preview show (M3 special-page
+        # negotiation: show the page without waiting for a region).
+        self._show_preview = show_preview
         # v0.3.0: when on (default) the worker drives translation through the AI
         # orchestration loop (``agent.run_page_visual``) instead of the batch
         # translation engine; a non-vision model falls back to the deterministic
         # baseline (fail-closed).
         self._agent_mode = agent_mode
-        # Rendered-output QA (report-only, read back the exported PDF).  Turned
-        # off by the user via the "译文质检" checkbox; only a PDF output with a
-        # vision-capable model actually runs it.
-        self._render_qa = render_qa
-        # AI table rebuild of scanned (OCR) statement pages: on, the vision model
-        # counts rows/columns and redraws a clean, regular table (ignoring the
-        # raster background / stamps / handwriting).  Falls back to the geometric
-        # OCR-grid redraw if the model is unavailable or misreads the table.
-        self._ai_table_rebuild = ai_table_rebuild
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
         # written from the GUI thread (``cancel``) and read from the worker
         # thread: the Event gives explicit, memory-model-safe signalling
         # instead of relying on the CPython GIL to make a bool atomic.
         self._cancelled = threading.Event()
+        #: The agent's ``WorkflowState`` while an AI-orchestrated run is active.
+        #: Set by ``_run_agent`` and read (while the worker is blocked in a
+        #: preview) to render an in-progress "translation" preview page.
+        self._agent_state: Any = None
 
     @pyqtSlot()
     def run(self) -> None:
@@ -216,27 +125,11 @@ class TranslateWorker(QObject):
             if self._ocr:
                 self.log.emit("已启用 OCR（自动识别原文语言），将识别无文本层的扫描页。")
             self.progress.emit(0, 0, "提取文本…")
-            # Whole-page AI review: after an OCR page is rebuilt, the original
-            # scan + the reconstruction are sent to the model, whose text fixes
-            # are applied conservatively and whose layout flags are logged.  Only
-            # for OCR'd (scanned) pages and only when the model opts in.
-            review = make_review_fn(self._model, self.log.emit) if self._ocr else None
-            if review is not None:
-                self.log.emit(
-                    "该模型支持视觉：将对重建的扫描页做整页审查（文字纠错 + 布局提示，不改几何）。"
-                )
-            # OCR-number verification (vision tool-use): re-read the plausible
-            # misreads on a freshly OCR'd page and correct them in place, so the
-            # figures feeding the translation are right.  Only for OCR'd pages and
-            # only when the model opts in (make_* returns None otherwise).
-            verify_fn = make_verify_number_tool_fn(self._model, self.log.emit) if self._ocr else None
             doc = pdfio.extract_document_text(
                 self._source,
                 ocr=self._ocr,
                 cancel=lambda: self._cancelled.is_set(),
                 log=lambda m: self.log.emit(m),
-                review_fn=review,
-                verify_fn=verify_fn,
             )
             if doc.ocr_count:
                 self.log.emit(f"有 {doc.ocr_count} 个页面无文本层，已通过 OCR 提取。")
@@ -251,82 +144,28 @@ class TranslateWorker(QObject):
             engine = TranslationEngine(self._model)
             self.log.emit(f"模型：{self._model.name} ({self._model.model})")
 
-            # Personal-name cells (a "姓名 / Name" table column) keep the
-            # original text — but only for a CJK target: when the output is
-            # Latin-script, leaving the Chinese names in place would produce a
-            # mixed-language document, so they are translated instead (the
-            # prompt rule romanizes them with consistent pinyin).
-            #
-            # Org-chart / architecture-diagram node labels are the opposite:
-            # they are structural, not prose, so they are never translated
-            # regardless of the target language (a diagram's box labels survive
-            # a language switch; transcribing them would mangle the diagram).
-            # The flat block order in ``doc.blocks`` matches ``doc.pages``, so
-            # walk the pages to collect those indices.
+            # v0.3.0: the hardcoded special-casing (org-chart / signature / name
+            # cells) is removed — those are decided by the AI orchestrator at
+            # runtime.  ``keep_original`` starts empty; the agent determines what
+            # to keep.  In the deterministic fallback every block is translated.
             target_is_cjk = any("一" <= c <= "鿿" for c in self._lang)
             keep_original: set[int] = set()
-            n_chart = 0
-            n_names = 0
-            flat = 0
-            for page_blocks in doc.pages:
-                for b in page_blocks:
-                    if b.is_chart:
-                        keep_original.add(flat)
-                        n_chart += 1
-                    elif b.keep_original:
-                        n_names += 1
-                        if target_is_cjk:
-                            keep_original.add(flat)
-                    flat += 1
-            if n_chart:
-                self.log.emit(
-                    f"已识别 {n_chart} 个组织结构图/架构图节点，将保留原文不做翻译。"
-                )
-            if n_names and target_is_cjk:
-                self.log.emit(
-                    f"已识别 {n_names} 个姓名块，将保留原文不做翻译。"
-                )
-            elif n_names:
-                self.log.emit(
-                    f"目标语言为西文，{n_names} 个姓名块将按规则罗马化（不保留中文原文）。"
-                )
 
-            # Vision second opinion (P1c): the rule-based chart-node detection can
-            # misjudge a compact heading (e.g. 二、公司组织架构图) as a diagram node
-            # and keep it untranslated.  A vision model that sees the source page
-            # may flag such a block as translatable content — this pass only
-            # *releases* (never keeps more), and only on high confidence; any
-            # classifier error is a no-op so the rule's decision stands.  The
-            # tool-use ``classify_block`` (text-based) is preferred; the image-based
-            # whole-page review is the fallback.
             translate_started = time.monotonic()
             if self._agent_mode and getattr(self._model, "vision", False):
-                # v0.3.0 default: the AI orchestrator drives translation.  It does
-                # its own classification (keep/translate), so the deterministic
-                # chart-node *release* pass is skipped; ``keep_original`` (chart /
-                # name cells) is still forced verbatim after the loop.
                 self.log.emit("已启用 AI 编排：采用 agent 驱动的单页视觉闭环。")
                 result = self._run_agent(doc, keep_original)
             else:
-                if n_chart:
-                    released: set[int] = set()
-                    tool_classify = make_classify_tool_fn(self._model, self.log.emit)
-                    if tool_classify is not None:
-                        released = _release_kept_blocks_via_tool(
-                            doc, keep_original, tool_classify, _KEEP_CONF_MIN, self.log.emit
-                        )
-                    else:
-                        review_classify = make_classify_review_fn(self._model, self.log.emit)
-                        released = pdfio.classify_keep_blocks(
-                            self._source, doc.pages, review_classify,
-                            keep_original, self.log.emit,
-                        )
-                    if released:
-                        keep_original -= released
-                        n_chart -= len(released)
-                        self.log.emit(
-                            f"保留复核后，实际保留 {n_chart} 个图表节点（其余将翻译）。"
-                        )
+                # Deterministic fallback: the model cannot see the page (no vision),
+                # so AI orchestration can't drive it.  v0.3.0 removed the old
+                # hardcoded chart-node / signature / name-cell protections and hands
+                # those decisions to the AI at runtime, so the fallback translates
+                # everything — say so instead of silently matching the old behaviour.
+                self.log.emit(
+                    "已回退到确定性批次流水线（当前模型不支持视觉）。"
+                    "注意：组织结构图节点/姓名列/扫描件手写签字将不再自动保留原文，"
+                    "统一按文本翻译；如需保留请改用支持视觉的模型。"
+                )
                 result = engine.translate_blocks(
                     doc.blocks,
                     self._lang,
@@ -350,6 +189,13 @@ class TranslateWorker(QObject):
                     "可稍后重新运行，已成功的部分会直接从缓存恢复。"
                 )
 
+            # Apply the protected chat/manual edits (the interaction chat's overlay)
+            # on top of the run's output: a user-AI edit always wins at export.
+            self._apply_overlay(result)
+            # Remember the final aligned translation so the chat can read the real
+            # current output (stops the AI re-editing already-translated blocks).
+            self._last_translated = list(result.translated)
+
             per_page = pdfio.group_by_page(
                 doc.block_pages, result.translated, doc.page_count
             )
@@ -360,62 +206,13 @@ class TranslateWorker(QObject):
             out_path = self._export(doc, per_page)
             export_elapsed = time.monotonic() - export_started
 
-            # Rendered-output QA: read back the exported PDF and surface anything
-            # a reader would notice (untranslated text, overlaps, overflowing
-            # glyphs, broken labels, too-small text).  A *correctable* report
-            # (residual Chinese / missing content) triggers a bounded re-translate
-            # of those cells; the QA may also return structured *adjustments* (a
-            # replacement text / a font-size target), applied deterministically by
-            # ``apply_render_adjustments``.  Either way we re-export once, bounded
-            # (single pass).  Fail-closed: any reviewer error is a no-op.
-            qa_elapsed = 0.0
-            correct_elapsed = 0.0
-            if self._render_qa and self._output_type in ("translated_pdf", "bilingual_pdf"):
-                rendered_review = make_rendered_review_fn(self._model, self.log.emit)
-                if rendered_review is not None:
-                    qa_started = time.monotonic()
-                    adjustments: list = []
-                    flagged = pdfio.review_rendered_pages(
-                        self._source, out_path, rendered_review,
-                        self.log.emit, adjustments=adjustments,
-                    )
-                    qa_elapsed = time.monotonic() - qa_started
-                    if (flagged or adjustments) and not self._cancelled.is_set():
-                        changed = 0
-                        retranslate = (
-                            make_retranslate_fn(self._model, self.log.emit) if flagged else None
-                        )
-                        if retranslate is not None:
-                            changed = _correct_residual_blocks(
-                                doc, result, keep_original, target_is_cjk,
-                                flagged, self._lang, retranslate, self.log.emit,
-                            )
-                        if adjustments:
-                            changed += pdfio.apply_render_adjustments(
-                                doc, result.translated, adjustments,
-                                keep_original, self.log.emit,
-                            )
-                        if changed:
-                            correct_started = time.monotonic()
-                            per_page = pdfio.group_by_page(
-                                doc.block_pages, result.translated, doc.page_count
-                            )
-                            out_path = self._export(doc, per_page)
-                            correct_elapsed = time.monotonic() - correct_started
-                            self.log.emit(
-                                f"  质检修正：应用 {changed} 处修改并重新导出。"
-                            )
-
             total_elapsed = time.monotonic() - started
             self.log.emit(f"完成：{out_path}")
             self.log.emit(
                 f"总用时：{format_duration(total_elapsed)}"
                 f"（提取 {format_duration(extract_elapsed)}，"
                 f"翻译 {format_duration(translate_elapsed)}，"
-                f"导出 {format_duration(export_elapsed)}"
-                + (f"，渲染校验 {format_duration(qa_elapsed)}" if qa_elapsed else "")
-                + (f"，质检修正 {format_duration(correct_elapsed)}" if correct_elapsed else "")
-                + "）"
+                f"导出 {format_duration(export_elapsed)}）"
             )
             self.finished.emit(out_path)
         except TranslationCancelled:
@@ -443,38 +240,138 @@ class TranslateWorker(QObject):
         """Request cancellation (safe to call from the GUI thread)."""
         self._cancelled.set()
 
+    def add_user_requirement(self, text: str) -> None:
+        """Inject a sidebar free-text message into the running AI agent.
+
+        The agent's ``observe()`` serialises ``WorkflowState.requirements`` into the
+        observation handed to the LLM each step, so appending here makes the model
+        see the user's requirement on its next tool decision.  Best-effort: if no
+        agent run is active, the message is a no-op.  The chat text stays only in the
+        sidebar — the main log gets a short operation status without echoing it.
+        """
+        state = self._agent_state
+        if state is not None and text and text.strip():
+            state.requirements.append(text.strip())
+            self.log.emit(f"  [编排] 已注入一条用户要求（当前共 {len(state.requirements)} 条）。")
+
+    def _apply_overlay(self, result: "TranslationResult") -> None:
+        """Overwrite the run's output with the protected chat/manual edits.
+
+        ``self._overlay`` maps a flat block index to ``{"text": ...}``; for each in
+        range, the committed translation is replaced with the overlay text (a blank
+        entry is skipped so it never wipes content to nothing).  Besides faithfully
+        applying a user-AI edit, this is the mechanism that keeps a chat edit across
+        runs.  On a cancelled or errored run the overlay is simply not applied (the
+        run reports as usual).
+        """
+        if not self._overlay:
+            return
+        translated = list(result.translated)
+        changed = 0
+        for idx, entry in self._overlay.items():
+            if isinstance(entry, dict) and 0 <= idx < len(translated):
+                new = str(entry.get("text", "")).strip()
+                if new and new != str(translated[idx]):
+                    translated[idx] = new
+                    changed += 1
+        result.translated = translated
+        if changed:
+            self.log.emit(f"  已应用 {changed} 处 AI 对话/标注编辑（受保护覆盖）。")
+
+    def set_current_page(self, page: int) -> None:
+        """Update the running session's ``current_page`` (preview navigation)."""
+        state = self._agent_state
+        if state is not None:
+            state.current_page = int(page)
+
+    def render_translation(self, page: int) -> bytes | None:
+        """Render an in-progress "translation" preview page for ``page``.
+
+        During an AI-orchestrated run the worker is blocked in the preview round
+        trip, so reading ``_agent_state`` here is safe.  Only blocks that already
+        have a translation (in ``out_doc``) are redacted and redrawn with the
+        translated text; the rest keep their source, so the preview shows exactly
+        the work done so far.  Returns ``None`` when there is no agent run or the
+        page has not translated anything (the caller falls back to the source page).
+        """
+        state = self._agent_state
+        if state is None or state.src_doc is None:
+            return None
+        pages = state.src_doc.pages
+        if not (0 <= page < len(pages)) or not pages[page]:
+            return None
+        offset = sum(len(p) for p in pages[:page])
+        out = state.out_doc or {}
+        to_draw = [
+            (b, str(entry.get("text", "")).strip())
+            for i, b in enumerate(pages[page])
+            if isinstance(entry := out.get(offset + i), dict) and str(entry.get("text", "")).strip()
+        ]
+        if not to_draw:
+            return None
+        import pymupdf as fitz
+
+        doc = fitz.open(str(self._source))
+        try:
+            if not (0 <= page < doc.page_count):
+                return None
+            page_obj = doc[page]
+            font = pdfio._CJK_FONT
+            # Redact the original text of the blocks we are about to replace (keep
+            # images/line-art), then draw the translation on top — the same in-place
+            # pattern the exporter uses (minus the table-layout expansion, which is a
+            # refinement not needed for a preview).
+            for b, _t in to_draw:
+                if not getattr(b, "ocr", False) and not getattr(b, "is_chart", False):
+                    page_obj.add_redact_annot(fitz.Rect(b.x0, b.y0, b.x1, b.y1))
+            page_obj.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            )
+            for b, t in to_draw:
+                if getattr(b, "ocr", False):
+                    page_obj.draw_rect(
+                        fitz.Rect(b.x0 - 0.5, b.y0 - 0.5, b.x1 + 0.5, b.y1 + 0.5),
+                        color=None, fill=(1, 1, 1),
+                    )
+                pdfio._draw_translated_block(page_obj, font, b, t)
+            return pdfio._render_page_png(page_obj, dpi=200)
+        finally:
+            doc.close()
+
     def _run_agent(self, doc: pdfio.DocumentText, keep_original: set[int]):
         """v0.3.0: drive translation through the AI-orchestration loop per page.
 
         Each page is handed to :func:`agent.run_page_visual` (the model sees it,
         calls the deterministic tools and writes its choices to ``out_doc``); the
         resulting translations are collected back into a ``TranslationResult`` so
-        the rest of the pipeline (group_by_page → export) is unchanged.
-        ``keep_original`` (chart nodes / name cells) is always kept verbatim, and a
-        page that fails is fail-closed to its source text.
+        the rest of the pipeline (group_by_page → export) is unchanged.  A page
+        that fails is fail-closed to its source text.
         """
         from . import agent as agent_mod
 
         state = agent_mod.WorkflowState(src_path=self._source, lang=self._lang)
         state.src_doc = doc
-        for i in range(doc.page_count):
-            if self._cancelled.is_set():
-                raise TranslationCancelled()
-            task = (
-                f"这是文档第 {i + 1} 页。请阅读页面，把需要翻译的块翻译成 {self._lang}；"
-                "数字/代码块保持原样。用 read_page 观察、用 set_text/translate_block 翻译，"
-                "最后用 check_residual 校验，没有可做的事就结束。"
-            )
-            try:
-                agent_mod.run_page_visual(
-                    state, i, self._model, task=task,
-                    log=self.log.emit,
-                    preview_handler=self.preview_handler,
-                    answer_handler=self.answer_handler,
-                    max_steps=24,
-                )
-            except Exception as exc:  # noqa: BLE001 — fail-closed per page
-                self.log.emit(f"  第 {i + 1} 页 AI 编排失败：{type(exc).__name__}: {exc}（该页保留原文）。")
+        self._agent_state = state
+
+        def _translate_page(st, page, model, *, task, **kw):
+            # Resolve through ``agent_mod`` at call time so a test's mock of
+            # ``agent_module.run_page_visual`` is honoured.
+            return agent_mod.run_page_visual(st, page, model, task=task, **kw)
+
+        try:
+            agent_mod.DocumentSession(
+                state, doc, self._model, log=self.log.emit,
+                translate_page=_translate_page,
+                progress=lambda d, t, s: self.progress.emit(d, t, s),
+                cancel=self._cancelled.is_set,
+                preview_handler=self.preview_handler,
+                answer_handler=self.answer_handler,
+                show_preview=self._show_preview,
+                max_steps_per_page=24,
+            ).run()
+        finally:
+            self._agent_state = None
         translated = list(doc.blocks)
         n_changed = 0
         for idx, entry in (state.out_doc or {}).items():
@@ -502,18 +399,8 @@ class TranslateWorker(QObject):
                 self._source, per_page, out, self._lang, doc.pages
             )
         elif kind == "translated_pdf":
-            table_rebuild = (
-                make_table_rebuild_fn(self._model, self._lang, self.log.emit)
-                if self._ai_table_rebuild else None
-            )
-            merge_tool = (
-                make_merge_tool_fn(self._model, self.log.emit) if self._ai_table_rebuild else None
-            )
             pdfio.save_translated_pdf(
                 self._source, doc.pages, per_page, out, self._lang,
-                redraw_ocr=self._ai_table_rebuild,
-                table_rebuild_fn=table_rebuild,
-                merge_tool_fn=merge_tool,
                 log=self.log.emit,
             )
         elif kind == "markdown":

@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
+from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
@@ -99,6 +100,7 @@ class SidebarChat(QWidget):
         send_btn.clicked.connect(self._send)
 
         self._asks_box = QWidget()
+        self._asks_box.setMinimumHeight(44)   # keep agent-question buttons visible
         self._asks_layout = QVBoxLayout(self._asks_box)
         self._asks_layout.setContentsMargins(0, 4, 0, 4)
 
@@ -117,6 +119,9 @@ class SidebarChat(QWidget):
         html = f'<p><b style="color:{"#2b6cb0" if role == "ai" else "#805ad5"}">{tag}:</b> ' \
                f'{str(text)}</p>'
         self._log.append(html)
+        # Keep the newest chat line visible.
+        self._log.moveCursor(QTextCursor.MoveOperation.End)
+        self._log.ensureCursorVisible()
 
     def show_question(self, question: str, options: list[str], target: str) -> None:
         """Display an agent question with answer buttons; forward the answer."""
@@ -128,11 +133,28 @@ class SidebarChat(QWidget):
     def _on_chosen(self, value, target: str) -> None:
         self.add_message("我", str(value))
         self.answerChosen.emit(value, target)
+        # Remove the answered question's buttons so old options don't pile up in
+        # the sidebar (only the Q&A text stays in the log).
+        row = self.sender()
+        if isinstance(row, _AskRow):
+            self._asks_layout.removeWidget(row)
+            row.deleteLater()
+
+    def send_message(self, text: str) -> None:
+        """Send ``text`` as a user message (shown in the log + emitted as ``userMessage``).
+
+        Used both by the input box (``_send``) and to auto-send a startup greeting,
+        so the AI interaction channel always sees the same signal.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        self.add_message("我", text)
+        self.userMessage.emit(text)
 
     def _send(self) -> None:
         text = self._input.text().strip()
         if not text:
             return
         self._input.clear()
-        self.add_message("我", text)
-        self.userMessage.emit(text)
+        self.send_message(text)
