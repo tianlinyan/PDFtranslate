@@ -802,6 +802,10 @@ class MainWindow(QWidget):
         """
         self._worker = worker
         self._thread = QThread(self)
+        # A pending sidebar question must be interruptible by "取消": wire the worker's
+        # cancellation flag so a blocked ``AnswerBridge.ask`` returns promptly.
+        if getattr(self, "answer_bridge", None) is not None:
+            self.answer_bridge.set_cancel(worker._cancelled.is_set)
         worker.moveToThread(self._thread)
         self._thread.started.connect(worker.run)
         worker.progress.connect(self._on_progress)

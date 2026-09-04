@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import threading
+from typing import Callable
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QTextCursor
@@ -32,11 +33,17 @@ class AnswerBridge(QObject):
 
     showQuestion = pyqtSignal(str, list, str)   # question, options, target
 
-    def __init__(self, parent: QObject | None = None, timeout: float = 600.0) -> None:
+    def __init__(self, parent: QObject | None = None, timeout: float | None = None,
+                 cancel: Callable[[], bool] | None = None) -> None:
         super().__init__(parent)
         self._ev = threading.Event()
         self._value: dict | None = None
+        # A user decision must NOT silently skip: ``timeout=None`` (default) waits until
+        # the user answers.  An old 600s timeout made the flow proceed as "未选择" and
+        # stacked a second question row.  ``cancel`` (optional) is polled so a worker
+        # cancellation interrupts the wait instead of hanging until answered.
         self._timeout = timeout
+        self._cancel = cancel
 
     def answer(self, value, target: str = "") -> None:
         """GUI side: the user answered (value is the chosen option or free text)."""
@@ -44,12 +51,27 @@ class AnswerBridge(QObject):
         self._ev.set()
 
     def ask(self, question: str, options: list[str] | None = None, target: str = "") -> dict | None:
-        """Worker side: surface ``question`` and block until the user answers."""
+        """Worker side: surface ``question`` and block until the user answers.
+
+        Waits indefinitely (a user decision is honored, never skipped).  If ``cancel``
+        is wired, the wait polls it every 100 ms so a user cancellation returns ``None``
+        (the caller treats that as a control signal) instead of hanging.
+        """
         self._value = None
         self._ev.clear()
         self.showQuestion.emit(question, list(options or []), target)
-        self._ev.wait(self._timeout)
+        if self._cancel is None:
+            self._ev.wait(self._timeout)          # None → block until answered
+        else:
+            while not self._ev.wait(0.1):
+                if self._cancel():
+                    return None
         return self._value
+
+    def set_cancel(self, cancel: Callable[[], bool] | None) -> None:
+        """Wire a cancellation probe (e.g. ``worker._cancelled.is_set``) so a pending
+        ask returns promptly (with ``None``) when the user cancels the run."""
+        self._cancel = cancel
 
     def clear(self) -> None:
         self._value = None

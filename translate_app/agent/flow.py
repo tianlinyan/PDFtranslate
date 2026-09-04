@@ -1313,6 +1313,11 @@ class DocumentSession:
                     self.log(f"  特殊页问答失败：{type(exc).__name__}: {exc}（按保留原文处理）。")
             else:
                 self.log(f"  （无问答通道，第 {i + 1} 特殊页按保留原文处理。）")
+            # A pending question is interruptible by "取消" (the answer bridge polls it);
+            # a cancelled ask returns ``None`` — treat that as a real cancellation, not as
+            # "保留原文", so the whole run aborts instead of silently continuing.
+            if self.cancel():
+                raise _tr.TranslationCancelled()
             t.decided = True
             t.decision = decision
             ps.issues.append(f"特殊页（{kind}）按用户意见：{decision}")
