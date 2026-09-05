@@ -52,6 +52,12 @@ CHAT_TOOL_SPECS: list[dict[str, Any]] = [
     _tool("get_settings", {}, []),
     _tool("classify_page",
           {"page": {"type": "integer", "description": "页号（0 起）"}}, ["page"]),
+    _tool("get_structure",
+          {"page": {"type": "integer", "description": "页号（0 起）"}}, ["page"]),
+    _tool("get_table",
+          {"page": {"type": "integer", "description": "页号（0 起）"},
+           "index": {"type": "integer", "description": "该页语义表格序号（默认 0）"}},
+          ["page"]),
     _tool("read_page",
           {"page": {"type": "integer", "description": "页号（0 起）"}}, ["page"]),
     _tool("goto_page",
@@ -235,7 +241,27 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         doc = ctx.ensure_doc()
         if doc is None or not (0 <= page < len(doc.pages)):
             return {"error": "页号越界或无文档。"}
-        return {"kind": pdfio.classify_page(doc.pages[page])}
+        structure = (doc.page_structure[page]
+                     if doc.page_structure and page < len(doc.page_structure) else None)
+        return {"kind": pdfio.classify_page(doc.pages[page], structure=structure)}
+
+    def get_structure(page: int) -> dict[str, Any]:
+        doc = ctx.ensure_doc()
+        if doc is None or not (0 <= page < len(doc.page_structure)):
+            return {"page": page, "parser": "", "elements": [], "tables": []}
+        ps = doc.page_structure[page]
+        tables = []
+        for i in range(len(ps.tables)):
+            t = pdfio.get_table(doc, page, i)
+            if t is not None:
+                tables.append(t)
+        return {"page": page, "parser": ps.parser, "elements": ps.elements, "tables": tables}
+
+    def get_table(page: int, index: int = 0) -> dict[str, Any] | None:
+        doc = ctx.ensure_doc()
+        if doc is None:
+            return None
+        return pdfio.get_table(doc, page, index)
 
     def read_page(page: int) -> dict[str, Any]:
         doc = ctx.ensure_doc()
@@ -244,6 +270,13 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         offset = sum(len(p) for p in doc.pages[:page])
         overlay = ctx.overlay()
         last = ctx.get_last_translated()
+        # B-④: per-block semantic kind/level when the doc carries a structure layer.
+        kind_by_idx: dict[int, tuple[str, int]] = {}
+        if doc.page_structure and page < len(doc.page_structure):
+            for el in doc.page_structure[page].elements:
+                for idx in el.get("block_indices", []):
+                    kind_by_idx[int(idx)] = (str(el.get("kind", "text")),
+                                             int(el.get("level", 0) or 0))
         blocks = []
         for i, b in enumerate(doc.pages[page]):
             idx = offset + i
@@ -258,6 +291,8 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
                 "bbox": [b.x0, b.y0, b.x1, b.y1],
                 "in_table": bool(getattr(b, "in_table", False)),
                 "is_chart": bool(getattr(b, "is_chart", False)),
+                "kind": kind_by_idx.get(idx, ("text", 0))[0],
+                "level": kind_by_idx.get(idx, ("text", 0))[1],
             })
         return {"page": page, "blocks": blocks}
 
@@ -561,6 +596,8 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         "get_doc_info": get_doc_info,
         "get_settings": get_settings,
         "classify_page": classify_page,
+        "get_structure": get_structure,
+        "get_table": get_table,
         "read_page": read_page,
         "goto_page": goto_page,
         "set_block_text": set_block_text,

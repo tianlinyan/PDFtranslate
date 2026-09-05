@@ -88,10 +88,23 @@ class ChatToolsTest(_CtxTest):
 
     def test_tools_expose_expected_set(self):
         self.assertEqual({
-            "get_doc_info", "get_settings", "classify_page", "read_page", "goto_page",
-            "set_block_text", "delete_block_text", "apply_annotation", "re_export",
-            "run_translate", "set_setting", "self_check", "run_flow", "retranslate",
+            "get_doc_info", "get_settings", "classify_page", "get_structure", "get_table",
+            "read_page", "goto_page", "set_block_text", "delete_block_text",
+            "apply_annotation", "re_export", "run_translate", "set_setting",
+            "self_check", "run_flow", "retranslate",
         }, self._tool_names())
+
+    def test_chat_semantic_tools_reported_by_specs(self):
+        # The two semantic tools are advertised in the OpenAI schema list too.
+        names = {t["function"]["name"] for t in chat_tools.CHAT_TOOL_SPECS}
+        self.assertIn("get_structure", names)
+        self.assertIn("get_table", names)
+
+    def test_chat_get_table_without_structure_returns_none(self):
+        # No structure backend ran → the semantic tools degrade to empty/None, no crash.
+        res = self.tools["get_structure"](0)
+        self.assertEqual(res["elements"], [])
+        self.assertIsNone(self.tools["get_table"](0, 0))
 
     # ---- retranslate: the chat can re-translate specific blocks/page in place ----
 

@@ -464,7 +464,9 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
 CHAT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_doc_info": "返回当前 PDF 的信息：页数/标题/语言/文本页/扫描页/图表页/块数/每页类型（表格页恒为 0）。",
     "get_settings": "返回当前应用设置快照：源文件名、目标语言、输出格式键与显示名、输出路径、模型名称/id、是否 OCR/智能编排。开始翻译前先看它确认设置。",
-    "classify_page": "判定某页类型：normal/scan/chart/uncertain。",
+    "classify_page": "判定某页类型：normal/scan/chart/uncertain；有语义结构时可为 formula/figure。",
+    "get_structure": "返回某页的语义结构：{page, parser, elements:[{kind,bbox,level,block_indices}], tables}，kind 为 text/heading/table/figure/formula/caption/note。用于识别公式/图表/标题层级/表格语义；无结构后端时 elements 为空（按普通文本处理）。",
+    "get_table": "返回某页第 index 个语义表格 {rows, cols, bbox, cells(行×列的扁平块索引), block_ref}；无表或无结构时返回 None。",
     "read_page": "读取某页的原始文本块与当前译文，含扁平块索引（供 set_block_text 使用）与布局元数据。",
     "goto_page": "在预览窗口显示指定页（原文/译文侧）。",
     "set_block_text": "把某块的译文直接置为指定文本（数字/代码块会被拒绝；写的是受保护的译文层）。",
