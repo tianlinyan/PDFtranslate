@@ -45,6 +45,16 @@ class RunFlowTest(unittest.TestCase):
         self.assertEqual(["a", "b"], rs.applied)
         self.assertEqual({"r": 1}, rs.result["a"])
 
+    def test_tool_step_logs_start_and_elapsed(self):
+        # A deterministic ``ToolStep`` logs its name when it starts and the elapsed
+        # time when it completes (so an audit_page / export step is visible).
+        logs: list = []
+        flow = self._flow(fs.ToolStep("demo", {"v": 1}))
+        rs = agent.run_flow(flow, tools={"demo": lambda v: {"r": v}}, log=logs.append)
+        self.assertTrue(rs.ok)
+        self.assertTrue(any("工具开始：demo" in m for m in logs), logs)
+        self.assertTrue(any("工具完成：demo" in m and "用时" in m for m in logs), logs)
+
     def test_agent_step_delegates_and_resolves_task_and_page(self):
         received: dict = {}
 
@@ -231,10 +241,17 @@ class RegistryTest(unittest.TestCase):
             self.assertEqual(want, agent.interpret_decision(answer), answer)
 
     def test_self_check_page_step_kinds_in_order(self):
+        # The audit→fix→re-audit rounds live inside ONE ``LoopStep`` (until clean, up to
+        # ``max_iter``): a fix that leaves residual issues is fixed again on the next
+        # round rather than abandoned after a single fix pass (the old structure ran one
+        # fix outside the loop and only re-audited).
         flow = agent.STANDARD_FLOWS["self_check_page"]
-        self.assertEqual(["tool", "if", "loop"], [s.kind for s in flow.steps])
-        self.assertEqual("audit_page", flow.steps[0].tool)
-        self.assertIsInstance(flow.steps[0], fs.ToolStep)
+        self.assertEqual(["loop"], [s.kind for s in flow.steps])
+        loop = flow.steps[0]
+        self.assertIsInstance(loop, fs.LoopStep)
+        self.assertEqual(["tool", "if"], [s.kind for s in loop.body])
+        self.assertEqual("audit_page", loop.body[0].tool)
+        self.assertEqual("agent", loop.body[1].then[0].kind)
 
     def test_self_check_page_runs_audit_then_fix_then_reaudit(self):
         # A realistic run of the registered P6 flow with injected fakes: the first
@@ -259,6 +276,30 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(2, state["audits"])            # initial + re-audit
         self.assertIn("agent:3", rs.applied)            # the AI fix pass ran once
         self.assertEqual("agent:3", rs.applied[1])
+
+    def test_self_check_page_retries_fix_until_clean(self):
+        # The fix step is INSIDE the ``LoopStep``: a fix that leaves residual issues
+        # is fixed again on the next round (up to ``max_iter``) rather than abandoned
+        # after a single pass (the old structure only re-audited without re-fixing).
+        state = {"audits": 0}
+
+        def audit_page(page, checks=None):
+            state["audits"] += 1
+            if state["audits"] <= 2:   # first two audits still find problems
+                return {"page": page, "issues": [{"check": "missing", "index": state["audits"]}],
+                        "clean": False}
+            return {"page": page, "issues": [], "clean": True}
+
+        def run_agent(*, task, page, **kw):
+            return {"ok": True, "page": page}
+
+        rs = agent.run_flow(agent.STANDARD_FLOWS["self_check_page"],
+                            tools={"audit_page": audit_page}, run_agent=run_agent,
+                            params={"page": 3})
+        self.assertTrue(rs.ok)
+        # audit(dirty)→fix→audit(dirty)→fix→audit(clean): 3 audits, 2 fix passes.
+        self.assertEqual(3, state["audits"])
+        self.assertEqual(2, rs.applied.count("agent:3"))
 
 
 if __name__ == "__main__":

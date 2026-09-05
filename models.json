@@ -6,8 +6,8 @@
       "type": "llama-server",
       "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
       "model": "qwen3.8-27b",
-      "reasoning_effort": "low",
-      "concurrency": 1,
+      "reasoning_effort": "none",
+      "concurrency": 2,
       "temperature":0.3,
       "vision": true,
       "batch_size": 8000

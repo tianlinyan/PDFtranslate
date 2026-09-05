@@ -9,7 +9,7 @@ import unittest
 
 from translate_app import agent
 from translate_app import pdfio
-from translate_app.agent.flow import DocumentSession, PHASE_DONE
+from translate_app.agent.flow import DocumentSession, PHASE_DONE, _page_translation_counts
 from translate_app.settings import ModelConfig
 from translate_app.translator import TranslationCancelled
 
@@ -392,6 +392,72 @@ class DocumentSessionTest(unittest.TestCase):
         # The normal page 0 was still translated.
         self.assertEqual("T0", state.out_doc[0]["text"])
         self.assertEqual(PHASE_DONE, state.phase)
+
+    def test_page_translation_counts_helper(self):
+        # The H5 guard: a page with translatable text but no AI translation is (n, 0);
+        # an all-numeric page is (0, 0); a translated page is (n, n).
+        doc = pdfio.DocumentText(
+            pages=[[_blk("总资产", page=0, x0=0, y0=0, x1=60, y1=10)],
+                   [_blk("12,345", page=1, x0=0, y0=0, x1=60, y1=10)]],
+            blocks=["总资产", "12,345"], block_pages=[0, 1], title="s",
+        )
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        state.out_doc = {}
+        self.assertEqual((1, 0), _page_translation_counts(state, 0))
+        self.assertEqual((0, 0), _page_translation_counts(state, 1))
+        state.out_doc = {0: {"text": "Total assets"}}
+        self.assertEqual((1, 1), _page_translation_counts(state, 0))
+
+    def test_page_with_no_ai_translation_is_needs_user_not_done(self):
+        # Regression: a page whose agent run "succeeded" (``rs.ok``) but produced no
+        # translation used to be marked DONE (fail-open).  It must be flagged
+        # needs_user so the export does not silently carry the untranslated source.
+        doc = _mixed_doc()
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            return st   # the AI never emitted a translation
+
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=fake_translate)
+        session._preprocess()
+        session._translate_normal()
+        self.assertEqual(agent.STATUS_NEEDS_USER, state.page(0).status)
+        self.assertTrue(any("未产生任何译文" in i for i in state.page(0).issues))
+
+    def test_review_include_kept_includes_kept_pages(self):
+        # U1 knob: ``include_kept=True`` makes the AI self-check also review pages the
+        # user chose to keep/skip (otherwise those pages are excluded — they carry the
+        # source verbatim and would be wrongly "translated" by a re-check).
+        doc = _mixed_doc()
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        state.triage = {
+            0: agent.PageTriage(page=0, kind="normal", decided=True, decision="translate"),
+            1: agent.PageTriage(page=1, kind="scan", decided=True, decision="keep"),
+            2: agent.PageTriage(page=2, kind="chart", decided=True, decision="keep"),
+        }
+        audited: list = []
+
+        def fake_audit(page=None, checks=None):
+            audited.append(page)
+            return {"page": page, "issues": [], "clean": True}
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            return st
+
+        # Default (include_kept=False): kept pages 1, 2 are excluded.
+        DocumentSession(state, doc, model=object(), log=lambda m: None,
+                        translate_page=fake_translate, audit=fake_audit)._ai_self_check()
+        self.assertEqual([0], audited)
+        # include_kept=True: pages the user chose to keep are reviewed too.
+        audited.clear()
+        DocumentSession(state, doc, model=object(), log=lambda m: None,
+                        translate_page=fake_translate, audit=fake_audit,
+                        include_kept=True)._ai_self_check()
+        self.assertEqual([0, 1, 2], audited)
 
 
 class NearestBlockTest(unittest.TestCase):

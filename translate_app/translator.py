@@ -826,4 +826,81 @@ def make_retranslate_fn(
     return _retranslate
 
 
+#: Batch re-translate prompt: translate *each* numbered segment; the reply must echo a
+#: ``[n]`` block per segment (so the caller can align ``[n]`` back onto the sources).
+_RETRANSLATE_BATCH_PROMPT = (
+    "请把下面每一段文字分别翻译成 {lang}。只输出译文，不要任何解释；"
+    "若某段已是目标语言，原样输出。不要保留任何原文语言。按编号逐段输出：\n{numbered}"
+)
+
+#: Matches ``[n]`` blocks in a batch re-translate reply (same shape as the translation).
+_RETRANSLATE_BATCH_RE = re.compile(r"(?ms)^\s*\[(\d+)\]\s*(.*?)(?=^\s*\[\d+\]\s*|\Z)")
+
+
+def _parse_retranslate_batch(text: str, n: int, sources: list[str]) -> list[str]:
+    """Map a reply of ``[n] translation`` blocks back onto ``sources`` (lenient).
+
+    Best-effort: a block the model missed, left blank, or a reply with no ``[n]``
+    markers keeps its source text (fail-closed — a re-translate must never blank a
+    cell or turn it into the wrong language).  ``n`` = len(sources); returns a list
+    aligned 1:1 with ``sources``.
+    """
+    matched: dict[int, str] = {}
+    for m in _RETRANSLATE_BATCH_RE.finditer(text):
+        pos = int(m.group(1)) - 1
+        val = " ".join(m.group(2).split())
+        if 0 <= pos < n and val and pos not in matched:
+            matched[pos] = val
+    if not matched:
+        # No ``[n]`` marker at all: accept a reply with exactly ``n`` non-empty lines,
+        # otherwise keep every source (a refusal / preamble must not become block 1).
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if len(lines) == n:
+            return list(lines)
+        return list(sources)
+    return [matched.get(i, sources[i]) for i in range(n)]
+
+
+def make_retranslate_batch_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None
+) -> Callable[[list[str], str], list[str]] | None:
+    """Return a direct *batch* re-translation callback, or ``None`` if disabled.
+
+    Signature ``(texts, target_language) -> list[str]`` (aligned with ``texts``).  All
+    texts are sent in ONE numbered request, bypassing the translation cache, so the AI
+    self-check can re-translate several problem blocks at once instead of one
+    ``chat.completions`` per block.  Best-effort — a block that fails or is missed
+    keeps its source, so a correction never makes a cell worse.
+    """
+    if not model.vision:
+        return None
+    client = OpenAI(**model.client_kwargs())
+
+    def _batch(texts: list[str], lang: str) -> list[str]:
+        try:
+            numbered = "\n\n".join(f"[{i + 1}]\n{t}" for i, t in enumerate(texts))
+            prompt = _RETRANSLATE_BATCH_PROMPT.format(lang=lang, numbered=numbered)
+            kwargs: dict = {
+                "model": model.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+            }
+            # Mirror ``_request_locked`` so llama.cpp-style endpoints that need
+            # ``reasoning_effort`` still work (otherwise this silently returns 500).
+            if model.max_tokens is not None:
+                kwargs["max_tokens"] = model.max_tokens
+            body_params = model.request_params()
+            if body_params:
+                kwargs["extra_body"] = body_params
+            resp = client.chat.completions.create(**kwargs)
+            content = getattr(resp.choices[0].message, "content", None) or ""
+            return _parse_retranslate_batch(str(content), len(texts), texts)
+        except Exception as exc:  # noqa: BLE001 — fail-closed, keep the originals
+            if log:
+                log(f"  批量修正重译失败：{type(exc).__name__}: {exc}")
+            return list(texts)
+
+    return _batch
+
+
 

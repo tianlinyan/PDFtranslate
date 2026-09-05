@@ -393,6 +393,80 @@ class LlmDecideAndPageLoopTest(unittest.TestCase):
         self.assertEqual({"reasoning_effort": "low"}, kw["extra_body"])
         self.assertEqual("auto", kw["tool_choice"])
 
+    def test_llm_decide_raises_translation_cancelled_on_cancel(self):
+        # A cancel during an in-flight request surfaces as ``TranslationCancelled``
+        # (a control signal), not a masked "decide failed → done" that would let the
+        # page keep running.  The watchdog closes the client → ``create`` raises →
+        # ``cancel()`` is true → re-raise.
+        class _Completions:
+            def create(self, **_k):
+                raise RuntimeError("connection aborted")
+        class _Chat:
+            completions = _Completions()
+        class _Client:
+            def __init__(self, **_k):
+                self.chat = _Chat()
+            def close(self):
+                pass
+        with mock.patch.object(translator, "OpenAI", lambda **_k: _Client()):
+            decide = agent.make_llm_decide(_vision_model(), task="observe the page",
+                                           image_provider=lambda _s: b"",
+                                           cancel=lambda: True)
+        s = agent.WorkflowState("a.pdf", "English")
+        s.page(0)
+        with self.assertRaises(translator.TranslationCancelled):
+            decide("obs", s)
+
+    def test_flow_agent_call_reraises_translation_cancelled(self):
+        # A per-tool ``TranslationCancelled`` must propagate (not be swallowed into an
+        # ``ok=False`` result), so the worker stops the run immediately.
+        s = agent.WorkflowState("a.pdf", "English")
+        def boom(**_k):
+            raise translator.TranslationCancelled()
+        fa = agent.FlowAgent(s, {"boom": boom},
+                             decide=lambda *a, **k: agent.Decision(action="call", tool="boom"))
+        with self.assertRaises(translator.TranslationCancelled):
+            fa._call("boom", {})
+
+    def test_tool_call_logs_start_and_elapsed(self):
+        # Each tool call logs its name when it starts and the elapsed time when it
+        # completes, so the main log shows what is running and how long it took.
+        s = agent.WorkflowState("a.pdf", "English")
+        logs: list[str] = []
+        fa = agent.FlowAgent(s, {"demo": lambda **kw: {"ok": True}},
+                             decide=lambda *a, **k: agent.Decision(action="call", tool="demo"),
+                             log=logs.append)
+        fa.step()
+        self.assertTrue(any("工具开始：demo" in m for m in logs), logs)
+        self.assertTrue(any("demo" in m and "用时" in m and "s" in m for m in logs), logs)
+
+    def test_window_messages_bounds_and_keeps_user_boundary(self):
+        # Scheme 2: the decide request is windowed to a bounded, protocol-valid tail
+        # (system + last messages, cut at a *user* boundary so an assistant tool_call
+        # and its tool result are never split), so a page with many tool rounds does
+        # not re-send O(n²) history.
+        from translate_app.agent.flow import _window_messages
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(30):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": "",
+                         "tool_calls": [{"id": f"t{i}", "type": "function",
+                                         "function": {"name": "f", "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": f"t{i}", "content": f"r{i}"})
+        msgs.append({"role": "user", "content": "final obs"})
+        w = _window_messages(msgs, cap=12)
+        self.assertLess(len(w), len(msgs))
+        self.assertLessEqual(len(w), 12 + 3)          # back-off may keep ≤2 extra
+        self.assertEqual("system", w[0]["role"])
+        self.assertEqual("user", w[1]["role"])         # cut at a user boundary
+        self.assertEqual("final obs", w[-1]["content"])  # freshest obs retained
+        # No tool message without its assistant, and no assistant before its tool.
+        roles = [m["role"] for m in w]
+        self.assertNotIn("assistant", roles[-1])        # last msg is the fresh obs
+        # A short list passes through unchanged.
+        short = [{"role": "system", "content": "s"}, {"role": "user", "content": "x"}]
+        self.assertEqual(short, _window_messages(short))
+
     def test_make_source_tools_read_page_is_read_only(self):
         s = agent.WorkflowState("a.pdf", "English")
         s.src_doc = pdfio.DocumentText(
@@ -841,6 +915,158 @@ class PageExecutorsTest(unittest.TestCase):
         self.assertEqual("TRANSLATED", res["translated"])
         self.assertEqual("TRANSLATED", s.out_doc[0]["text"])
 
+    def test_translate_blocks_batches_and_writes(self):
+        # The batch tool translates many blocks in ONE ``engine.translate_blocks``
+        # call (the engine batches internally), writes each result to out_doc, and
+        # skips numeric / code cells — a whole page in a fraction of the per-block
+        # requests that a block-by-block loop would need.
+        seen: list = []
+
+        class _Eng:
+            def __init__(self, model):
+                self.model = model
+
+            def translate_blocks(self, blocks, lang, **kw):
+                seen.append(list(blocks))
+                return type("R", (), {
+                    "translated": [f"TR-{b}" for b in blocks], "errors": []})()
+
+        s = self._state()
+        with mock.patch.object(translator, "TranslationEngine", _Eng):
+            tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["translate_blocks"](0)   # all translatable blocks on page 0
+        self.assertTrue(res["ok"])
+        self.assertEqual(2, res["count"])     # 总资产 + 总负债 (numeric cell skipped)
+        self.assertEqual(1, len(seen))        # ONE batched request, not per-block
+        self.assertEqual(["总资产", "总负债"], seen[0])
+        self.assertEqual("TR-总资产", s.out_doc[0]["text"])
+        self.assertEqual("TR-总负债", s.out_doc[2]["text"])
+        self.assertNotIn(1, (s.out_doc or {}))     # numeric cell untouched
+        self.assertEqual([], res["failed"])
+
+    def test_translate_blocks_accepts_explicit_indices(self):
+        seen: list = []
+
+        class _Eng:
+            def __init__(self, model):
+                self.model = model
+
+            def translate_blocks(self, blocks, lang, **kw):
+                seen.append(list(blocks))
+                return type("R", (), {
+                    "translated": [f"TR-{b}" for b in blocks], "errors": []})()
+
+        s = self._state()
+        with mock.patch.object(translator, "TranslationEngine", _Eng):
+            tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["translate_blocks"](0, indices=[0, 99, 1, 2])
+        self.assertTrue(res["ok"])
+        self.assertEqual(["总资产", "总负债"], seen[0])   # bogus 99 / numeric 1 dropped
+        self.assertEqual(2, res["count"])
+
+    def test_translate_blocks_nothing_to_translate_errors(self):
+        class _Eng:
+            def __init__(self, model):
+                self.model = model
+
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("12345", page=0, x0=0, y0=0, x1=50, y1=10)]],
+            blocks=["12345"], block_pages=[0])
+        with mock.patch.object(translator, "TranslationEngine", _Eng):
+            tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["translate_blocks"](0)
+        self.assertFalse(res["ok"])
+        self.assertIn("没有可翻译的块", res["error"])
+
+    def test_retranslate_blocks_batches_and_writes(self):
+        # The self-check's batch re-translate: ONE request, bypasses the cache,
+        # writes the fresh translations to out_doc (numeric cells skipped).
+        seen: list = []
+
+        def fake_batch(texts, lang):
+            seen.append((list(texts), lang))
+            return [f"RT-{t}" for t in texts]
+
+        s = self._state()
+        with mock.patch.object(translator, "make_retranslate_batch_fn",
+                               lambda model, log=None: fake_batch):
+            tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["retranslate_blocks"](0, indices=[0, 1, 2])
+        self.assertTrue(res["ok"])
+        self.assertEqual(["总资产", "总负债"], seen[0][0])      # numeric cell 1 dropped
+        self.assertEqual("RT-总资产", s.out_doc[0]["text"])
+        self.assertEqual("RT-总负债", s.out_doc[2]["text"])
+        self.assertNotIn(1, (s.out_doc or {}))                   # numeric untouched
+        self.assertEqual([], res["failed"])
+
+    def test_retranslate_blocks_untouched_source_is_failed(self):
+        # A block whose retranslation comes back as the source (model declined /
+        # failed) is NOT written and is reported in ``failed`` (fail-closed).
+        def fake_batch(texts, lang):
+            return list(texts)   # model returns the source verbatim
+
+        s = self._state()
+        with mock.patch.object(translator, "make_retranslate_batch_fn",
+                               lambda model, log=None: fake_batch):
+            tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["retranslate_blocks"](0, indices=[0])
+        self.assertTrue(res["ok"])
+        self.assertEqual([0], res["failed"])
+        self.assertNotIn(0, (s.out_doc or {}))
+
+    def test_retranslate_blocks_nothing_to_translate_errors(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("12345", page=0, x0=0, y0=0, x1=50, y1=10)]],
+            blocks=["12345"], block_pages=[0])
+        with mock.patch.object(translator, "make_retranslate_batch_fn",
+                               lambda model, log=None: lambda texts, lang: texts):
+            tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["retranslate_blocks"](0)
+        self.assertFalse(res["ok"])
+        self.assertIn("没有可重译的块", res["error"])
+
+    def test_detect_page_skew_asks_and_records(self):
+        # A noticeable skew → the tool files a question, records the decision, and
+        # reports it (low-risk: it never modifies the PDF).
+        s = self._state()
+        s.src_path = "a.pdf"
+        asked = []
+
+        def ah(question, options, target):
+            asked.append((question, options, target))
+            return {"value": "校正", "target": target}
+
+        with mock.patch.object(pdfio, "detect_page_skew",
+                               return_value={"page": 0, "skew_degrees": 1.2,
+                                             "recommended": True, "reason": "倾斜"}):
+            tools = agent.make_page_executors(s, _dummy_model(), answer_handler=ah)
+            res = tools["detect_page_skew"](0)
+        self.assertTrue(res["ok"])
+        self.assertEqual(1.2, res["skew_degrees"])
+        self.assertEqual("校正", res["decision"])
+        self.assertTrue(asked and "几何校正" in asked[0][0])
+        self.assertEqual(["校正", "忽略"], asked[0][1])
+        self.assertIn("ocr_skew:0", s.user_decisions)
+        self.assertTrue(s.user_decisions["ocr_skew:0"]["apply"])
+        self.assertTrue(any(op.tool == "detect_page_skew" and op.user_confirmed
+                            for op in s.ops))
+
+    def test_detect_page_skew_clean_does_not_ask(self):
+        s = self._state()
+        s.src_path = "a.pdf"
+        with mock.patch.object(pdfio, "detect_page_skew",
+                               return_value={"page": 0, "skew_degrees": 0.1,
+                                             "recommended": False, "reason": "平正"}):
+            tools = agent.make_page_executors(s, _dummy_model(),
+                                              answer_handler=lambda *a: None)
+            res = tools["detect_page_skew"](0)
+        self.assertTrue(res["ok"])
+        self.assertEqual(0.1, res["skew_degrees"])
+        self.assertFalse(res["recommended"])
+        self.assertIsNone(res["decision"])     # no question was asked
+
     def test_preview_page_invokes_handler_and_returns_bytes(self):
         s = self._state()
         got = {}
@@ -1070,6 +1296,16 @@ class ReviewPageTaskPromptTest(unittest.TestCase):
         self.assertIn("复核", task)
         self.assertIn("set_text", task)
         self.assertIn("retranslate_block", task)
+
+    def test_review_page_task_guides_batch_retranslate(self):
+        # The review task should steer the model to batch re-translate several findings
+        # (retranslate_blocks) instead of one retranslate_block per problem — the
+        # scheme-1 analogue for the AI self-check.
+        from translate_app import prompts
+
+        task = prompts.review_page_task(2, auto_fix=True)
+        self.assertIn("retranslate_blocks", task)
+        self.assertIn("批量重译", task)
 
     def test_findings_are_injected_as_concrete_data(self):
         from translate_app import prompts

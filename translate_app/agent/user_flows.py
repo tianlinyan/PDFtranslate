@@ -232,6 +232,12 @@ def build_flow(spec: FlowSpec) -> Flow:
         flow.params["kind"] = spec.kind
     if spec.output_type:
         flow.params["output_type"] = spec.output_type
+    # U1 knob: carry ``include_kept`` so a custom review flow explicitly opts into
+    # reviewing pages the user chose to keep/skip.  The live M4 driver honours it via
+    # ``DocumentSession(include_kept=...)`` (see ``_ai_self_check``); this keeps the
+    # compiled flow's params consistent for a caller that builds a session from it.
+    if spec.include_kept:
+        flow.params["include_kept"] = True
     if spec.scope is not None:
         pages = [int(p) for p in spec.scope]
         if spec.base in _PER_PAGE_BASES and len(pages) > 1:

@@ -824,6 +824,66 @@ class SystemPromptNumberingTest(unittest.TestCase):
         self.assertIn("点击", prompt)
 
 
+class RetranslateBatchTest(unittest.TestCase):
+    """The batch (cache-bypassing) re-translate callback + its lenient parser."""
+
+    _VISION = ModelConfig.from_dict(dict(
+        id="v", name="v", type="llama-server",
+        endpoint="http://127.0.0.1:9/v1/chat/completions", model="m", vision=True,
+    ))
+
+    def test_parse_retranslate_batch_numbered(self):
+        sources = ["甲", "乙", "丙"]
+        self.assertEqual(["A", "B", "C"],
+                         translator._parse_retranslate_batch("[1]\nA\n[2]\nB\n[3]\nC", 3, sources))
+        # A missing block keeps its source (fail-closed, never blank).
+        self.assertEqual(["A", "乙", "C"],
+                         translator._parse_retranslate_batch("[1]\nA\n[3]\nC", 3, sources))
+
+    def test_parse_retranslate_batch_unmarked(self):
+        sources = ["甲", "乙", "丙"]
+        # Exactly n non-empty lines are accepted; otherwise everything keeps source.
+        self.assertEqual(["A", "B", "C"], translator._parse_retranslate_batch("A\nB\nC", 3, sources))
+        self.assertEqual(sources, translator._parse_retranslate_batch("A\nB", 3, sources))
+
+    def test_make_retranslate_batch_fn_maps_numbered_reply(self):
+        seen = []
+
+        class _Msg:
+            content = "[1]\nAlpha\n[2]\nBeta"
+
+        class _Ch:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Ch()]
+
+        class _Completions:
+            def create(self, **kw):
+                seen.append(kw)
+                return _Resp()
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Client:
+            def __init__(self, **_k):
+                self.chat = _Chat()
+
+        with mock.patch.object(translator, "OpenAI", lambda **_k: _Client()):
+            fn = translator.make_retranslate_batch_fn(self._VISION)
+        self.assertIsNotNone(fn)
+        out = fn(["甲", "乙"], "English")
+        self.assertEqual(["Alpha", "Beta"], out)
+        # The numbered sources were in the prompt, one request (batch), temperature 0.
+        self.assertEqual("[1]\n甲\n\n[2]\n乙", seen[0]["messages"][0]["content"].split("：\n", 1)[-1])
+        self.assertEqual(0.0, seen[0]["temperature"])
+        # Non-vision model → None.
+        self.assertIsNone(translator.make_retranslate_batch_fn(
+            ModelConfig.from_dict(dict(id="nv", name="nv", type="x",
+                                       endpoint="http://127.0.0.1:9", model="m"))))
+
+
 if __name__ == "__main__":
     unittest.main()
 

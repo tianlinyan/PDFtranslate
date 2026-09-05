@@ -186,9 +186,12 @@ def agent_tool_policy() -> str:
         "某工具返回 ok=false 先读 error 判断原因、别盲目重试；index 一律用 read_page 的**扁平 index**（写回就靠它）。"
         "各工具的返回值见其 schema，这里只补关键差异：\n"
         "① 观察（只读原文，绝不改写）：read_page（含扁平 index，超大页可 offset/limit 分页）、get_layout、get_doc_info、"
-        "classify_page、render_page（渲染译文 PNG 供自检）、preview_page（弹窗给用户看）。\n"
-        "② 修改（写可编辑译文，原文不可动）：translate_block（翻译并**写入**，首选）、set_text（写已知译名；数字/代码块被拒）、"
-        "retranslate_block（**只返回译文**，需再 set_text 写入）、apply_terminology（锁术语）、delete_block（撤为原文）、"
+        "classify_page、render_page（渲染译文 PNG 供自检）、preview_page（弹窗给用户看）、"
+        "detect_page_skew（检测扫描页文本倾斜角，供几何校正决定——recommended 时会问用户）。\n"
+        "② 修改（写可编辑译文，原文不可动）：translate_blocks（**批量**翻译并写入，整行/整表/整页首选——远快于逐块请求）、"
+        "translate_block（翻译并**写入**，单块，仅翻少数块时用）、set_text（写已知译名；数字/代码块被拒）、"
+        "retranslate_blocks（**批量重译并写入**，绕过缓存，修正多条 finding 时首选）、"
+        "retranslate_block（**只返回译文**，需再 set_text 写入，单块）、apply_terminology（锁术语）、delete_block（撤为原文）、"
         "apply_annotation（按用户框选改）。\n"
         "③ 校验（只报告，无副作用）：check_residual（残留+空块；目标为西文看残留中文、中文目标看未译英文成句；"
         "纯代码/缩写/单位/数字不算）、check_missing（源有译文空；纯数字/代码不算）、check_numbers（数字按值一致；"
@@ -236,8 +239,9 @@ def page_task(page_index: int, lang: str, kind: str | None = None) -> str:
     return (
         f"{head}请把本页**所有文本块**均翻译成 {lang}——整页最终应**全部是 {lang}**；"
         "只有纯数字/金额/代码/单位块保持原样。\n"
-        "① read_page(page) 读本页全部块并记下 index；② 对每个**应翻译**的块 translate_block(index)（自动用该块原文），"
-        "确知的译名可直接 set_text(page, index, text)；③ 最后**必须** check_residual 校验。"
+        "① read_page(page) 读本页全部块并记下 index；② **优先 translate_blocks(page) 一次批量翻译整页所有可翻译块**"
+        "（它自动按字符预算分批+并发，且跳过数字/代码块，远快于逐块请求）；确知的译名可直接 set_text(page, index, text)；"
+        "个别需单独重译的块才用 translate_block(index)；③ 最后**必须** check_residual 校验。"
         f"若仍报有块未译/残留，必须继续翻译——**确认整页都已译成 {lang}、且无残留才结束，不得提前结束**。"
     )
 
@@ -325,8 +329,10 @@ def review_page_task(page_index: int, *, findings: dict | None = None,
     )
     if auto_fix:
         lines.append(
-            "修正：set_text 写入已知译文；retranslate_block 只返回译文、需再 set_text 写入；"
-            "apply_annotation 按用户框选改动。必须让本页适用的上述各项都无问题才结束，否则继续修正，不得提前结束。"
+            "修正：**多条 finding 先 retranslate_blocks(page, indices=[...]) 一次批量重译并写入**"
+            "（绕过缓存，不会让旧译文复现，远快于逐条重译）；确知的译名 set_text；"
+            "单个块或只想拿到译文再写回的用 retranslate_block；apply_annotation 按用户框选改动。"
+            "必须让本页适用的上述各项都无问题才结束，否则继续修正，不得提前结束。"
         )
     else:
         lines.append("（本次为**只读复核**：只报告问题，不要修改任何译文。）")
@@ -399,8 +405,10 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_layout": "提取某页的行/列聚类、二维网格与单元格跨度",
     "get_doc_info": "返回原文件信息：页数/标题/语言/文本页/扫描页/图表页/块数/每页类型（表格页恒为 0）",
     "classify_page": "判定某页类型：normal/scan/chart/uncertain",
-    "translate_block": "翻译某块并写入其译文（走缓存+编号协议）",
+    "translate_block": "翻译某块并写入其译文（走缓存+编号协议；单块请求，仅翻少数块时用）",
+    "translate_blocks": "一次批量翻译多块并写入（单次请求、引擎自动按字符预算分批+并发）：传扁平块索引列表，或只传 page 翻译整页所有可翻译块；返回 {count, indices, translated:{index:text}, failed}。整行/整表/整页应优先用它，比逐块 translate_block 快得多；数字/代码/空块被自动跳过",
     "retranslate_block": "避开缓存强制重译一段文本，**只返回译文**（不会写入；需再用 set_text 把它写到目标块）。常用于残中/空缺修正",
+    "retranslate_blocks": "一次批量重译多个块并**直接写入**（单次请求、绕过缓存，避免复用旧译文）：传扁平块索引列表，或只传 page 重译整页所有可翻译块；返回 {count, indices, translated:{index:text}, failed:[...]}。**修正多条 finding 时应优先用它**（远快于逐条 retranslate_block）；数字/代码/空块被自动跳过",
     "set_text": "把某块文本直接置为指定值（数字/代码块会被拒绝）",
     "apply_annotation": "按预览中用户框选的区域改写/删除对应块（M6）",
     "apply_terminology": "为某源词设定统一的术语译文（会并入本页翻译所用的术语表）",
@@ -413,6 +421,7 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "audit_page": "对某页一次性跑指定的确定性审计并合并结果：返回 {checks_requested, checks, issues, clean}（issues 是带 check 标签的列单项，供你逐条修正）；checks 可传子集（如 ['numbers','table']），默认全五类。只读复核（不修任何东西）时把 clean 当作本轮是否达标",
     "render_page": "把当前处理到该页的译文渲染成 PNG 供视觉自检（检查溢出/越线/密度）",
     "preview_page": "在预览窗口显示指定页面（供用户查看），可聚焦某区域/块",
+    "detect_page_skew": "检测某扫描页文本的整体倾斜角（度）：返回 {page, skew_degrees, recommended, decision, reason}；若 recommended 且已接入问答通道，会向用户询问是否做几何校正并把决定记入状态。扫描件翻译前可先调用它判断是否需要（低风险定向）几何校正——它只检测/询问、不修改原 PDF",
     "ask_user": "向用户提问并等待回答（关键决策/歧义/术语确认）",
 }
 

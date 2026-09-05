@@ -918,6 +918,28 @@ class VerticalLabelTest(unittest.TestCase):
             pdfio._is_vertical_label(self._block(single_line=False))
         )
 
+    def test_extraction_marks_rotated_labels_single_line_and_chart(self):
+        # Regression: the old ``single_line`` heuristic used ``rect.height <= 1.5*size``,
+        # which is always False for a vertically-rotated label (its bbox is *tall*), so
+        # ``_is_vertical_label`` never fired on real extraction — the page was classified
+        # ``normal`` and labels were drawn as horizontal one-char shards.  This drives the
+        # real extraction path (not a hand-built ``Block``) and asserts the labels come
+        # back single-line + the page triages as ``chart``.
+        src = _OUT / "orgchart.pdf"
+        doc = fitz.open()
+        page = doc.new_page()
+        for y in (100, 200, 300):
+            page.insert_text(fitz.Point(60, y), "公司的架构", fontsize=8,
+                             fontname="china-s", rotate=90)
+        doc.save(str(src))
+        doc.close()
+        extracted = pdfio.extract_document_text(str(src))
+        labels = [b for b in extracted.pages[0] if pdfio._is_vertical_label(b)]
+        self.assertGreaterEqual(len(labels), 3, "rotated org-chart labels not detected")
+        for b in labels:
+            self.assertTrue(b.single_line, f"vertical label not single_line: {b.text!r}")
+        self.assertEqual(pdfio.classify_page(extracted.pages[0]), pdfio.PAGE_CHART)
+
     def test_rotation_keeps_label_inside_the_box(self):
         font = fitz.Font("cjk")
         doc = fitz.open()
@@ -1134,6 +1156,68 @@ class MultilineCellAnchorTest(unittest.TestCase):
         # and stay inside the cell rather than overflowing the bottom rule.
         self.assertLess(min(s[1] for s in spans) - cell_top, 8.0)
         self.assertLessEqual(max(s[3] for s in spans), cell_bot + 1.0)
+
+
+class SkewDetectTest(unittest.TestCase):
+    """The low-risk OCR skew detector's pure angle math."""
+
+    def test_angle_median_wraps_to_45(self):
+        # Angles fold into [-45, 45): a 0° and a 179° line are the same baseline.
+        self.assertEqual(0.0, pdfio._angle_median([0.0, 0.5, -0.5]))
+        self.assertAlmostEqual(10.0, pdfio._angle_median([9.0, 10.0, 11.0]))
+        self.assertAlmostEqual(-1.0, pdfio._angle_median([179.0, 181.0, -1.0]), places=5)
+        self.assertIsNone(pdfio._angle_median([]))
+
+    def test_deskew_affine_roundtrips_points(self):
+        # A point in the original image, rotated forward to the deskewed frame, then
+        # mapped back with ``_map_pt_back`` must land exactly on the original point —
+        # this is the geometry that keeps OCR boxes on the real page after a deskew.
+        import cv2
+        import numpy as np
+
+        img = np.zeros((300, 400, 3), np.uint8)     # H=300, W=400
+        for skew in (1.5, -2.0):
+            rotated, inv_m, pad = pdfio._deskew_affine(img, skew)
+            m = cv2.invertAffineTransform(inv_m)
+            for (x, y) in ((5, 5), (37, 123), (395, 295)):
+                v = m @ np.array([float(x + pad), float(y + pad), 1.0])
+                ox, oy = pdfio._map_pt_back(inv_m, pad, float(v[0]), float(v[1]))
+                self.assertAlmostEqual(float(x), ox, places=4)
+                self.assertAlmostEqual(float(y), oy, places=4)
+
+    def test_estimate_skew_from_gray_detects_angle(self):
+        import cv2
+        import numpy as np
+
+        for want in (1.5, -2.0):
+            img = np.full((400, 500), 255, np.uint8)
+            ang = np.radians(want)
+            cx, cy = 250.0, 200.0
+            dx, dy = 200.0, 0.0
+            x1 = cx + dx * np.cos(ang) - dy * np.sin(ang)
+            y1 = cy + dx * np.sin(ang) + dy * np.cos(ang)
+            x2 = cx - dx * np.cos(ang) + dy * np.sin(ang)
+            y2 = cy - dx * np.sin(ang) - dy * np.cos(ang)
+            cv2.line(img, (int(x1), int(y1)), (int(x2), int(y2)), 0, 3)
+            got = pdfio._estimate_skew_from_gray(img)
+            self.assertIsNotNone(got)
+            self.assertAlmostEqual(float(want), float(got), delta=1.2)
+
+    def test_detect_page_skew_flat_page_is_not_recommended(self):
+        # A page with straight horizontal rules reads as ~0° (no geometry correction
+        # is recommended).  --- a smoke test that the CV path runs without error.
+        import pymupdf as fitz
+        src = _OUT / "skew_flat.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=300)
+        for y in (40, 80, 120, 160, 200, 240):
+            page.draw_line(fitz.Point(30, y), fitz.Point(270, y),
+                           color=(0, 0, 0), width=1)
+        doc.save(str(src))
+        doc.close()
+        res = pdfio.detect_page_skew(str(src), 0)
+        self.assertIsInstance(res["skew_degrees"], float)
+        self.assertIn(res["reason"], ("版面基本平正", "未检测到文本线"))
 
 
 if __name__ == "__main__":

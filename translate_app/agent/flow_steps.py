@@ -38,6 +38,7 @@ Step semantics
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -251,14 +252,21 @@ class _Executor:
             rs.record(label)
             rs.error = f"unknown tool: {step.tool}"
             return
+        # Surface the tool call as it starts and report its elapsed time when done,
+        # so a deterministic step (audit_page / export) is visible in the main log.
+        self.log(f"  工具开始：{step.tool}")
+        started = time.monotonic()
         try:
             data = fn(**args)
         except FlowCancelled:
             raise                     # a control signal must never be swallowed
         except Exception as exc:  # noqa: BLE001 — fail-closed, never crash the flow
+            self.log(f"  工具失败：{step.tool}（用时 {time.monotonic() - started:.2f}s）："
+                     f"{type(exc).__name__}: {exc}")
             rs.record(label)
             rs.error = f"tool {step.tool} failed: {type(exc).__name__}: {exc}"
             return
+        self.log(f"  工具完成：{step.tool}（用时 {time.monotonic() - started:.2f}s）")
         rs.record(label, data)
 
     def _agent(self, step: AgentStep, rs: FlowRunState, params: dict[str, Any]) -> None:
@@ -398,18 +406,24 @@ def _review_task(rs: FlowRunState, params: dict[str, Any]) -> str:
 
 
 def make_self_check_page() -> Flow:
-    """P6 self_check_page: deterministic audit → fix findings → re-audit (see docs/0.3.4)."""
+    """P6 self_check_page: deterministic audit → fix findings → re-audit (see docs/0.3.4).
+
+    The fix (``AgentStep``) lives INSIDE the ``LoopStep``: each round audits, fixes any
+    reported findings, and the next round re-audits — so a fix that leaves residual
+    issues is fixed again rather than abandoned after a single pass (the old structure
+    ran one fix then only re-audited, spending ``max_iter`` re-checking without ever
+    re-fixing).  ``max_iter`` bounds the number of audit→fix rounds.
+    """
     return Flow(
         name="self_check_page",
         description="对一页做确定性审计，并把发现的问题交给 AI 就地修正；只复核真正翻译过的页。",
         params={"page": 0, "checks": None, "auto_fix": True, "max_iter": 3},
         steps=[
-            ToolStep("audit_page", {"page": "{{page}}", "checks": "{{checks}}"}),
-            IfStep(cond=_has_findings, then=[
-                AgentStep(task=_review_task, page="{{page}}", image=True),
-            ]),
             LoopStep(until=_clean, max_iter="{{max_iter}}", body=[
                 ToolStep("audit_page", {"page": "{{page}}", "checks": "{{checks}}"}),
+                IfStep(cond=_has_findings, then=[
+                    AgentStep(task=_review_task, page="{{page}}", image=True),
+                ]),
             ]),
         ],
         guards={"protect": True, "scope": "translated_pages"},

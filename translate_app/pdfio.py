@@ -718,8 +718,128 @@ def _page_to_array(page) -> tuple[object, float]:
     return img, zoom
 
 
+#: A scanned page whose dominant text lines are tilted by at least this many degrees is
+#: worth a geometry check — below it the axis-aligned grid clustering still holds.
+_SKEW_RECOMMEND_DEG = 0.5
+#: A scan tilted by at least this many degrees is deskewed *before* OCR (rotate the
+#: render so text lines become axis-aligned).  Below it we skip the transform entirely,
+#: so a flat, aligned scan is never "over-rotated" — this is the low-risk correction.
+_SKEW_CORRECT_DEG = 0.5
+
+
+def _angle_median(angles: Sequence[float]) -> float | None:
+    """Median of line angles normalized to ``[-45, 45]`` (the deskew estimate).
+
+    Line angles from an image wrap at ±90°; rotating a segment by 180° flips its sign,
+    so each angle is folded into ``[-45, 45)`` before the median is taken.
+    """
+    norm: list[float] = []
+    for a in angles:
+        norm.append((float(a) + 45.0) % 90.0 - 45.0)
+    if not norm:
+        return None
+    norm.sort()
+    return norm[len(norm) // 2]
+
+
+def _estimate_skew_from_gray(gray) -> float | None:
+    """Median near-horizontal Hough angle of a (grayscale) image, or ``None``."""
+    import numpy as np
+    import cv2
+
+    if gray is None or gray.size == 0:
+        return None
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    edges = cv2.Canny(bw, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=80,
+                            minLineLength=max(30, int(gray.shape[1] * 0.06)), maxLineGap=8)
+    angles: list[float] = []
+    if lines is not None:
+        # ``HoughLinesP`` returns either (N,1,4) or (N,4) depending on the build;
+        # flatten to (N,4) so each segment is a 4-element vector.
+        for seg in np.asarray(lines).reshape(-1, 4):
+            x1, y1, x2, y2 = (float(v) for v in seg)
+            dx, dy = x2 - x1, y2 - y1
+            if abs(dx) < 1e-3:
+                continue
+            ang = float(np.degrees(np.arctan2(dy, dx)))
+            wrapped = (ang + 45.0) % 90.0 - 45.0
+            if abs(wrapped) <= 30.0:   # keep near-horizontal text baselines / rules
+                angles.append(wrapped)
+    return _angle_median(angles)
+
+
+#: Pad (px) added around the image before deskew-rotating, so the small rotation does
+#: not crop content at the page edges; a minimal 20px margin covers very slight skew.
+def _deskew_affine(img, skew: float) -> tuple[object, object, int]:
+    """Return ``(rotated_img, inv_affine, pad)`` for deskewing ``img`` by ``skew``°.
+
+    ``cv2.getRotationMatrix2D`` rotates about the image centre; the image is first
+    padded so the small rotation does not clip page-edge content, and the returned
+    inverse affine maps a point in the rotated(+padded) frame back to the ORIGINAL
+    (unpadded) image coordinates — subtract ``pad`` after applying it.
+    """
+    import numpy as np
+    import cv2
+
+    h, w = img.shape[:2]
+    rad = float(np.radians(abs(skew)))
+    pad = int(max(w, h) * float(np.sin(rad)) + max(w, h) * (1.0 - float(np.cos(rad)))) + 20
+    padded = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+    cx, cy = w / 2.0 + pad, h / 2.0 + pad
+    m = cv2.getRotationMatrix2D((cx, cy), -skew, 1.0)
+    rotated = cv2.warpAffine(padded, m, (w + 2 * pad, h + 2 * pad),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return rotated, cv2.invertAffineTransform(m), pad
+
+
+def _map_pt_back(inv_affine, pad: int, px: float, py: float) -> tuple[float, float]:
+    """Map a deskuwed-frame point ``(px, py)`` back to original image pixels."""
+    import numpy as np
+
+    v = inv_affine @ np.array([float(px), float(py), 1.0])
+    return float(v[0] - pad), float(v[1] - pad)
+
+
+def detect_page_skew(src_path: str | Path, page_index: int, dpi: float = 150.0) -> dict[str, Any]:
+    """Estimate a page's dominant skew (degrees) from its rendered text lines.
+
+    Renders the page (grayscale), binarizes it, and takes the median angle of the
+    near-horizontal Hough line segments: a flat, aligned scan clusters around 0°, a
+    skewed one drifts away.  Deterministic and read-only.  Returns
+    ``{"page", "skew_degrees", "recommended", "reason"}``.  This is the low-risk
+    detector behind the agent's ``detect_page_skew`` tool — it never modifies the PDF,
+    only reports whether a geometry correction should be considered.
+    """
+    import pymupdf as fitz
+    import numpy as np
+
+    doc = fitz.open(str(src_path))
+    try:
+        if not (0 <= int(page_index) < doc.page_count):
+            return {"page": int(page_index), "skew_degrees": 0.0, "recommended": False,
+                    "reason": "页号越界"}
+        page = doc[int(page_index)]
+        zoom = dpi / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    finally:
+        doc.close()
+    skew = _estimate_skew_from_gray(img)
+    if skew is None:
+        return {"page": int(page_index), "skew_degrees": 0.0, "recommended": False,
+                "reason": "未检测到文本线"}
+    return {"page": int(page_index), "skew_degrees": round(float(skew), 2),
+            "recommended": abs(float(skew)) >= _SKEW_RECOMMEND_DEG,
+            "reason": ("检测到文本整体倾斜" if abs(float(skew)) >= _SKEW_RECOMMEND_DEG
+                       else "版面基本平正")}
+
+
 def _block_to_dict(b: Block) -> dict:
     return asdict(b)
+
 
 
 def _block_from_dict(data: dict) -> Block:
@@ -1154,6 +1274,53 @@ def _needs_ocr(page) -> bool:
         return False
 
 
+def _ocr_results_from_img(engine, img, zoom, page_index, log=None) -> list[tuple[list, str]]:
+    """Run RapidOCR on a rendered page, deskewing first if it is noticeably tilted.
+
+    Returns ``[(pdf_box, text), ...]`` with boxes already in PDF points.  When the page's
+    dominant text lines are tilted by at least ``_SKEW_CORRECT_DEG``, the BGR image is
+    padded and rotated (``cv2.getRotationMatrix2D``) so the text becomes axis-aligned
+    before OCR; every detected box is mapped back to the ORIGINAL page coordinates via the
+    inverse affine, so the grid reconstruction still sees correct, un-rotated geometry.  A
+    near-flat page skips the transform entirely — the low-risk "don't over-rotate a good
+    scan" guard.
+    """
+    import cv2
+    import numpy as np
+
+    gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            if img.ndim == 3 and img.shape[2] >= 3 else img)
+    skew = _estimate_skew_from_gray(gray)
+    deskew = skew is not None and abs(float(skew)) >= _SKEW_CORRECT_DEG
+    if deskew:
+        rotated, inv_affine, pad = _deskew_affine(img, float(skew))
+        out = engine(rotated)
+        if log:
+            log(f"  第 {page_index + 1} 页：OCR 检测到 {abs(skew):.1f}° 倾斜，已校正后再识别。")
+    else:
+        out = engine(img)
+        inv_affine = pad = None
+    items = out[0] if isinstance(out, tuple) else out
+    results: list[tuple[list, str]] = []
+    if not items:
+        return results
+    for item in items:
+        if not item or len(item) < 2:
+            continue
+        box, text = item[0], item[1]
+        if not text:
+            continue
+        pts: list[list[float]] = []
+        for px, py in box:
+            if deskew:
+                ox, oy = _map_pt_back(inv_affine, pad, float(px), float(py))
+            else:
+                ox, oy = float(px), float(py)
+            pts.append([ox / zoom, oy / zoom])
+        results.append((pts, text))
+    return results
+
+
 def _ocr_page_blocks(
     page_index: int,
     page,
@@ -1194,21 +1361,7 @@ def _ocr_page_blocks(
         return []
     try:
         img, zoom = _page_to_array(page)
-        out = engine(img)
-        # RapidOCR returns (list of [box, text, score] or None, timings).
-        items = out[0] if isinstance(out, tuple) else out
-        if not items:
-            return []
-        results: list[tuple[list, str]] = []
-        for item in items:
-            if not item or len(item) < 2:
-                continue
-            box = item[0]
-            text = item[1]
-            if not text:
-                continue
-            pdf_box = [[float(px) / zoom, float(py) / zoom] for px, py in box]
-            results.append((pdf_box, text))
+        results = _ocr_results_from_img(engine, img, zoom, page_index, log)
         return _synthesize_ocr_blocks(
             results, page_index, log, page_height=page.rect.height
         )
@@ -1226,6 +1379,7 @@ _BULLET_CHARS = (
     "\u2192\u2190\u25b8\u25b6\u00bb\u2023\u2043\u2219\u00b7\u275a\u25d8\u25cb"
 )
 _BULLET_RE = re.compile(r"^\s*[" + re.escape(_BULLET_CHARS) + r"]\s*")
+
 #: A dash/asterisk used as a bullet only when followed by whitespace (so a
 #: leading hyphenated word is not mistaken for a list marker).
 _DASH_BULLET_RE = re.compile(r"^\s*(?:\*\s+|-\s+|\u2013\s+|\u2014\s+)")
@@ -1515,8 +1669,17 @@ def _block_meta(
     spans: Sequence[tuple[fitz.Rect, float, bool]],
     page_x0: float,
     page_x1: float,
+    n_lines: int | None = None,
 ) -> dict:
-    """Layout hints for one block: size, alignment, bold, single-line."""
+    """Layout hints for one block: size, alignment, bold, single-line.
+
+    ``n_lines`` (when given) is the block's own visual line count and is the
+    authoritative source for ``single_line`` — a vertically-rotated org-chart
+    label is ONE line yet its bbox is *tall*, so neither the bbox height nor the
+    overlapping neighbour spans (line pitch < glyph height makes adjacent spans
+    ``intersect`` a line's rect) can be trusted.  When omitted it falls back to
+    the distinct-baseline count of the intersecting spans.
+    """
     sizes: list[float] = []
     bold = False
     minx = maxx = None
@@ -1563,7 +1726,13 @@ def _block_meta(
             # rightmost text edge and start in the right half of the text area.
             if page_x1 - maxx <= 2.0 and minx - page_x0 > (page_x1 - page_x0) / 2:
                 align = "right"
-    single_line = rect.height <= 1.5 * size
+    # ``single_line`` means "one visual line".  The block's own line count (``n_lines``,
+    # i.e. the number of ``_collect_lines`` entries merged into it) is authoritative:
+    # a vertically-rotated org-chart label is a single line with a *tall* bbox, so a
+    # ``rect.height <= 1.5 * size`` heuristic (which drove ``_is_vertical_label``) always
+    # reported it as multi-line and mangled the label into horizontal per-character
+    # shards.  Count the distinct baselines only as a fallback (no reliable line count).
+    single_line = (n_lines if n_lines is not None else len(per_line)) <= 1
     return {"size": size, "align": align, "bold": bold, "single_line": single_line}
 
 
@@ -1639,7 +1808,7 @@ def _group_to_block(
     text = " ".join(ln["text"] for ln in group)
     if not text.strip() or _is_pure_symbol(text):
         return None
-    meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1)
+    meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1, n_lines=len(group))
     color = Counter(ln["color"] for ln in group).most_common(1)[0][0]
     return Block(text=text, page=page_index, x0=x0, y0=y0, x1=x1, y1=y1, color=color, **meta)
 
@@ -1767,7 +1936,7 @@ def _build_table_blocks(
         if groups is None:
             # No per-span info (test-constructed line): keep the single-block,
             # whole-line behaviour so a whole row is one cell.
-            meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1)
+            meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1, n_lines=1)
             cell = _cell_for_line(ln, cell_rects)
             if cell is not None:
                 x0, x1 = cell.x0 + _TABLE_CELL_PAD, cell.x1 - _TABLE_CELL_PAD
@@ -1784,7 +1953,7 @@ def _build_table_blocks(
         for cell, text, extent in groups:
             if cell is not None:
                 cx0, cx1 = cell.x0 + _TABLE_CELL_PAD, cell.x1 - _TABLE_CELL_PAD
-                meta = _block_meta(cell, spans, page_x0, page_x1)
+                meta = _block_meta(cell, spans, page_x0, page_x1, n_lines=1)
                 meta["align"] = "right" if _is_numeric_cell(text) else "center"
                 blocks.append(
                     Block(
@@ -1794,7 +1963,7 @@ def _build_table_blocks(
                 )
             else:
                 # A span that sits outside any content cell: paragraph-style block.
-                meta = _block_meta(extent, spans, page_x0, page_x1)
+                meta = _block_meta(extent, spans, page_x0, page_x1, n_lines=1)
                 blocks.append(
                     Block(
                         text=text, page=page_index, x0=extent.x0, y0=extent.y0,
