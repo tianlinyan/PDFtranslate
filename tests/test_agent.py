@@ -1467,5 +1467,47 @@ class FormulaFigureNegotiationTest(unittest.TestCase):
         self.assertIn("formula/figure", prompts.agent_tool_policy())
 
 
+class SemanticToolTest(unittest.TestCase):
+    """B-④/B-⑤ as AI tool calls: the semantic structure is exposed as source tools."""
+
+    def _doc(self):
+        blocks = [pdfio.Block("alpha", page=0, x0=0, y0=0, x1=100, y1=20),
+                  pdfio.Block("x^2 + y^2 = z^2", page=0, x0=0, y0=20, x1=100, y1=40)]
+        ps = pdfio.PageStructure(page=0, parser="mock", elements=[
+            {"kind": "text", "bbox": [0, 0, 100, 20], "level": 0,
+             "block_indices": [0], "parser": "mock"},
+            {"kind": "formula", "bbox": [0, 20, 100, 40], "level": 0,
+             "block_indices": [1], "parser": "mock"},
+        ], tables=[pdfio.StructTable(rows=1, cols=2, bbox=(0, 0, 100, 40),
+                                     cells=[[0, 1]], block_ref={0, 1})])
+        return pdfio.DocumentText(pages=[blocks], blocks=[b.text for b in blocks],
+                                  block_pages=[0, 0], page_structure=[ps], structure_parser="mock")
+
+    def test_semantic_tools_registered_read_only(self):
+        for n in ("get_structure", "get_table"):
+            t = agent.by_name(n)
+            self.assertIsNotNone(t, n)
+            self.assertEqual("source", t.target, n)
+
+    def test_get_structure_bound_and_returns_elements(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = self._doc()
+        tools = agent.make_source_tools(s)
+        out = tools["get_structure"](0)
+        self.assertEqual(out["parser"], "mock")
+        kinds = {e["kind"] for e in out["elements"]}
+        self.assertIn("formula", kinds)
+        self.assertEqual(len(out["tables"]), 1)
+
+    def test_get_table_bound_and_returns_grid(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = self._doc()
+        tools = agent.make_source_tools(s)
+        out = tools["get_table"](0, 0)
+        self.assertEqual(out["rows"], 1)
+        self.assertEqual(out["cells"][0], [0, 1])
+        self.assertIsNone(tools["get_table"](0, 9))
+
+
 if __name__ == "__main__":
     unittest.main()

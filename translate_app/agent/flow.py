@@ -627,8 +627,31 @@ def make_source_tools(state: WorkflowState, *, src_path=None) -> dict[str, Calla
                      if src.page_structure and page < len(src.page_structure) else None)
         return {"kind": pdfio.classify_page(src.pages[page], structure=structure)}
 
+    def get_structure(page: int) -> dict[str, Any]:
+        src = state.src_doc
+        if src is None or not (0 <= page < len(src.page_structure)):
+            return {"page": page, "parser": "", "elements": [], "tables": []}
+        from .. import pdfio
+
+        ps = src.page_structure[page]
+        tables = []
+        for i in range(len(ps.tables)):
+            t = pdfio.get_table(src, page, i)
+            if t is not None:
+                tables.append(t)
+        return {"page": page, "parser": ps.parser, "elements": ps.elements, "tables": tables}
+
+    def get_table(page: int, index: int = 0) -> dict[str, Any] | None:
+        src = state.src_doc
+        if src is None:
+            return None
+        from .. import pdfio
+
+        return pdfio.get_table(src, page, index)
+
     return {"read_page": read_page, "get_layout": get_layout,
-            "get_doc_info": get_doc_info, "classify_page": classify_page}
+            "get_doc_info": get_doc_info, "classify_page": classify_page,
+            "get_structure": get_structure, "get_table": get_table}
 
 
 def _has_cjk(text: Any) -> bool:

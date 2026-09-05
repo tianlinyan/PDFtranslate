@@ -434,7 +434,12 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "read_page": "读取指定页的文本块与布局元数据",
     "get_layout": "提取某页的行/列聚类、二维网格与单元格跨度",
     "get_doc_info": "返回原文件信息：页数/标题/语言/文本页/扫描页/图表页/块数/每页类型（表格页恒为 0）",
-    "classify_page": "判定某页类型：normal/scan/chart/uncertain",
+    "classify_page": "判定某页类型：normal/scan/chart/uncertain；有语义结构时可为 formula/figure",
+    "get_structure": "返回某页的语义结构：{page, parser, elements:[{kind,bbox,level,block_indices}], tables}，"
+                     "kind 为 text/heading/table/figure/formula/caption/note。用于识别公式/图表/标题层级/表格语义；"
+                     "无结构后端时 elements 为空（此时按普通文本处理）",
+    "get_table": "返回某页第 index 个语义表格 {rows, cols, bbox, cells(行×列的扁平块索引), block_ref}；无表或无结构时返回 None，"
+                 "用于定位表格单元格/跨页表",
     "translate_block": "翻译某块并写入其译文（走缓存+编号协议；单块请求，仅翻少数块时用）",
     "translate_blocks": "一次批量翻译多块并写入（单次请求、引擎自动按字符预算分批+并发）：传扁平块索引列表，或只传 page 翻译整页所有可翻译块；返回 {count, indices, translated:{index:text}, failed}。整行/整表/整页应优先用它，比逐块 translate_block 快得多；数字/代码/空块被自动跳过",
     "retranslate_block": "避开缓存强制重译一段文本，**只返回译文**（不会写入；需再用 set_text 把它写到目标块）。常用于残中/空缺修正",

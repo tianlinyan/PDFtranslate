@@ -83,6 +83,13 @@ AGENT_TOOLS: list[ToolDef] = [
           returns="{pages, title, language, text_pages, scan_pages, chart_pages, table_pages, block_count, kinds}"),
     _tool("classify_page", {"page": {"type": "integer"}}, ["page"], CAT_READ, target="source",
           returns="{kind}"),
+    _tool("get_structure", {"page": {"type": "integer"}}, ["page"], CAT_READ, target="source",
+          returns="该页语义结构：{page, parser, elements:[{kind,bbox,level,block_indices}], tables}；"
+                  "无结构后端时 elements 为空"),
+    _tool("get_table", {"page": {"type": "integer"},
+                        "index": {"type": "integer", "description": "该页语义表格序号（默认 0）"}},
+          ["page"], CAT_READ, target="source",
+          returns="该页第 index 个语义表格 {rows,cols,bbox,cells,block_ref}；无则 None"),
     _tool("render_page",
           {"page": {"type": "integer", "description": "页号（0 起）"},
            "what": {"type": "string", "enum": ["source", "translation"],
