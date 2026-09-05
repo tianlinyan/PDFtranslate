@@ -187,8 +187,10 @@ def agent_tool_policy() -> str:
         "\n\n【工具功能与用法】先观察、再修改、最后校验；读过的页别重读；改完必须校验；"
         "某工具返回 ok=false 先读 error 判断原因、别盲目重试；index 一律用 read_page 的**扁平 index**（写回就靠它）。"
         "各工具的返回值见其 schema，这里只补关键差异：\n"
-        "① 观察（只读原文，绝不改写）：read_page（含扁平 index，超大页可 offset/limit 分页）、get_layout、get_doc_info、"
-        "classify_page、render_page（渲染译文 PNG 供自检）、preview_page（弹窗给用户看）、"
+        "① 观察（只读原文，绝不改写）：read_page（含扁平 index，超大页可 offset/limit 分页；块可带 kind/level——"
+        "formula/figure 是结构内容、应保留原文，caption/heading 照常翻译并按 level 处理）、get_layout、get_doc_info、"
+        "classify_page（结构存在时会给出 formula/figure 页分型）、render_page（渲染译文 PNG 供自检）、"
+        "preview_page（弹窗给用户看）、"
         "detect_page_skew（检测扫描页文本倾斜角，供几何校正决定——recommended 时会问用户）。\n"
         "② 修改（写可编辑译文，原文不可动）：translate_blocks（**批量**翻译并写入，整行/整表/整页首选——远快于逐块请求）、"
         "translate_block（翻译并**写入**，单块，仅翻少数块时用）、set_text（写已知译名；数字/代码块被拒）、"
@@ -265,6 +267,14 @@ def special_page_question(page_index: int, kind: str) -> tuple[str, list[str]]:
         return (f"第 {n} 页是组织架构图，节点标签通常保留原文。请问要怎么处理？"
                 f"请用一句话告诉我（例如：保留原文 / 翻译 / 跳过）。",
                 ["保留原文", "翻译", "跳过"])
+    if kind == "formula":
+        return (f"第 {n} 页含数学公式。公式是数学内容、不应改写，只有公式说明/表注需要翻译。"
+                f"请问怎么处理？请用一句话告诉我（例如：翻译说明、保留公式 / 整页都翻 / 跳过）。",
+                ["保留公式并翻译说明", "整页翻译", "跳过"])
+    if kind == "figure":
+        return (f"第 {n} 页是图表。图内文字是结构/图注，通常只翻译图注、保留图形与图内文字。"
+                f"请问怎么处理？请用一句话告诉我（例如：翻译图注 / 保留原文 / 跳过）。",
+                ["翻译图注", "保留原文", "跳过"])
     return (f"第 {n} 页类型不确定。请问要怎么处理？请用一句话告诉我"
             f"（例如：翻译 / 保留原文 / 跳过）。",
             ["翻译", "保留原文", "跳过"])

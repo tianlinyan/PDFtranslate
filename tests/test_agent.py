@@ -1447,5 +1447,25 @@ class SourceToolStructureTest(unittest.TestCase):
         self.assertIn(out["kind"], (pdfio.PAGE_FORMULA, pdfio.PAGE_NORMAL))
 
 
+class FormulaFigureNegotiationTest(unittest.TestCase):
+    """B-⑤: formula / figure pages negotiate as their own special pages."""
+
+    def test_special_page_question_formula(self):
+        from translate_app import prompts
+        q, options = prompts.special_page_question(0, "formula")
+        self.assertIn("公式", q)
+        self.assertEqual(options[0], "保留公式并翻译说明")
+
+    def test_special_page_question_figure(self):
+        from translate_app import prompts
+        q, options = prompts.special_page_question(0, "figure")
+        self.assertIn("图注", q)
+        self.assertEqual(options[0], "翻译图注")
+
+    def test_agent_tool_policy_mentions_structural_kinds(self):
+        from translate_app import prompts
+        self.assertIn("formula/figure", prompts.agent_tool_policy())
+
+
 if __name__ == "__main__":
     unittest.main()
