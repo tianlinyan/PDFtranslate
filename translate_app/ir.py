@@ -17,10 +17,11 @@ applicable falls back to the block path.  ``build_ir`` is offline and pure.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Callable, Sequence
 
 from . import pdfio
 from .pdfio import Block, DocumentText
+from .translator import _needs_translation
 
 
 @dataclass
@@ -191,3 +192,78 @@ def structural_groups(ir: IRDoc) -> list[list[IRBlock]]:
                 order.append(blk.group_id)
             by_group[blk.group_id].append(blk)
     return [by_group[g] for g in order]
+
+
+def set_terms(ir: IRDoc, glossary: dict[str, str]) -> IRDoc:
+    """Store a document-level glossary on the IR (C-⑥ Stage 2).
+
+    ``translate_ir`` passes this through as ``extra_glossary`` so every group in
+    the document uses the same terminology (cross-page consistency).
+    """
+    ir.terms = {str(k): str(v) for k, v in (glossary or {}).items() if str(k).strip()}
+    return ir
+
+
+def _is_verbatim(block: Block) -> bool:
+    """True when a block is expected to stay byte-identical (engine-skipped/numeric)."""
+    return not _needs_translation(str(block.text)) or pdfio._is_numeric_cell(str(block.text))
+
+
+#: A ``translate_fn`` maps a list of source texts to a same-length list of target
+#: texts, honouring a glossary: ``fn(texts, *, lang, extra_glossary) -> list[str]``.
+#: The default bound by :func:`make_ir_translate_fn` calls
+#: ``translation_engine.translate_blocks``; tests inject a mock.
+def translate_ir(
+    ir: IRDoc,
+    translate_fn: Callable[..., Sequence[str]],
+    *,
+    lang: str,
+    extra_glossary: dict[str, str] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict[int, str]:
+    """IR-level translation → ``{src_id: translated_text}``.
+
+    Structural blocks (``formula`` / ``figure``) and verbatim blocks (numeric /
+    engine-skipped) are kept as their source; everything else goes through
+    ``translate_fn``, which receives every translatable text in one call so the
+    whole document shares one glossary (``ir.terms`` unless overridden) for
+    terminology consistency.  The per-``src_id`` output aligns with the flat block
+    list, so it drops straight into the existing ``out_doc`` / eval harness.
+    """
+    glossary = ir.terms if extra_glossary is None else extra_glossary
+    blocks = [b for ipage in ir.pages for b in ipage.blocks]
+    requests: list[tuple[int, str]] = []
+    out: dict[int, str] = {}
+    for b in blocks:
+        if is_structural_role(b.role) or _is_verbatim(b.anchor):
+            out[b.src_id] = b.text      # formula/figure/numeric → keep source
+        else:
+            requests.append((b.src_id, b.text))
+    if not requests:
+        return out
+    got = translate_fn([t for _, t in requests], lang=lang, extra_glossary=glossary)
+    if len(got) != len(requests):
+        raise ValueError(
+            f"translate_fn 返回 {len(got)} 条译文，与 {len(requests)} 条请求不一致")
+    for (src_id, _), t in zip(requests, got):
+        out[src_id] = str(t)
+    return out
+
+
+def make_ir_translate_fn(engine, *, doc_path: "Path | None" = None,
+                         log: Callable[[str], None] | None = None):
+    """Bind a real ``TranslationEngine`` as a ``translate_fn`` for :func:`translate_ir`.
+
+    The returned callable does one ``translate_blocks`` for all texts in a single
+    batch (with ``extra_glossary`` merged over the on-disk glossary), sharing the
+    engine's client / concurrency / cache.  ``doc_path`` enables the on-disk
+    glossary and cache keying.
+    """
+    def _translate(texts: Sequence[str], *, lang: str,
+                   extra_glossary: dict[str, str] | None = None):
+        result = engine.translate_blocks(
+            list(texts), lang, log=log or (lambda m: None),
+            doc_path=doc_path, resume=False, extra_glossary=extra_glossary,
+        )
+        return list(result.translated)
+    return _translate

@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 
 from translate_app import ir, pdfio
+from translate_app.ir import IRBlock, IRDoc, IRPage
+from translate_app.pdfio import Block
 
 from tests._helpers import build_sample_pdf
 
@@ -70,6 +72,62 @@ class BuildIrTest(unittest.TestCase):
         self.assertEqual(total, doc_ir.block_count)
         self.assertTrue(ir.is_structural_role("formula"))
         self.assertFalse(ir.is_structural_role("text"))
+
+
+class TranslateIrTest(unittest.TestCase):
+    def _ir(self):
+        ir0 = IRDoc(title="t", block_count=3)
+        ir0.pages.append(IRPage(page=0, blocks=[
+            IRBlock(anchor=Block("alpha", 0, 0, 0, 100, 20), text="alpha",
+                    role="text", src_id=0),
+            IRBlock(anchor=Block("x^2 + y^2 = z^2", 0, 0, 0, 100, 20),
+                    text="x^2 + y^2 = z^2", role="formula", src_id=1),
+            IRBlock(anchor=Block("1,234.56", 0, 0, 0, 100, 20),
+                    text="1,234.56", role="text", src_id=2),
+        ]))
+        return ir0
+
+    def test_structural_and_verbatim_kept(self):
+        ir0 = self._ir()
+        out = ir.translate_ir(ir0, lambda texts, *, lang, extra_glossary=None:
+                              ["BETA"], lang="English")
+        # Formula + numeric are kept verbatim; the one prose block is translated.
+        self.assertEqual(out[1], "x^2 + y^2 = z^2")
+        self.assertEqual(out[2], "1,234.56")
+        self.assertEqual(out[0], "BETA")
+
+    def test_glossary_passed_through(self):
+        ir0 = self._ir()
+        seen = {}
+        def fn(texts, *, lang, extra_glossary=None):
+            seen["g"] = extra_glossary
+            return ["BETA"]
+        ir.set_terms(ir0, {"report": "报告", "revenue": "收入"})
+        ir.translate_ir(ir0, fn, lang="English")
+        self.assertEqual(seen["g"], {"report": "报告", "revenue": "收入"})
+
+    def test_translate_ir_length_mismatch_raises(self):
+        ir0 = self._ir()
+        with self.assertRaises(ValueError):
+            ir.translate_ir(ir0, lambda *a, **k: [], lang="English")
+
+    def test_make_ir_translate_fn_binds_engine(self):
+        class FakeEngine:
+            def __init__(self):
+                self.captured = None
+            def translate_blocks(self, blocks, lang, *, log=None, doc_path=None,
+                                 resume=True, extra_glossary=None):
+                self.captured = (lang, doc_path, extra_glossary)
+                class R: pass
+                r = R()
+                r.translated = ["T|" + b for b in blocks]
+                return r
+        engine = FakeEngine()
+        fn = ir.make_ir_translate_fn(engine, doc_path=Path("/x"), log=lambda m: None)
+        out = fn(["a", "b"], lang="English", extra_glossary={"k": "v"})
+        self.assertEqual(out, ["T|a", "T|b"])
+        self.assertEqual(engine.captured[1], Path("/x"))
+        self.assertEqual(engine.captured[2], {"k": "v"})
 
 
 if __name__ == "__main__":
