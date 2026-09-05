@@ -62,7 +62,7 @@ def _pdf_only(src: str, tgt: str, lang: str, skip: str | None,
 
 
 def _outdoc(src: str, outdoc: str, lang: str, json_out: str | None,
-            baseline: str | None, compare: bool) -> int:
+            baseline: str | None, compare: bool, judge: str | None = None) -> int:
     dt = pdfio.extract_document_text(src, ocr=False, log=lambda m: None)
     try:
         out = json.loads(Path(outdoc).read_text("utf-8"))
@@ -82,6 +82,12 @@ def _outdoc(src: str, outdoc: str, lang: str, json_out: str | None,
         offset += len(page)
 
     summary = ev.eval_pages(pages_blocks, pages_trans, lang=lang)
+    if judge:
+        try:
+            summary["judge"] = ev.judge_pages(pages_blocks, pages_trans, lang=lang,
+                                              judge_fn=_make_judge_fn(judge))
+        except Exception as exc:  # noqa: BLE001 — judge outage degrades, never aborts
+            _say(f"[warn] LLM-as-judge 不可用：{type(exc).__name__}: {exc}")
     if baseline and compare:
         try:
             base = json.loads(Path(baseline).read_text("utf-8"))
@@ -111,6 +117,44 @@ def _say(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _make_judge_fn(model_id: str):
+    """Build a real ``judge_fn(page, src_text, tgt_text) -> 0..100`` (LLM-as-judge).
+
+    Uses the OpenAI-compatible model ``model_id`` from ``models.json`` to score one
+    page (fidelity / terminology / readability).  Only the score number is kept.
+    Requires the model to be online — calling it is opt-in (``--judge``).
+    """
+    import json
+    import re as _re
+
+    from openai import OpenAI
+
+    from translate_app.settings import ModelConfig
+
+    raw = json.load(open("models.json", encoding="utf-8"))["models"]
+    model = ModelConfig.from_dict(next(m for m in raw if m["id"] == model_id))
+    client = OpenAI(**model.client_kwargs())
+    sys_prompt = ("你是译文质量评审。比较源代码与译文，就【忠实度/术语一致/可读性】给 0-100 分。"
+                  "只输出一个 0-100 的数字，不要任何其它文字。")
+    request_params = model.request_params() if hasattr(model, "request_params") else {}
+    temperature = getattr(model, "temperature", 0.0)
+
+    def judge_fn(page: int, src_text: str, tgt_text: str) -> float:
+        resp = client.chat.completions.create(
+            model=model.model,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": f"源文：\n{src_text[:4000]}\n\n译文：\n{tgt_text[:4000]}"},
+            ],
+            temperature=temperature,
+            **request_params,
+        )
+        content = (resp.choices[0].message.content or "0")
+        m = _re.search(r"(\d{1,3}(?:\.\d+)?)", content)
+        return float(m.group(1)) if m else 0.0
+    return judge_fn
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--pdf-only", action="store_true",
@@ -124,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", default=None, help="机器可读报告输出路径")
     p.add_argument("--baseline", default=None, help="baseline 报告（--compare 用）")
     p.add_argument("--compare", action="store_true", help="与 --baseline 对比并输出 delta")
+    p.add_argument("--judge", default=None, metavar="MODEL_ID",
+                   help="用 models.json 里的模型做 LLM-as-judge 译文保真软评分（可选、需模型在线）")
     args = p.parse_args(argv)
 
     if not args.file1 or not args.file2:
@@ -136,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         return _pdf_only(args.file1, args.file2, args.lang, args.skip, args.json)
     if args.outdoc:
         return _outdoc(args.file1, args.file2, args.lang, args.json,
-                       args.baseline, args.compare)
+                       args.baseline, args.compare, judge=args.judge)
     _say("未指定模式：需要 --pdf-only 或 --outdoc。")
     p.print_help()
     return 2

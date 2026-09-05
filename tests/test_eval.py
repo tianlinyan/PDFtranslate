@@ -14,6 +14,7 @@ from translate_app.eval import (
     aggregate,
     compare,
     eval_pages,
+    judge_pages,
     measure_complete,
     measure_layout,
     measure_numbers,
@@ -118,6 +119,22 @@ class AggregateCompareTest(unittest.TestCase):
         # The candidate introduced a number defect, so the score must drop.
         self.assertIsNotNone(out["score_delta"])
         self.assertGreaterEqual(out["numbers"]["total_delta"], 1)
+
+
+class JudgePagesTest(unittest.TestCase):
+    def test_judge_pages_aggregates_mock_scores(self):
+        pages = [[_block("hello")], [_block("goodbye")]]
+        trans = [["bonjour"], ["au revoir"]]
+        res = judge_pages(pages, trans, lang="English",
+                          judge_fn=lambda page, s, t: 50 + page * 10)
+        self.assertEqual(res["score"], 55.0)     # (50 + 60) / 2
+        self.assertEqual(res["per_page"], {0: 50.0, 1: 60.0})
+
+    def test_judge_outage_degrades_to_zero_on_that_page(self):
+        pages = [[_block("hello")]]
+        res = judge_pages(pages, [["bonjour"]], lang="English",
+                          judge_fn=lambda page, s, t: (_ for _ in ()).throw(RuntimeError()))
+        self.assertEqual(res["score"], 0.0)
 
 
 if __name__ == "__main__":

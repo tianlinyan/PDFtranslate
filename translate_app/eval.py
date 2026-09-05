@@ -21,7 +21,7 @@ without a ``QApplication`` or a real model.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Sequence
+from typing import Callable, Sequence
 
 from . import pdfio
 from .translator import _needs_translation
@@ -288,3 +288,29 @@ def compare(base: dict, cand: dict) -> dict:
     out["complete"]["missing_delta"] = _delta(base["complete"]["missing"], cand["complete"]["missing"])
     out["complete"]["residual_delta"] = _delta(base["complete"]["residual"], cand["complete"]["residual"])
     return out
+
+
+def judge_pages(pages_blocks: Sequence[Sequence], pages_translated: Sequence[Sequence[str]],
+                *, judge_fn: Callable[[int, str, str], float], lang: str = "English") -> dict:
+    """Soft *translation-fidelity* metric via an injectable ``judge_fn`` (A-②).
+
+    ``judge_fn(page, src_text, tgt_text) -> 0..100`` scores one page (fidelity /
+    terminology / readability — a real backend is an LLM-as-judge; tests inject a
+    mock).  Returns ``{lang, score, per_page}`` where ``score`` is the page mean.
+    This is the *soft* counterpart to :func:`eval_pages`' hard metrics and does not
+    over-ride them (a judge score never gates a layout/number regression).
+    """
+    scores: list[float] = []
+    per_page: dict[int, float] = {}
+    for p, (blocks, trans) in enumerate(zip(pages_blocks, pages_translated)):
+        src_text = "\n".join(str(b.text) for b in blocks)
+        tgt_text = "\n".join(str(t) for t in trans)
+        try:
+            s = float(judge_fn(p, src_text, tgt_text))
+        except Exception:  # noqa: BLE001 — a judge outage degrades that page, never aborts
+            s = 0.0
+        s = min(100.0, max(0.0, s))
+        per_page[p] = round(s, 2)
+        scores.append(s)
+    return {"lang": lang, "score": round(sum(scores) / len(scores), 2) if scores else 0.0,
+            "per_page": per_page}
