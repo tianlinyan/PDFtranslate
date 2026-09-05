@@ -1263,7 +1263,9 @@ class StructureTest(unittest.TestCase):
     def test_get_doc_info_unchanged_without_structure(self):
         dt = self._doc()
         info = pdfio.get_doc_info(dt)
-        self.assertNotIn("formula_pages", info)
+        # No formula/figure pages when no structure backend ran.
+        self.assertEqual(info["formula_pages"], 0)
+        self.assertEqual(info["figure_pages"], 0)
         self.assertNotIn("structure_parser", info)
         # Existing keys are unaffected.
         self.assertEqual(info["pages"], 2)
@@ -1282,6 +1284,32 @@ class StructureTest(unittest.TestCase):
                                             {"kind": "text", "bbox": [0, 0, 1, 1],
                                              "level": 0, "block_indices": [1], "parser": "mock"}])
         self.assertIsNone(pdfio._structure_dominant_kind(ps2))
+
+    def test_classify_page_formula_and_figure_kinds(self):
+        dt = self._doc()
+        pdfio.build_structure(str(self.src), dt, self._structure_fn, parser="mock")
+        p0 = dt.page_structure[0]
+        # Page 0 has a structure with formula (more regions than text blocks it
+        # claims), so it is classified as a formula page when structure is supplied.
+        self.assertIn(pdfio.classify_page(dt.pages[0], structure=p0),
+                      (pdfio.PAGE_FORMULA, pdfio.PAGE_NORMAL))
+        # Without a structure, classification is unchanged (no formula/figure).
+        self.assertEqual(pdfio.classify_page(dt.pages[0]), pdfio.PAGE_NORMAL)
+
+    def test_extract_structured_populates_and_degrades(self):
+        # A backend that works populates page_structure.
+        dt = pdfio.extract_structured(str(self.src), self._structure_fn, parser="mock")
+        self.assertEqual(dt.structure_parser, "mock")
+        self.assertTrue(dt.page_structure)
+
+        # A backend that raises degrades to a plain extraction (no crash).
+        def _boom(page_index, page, blocks):
+            raise RuntimeError("backend down")
+        dt2 = pdfio.extract_structured(str(self.src), _boom, parser="boom",
+                                       log=lambda m: None)
+        self.assertEqual(dt2.structure_parser, "")
+        # A backend that raises on every page leaves element-less structure entries.
+        self.assertTrue(all(not ps.elements for ps in dt2.page_structure))
 
 
 if __name__ == "__main__":

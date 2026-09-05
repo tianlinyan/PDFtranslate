@@ -164,6 +164,10 @@ PAGE_SCAN = "scan"
 PAGE_CHART = "chart"
 PAGE_TABLE = "table"
 PAGE_UNCERTAIN = "uncertain"
+#: Structure-driven kinds (B-④): a page dominated by formula / figure regions is
+#: negotiated as its own special page rather than treated as ordinary text.
+PAGE_FORMULA = "formula"
+PAGE_FIGURE = "figure"
 
 #: A page is treated as a *chart* (org / architecture diagram) when at least this
 #: many narrow-tall node boxes are present (the strong diagram signature).
@@ -193,8 +197,9 @@ def detect_language(texts: Sequence[str]) -> str:
     return "mixed"
 
 
-def classify_page(blocks: Sequence[Block]) -> str:
-    """Classify one page as ``normal`` / ``scan`` / ``chart`` / ``uncertain``.
+def classify_page(blocks: Sequence[Block], structure: PageStructure | None = None) -> str:
+    """Classify one page as ``normal`` / ``scan`` / ``chart`` / ``uncertain``
+    (plus ``formula`` / ``figure`` when a B-④ ``structure`` is supplied).
 
     Deterministic, block-flag based (no model call):
     * ``scan`` — every block came from OCR (``Block.ocr``) i.e. a scanned raster page
@@ -204,6 +209,9 @@ def classify_page(blocks: Sequence[Block]) -> str:
     * ``uncertain`` — mixed OCR + text, or ambiguous (very few blocks).
     * ``normal`` — everything else, **including a non-scanned (text-layer) table page**:
       a normal table is just ordinary text to translate, not a special page.
+    * ``formula`` / ``figure`` — (only with a ``structure``) a page whose semantic
+      regions are dominated by formulas or figures; the caller negotiates it as a
+      special page.  This is advisory and never overrides ``scan``/``chart``.
     """
     if not blocks:
         return PAGE_UNCERTAIN
@@ -218,6 +226,12 @@ def classify_page(blocks: Sequence[Block]) -> str:
     # user; a pure-text page — even with a single block — is normal.
     if 0 < n_ocr < n:
         return PAGE_UNCERTAIN
+    if structure is not None:
+        dk = _structure_dominant_kind(structure)
+        if dk == "formula":
+            return PAGE_FORMULA
+        if dk == "figure":
+            return PAGE_FIGURE
     return PAGE_NORMAL
 
 
@@ -228,10 +242,13 @@ def get_doc_info(doc: "DocumentText") -> dict[str, Any]:
     text / scan / chart / table / special pages (used by ``get_doc_info`` tool and
     the preprocess phase).  Never touches the model — purely deterministic.
     """
-    kinds = [classify_page(p) for p in doc.pages]
+    kinds = [classify_page(p, structure=(doc.page_structure[i] if i < len(doc.page_structure) else None))
+             for i, p in enumerate(doc.pages)]
     text_pages = sum(1 for k in kinds if k == PAGE_NORMAL)
     chart_pages = sum(1 for k in kinds if k == PAGE_CHART)
     table_pages = sum(1 for k in kinds if k == PAGE_TABLE)
+    formula_pages = sum(1 for k in kinds if k == PAGE_FORMULA)
+    figure_pages = sum(1 for k in kinds if k == PAGE_FIGURE)
     uncertain_pages = sum(1 for k in kinds if k == PAGE_UNCERTAIN)
     scan_pages = doc.ocr_count
     info = {
@@ -242,16 +259,19 @@ def get_doc_info(doc: "DocumentText") -> dict[str, Any]:
         "scan_pages": scan_pages,
         "chart_pages": chart_pages,
         "table_pages": table_pages,
+        "formula_pages": formula_pages,
+        "figure_pages": figure_pages,
         "uncertain_pages": uncertain_pages,
-        "special_pages": chart_pages + table_pages + uncertain_pages + scan_pages,
+        "special_pages": chart_pages + table_pages + uncertain_pages + scan_pages
+                        + formula_pages + figure_pages,
         "block_count": len(doc.blocks),
         "kinds": kinds,
     }
     if doc.page_structure:
-        # Deliberately ADDITIVE: existing counts/kinds stay; the structure layer
-        # only adds formula/figure counts + the parser name.  No existing consumer
-        # sees a changed value, so enabling a backend can't regress the audit flow.
-        info.update(get_structure_summary(doc))
+        # Deliberately ADDITIVE: existing counts/kinds are recomputed with the
+        # structure layer's formula/figure pages folded in; the parser name is
+        # added so a backend is visible to the session.
+        info["structure_parser"] = doc.structure_parser
     return info
 
 
@@ -319,14 +339,42 @@ def build_structure(
             offset = sum(len(pg) for pg in dt.pages[:p])
             try:
                 regions = structure_fn(p, doc[p], blocks)
+                page_parser = parser
             except Exception:  # noqa: BLE001 — a backend failure degrades the page
-                regions = None
-            dt.page_structure.append(_fuse_structure(p, blocks, offset, regions or [], parser))
-        dt.structure_parser = parser if dt.page_structure and any(
-            ps.parser for ps in dt.page_structure
-        ) else ""
+                regions, page_parser = [], ""
+            dt.page_structure.append(
+                _fuse_structure(p, blocks, offset, regions or [], page_parser))
+        dt.structure_parser = parser if any(ps.elements for ps in dt.page_structure) else ""
     finally:
         doc.close()
+    return dt
+
+
+def extract_structured(
+    path: str | Path,
+    structure_fn: Callable[[int, "fitz.Page", Sequence[Block]], Sequence[dict]],
+    *,
+    parser: str = "structure",
+    ocr: bool = False,
+    title: str | None = None,
+    ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
+    cancel: Callable[[], bool] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> DocumentText:
+    """Extract text then populate the B-④ structure layer, in one call.
+
+    Equivalent to ``build_structure(path, extract_document_text(...), structure_fn)``
+    but tolerant of an absent/crashed backend: it degrades to a plain extraction
+    (structure stays empty) instead of failing the whole run.  This is the entry
+    point a worker/session uses when a structure parser is configured.
+    """
+    dt = extract_document_text(path, title=title, ocr=ocr, ocr_fn=ocr_fn,
+                               cancel=cancel, log=log)
+    try:
+        build_structure(path, dt, structure_fn, parser=parser)
+    except Exception as exc:  # noqa: BLE001 — a backend outage degrades, never aborts
+        if log:
+            log(f"[structure] 解析后端不可用，回落几何路径：{type(exc).__name__}: {exc}")
     return dt
 
 
