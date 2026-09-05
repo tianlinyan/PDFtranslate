@@ -130,6 +130,50 @@ class TranslateIrTest(unittest.TestCase):
         self.assertEqual(engine.captured[2], {"k": "v"})
 
 
+class InferTermsTest(unittest.TestCase):
+    def _ir(self):
+        blocks = [
+            IRBlock(anchor=Block("Revenue in 2024", 0, 0, 0, 100, 20),
+                    text="Revenue in 2024", role="text", src_id=0),
+            IRBlock(anchor=Block("Revenue and Costs", 0, 0, 0, 100, 20),
+                    text="Revenue and Costs", role="text", src_id=1),
+            IRBlock(anchor=Block("hello world", 0, 0, 0, 100, 20),
+                    text="hello world", role="text", src_id=2),
+        ]
+        return IRDoc(title="t", pages=[IRPage(page=0, blocks=blocks)], block_count=3)
+
+    def test_infer_terms_detects_repeated_candidates(self):
+        terms = ir.infer_terms(self._ir())
+        self.assertIn("Revenue", terms)   # appears twice (TitleCase)
+        self.assertNotIn("hello", terms)  # appears once
+
+    def test_translate_ir_infer_injects_computed_glossary(self):
+        ir0 = self._ir()
+        calls = []
+        def fn(texts, *, lang, extra_glossary=None):
+            calls.append({"texts": list(texts), "g": dict(extra_glossary or {})})
+            return ["T|" + t for t in texts]
+        ir.translate_ir(ir0, fn, lang="English", infer=True)
+        # The term batch ran first, then the main batch got the inferred glossary.
+        self.assertGreater(len(calls), 1)
+        self.assertIn("Revenue", calls[0]["texts"])          # term minibatch
+        self.assertEqual(calls[-1]["g"].get("Revenue"), "T|Revenue")  # injected
+        # ir.terms now carries the computed doc glossary.
+        self.assertEqual(ir0.terms.get("Revenue"), "T|Revenue")
+
+    def test_translate_ir_infer_skips_when_terms_present(self):
+        ir0 = self._ir()
+        user_glossary = {"Revenue": "营业收入"}
+        calls = []
+        def fn(texts, *, lang, extra_glossary=None):
+            calls.append({"texts": list(texts), "g": dict(extra_glossary or {})})
+            return ["T|" + t for t in texts]
+        ir.translate_ir(ir0, fn, lang="English", extra_glossary=user_glossary, infer=True)
+        # A caller-provided glossary is honoured and no term minibatch is run.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[-1]["g"], user_glossary)
+
+
 class SaveIrTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

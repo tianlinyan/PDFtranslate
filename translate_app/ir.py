@@ -16,6 +16,8 @@ applicable falls back to the block path.  ``build_ir`` is offline and pure.
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -213,6 +215,40 @@ def _is_verbatim(block: Block) -> bool:
 #: texts, honouring a glossary: ``fn(texts, *, lang, extra_glossary) -> list[str]``.
 #: The default bound by :func:`make_ir_translate_fn` calls
 #: ``translation_engine.translate_blocks``; tests inject a mock.
+def infer_terms(ir: IRDoc, *, max_terms: int = 80) -> list[str]:
+    """Conservative document-level terminology candidates (C-⑥).
+
+    Source-only (no translation): call :func:`translate_ir` with ``infer=True`` to
+    translate them once and inject the result as ``IRDoc.terms``, giving every
+    occurrence the same target across pages.  Candidates are CJK phrases (2–4 chars)
+    and TitleCase / ALL-CAPS Latin words that appear >=2 times, capped at
+    ``max_terms``.  Deliberately conservative: a noisy candidate is just translated
+    once extra, never a correctness risk.
+    """
+    cjk: Counter[str] = Counter()
+    latin: Counter[str] = Counter()
+    for ipage in ir.pages:
+        for b in ipage.blocks:
+            if is_structural_role(b.role) or _is_verbatim(b.anchor):
+                continue
+            t = str(b.text)
+            for m in re.finditer(r"[\u4e00-\u9fff]{2,4}", t):
+                cjk[m.group(0)] += 1
+            for w in re.findall(r"\b[A-Z][a-z]{2,}\b|\b[A-Z]{3,}\b", t):
+                latin[w] += 1
+    cands = [t for t, n in cjk.items() if n >= 2]
+    cands += [w for w, n in latin.items() if n >= 2]
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
 def translate_ir(
     ir: IRDoc,
     translate_fn: Callable[..., Sequence[str]],
@@ -220,18 +256,29 @@ def translate_ir(
     lang: str,
     extra_glossary: dict[str, str] | None = None,
     log: Callable[[str], None] | None = None,
+    infer: bool = False,
 ) -> dict[int, str]:
     """IR-level translation → ``{src_id: translated_text}``.
 
     Structural blocks (``formula`` / ``figure``) and verbatim blocks (numeric /
     engine-skipped) are kept as their source; everything else goes through
     ``translate_fn``, which receives every translatable text in one call so the
-    whole document shares one glossary (``ir.terms`` unless overridden) for
-    terminology consistency.  The per-``src_id`` output aligns with the flat block
+    whole document shares one glossary (``IRDoc.terms`` unless overridden) for
+    terminology consistency.  ``infer=True`` (and no ``ir.terms`` / not overridden)
+    first extracts candidate terms via :func:`infer_terms`, translates them once and
+    injects the result as the doc glossary — so cross-page terminology is pinned
+    before the main pass.  The per-``src_id`` output aligns with the flat block
     list, so it drops straight into the existing ``out_doc`` / eval harness.
     """
-    glossary = ir.terms if extra_glossary is None else extra_glossary
+    glossary = dict(ir.terms) if extra_glossary is None else dict(extra_glossary)
     blocks = [b for ipage in ir.pages for b in ipage.blocks]
+    if infer and not glossary:
+        terms = infer_terms(ir)
+        if terms:
+            got = translate_fn(terms, lang=lang, extra_glossary={})
+            if len(got) == len(terms):
+                glossary = {s: str(t) for s, t in zip(terms, got) if str(t).strip()}
+                ir.terms = glossary
     requests: list[tuple[int, str]] = []
     out: dict[int, str] = {}
     for b in blocks:
