@@ -64,6 +64,9 @@ class IRDoc:
 
 #: Roles that are structurally protected (never translated as prose).
 _STRUCTURAL_ROLES = ("formula", "figure")
+#: Tunable knobs for :func:`infer_terms` (document-level terminology extraction).
+_INFER_MAX_TERMS = 80    # cap on candidate terms translated once
+_INFER_MIN_FREQ = 2      # a term must appear at least this many times to be a candidate
 
 
 def is_structural_role(role: str) -> bool:
@@ -214,7 +217,7 @@ def _is_verbatim(block: Block) -> bool:
 #: texts, honouring a glossary: ``fn(texts, *, lang, extra_glossary) -> list[str]``.
 #: The default bound by :func:`make_ir_translate_fn` calls
 #: ``translation_engine.translate_blocks``; tests inject a mock.
-def infer_terms(ir: IRDoc, *, max_terms: int = 80) -> list[str]:
+def infer_terms(ir: IRDoc, *, max_terms: int | None = None) -> list[str]:
     """Conservative document-level terminology candidates (C-⑥).
 
     Source-only (no translation): call :func:`translate_ir` with ``infer=True`` to
@@ -237,15 +240,15 @@ def infer_terms(ir: IRDoc, *, max_terms: int = 80) -> list[str]:
                     cjk[run] += 1
             for w in re.findall(r"\b[A-Z][a-z]{2,}\b|\b[A-Z]{3,}\b", t):
                 latin[w] += 1
-    cands = [t for t, n in cjk.items() if n >= 2]
-    cands += [w for w, n in latin.items() if n >= 2]
+    cands = [t for t, n in cjk.items() if n >= _INFER_MIN_FREQ]
+    cands += [w for w, n in latin.items() if n >= _INFER_MIN_FREQ]
     seen: set[str] = set()
     out: list[str] = []
     for c in cands:
         if c not in seen:
             seen.add(c)
             out.append(c)
-        if len(out) >= max_terms:
+        if len(out) >= (max_terms or _INFER_MAX_TERMS):
             break
     return out
 

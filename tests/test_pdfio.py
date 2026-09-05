@@ -1434,6 +1434,14 @@ class GeometricStructureTest(unittest.TestCase):
         finally:
             pdfio._OCR_BACKENDS.pop("vlm", None)
 
+    def test_caption_regex_requires_a_numeral(self):
+        # A bare "图" / "Fig" is a prose lead-in, not a caption; a labelled numeral is.
+        self.assertRegex("图3 收入构成", pdfio._CAPTION_RE)
+        self.assertRegex("Fig. 1: revenue trend", pdfio._CAPTION_RE)
+        self.assertRegex("Table 2 主要指标", pdfio._CAPTION_RE)
+        self.assertIsNone(pdfio._CAPTION_RE.match("图"))
+        self.assertIsNone(pdfio._CAPTION_RE.match("Fig"))
+
     def test_get_table_page1_uses_flat_offset(self):
         # A table on page 1 must produce *flat* cells (offset added): page-local
         # index 0/1 become flat 2/3 when page 0 has 2 blocks.

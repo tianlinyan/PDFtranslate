@@ -103,7 +103,31 @@ python main.py "C:\path\to\doc.pdf"
 * `max_tokens`（可选）：单次请求的最大输出 token 数（缺省使用服务端默认）。
 * 其余未识别键透传给 OpenAI client 构造参数（如 `timeout`，默认 300 秒）。
 
-## 说明
+> 一份**调优过、带全字段**的样板见 `models.example.json`。
+
+## 调优建议（0.4.0）
+
+**按场景配 `models.json`**
+
+| 参数 | 本地 `llama-server` | 云端 API |
+|---|---|---|
+| `concurrency`（批次并发） | 1–2（GPU 是瓶颈） | 4 |
+| `page_concurrency`（agent 并行页） | 1（本地串行排队） | 4 |
+| `batch_size`（每批字符预算） | 12000（**少请求**、摊薄固定开销） | 4000 |
+| `temperature` | 0.2 | 0.2 |
+| `reasoning_effort` | `low`（缺它 llama.cpp 可能 500） | `low`／`off` |
+| `vision` | `true`（走 agent 视觉闭环） | 视模型 |
+
+**两套请求参数（别混）**：`temperature`/`reasoning_effort` = **翻译侧**（翻译引擎、agent 决策、自检、导出）；`interaction_temperature`/`interaction_reasoning_effort` = **交互侧**（常驻对话 `ChatSession`）。二者独立。
+
+**语义结构 / IR 开关**（`run.bat` 默认 `STRUCTURE_MODE=1`、`IR_MODE=1`）
+- `PDFTRANSLATE_STRUCTURE_MODE=1`：提取带公式/图/标题/图注/表格结构（几何后端、离线无模型）。
+- `PDFTRANSLATE_IR_MODE=1`：翻译走 **IR 文档级管线**（无交互批处理、公式/数字保真、术语跨页一致）。
+- 想要**完整交互**（特殊页协商/自检/预览）→ 把 `PDFTRANSLATE_IR_MODE` 设为空，只保留 `STRUCTURE_MODE`。
+
+**内部阈值（可调，已命名）**：公式检测 `_is_formula_block`（符号数/长度）、术语抽取 `infer_terms`（`_INFER_MAX_TERMS`/`_INFER_MIN_FREQ`）、图注 `_CAPTION_RE`/`_CAPTION_MAX_LEN`、几何分型等——改保守/激进就在这些常量处。
+
+
 
 * **翻译缓存**：翻译结果按「文档 + 目标语言 + 模型」缓存到
   `~/.pdftranslate/cache`，再次翻译相同内容时会复用，节省调用。缓存带版本号，

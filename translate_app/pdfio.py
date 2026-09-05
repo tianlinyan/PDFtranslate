@@ -599,9 +599,13 @@ def get_table(doc: DocumentText, page: int, index: int = 0) -> dict | None:
 
 
 #: A caption line: short, a figure/table label, not bold (so a bold *title* is a
-#: heading, not a caption).
-_CAPTION_RE = re.compile(r"^\s*(?:(?:图|表)\s*\d+|Fig(?:ure)?\.?\s*\d+|Table\.?\s*\d+|图|Fig\.?|Table\.?)\b",
-                        re.IGNORECASE)
+#: heading, not a caption).  A numeral is required after the label so a bare
+#: "图" / "Fig" / "Table" (common prose lead-ins) is not mis-flagged.
+_CAPTION_RE = re.compile(
+    r"^\s*(?:图\s*\d+|表\s*\d+|Fig(?:ure)?\.?\s*\d+|Table\.?\s*\d+)",
+    re.IGNORECASE)
+#: A caption is short (a figure/table label, not a paragraph).
+_CAPTION_MAX_LEN = 60
 
 
 def make_geometric_structure_fn(*, log: Callable[[str], None] | None = None):
@@ -686,7 +690,7 @@ def make_geometric_structure_fn(*, log: Callable[[str], None] | None = None):
             if i in chart_idx or getattr(b, "bold", False) or getattr(b, "in_table", False):
                 continue
             t = str(b.text).strip()
-            if len(t) <= 60 and _CAPTION_RE.match(t):
+            if len(t) <= _CAPTION_MAX_LEN and _CAPTION_RE.match(t):
                 regions.append({"kind": "caption", "bbox": [b.x0, b.y0, b.x1, b.y1]})
         return regions
     return structure_fn

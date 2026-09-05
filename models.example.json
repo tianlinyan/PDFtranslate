@@ -1,0 +1,36 @@
+{
+  "_readme": "示例配置（tuned）。复制为 models.json 后按需改字段。0.4.0 推荐：翻译侧 temperature/reasoning_effort，交互侧 interaction_*，agent 并行页翻译 page_concurrency，语义结构/IR 用 PDFTRANSLATE_STRUCTURE_MODE / PDFTRANSLATE_IR_MODE（run.bat 默认 1/1）。",
+  "models": [
+    {
+      "id": "qwen3.8-local",
+      "name": "qwen3.8（本地）",
+      "type": "llama-server",
+      "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
+      "model": "qwen3.8-27b",
+      "vision": true,
+      "reasoning_effort": "low",
+      "temperature": 0.2,
+      "concurrency": 1,
+      "page_concurrency": 1,
+      "batch_size": 12000,
+      "interaction_temperature": 0.6,
+      "interaction_reasoning_effort": "medium"
+    },
+    {
+      "id": "ds4-pro",
+      "name": "DS4（云端）",
+      "type": "deepseek",
+      "endpoint": "https://api.deepseek.com/v1/chat/completions",
+      "model": "deepseek-v4-flash",
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "tools_choice": "auto",
+      "reasoning_effort": "low",
+      "temperature": 0.2,
+      "concurrency": 4,
+      "page_concurrency": 4,
+      "batch_size": 4000,
+      "interaction_temperature": 0.6,
+      "interaction_reasoning_effort": "medium"
+    }
+  ]
+}
