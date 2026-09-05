@@ -1070,6 +1070,39 @@ def _is_numeric_cell(text: str) -> bool:
     return bool(_NUMERIC_CELL_RE.match(t))
 
 
+#: Characters typical of a math / formula expression (operators, relations,
+#: radicals, sub/superscript marks).
+_FMATH_CHARS = frozenset("=+−-×÷±∑∏∫√∞≈≠≤≥→←↑↓^_")
+#: A relation / radical / power mark that turns a bare operator list into an
+#: expression (an equation, an integral, a root, an exponent).
+_FMATH_EXPR_RE = re.compile(r"[=≈≤≥]|[∑∫√]|[\^_]")
+#: A formula block is short (a formula sits on one line, never a run-on paragraph).
+_FMATH_MAX_LEN = 80
+
+
+def _is_formula_block(text: str) -> bool:
+    """Conservative detector for a *math expression* block (B-⑤).
+
+    ``True`` only when the block is short, contains no CJK, is dense in math
+    operators/relations and carries an equation mark (``=``/``≈``/relational),
+    a radical (``∑``/``∫``/``√``) or a power/subscript (``^``/``_``) — i.e. a real
+    expression, not a prose sentence that happens to contain a stray operator.
+
+    *Conservative by design*: a cell we are not sure about is left as ordinary
+    text (translated) rather than wrongly protected — the cost of a false
+    positive is a block that gets translated as prose, not a broken formula.
+    """
+    t = str(text).strip()
+    if not t or any("\u4e00" <= c <= "\u9fff" for c in t):
+        return False
+    if len(t) > _FMATH_MAX_LEN:
+        return False
+    sym = sum(1 for c in t if c in _FMATH_CHARS)
+    if sym < 3:
+        return False
+    return bool(_FMATH_EXPR_RE.search(t))
+
+
 def _cluster_ocr_rows(items: Sequence[tuple], ytol: float = 4.5) -> list[list[tuple]]:
     """Group OCR ``(y0, x0, x1, y1, text)`` items into table rows by y-centre.
 

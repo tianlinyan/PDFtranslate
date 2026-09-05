@@ -64,6 +64,8 @@ def _is_measurable(block) -> bool:
         return False
     if pdfio._is_vertical_label(block):
         return False
+    if pdfio._is_formula_block(str(block.text)):
+        return False   # a math expression is content, not prose → never "missing"
     if not _needs_translation(str(block.text)):
         return False
     if pdfio._is_numeric_cell(str(block.text)):

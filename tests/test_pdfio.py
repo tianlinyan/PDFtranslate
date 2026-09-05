@@ -1312,5 +1312,22 @@ class StructureTest(unittest.TestCase):
         self.assertTrue(all(not ps.elements for ps in dt2.page_structure))
 
 
+class FormulaProtectionTest(unittest.TestCase):
+    """B-⑤: a detected math-expression block is never translated (kept verbatim)."""
+
+    def test_formula_detector(self):
+        self.assertTrue(pdfio._is_formula_block("x^2 + y^2 = z^2"))
+        self.assertTrue(pdfio._is_formula_block("∫_0^∞ e^{-x^2} dx = √π"))
+        self.assertFalse(pdfio._is_formula_block("This is an ordinary English sentence."))
+        self.assertFalse(pdfio._is_formula_block("3,702,726,474.45"))
+        self.assertFalse(pdfio._is_formula_block("营业收入 合计"))
+
+    def test_formula_not_reported_missing(self):
+        from translate_app.eval import measure_complete
+        from translate_app.pdfio import Block
+        res = measure_complete([Block("x^2 + y^2 = z^2", 0, 0, 0, 100, 20)], [""])
+        self.assertEqual(res["missing_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
