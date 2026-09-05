@@ -39,6 +39,28 @@ class WorkflowStateTest(unittest.TestCase):
         self.assertEqual(1, len(s.ops))
         self.assertTrue(s.budget.remaining_steps() < s.budget.max_steps)
 
+    def test_record_op_increments_budget_atomically_under_threads(self):
+        # ``used_steps += 1`` is a read-modify-write; the state lock must prevent
+        # parallel page loops (page_concurrency > 1) from losing increments.
+        import threading
+
+        s = agent.WorkflowState("a.pdf", "English")
+        n_threads, per_thread = 8, 2000
+        barrier = threading.Barrier(n_threads)
+
+        def worker():
+            barrier.wait()
+            for _ in range(per_thread):
+                s.record_op("t")
+
+        threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(n_threads * per_thread, s.budget.used_steps)
+        self.assertEqual(n_threads * per_thread, len(s.ops))
+
     def test_ask_answer_roundtrip(self):
         s = agent.WorkflowState("a.pdf", "English")
         s.ask("要擦除签字区？", ["确认", "跳过"], target="erase:sig")

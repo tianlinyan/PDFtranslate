@@ -74,6 +74,7 @@ from .user_flows import (
     flow_tool_names,
     get_user_flow,
     load_user_flow_specs,
+    make_llm_flow_compiler,
     save_flow_spec,
     validate_flow_tools,
 )
@@ -127,6 +128,7 @@ __all__ = [
     "interpret_decision",
     "load_user_flow_specs",
     "make_llm_decide",
+    "make_llm_flow_compiler",
     "make_llm_interpret",
     "make_page_executors",
     "make_source_tools",

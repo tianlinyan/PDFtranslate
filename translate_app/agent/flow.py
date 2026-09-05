@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
 
@@ -172,10 +173,20 @@ class FlowAgent:
         return dec
 
     def run(self, max_rounds: int | None = None) -> WorkflowState:
-        """Loop until done / unanswered ask / budget exhausted / round cap."""
+        """Loop until done / unanswered ask / budget exhausted / round cap.
+
+        When ``max_rounds`` is given it is the SOLE round bound — deliberately
+        independent of the shared ``state.budget`` counter, which is racy when
+        pages translate in parallel (each page resets/increments it) and could
+        otherwise stop a page prematurely.  When ``max_rounds`` is ``None`` the
+        loop falls back to ``state.budget.exhausted()`` (the original behaviour).
+        """
         i = 0
-        while not self.state.budget.exhausted():
-            if max_rounds is not None and i >= max_rounds:
+        while True:
+            if max_rounds is not None:
+                if i >= max_rounds:
+                    break
+            elif self.state.budget.exhausted():
                 break
             if self.cancel_fn is not None and self.cancel_fn():
                 break   # a user cancellation stops the loop; the caller raises
@@ -340,7 +351,8 @@ def make_llm_decide(model, *, task: str, image_provider=None,
                     log: Callable[[str], None] | None = None,
                     max_tokens: int = 4096,
                     tool_names: Sequence[str] | None = None,
-                    cancel: Callable[[], bool] | None = None):
+                    cancel: Callable[[], bool] | None = None,
+                    client: Any = None):
     """Return a real-LLM ``decide(obs, state, last_result) -> Decision``.
 
     Wraps an OpenAI-compatible ``chat.completions`` call with the agent's tool
@@ -362,7 +374,7 @@ def make_llm_decide(model, *, task: str, image_provider=None,
     """
     if not getattr(model, "vision", False):
         return None
-    client = _tr.OpenAI(**model.client_kwargs())
+    client = client or _tr.OpenAI(**model.client_kwargs())
     specs = agent_openai_tools(names=list(tool_names) if tool_names is not None else None)
     messages: list[dict] = [{"role": "system", "content": str(task) + prompts.agent_interaction_rules() + prompts.agent_tool_policy() + prompts.agent_workflow()}]
     sent_image = False
@@ -489,7 +501,7 @@ def make_llm_decide(model, *, task: str, image_provider=None,
     return _decision
 
 
-def make_llm_interpret(model, log: Callable[[str], None] | None = None):
+def make_llm_interpret(model, log: Callable[[str], None] | None = None, client: Any = None):
     """Return an ``interpret(answer, kind) -> 'translate'|'keep'|'skip'`` backed by the LLM.
 
     This is the AI-driven reading of a special-page answer (the M3 negotiation lets the
@@ -497,14 +509,15 @@ def make_llm_interpret(model, log: Callable[[str], None] | None = None):
     is a translation-side call (``model.client_kwargs`` + ``request_params``), a tiny
     temperature-0 classification.  Fail-closed: on a bad client / network error / an
     unparseable reply it degrades to :func:`interpret_decision`, so the negotiation
-    never hangs.
+    never hangs.  ``client`` (optional) reuses a shared OpenAI client.
     """
     from .. import translator as _tr
 
-    try:
-        client = _tr.OpenAI(**model.client_kwargs())
-    except Exception:  # noqa: BLE001 — no client → no AI interpretation, use the matcher
-        return None
+    if client is None:
+        try:
+            client = _tr.OpenAI(**model.client_kwargs())
+        except Exception:  # noqa: BLE001 — no client → no AI interpretation, use the matcher
+            return None
 
     def interpret(answer, kind):
         try:
@@ -923,7 +936,8 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
                         preview_handler: Callable[..., bytes] | None = None,
                         answer_handler: Callable[..., Any] | None = None,
                         cancel: Callable[[], bool] | None = None,
-                        render_handler: Callable[[int, str], bytes | None] | None = None) -> dict[str, Callable]:
+                        render_handler: Callable[[int, str], bytes | None] | None = None,
+                        client: Any = None) -> dict[str, Callable]:
     """Bound deterministic content / verify / draw tools that operate on ``out_doc``.
 
     These are the agent's *hands* for a single page (the source is read-only via
@@ -944,24 +958,28 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
     from .. import pdfio
     from .. import translator as _tr
 
-    engine = _tr.TranslationEngine(model)
-    retranslate = _tr.make_retranslate_fn(model, log)
-    retranslate_batch = _tr.make_retranslate_batch_fn(model, log)
+    # ``client`` is passed only when non-None so these constructors stay callable
+    # positionally (tests mock them with ``(model[, log])`` signatures).
+    shared = {"client": client} if client is not None else {}
+    engine = _tr.TranslationEngine(model, **shared)
+    retranslate = _tr.make_retranslate_fn(model, log, **shared)
+    retranslate_batch = _tr.make_retranslate_batch_fn(model, log, **shared)
+
+    # The flat block list and the block→index map are built ONCE per page (the
+    # source is immutable for this executor's lifetime).  ``_block`` is called per
+    # picked block inside ``translate_blocks`` / ``retranslate_blocks``, so
+    # re-flattening the whole document on every call was O(n) per block.
+    _flat: list = [b for page in state.src_doc.pages for b in page] if state.src_doc is not None else []
+    _by_id: dict[int, int] = {id(b): i for i, b in enumerate(_flat)}
 
     def _flat_blocks() -> list:
-        if state.src_doc is None:
-            return []
-        return [b for page in state.src_doc.pages for b in page]
+        return _flat
 
     def _block(index: int):
-        blocks = _flat_blocks()
-        return blocks[index] if 0 <= index < len(blocks) else None
+        return _flat[index] if 0 <= index < len(_flat) else None
 
     def _flat_of(b) -> int | None:
-        for i, x in enumerate(_flat_blocks()):
-            if x is b:
-                return i
-        return None
+        return _by_id.get(id(b))
 
     def _out() -> dict:
         if state.out_doc is None:
@@ -1268,15 +1286,21 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         d = pdfio.detect_page_skew(state.src_path, int(page))
         decision = None
         if d.get("recommended") and answer_handler is not None:
-            q = (f"第 {int(page) + 1} 页（扫描件）检测到约 {d.get('skew_degrees', 0.0):.1f}° 文本倾斜，"
-                 f"是否做几何校正？")
+            q = (f"第 {int(page) + 1} 页（扫描件）检测到约 {d.get('skew_degrees', 0.0):.1f}° 文本倾斜。"
+                 f"希望对它做几何校正吗？请用一句话告诉我（例如：校正 / 不用，忽略）。")
             try:
                 ans = answer_handler(q, ["校正", "忽略"], f"ocr_skew:{int(page)}")
             except Exception as exc:  # noqa: BLE001 — fail-closed to "no correction"
                 return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             val = (ans.get("value") if isinstance(ans, dict) else ans)
-            raw = str(val or "").strip()
-            decision = "校正" if any(k in raw for k in ("校正", "纠正", "修正")) else "忽略"
+            raw = str(val or "").strip().lower()
+            # Negation wins (不要/不用/算了吧); otherwise an approval word means correct.
+            if any(k in raw for k in ("不", "别", "不用", "忽略", "算了", "不需要", "跳过", "否")):
+                decision = "忽略"
+            elif any(k in raw for k in ("校正", "纠正", "修正", "调整", "做", "好", "可以", "要")):
+                decision = "校正"
+            else:
+                decision = "忽略"
             state.user_decisions[f"ocr_skew:{int(page)}"] = {
                 "skew": d.get("skew_degrees"), "apply": decision == "校正",
             }
@@ -1337,10 +1361,10 @@ def run_page_visual(state: WorkflowState, page_index: int, model,
         state.todo.append(Goal(kind="page", page=page_index))
     src_path = src_path or state.src_path
 
-    # ``state.budget`` is shared across pages when the worker drives every page
-    # through this call (``_run_agent``), so its counters must be reset per page —
-    # otherwise ``used_steps`` accumulates and every page after the first starts
-    # already exhausted and does nothing.
+    # ``state.budget`` is shared across pages (``_run_agent``), so reset the counter
+    # per page.  In the parallel agent path the loop bound is ``max_rounds``, not
+    # ``budget.exhausted()``, so this reset only keeps the per-page step LOG
+    # meaningful — the shared counter's value is informational (see ``Budget``).
     state.budget.used_steps = 0
 
     def image_provider(_s: WorkflowState) -> bytes:
@@ -1355,17 +1379,23 @@ def run_page_visual(state: WorkflowState, page_index: int, model,
             log("  [agent] 模型不支持视觉，单页编排跳过。")
         return state
 
+    # One shared OpenAI client for this page's engine + re-translate fns + decide
+    # loop: a single connection pool instead of one per call site (less handshake
+    # and memory churn).  The watchdogs still close it on cancel/abort.
+    shared_client = _tr.OpenAI(**model.client_kwargs())
     all_tools = dict(make_source_tools(state, src_path=src_path))
     all_tools.update(make_page_executors(state, model, log=log,
                                          preview_handler=preview_handler,
                                          answer_handler=answer_handler,
                                          cancel=cancel,
-                                         render_handler=render_handler))
+                                         render_handler=render_handler,
+                                         client=shared_client))
     if tools:
         all_tools.update(tools)
     decide = make_llm_decide(model, task=task,
                              image_provider=image_provider, log=log,
-                             tool_names=list(all_tools), cancel=cancel)
+                             tool_names=list(all_tools), cancel=cancel,
+                             client=shared_client)
     agent = FlowAgent(state, all_tools, decide, log=log, max_steps=max_steps,
                       answer_handler=answer_handler, cancel_fn=cancel)
     return agent.run(max_rounds=max_rounds)
@@ -1452,6 +1482,12 @@ class DocumentSession:
         """
         plan = list(STANDARD_FLOWS["translate_doc"].scope.get(
             "phases", ["preprocess", "translate_normal", "special_pages", "review", "completed"]))
+        # Initialise the mutable translation overlay up front so concurrent page
+        # loops never race on the lazy ``if out_doc is None: out_doc = {}`` inside
+        # ``make_page_executors`` (two pages could both see ``None`` and one clobber
+        # the other's fresh dict).
+        if self.state.out_doc is None:
+            self.state.out_doc = {}
         for name in plan:
             self.state.phase = self._PHASE_OF.get(name, self.state.phase)
             method = getattr(self, f"_{name}", None)
@@ -1488,10 +1524,15 @@ class DocumentSession:
         ``except``).
         """
         def run_agent(*, task, page, max_steps=None, image=False):
+            steps = max_steps or self.max_steps_per_page
             try:
                 return self.translate_page(
                     self.state, page, self.model, task=task,
-                    max_steps=max_steps or self.max_steps_per_page, log=self.log,
+                    max_steps=steps,
+                    # A hard round cap bounds the loop independently of the shared
+                    # ``state.budget`` counter (which is racy when pages translate
+                    # in parallel) — fail-safe, never an unbounded loop.
+                    max_rounds=steps, log=self.log,
                     preview_handler=self.preview_handler, answer_handler=self.answer_handler,
                     cancel=self.cancel, render_handler=self.render_handler,
                 )
@@ -1499,46 +1540,90 @@ class DocumentSession:
                 raise FlowCancelled()
         return run_agent
 
+    def _translate_one_normal(self, i: int) -> None:
+        """Translate one ``normal`` page (fail-closed to its source on error)."""
+        ps = self.state.page(i)
+        ps.status = STATUS_IN_PROGRESS
+        try:
+            rs = run_flow(STANDARD_FLOWS["translate_page"],
+                          run_agent=self._page_agent(i), cancel=self.cancel,
+                          log=self.log,
+                          params={"page": i, "lang": self.state.lang})
+        except FlowCancelled:
+            raise _tr.TranslationCancelled()
+        except _tr.TranslationCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 — fail-closed per page
+            ps.status = STATUS_NEEDS_USER
+            ps.issues.append(f"翻译失败：{type(exc).__name__}")
+            self.log(f"  第 {i + 1} 页翻译失败：{type(exc).__name__}: {exc}（保留原文）。")
+            return
+        if rs.ok:
+            # Fail-closed: a page with translatable blocks but NO AI translation
+            # (the model answered with prose / never called a translate tool) must
+            # not be recorded DONE — the export would carry the untranslated
+            # source.  ``_page_translation_counts`` returns 0,0 for an all-
+            # numeric/protected page, which falls through to DONE correctly.
+            translatable, translated = _page_translation_counts(self.state, i)
+            if translatable > 0 and translated == 0:
+                ps.status = STATUS_NEEDS_USER
+                ps.issues.append("该页未产生任何译文（AI 未执行翻译）")
+                self.log(f"  第 {i + 1} 页未产生任何译文（AI 未执行翻译），保留原文。")
+            else:
+                ps.status = STATUS_DONE
+        else:
+            ps.status = STATUS_NEEDS_USER
+            ps.issues.append(f"翻译失败：{rs.error}")
+            self.log(f"  第 {i + 1} 页翻译失败：{rs.error}（保留原文）。")
+
     def _translate_normal(self) -> None:
         normal = [i for i, t in self.state.triage.items() if t.kind == "normal"]
         total = len(normal)
+        if not total:
+            self.log("  未发现正常文本页，跳过批量翻译。")
+            return
+        # The mutable translation overlay must exist before any page loop runs:
+        # ``make_page_executors`` initialises it lazily (``if out_doc is None``),
+        # which races when pages translate in parallel (two pages both see None
+        # and one clobbers the other's fresh dict).  ``run()`` also seeds it; this
+        # is the owner-of-parallelism guard so a direct ``_translate_normal`` call
+        # is safe too.
+        if self.state.out_doc is None:
+            self.state.out_doc = {}
+        # Pre-create every page's state so concurrent page loops never race on
+        # ``WorkflowState.page()``'s check-then-grow of the pages list.
+        for i in normal:
+            self.state.page(i)
+
+        concurrency = max(1, int(getattr(self.model, "page_concurrency", 1) or 1))
+        if concurrency > 1 and total > 1:
+            # Parallel pages: each normal page is an independent agent loop that
+            # writes to a disjoint slice of ``state.out_doc``.  ``page_concurrency``
+            # is opt-in (default 1 = the original sequential behaviour) — enable it
+            # for cloud endpoints with headroom; a single-GPU local server still
+            # serialises the actual generations.
+            self.log(f"  并行翻译 {total} 个正常页（page_concurrency={concurrency}）。")
+            done = 0
+            lock = threading.Lock()
+
+            def _work(i: int) -> None:
+                self._translate_one_normal(i)
+
+            with ThreadPoolExecutor(max_workers=min(concurrency, total)) as pool:
+                futures = [pool.submit(_work, i) for i in normal]
+                for fut in as_completed(futures):
+                    if self.cancel():
+                        raise _tr.TranslationCancelled()
+                    fut.result()   # re-raises TranslationCancelled from a page
+                    with lock:
+                        done += 1
+                    self.progress(done, total, "翻译正常页")
+            return
         for done, i in enumerate(normal, start=1):
             if self.cancel():
                 raise _tr.TranslationCancelled()
-            ps = self.state.page(i)
-            ps.status = STATUS_IN_PROGRESS
-            try:
-                rs = run_flow(STANDARD_FLOWS["translate_page"],
-                              run_agent=self._page_agent(i), cancel=self.cancel,
-                              log=self.log,
-                              params={"page": i, "lang": self.state.lang})
-            except FlowCancelled:
-                raise _tr.TranslationCancelled()
-            except Exception as exc:  # noqa: BLE001 — fail-closed per page
-                ps.status = STATUS_NEEDS_USER
-                ps.issues.append(f"翻译失败：{type(exc).__name__}")
-                self.log(f"  第 {i + 1} 页翻译失败：{type(exc).__name__}: {exc}（保留原文）。")
-            else:
-                if rs.ok:
-                    # Fail-closed: a page with translatable blocks but NO AI translation
-                    # (the model answered with prose / never called a translate tool) must
-                    # not be recorded DONE — the export would carry the untranslated
-                    # source.  ``_page_translation_counts`` returns 0,0 for an all-
-                    # numeric/protected page, which falls through to DONE correctly.
-                    translatable, translated = _page_translation_counts(self.state, i)
-                    if translatable > 0 and translated == 0:
-                        ps.status = STATUS_NEEDS_USER
-                        ps.issues.append("该页未产生任何译文（AI 未执行翻译）")
-                        self.log(f"  第 {i + 1} 页未产生任何译文（AI 未执行翻译），保留原文。")
-                    else:
-                        ps.status = STATUS_DONE
-                else:
-                    ps.status = STATUS_NEEDS_USER
-                    ps.issues.append(f"翻译失败：{rs.error}")
-                    self.log(f"  第 {i + 1} 页翻译失败：{rs.error}（保留原文）。")
+            self._translate_one_normal(i)
             self.progress(done, total, "翻译正常页")
-        if not total:
-            self.log("  未发现正常文本页，跳过批量翻译。")
 
     def _special_pages(self) -> None:
         special = [i for i, t in self.state.triage.items() if t.kind != "normal"]
@@ -1659,35 +1744,73 @@ class DocumentSession:
         return False
 
     def _completed(self) -> None:
-        d = self.state.doc_info
-        if d is not None:
-            self.state.summary = (
-                f"已完成正常页 {d.text_pages}/{d.pages}，特殊页 {d.special_pages} 页待协商。"
-            )
-            self.log(f"  [完成] {self.state.summary}")
+        """End of the standard flow: report what was done (no self-check prompt).
+
+        The report lists translated pages, kept/pending pages, and a pointer to the
+        on-demand self-check (a custom audit/fix requirement).  ``state.summary`` is
+        surfaced by the worker so the user sees a completion report, not a question.
+        """
+        pages = list(self.state.pages)
+        done = [ps.index for ps in pages if ps.status == STATUS_DONE]
+        need = [ps.index for ps in pages if ps.status == STATUS_NEEDS_USER]
+        translated = sum(
+            1 for e in (self.state.out_doc or {}).values()
+            if isinstance(e, dict) and str(e.get("text", "")).strip()
+        )
+        parts = [f"翻译完成：共处理 {len(pages)} 页，翻译 {translated} 块。"]
+        if done:
+            parts.append(f"完成页 {len(done)} 页（{done}）。")
+        if need:
+            parts.append(f"待处理/保留页 {len(need)} 页（{need}；含保留/跳过或翻译失败页）。")
+        if self.state.doc_info is not None:
+            d = self.state.doc_info
+            parts.append(f"文档 {d.title or '(无标题)'}，{d.pages} 页。")
+        parts.append("如需核对（如“检查第N页数字/有没有漏译/翻译得怎么样”），直接在侧栏告诉我。")
+        self.state.summary = "；".join(parts)
+        self.log(f"  [完成] {self.state.summary}")
 
     def _answer_value(self, val) -> str:
         """Normalise an ``answer_handler`` result to a trimmed string."""
         value = (val or {}).get("value") if isinstance(val, dict) else val
         return str(value or "").strip()
 
-    def _review(self) -> None:
-        """M4 REVIEW: pick AI self-check / manual check, then confirm export.
+    @staticmethod
+    def _classify_choice(answer: str, kind: str) -> str:
+        """Map a free-text answer onto a discrete choice (used where a specific
+        decision channel isn't wired).
 
-        After every page is drafted the session surfaces the review-mode question
-        (``review_mode_question``).  ``ai`` runs a per-page self-check-fix pass;
-        ``user`` lets the user inspect via the preview / sidebar (M5/M6 tools already
-        exist).  Either way the session then confirms export before completing —
-        a "继续检查" answer keeps the session in manual-review mode (the worker just
-        exports afterwards; a non-exporting review can be resumed from the chat).
+        Now that choices are posed as natural-language questions and answered in free
+        text, a keyword read (rather than exact-button matching) decides the intent —
+        e.g. "我自己来检查" → user, "先别导，我再看看" → continue.
+        """
+        v = str(answer or "").strip().lower()
+        if kind == "review_mode":
+            if any(k in v for k in ("手动", "自己", "我来", "我来看", "人工", "自己的")):
+                return "user"
+            return "ai"
+        if kind == "export":
+            if any(k in v for k in ("继续", "再检查", "再看看", "先不", "先别", "不导", "稍后", "暂不")):
+                return "continue"
+            return "export"
+        return v
+
+    def _review(self) -> None:
+        """M4 REVIEW (on-demand): pick AI self-check / manual check, then confirm export.
+
+        Both are natural-language prompts (no buttons) and the user answers in free
+        text; the intent is read by :meth:`_classify_choice`.  ``ai`` runs a per-page
+        self-check-fix pass; ``user`` lets the user inspect via the preview / sidebar.
+        Either way the session then confirms export before completing — a "继续检查"
+        answer keeps the session in manual-review mode (the worker exports afterwards).
         """
         mode = "ai"
         if self.answer_handler is not None:
             try:
                 q, opts = prompts.review_mode_question()
-                ans = self._answer_value(self.answer_handler(q, list(opts), "review_mode"))
-                if ans in ("我手动检查", "user"):
-                    mode = "user"
+                ans = self._classify_choice(
+                    self._answer_value(self.answer_handler(q, list(opts), "review_mode")),
+                    "review_mode")
+                mode = ans
             except Exception as exc:  # noqa: BLE001 — fail-closed to AI self-check
                 self.log(f"  复核模式询问失败：{type(exc).__name__}: {exc}（按 AI 自检处理）。")
         self.state.review_mode = mode
@@ -1700,8 +1823,10 @@ class DocumentSession:
         if self.answer_handler is not None:
             try:
                 q, opts = prompts.review_export_question()
-                ans = self._answer_value(self.answer_handler(q, list(opts), "export"))
-                if ans in ("继续检查", "continue"):
+                ans = self._classify_choice(
+                    self._answer_value(self.answer_handler(q, list(opts), "export")),
+                    "export")
+                if ans == "continue":
                     export = False
             except Exception as exc:  # noqa: BLE001 — fail-closed to export
                 self.log(f"  复核导出确认失败：{type(exc).__name__}: {exc}（按导出处理）。")

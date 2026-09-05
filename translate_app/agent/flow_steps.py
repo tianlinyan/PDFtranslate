@@ -42,6 +42,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..control import ControlSignal
+
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([\w.-]+)\s*\}\}")
 
 
@@ -187,7 +189,7 @@ class FlowRunState:
         return not self.error
 
 
-class FlowCancelled(Exception):
+class FlowCancelled(ControlSignal):
     """Raised when a user cancellation stops a flow run (control signal — the
     caller catches it and reports "已取消", mirroring ``TranslationCancelled``)."""
 
@@ -258,7 +260,7 @@ class _Executor:
         started = time.monotonic()
         try:
             data = fn(**args)
-        except FlowCancelled:
+        except ControlSignal:
             raise                     # a control signal must never be swallowed
         except Exception as exc:  # noqa: BLE001 — fail-closed, never crash the flow
             self.log(f"  工具失败：{step.tool}（用时 {time.monotonic() - started:.2f}s）："
@@ -282,7 +284,7 @@ class _Executor:
         try:
             data = self.run_agent(task=task, page=page, max_steps=step.max_steps,
                                   image=step.image)
-        except FlowCancelled:
+        except ControlSignal:
             raise                     # a control signal must never be swallowed
         except Exception as exc:  # noqa: BLE001 — fail-closed
             rs.record(label)
@@ -306,7 +308,7 @@ class _Executor:
             question, options = question[0], list(question[1] or options or [])
         try:
             value = self.ask(question, options, target)
-        except FlowCancelled:
+        except ControlSignal:
             raise                     # a control signal must never be swallowed
         except Exception as exc:  # noqa: BLE001 — fail-closed
             rs.record(label)
@@ -375,7 +377,7 @@ def run_flow(flow: Flow, *, tools: dict[str, Callable] | None = None,
                          cancel=cancel, max_steps=max_steps, report=report)
     try:
         executor.run(flow.steps, rs, merged)
-    except FlowCancelled:
+    except ControlSignal:
         raise                      # control signal — the caller decides
     except FlowBudgetExceeded:
         rs.error = "流程执行超出预算上限"
@@ -554,35 +556,28 @@ def make_special_pages() -> Flow:
     )
 
 
-def _review_mode_question_builder(rs: FlowRunState, params: dict[str, Any]):
-    from .. import prompts
-
-    return prompts.review_mode_question()
-
-
-def _review_export_question_builder(rs: FlowRunState, params: dict[str, Any]):
-    from .. import prompts
-
-    return prompts.review_export_question()
-
-
 def make_translate_doc() -> Flow:
-    """P3: the top-level orchestration flow (the phase ORDER declared as a Flow).
+    """P3: the standard top-level orchestration flow (the phase ORDER as data).
 
     Preprocess is a prerequisite (it computes the page sets above) and stays in
     ``DocumentSession``; this flow drives the downstream phases whose page sets are
-    known once preprocess ran — normal translation, special-page negotiation, review
-    mode, the self-check gate, and the export confirmation.
+    known once preprocess ran — normal translation, then special-page negotiation.
+
+    **The review/self-check gate and the export confirmation are deliberately NOT part
+    of the standard flow** (decoupled): "开始翻译" runs translation and reports; a
+    self-check only happens when the user explicitly asks (a custom audit/fix
+    requirement routes to ``ai_self_check`` / ``self_check_page``, or via the chat's
+    ``self_check`` / ``run_flow``).  So the standard flow ends at ``completed`` with a
+    completion report, not a "是否自检？" prompt.
     """
     return Flow(
         name="translate_doc",
-        description="整篇翻译顶层编排：正常页→特殊页协商→复核→导出确认。",
-        params={"normal_pages": [], "special_pages": [], "review_pages": [],
-                "lang": "", "checks": None, "auto_fix": True, "max_iter": 3},
+        description="整篇翻译标准流程：正常页→特殊页协商→完成报告。复核/自检按用户自定义要求另行触发。",
+        params={"normal_pages": [], "special_pages": [], "lang": ""},
         # The top-level phase ORDER, declared as data so ``DocumentSession.run`` is a thin
         # dispatcher over it (rather than a hardcoded call sequence).  Preprocess stays a
         # prerequisite (it computes the page sets the steps below need).
-        scope={"phases": ["preprocess", "translate_normal", "special_pages", "review", "completed"]},
+        scope={"phases": ["preprocess", "translate_normal", "special_pages", "completed"]},
         steps=[
             ForEachPage(pages="{{normal_pages}}", body=[
                 AgentStep(task=_page_task_builder, page="{{page}}", image=True),
@@ -590,9 +585,6 @@ def make_translate_doc() -> Flow:
             ForEachPage(pages="{{special_pages}}", body=[
                 UserStep(question=_special_question_builder, target="page:{{page}}"),
             ]),
-            UserStep(question=_review_mode_question_builder, target="review_mode"),
-            ForEachPage(pages="{{review_pages}}", body=make_self_check_page().steps),
-            UserStep(question=_review_export_question_builder, target="export"),
         ],
     )
 

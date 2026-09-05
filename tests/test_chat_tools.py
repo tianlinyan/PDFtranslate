@@ -90,8 +90,113 @@ class ChatToolsTest(_CtxTest):
         self.assertEqual({
             "get_doc_info", "get_settings", "classify_page", "read_page", "goto_page",
             "set_block_text", "delete_block_text", "apply_annotation", "re_export",
-            "run_translate", "set_setting",
+            "run_translate", "set_setting", "self_check", "run_flow", "retranslate",
         }, self._tool_names())
+
+    # ---- retranslate: the chat can re-translate specific blocks/page in place ----
+
+    def _retranslate_tools(self, translate_texts=None):
+        return chat_tools.make_chat_tools(self.ctx, translate_texts=translate_texts)
+
+    def test_retranslate_requires_engine(self):
+        # No translation channel wired → fail-closed, not a crash.
+        res = self.tools["retranslate"](0)
+        self.assertFalse(res["ok"])
+        self.assertIn("重译通道", res["error"])
+
+    def test_retranslate_whole_page_writes_overlay(self):
+        tools = self._retranslate_tools(lambda texts, lang: ["Translated text"] * len(texts))
+        n = len(self.tools["read_page"](0)["blocks"])
+        res = tools["retranslate"](0)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(n, res["count"])
+        self.assertEqual(n, len(res["indices"]))
+        self.assertEqual([], res["failed"])
+        for i in res["indices"]:
+            self.assertEqual("Translated text", self.ctx.get_overlay(i)["text"])
+
+    def test_retranslate_specific_indices(self):
+        tools = self._retranslate_tools(lambda texts, lang: ["Fixed " + t for t in texts])
+        idx = self.tools["read_page"](0)["blocks"][0]["index"]
+        res = tools["retranslate"](0, [idx])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([idx], res["indices"])
+        self.assertTrue(self.ctx.get_overlay(idx)["text"].startswith("Fixed "))
+
+    def test_retranslate_reports_failed_blocks(self):
+        # The model returns the source verbatim → no write; those blocks are "failed"
+        # and the tool must say so (failure transparency).
+        tools = self._retranslate_tools(lambda texts, lang: list(texts))
+        n = len(self.tools["read_page"](0)["blocks"])
+        res = tools["retranslate"](0)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(0, res["count"])
+        self.assertEqual(n, len(res["failed"]))
+        self.assertTrue(res["note"])  # mentions the failed blocks
+
+    def test_retranslate_skips_numeric_only_page(self):
+        num_ctx = DocContext()
+        num_ctx.set_source(str(_build_numeric_pdf(self.tmp / "num2.pdf")))
+        tools = chat_tools.make_chat_tools(
+            num_ctx, translate_texts=lambda texts, lang: ["x"] * len(texts))
+        res = tools["retranslate"](0)
+        self.assertFalse(res["ok"])
+        self.assertIn("没有可重译的块", res["error"])
+
+    def test_retranslate_bad_page(self):
+        tools = self._retranslate_tools(lambda texts, lang: ["x"] * len(texts))
+        res = tools["retranslate"](99)
+        self.assertFalse(res["ok"])
+        self.assertIn("bad page", res["error"])
+
+    def test_retranslate_call_failure_is_transparent(self):
+        # The translation call itself raises → fail-closed, all picked blocks reported.
+        tools = self._retranslate_tools(lambda texts, lang: (_ for _ in ()).throw(RuntimeError("boom")))
+        res = tools["retranslate"](0)
+        self.assertFalse(res["ok"])
+        self.assertIn("boom", res["error"])
+        self.assertTrue(res["failed"])
+        self.assertTrue(self.ctx.ensure_doc().blocks)
+
+    # ---- run_flow: an ``auto_fix`` flow can re-translate problem blocks ----
+
+    def test_run_flow_stays_read_only_when_channel_missing(self):
+        # No translation channel → mode read_only (existing behaviour).
+        res = self.tools["run_flow"]("自检只查数字，第1页")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual("read_only", res["mode"])
+        self.assertEqual(0, res["fixed_blocks"])
+
+    def test_run_flow_fixes_in_place_when_channel_wired(self):
+        tools = self._retranslate_tools(lambda texts, lang: ["Translated text"] * len(texts))
+        res = tools["run_flow"]("自检第1页残留和漏译")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual("self_check_page", res["base"])
+        self.assertEqual("fixed", res["mode"])
+        self.assertGreater(res["fixed_blocks"], 0)
+        self.assertEqual(0, res["remaining_issue_count"])
+        self.assertTrue(res["clean"], res)
+        # The fix wrote the protected overlay, so the chat's read_page picks it up.
+        overlay = self.ctx.overlay()
+        self.assertTrue(overlay)
+
+    def test_run_flow_read_only_when_spec_says_no_fix(self):
+        tools = self._retranslate_tools(lambda texts, lang: ["x"] * len(texts))
+        # "不修改" → auto_fix False → read-only even though the channel is wired.
+        res = tools["run_flow"]("自检第1页残留，不修改")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual("read_only", res["mode"])
+        self.assertEqual(0, res["fixed_blocks"])
+
+    def test_run_flow_reports_unfixable_blocks(self):
+        # The model keeps the source → those blocks stay untranslated and are reported.
+        tools = self._retranslate_tools(lambda texts, lang: list(texts))
+        res = tools["run_flow"]("自检第1页残留和漏译")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual("fixed", res["mode"])
+        self.assertGreater(res["failed_blocks"], [])
+        self.assertGreater(res["remaining_issue_count"], 0)
+        self.assertFalse(res["clean"], res)
 
     def test_get_doc_info(self):
         info = self.tools["get_doc_info"]()
@@ -250,6 +355,70 @@ class ChatToolsTest(_CtxTest):
     def test_classify_page_ok(self):
         res = self.tools["classify_page"](0)
         self.assertIn("kind", res)
+
+    def test_self_check_returns_structured_report(self):
+        # Nothing translated yet → the deterministic audit reports residual/missing.
+        res = self.tools["self_check"](0)
+        self.assertTrue(res["ok"], res)
+        self.assertIn("checks_requested", res)
+        self.assertIn("issues", res)
+        self.assertIn("clean", res)
+        self.assertFalse(res["clean"])
+
+    def test_self_check_filters_checks(self):
+        res = self.tools["self_check"](0, checks=["numbers"])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(["numbers"], res["checks_requested"])
+
+    def test_self_check_clean_when_translated(self):
+        # With a committed translation (no CJK residual, nothing missing) the
+        # residual+missing checks come back clean.
+        n = len(self.ctx.ensure_doc().blocks)
+        self.ctx.set_last_translated([f"Translated text {i}" for i in range(n)])
+        res = self.tools["self_check"](0, checks=["residual", "missing"])
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["clean"], res)
+
+    def test_self_check_requires_source(self):
+        tools = chat_tools.make_chat_tools(DocContext())
+        res = tools["self_check"]()
+        self.assertFalse(res["ok"])
+        self.assertIn("没有已加载的 PDF", res["error"])
+
+    def test_run_flow_compiles_and_audits_scope(self):
+        res = self.tools["run_flow"]("自检只查数字，第1页")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual("self_check_page", res["base"])
+        self.assertEqual(["numbers"], res["checks"])
+        self.assertEqual([0], res["scope"])
+        self.assertEqual(1, res["pages_audited"])
+        self.assertIn("issue_count", res)
+
+    def test_run_flow_redirects_translate_base(self):
+        res = self.tools["run_flow"]("重译第2页")
+        self.assertFalse(res["ok"])
+        self.assertEqual("translate_page", res["base"])
+        self.assertIn("run_translate", res["error"])
+
+    def test_run_flow_redirects_export_base(self):
+        res = self.tools["run_flow"]("重新导出")
+        self.assertFalse(res["ok"])
+        self.assertEqual("export", res["base"])
+        self.assertIn("re_export", res["error"])
+
+    def test_run_flow_promotes_named_flow_in_memory(self):
+        from translate_app.agent import user_flows as uf
+
+        saved = dict(uf.USER_FLOW_SPECS)
+        try:
+            res = self.tools["run_flow"]("自检只查表格", name="my_table_check")
+            self.assertTrue(res["ok"], res)
+            self.assertTrue(res["promoted"])
+            self.assertIn("my_table_check", uf.USER_FLOW_SPECS)
+            self.assertEqual(["table"], uf.USER_FLOW_SPECS["my_table_check"].checks)
+        finally:
+            uf.USER_FLOW_SPECS.clear()
+            uf.USER_FLOW_SPECS.update(saved)
 
 
 if __name__ == "__main__":

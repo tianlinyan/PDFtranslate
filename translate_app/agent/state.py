@@ -11,6 +11,7 @@ See ``docs/0.3.0-设计.md`` for the architecture (this is P1: the skeleton).
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,7 +33,15 @@ PHASE_DONE = "done"
 
 @dataclass
 class Budget:
-    """Bounded recursion budget for a run (fail-closed beyond these limits)."""
+    """Bounded recursion budget for a run (fail-closed beyond these limits).
+
+    NOTE (parallel pages): ``used_steps`` is a SHARED counter that each page's
+    ``run_page_visual`` resets to 0 at the start of its loop, so its VALUE is not a
+    reliable cross-page total under ``page_concurrency > 1`` — it is informational
+    (logging / ``remaining_steps``) and the ``max_rounds=None`` fallback.  The real
+    per-page loop bound in the parallel agent path is ``FlowAgent.run(max_rounds=…)``.
+    ``record_op`` still increments it under a lock so no increment is *lost*.
+    """
     max_steps: int = 200          # max total tool calls
     used_steps: int = 0
 
@@ -165,6 +174,9 @@ class WorkflowState:
     ops: list[Op] = field(default_factory=list)
     todo: list[Goal] = field(default_factory=list)
     budget: Budget = field(default_factory=Budget)
+    #: Guards ``ops`` + ``budget.used_steps`` so a parallel page run cannot lose a
+    #: ``used_steps += 1`` increment (read-modify-write is not atomic under the GIL).
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     pending_question: dict[str, Any] | None = None   # surfaced ask to the GUI
     log: list[str] = field(default_factory=list)
     #: Interactive-session fields (see docs/0.3.1-交互式翻译流程设计.md).
@@ -192,7 +204,13 @@ class WorkflowState:
         reason: str = "",
         user_confirmed: bool = False,
     ) -> Op:
-        """Append a provenance ``Op`` and advance the step counter."""
+        """Append a provenance ``Op`` and advance the step counter.
+
+        The ``used_steps`` increment is done under ``self._lock`` so parallel page
+        loops (``page_concurrency > 1``) never lose an increment to a torn
+        read-modify-write.  ``used_steps``'s *value* is still a shared, per-page-
+        reset counter — see :class:`Budget`.
+        """
         op = Op(
             tool=tool,
             args=args or {},
@@ -202,8 +220,9 @@ class WorkflowState:
             reason=reason,
             user_confirmed=user_confirmed,
         )
-        self.ops.append(op)
-        self.budget.used_steps += 1
+        with self._lock:
+            self.ops.append(op)
+            self.budget.used_steps += 1
         return op
 
     def ask(self, question: str, options: list[str] | None = None, *, target: str = "") -> None:

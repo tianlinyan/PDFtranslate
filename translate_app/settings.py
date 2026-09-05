@@ -41,6 +41,7 @@ class ModelConfig:
     temperature: float | None = None   # sampling temperature (None → engine default)
     max_tokens: int | None = None      # per-request max completion tokens (None → server default)
     concurrency: int = 1               # parallel batch requests per translation run
+    page_concurrency: int = 1          # parallel PAGE translation in the agent path (1 = sequential)
     batch_size: int = 4000             # source-character budget per batch request
     #: When true, the model may be used to *review* an OCR-rebuilt scanned page:
     #: the original page and the reconstruction are sent to it, and its text
@@ -83,6 +84,7 @@ class ModelConfig:
                 int(item["max_tokens"]) if item.get("max_tokens") not in (None, "") else None
             ),
             concurrency=int(item.get("concurrency") or 1),
+            page_concurrency=int(item.get("page_concurrency") or 1),
             batch_size=int(item.get("batch_size") or 4000),
             vision=bool(item.get("vision", False)),
             interaction_temperature=(
@@ -107,6 +109,7 @@ class ModelConfig:
         "temperature",
         "max_tokens",
         "concurrency",
+        "page_concurrency",
         "batch_size",
         "vision",
         "interaction_temperature",

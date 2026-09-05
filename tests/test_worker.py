@@ -234,15 +234,18 @@ class AgentModeWiringTest(_WorkerTestBase):
                                    side_effect=fake_run_page_visual):
                 with mock.patch.object(worker_module, "TranslationEngine", _StubEngine):
                     events = self._run(worker)
-        # The agent path handed the preview_handler through, ran the translate task
-        # AND the M4 review pass (a separate '复核' task), and the resulting
-        # out_doc fed the export (not the deterministic engine).
+        # The agent path handed the preview_handler through, ran the translate task,
+        # and the resulting out_doc fed the export (not the deterministic engine).
+        # The review/self-check is DECOUPLED: a plain "开始翻译" no longer auto-runs a
+        # '复核' pass — that is triggered on demand (a custom audit/fix flow).  The run
+        # instead ends with a completion report surfaced to the user.
         self.assertEqual(handler, captured["preview_handler"])
         self.assertTrue(any("翻译成 English" in t and "set_text" in t for t in tasks), tasks)
-        self.assertTrue(any("复核" in t for t in tasks), tasks)   # M4 AI self-check ran
+        self.assertFalse(any("复核" in t for t in tasks), tasks)   # no auto self-check
         self.assertIn("Hello from agent", Path(out).read_text("utf-8"))
         self.assertIn("finished", events)
         self.assertTrue(any("已启用 AI 编排" in m for m in logs), logs)
+        self.assertTrue(any("翻译完成" in m for m in logs), logs)   # completion report surfaced
 
     def test_requirements_seeded_into_agent_state(self):
         # The "开始翻译+要求" entry seeds a requirement into the agent's workflow

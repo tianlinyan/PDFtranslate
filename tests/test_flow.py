@@ -152,6 +152,24 @@ class RunFlowTest(unittest.TestCase):
         self.assertFalse(rs.ok)
         self.assertIn("unknown tool", rs.error)
 
+    def test_tool_step_re_raises_translation_cancelled(self):
+        # A deterministic ToolStep that raises the translation engine's cancellation
+        # signal must propagate it as a control signal, NOT swallow it as a tool error.
+        from translate_app.translator import TranslationCancelled
+
+        def boom():
+            raise TranslationCancelled()
+
+        with self.assertRaises(TranslationCancelled):
+            agent.run_flow(self._flow(fs.ToolStep("boom")), tools={"boom": boom})
+
+    def test_control_signal_hierarchy(self):
+        from translate_app.control import ControlSignal
+        from translate_app.translator import TranslationCancelled
+
+        self.assertTrue(issubclass(fs.FlowCancelled, ControlSignal))
+        self.assertTrue(issubclass(TranslationCancelled, ControlSignal))
+
 
 class RegistryTest(unittest.TestCase):
     def test_standard_flows_are_registered(self):
@@ -164,7 +182,9 @@ class RegistryTest(unittest.TestCase):
         # The top-level phase ORDER is data (declarative), which ``DocumentSession.run``
         # dispatches over — not a hardcoded call sequence.
         phases = agent.STANDARD_FLOWS["translate_doc"].scope["phases"]
-        self.assertEqual(["preprocess", "translate_normal", "special_pages", "review", "completed"],
+        # The review/self-check is decoupled: the standard translate flow ends at
+        # "completed" and reports; a review is triggered on demand (custom flow).
+        self.assertEqual(["preprocess", "translate_normal", "special_pages", "completed"],
                          phases)
 
     def test_report_hook_called_per_page(self):

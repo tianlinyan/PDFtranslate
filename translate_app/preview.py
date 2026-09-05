@@ -1,8 +1,9 @@
-"""Preview window for the v0.3.0 agent (drawable region + send-to-AI).
+"""Preview window: shows a page, with zoom, left-drag pan and right-drag ink.
 
-A preview page is shown as an image; the user holds the left mouse button and
-draws a frame on it, then presses "发送" to crop the framed region and hand it to
-the AI (the cropped image is emitted on :attr:`PreviewWindow.sendRequested`).
+The current model sends the WHOLE page image (plus any hand-drawn annotation) to
+the AI on "发送".  Navigation uses 上页/下页/跳转; the wheel and ＋/－/适应 control
+zoom.  Mouse: **left-drag pans** a zoomed page (a no-op at fit-to-window);
+**right-drag draws a freehand marker stroke** (image space, stays glued on zoom).
 Cropping / coordinate mapping are pure helpers (:func:`crop_region`,
 :func:`scale_rect`) so they are unit-testable without a :class:`QApplication`.
 """
@@ -54,6 +55,21 @@ def scale_rect(rect, disp_x: float, disp_y: float, disp_w: float, disp_h: float,
             (rect[2] - disp_x) * sx, (rect[3] - disp_y) * sy]
 
 
+def clamp_pan(dx: float, dy: float, zoomed_w: float, zoomed_h: float,
+              avail_w: float, avail_h: float) -> tuple[float, float]:
+    """Clamp a left-drag pan so the zoomed image still covers the viewport on each axis.
+
+    ``(zoomed_w, zoomed_h)`` is the on-screen size of the image at the current zoom;
+    ``(avail_w, avail_h)`` is the viewport size.  An axis where the image does not
+    overflow the viewport (e.g. at fit-to-window) allows no pan on that axis; a zoomed
+    axis can move by at most its overshoot, so every part stays reachable and the page
+    is never dragged off-screen.  Returns ``(dx, dy)``.
+    """
+    max_dx = max(0.0, (zoomed_w - avail_w) / 2.0)
+    max_dy = max(0.0, (zoomed_h - avail_h) / 2.0)
+    return (max(-max_dx, min(max_dx, dx)), max(-max_dy, min(max_dy, dy)))
+
+
 class SelectionCanvas(QWidget):
     """Displays a preview image; zoomable (wheel/buttons); right-click draws a stroke."""
 
@@ -62,6 +78,12 @@ class SelectionCanvas(QWidget):
         self._pixmap: QPixmap | None = None
         self._zoom = 1.0            # multiplier over the fit-to-window scale
         self._pan = QPointF(0, 0)   # pan offset (display px), 0 = centred
+        # Left-button drag pans the zoomed view (a no-op at fit-to-window).  ``_panning``
+        # is True while the left button is held; ``_pan_start``/``_pan_origin`` record the
+        # press point and the pan at press so the image "follows" the cursor.
+        self._panning = False
+        self._pan_start = QPointF(0, 0)
+        self._pan_origin = QPointF(0, 0)
         # Right-button freehand annotation strokes, in IMAGE space so they stay glued
         # to the page when the user zooms.  ``_active_ink`` is the stroke being drawn
         # right now; ``_strokes`` are the finished ones (accumulated markup, cleared
@@ -81,6 +103,8 @@ class SelectionCanvas(QWidget):
         self._pixmap = pixmap
         self._strokes = []
         self._active_ink = None
+        self._panning = False
+        self.unsetCursor()
         if not same:
             self._zoom = 1.0
             self._pan = QPointF(0, 0)
@@ -150,7 +174,28 @@ class SelectionCanvas(QWidget):
         """True when ``pos`` (display) is over the displayed image area."""
         return self._pixmap is not None and self._view_rect().contains(pos)
 
+    def _clamp_pan(self, pan: QPointF) -> QPointF:
+        """Clamp a pan so the zoomed image still covers the viewport on each axis.
+
+        At fit-to-window (``_zoom == 1``) the image exactly fits on its limiting axis,
+        so there is no pan room and ``max_dx/dy`` are 0 — left-drag becomes a no-op
+        (as it should be).  Once the user zooms in beyond the window, the image can move
+        by at most the overshoot on each axis, keeping every part reachable without
+        dragging it off-screen.
+        """
+        if self._pixmap is None:
+            return QPointF(0, 0)
+        avail = self.rect()
+        base = self._fit_rect()
+        dx, dy = clamp_pan(pan.x(), pan.y(),
+                           base.width() * self._zoom, base.height() * self._zoom,
+                           avail.width(), avail.height())
+        return QPointF(dx, dy)
+
     def resizeEvent(self, _ev) -> None:  # noqa: N802
+        # A resize (or zoom) can leave the pan outside the new bounds — re-clamp.
+        if self._pixmap is not None:
+            self._pan = self._clamp_pan(self._pan)
         self.update()
 
     # -- painting ------------------------------------------------------------
@@ -180,24 +225,42 @@ class SelectionCanvas(QWidget):
     def mousePressEvent(self, ev) -> None:  # noqa: N802
         if self._pixmap is None:
             return
+        pos = ev.position()
+        if not self._ink_contains(pos):
+            return
         if ev.button() == Qt.MouseButton.RightButton:
             # Freehand annotation: hold right + drag to draw a stroke over the image.
-            if self._ink_contains(ev.position()):
-                self._active_ink = [self._to_image_pos(ev.position())]
-                self.update()
+            self._active_ink = [self._to_image_pos(pos)]
+            self.update()
+        elif ev.button() == Qt.MouseButton.LeftButton:
+            # Left-drag pans the zoomed view (no-op at fit-to-window).  The image
+            # "follows" the cursor; ``_clamp_pan`` keeps it reachable/on-screen.
+            self._panning = True
+            self._pan_start = pos
+            self._pan_origin = QPointF(self._pan)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, ev) -> None:  # noqa: N802
+        pos = ev.position()
         if self._active_ink is not None:
             # Freehand stroke being drawn (right button held): append the point.
-            self._active_ink.append(self._to_image_pos(ev.position()))
+            self._active_ink.append(self._to_image_pos(pos))
+            self.update()
+        elif self._panning:
+            # Pan: move the view by the drag delta (clamped so the page stays in view).
+            self._pan = self._clamp_pan(self._pan_origin + (pos - self._pan_start))
             self.update()
 
     def mouseReleaseEvent(self, ev) -> None:  # noqa: N802
-        if self._active_ink is not None:
+        if ev.button() == Qt.MouseButton.RightButton and self._active_ink is not None:
             # Finish the freehand stroke; keep it as markup on this page.
             self._strokes.append(self._active_ink)
             self._active_ink = None
             self.update()
+        elif ev.button() == Qt.MouseButton.LeftButton and self._panning:
+            # End the pan; restore the cursor.
+            self._panning = False
+            self.unsetCursor()
 
     def clear_ink(self) -> None:
         """Erase all freehand right-button strokes on the current page."""
@@ -230,7 +293,7 @@ class PreviewWindow(QWidget):
 
         self.canvas = SelectionCanvas()
 
-        hint = QLabel("右键拖动画任意线；点「发送」把整页图片（含标注）发给 AI（滚轮缩放）。")
+        hint = QLabel("左键拖动平移；右键拖动画标注；滚轮缩放；点「发送」把整页图片（含标注）发给 AI。")
         hint.setWordWrap(True)
 
         # --- zoom controls ---

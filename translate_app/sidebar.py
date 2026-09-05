@@ -79,24 +79,23 @@ class AnswerBridge(QObject):
 
 
 class _AskRow(QWidget):
-    """A stack of answer buttons for one agent question, plus a free-text field."""
+    """A natural-language answer field for one agent question (no buttons).
+
+    The question is already shown as an AI chat message above; this row is only a
+    free-text field where the user types their answer in plain language (press Enter).
+    The ``options`` list is deliberately NOT rendered as buttons — choices are made
+    through a natural-language reply that the AI (or a keyword matcher) interprets.
+    """
 
     chosen = pyqtSignal(object, str)   # value, target
 
-    def __init__(self, question: str, options: list[str], target: str) -> None:
+    def __init__(self, target: str) -> None:
         super().__init__()
         self._target = target
         box = QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
-        buttons = QHBoxLayout()
-        for opt in options:
-            b = QPushButton(str(opt))
-            b.clicked.connect(lambda _c, o=opt: self.chosen.emit(o, self._target))
-            buttons.addWidget(b)
-        buttons.addStretch()
-        box.addLayout(buttons)
         field = QLineEdit()
-        field.setPlaceholderText("或输入其他回答…")
+        field.setPlaceholderText("请用自然语言回答（按回车确认）…")
         field.returnPressed.connect(lambda: self.chosen.emit(field.text().strip(), self._target)
                                     if field.text().strip() else None)
         box.addWidget(field)
@@ -152,9 +151,11 @@ class SidebarChat(QWidget):
         self._log.ensureCursorVisible()
 
     def show_question(self, question: str, options: list[str], target: str) -> None:
-        """Display an agent question with answer buttons; forward the answer."""
+        """Display an agent question as a natural-language prompt and collect the
+        answer in free text (no buttons).  ``options`` is carried for the interpreter
+        but is not rendered — the user answers in plain language."""
         self.add_message("ai", question)
-        row = _AskRow(question, options, target)
+        row = _AskRow(target)
         row.chosen.connect(self._on_chosen)
         self._asks_layout.addWidget(row)
 

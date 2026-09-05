@@ -167,10 +167,12 @@ def agent_interaction_rules() -> str:
     return (
         "\n\n【与用户交互】仅在这 4 种情况先调 ask_user 拿用户决定，再继续：\n"
         "① 术语/专有名/报表科目名不确定时（给出候选）。"
-        "② 某块保留原文还是翻译、判断不确定时（『保留/翻译』）。"
+        "② 某块保留原文还是翻译、判断不确定时（『保留原文还是翻译？』）。"
         "③ 要删除/覆盖/擦除译文或整页（不可逆，先确认）。"
         "④ 接近预算上限、或当前无法推进时（询问是否收尾/继续）。\n"
-        "其余情况不要打扰用户。ask_user 返回的是用户的选择，据此继续。"
+        "其余情况不要打扰用户。**提问必须是清晰的自然语言问题，不要依赖按钮**；"
+        "ask_user 的 options 只是可选的提示文字，用户会用一句话自由回答，"
+        "你要从这句话里理解其意图并据此继续（拿到的是用户的自由文本回答）。"
     )
 
 
@@ -247,29 +249,38 @@ def page_task(page_index: int, lang: str, kind: str | None = None) -> str:
 
 
 def special_page_question(page_index: int, kind: str) -> tuple[str, list[str]]:
-    """The per-kind question + answer options for a special page (M3 negotiation).
+    """The per-kind *natural-language* question for a special page (M3 negotiation).
 
-    Returns ``(question, options)`` surfaced in the sidebar as buttons; the chosen
-    option is mapped to translate / keep / skip by ``DocumentSession._ask_decision``.
+    Returns ``(question, options)``; the question is an open, plain-language prompt and
+    ``options`` is only a hint list (never rendered as buttons) so the free-text answer
+    is interpreted by ``DocumentSession._interpret_answer`` (an AI read, else a keyword
+    matcher) into translate / keep / skip.
     """
     n = page_index + 1
     if kind == "scan":
-        return (f"第 {n} 页是扫描件，需 OCR 识别后翻译。如何处理？",
+        return (f"第 {n} 页是扫描件，需要先识别文字再翻译。请问你希望怎么处理这一页？"
+                f"请用一句话告诉我（例如：翻译它 / 保留原文 / 跳过这页）。",
                 ["OCR并翻译", "保留原文", "跳过"])
     if kind == "chart":
-        return (f"第 {n} 页是组织架构图，节点标签宜保留原文。如何处理？",
+        return (f"第 {n} 页是组织架构图，节点标签通常保留原文。请问要怎么处理？"
+                f"请用一句话告诉我（例如：保留原文 / 翻译 / 跳过）。",
                 ["保留原文", "翻译", "跳过"])
-    return (f"第 {n} 页类型不确定。如何处理？", ["翻译", "保留原文", "跳过"])
+    return (f"第 {n} 页类型不确定。请问要怎么处理？请用一句话告诉我"
+            f"（例如：翻译 / 保留原文 / 跳过）。",
+            ["翻译", "保留原文", "跳过"])
 
 
 def review_mode_question() -> tuple[str, list[str]]:
-    """M4: ask whether the draft is handed to the AI self-check or the user checks it."""
-    return ("全文初稿已生成。交由 AI 自检，还是你手动检查？", ["AI 自检", "我手动检查"])
+    """M4: ask (in natural language) whether the draft goes to AI self-check or user review."""
+    return ("全文初稿已生成。请问由我来自动自检，还是你自己手动检查？"
+            "请用一句话告诉我（例如：你自检 / 我手动检查）。",
+            ["AI 自检", "我手动检查"])
 
 
 def review_export_question() -> tuple[str, list[str]]:
-    """M4: after the review, confirm whether to export the result."""
-    return ("复核完成。是否导出？", ["导出", "继续检查"])
+    """M4: after the review, confirm (in natural language) whether to export."""
+    return ("复核进行中。要直接导出成品吗？请用一句话告诉我（例如：导出 / 先别导，我再看看）。",
+            ["导出", "继续检查"])
 
 
 def review_page_task(page_index: int, *, findings: dict | None = None,
@@ -361,12 +372,21 @@ def chat_tool_hint() -> str:
         "delete_block_text、apply_annotation）的功能见各工具说明，这里只讲入口规则：\n"
         "**用户要最新译文 → 直接调 re_export**（用当前修改重新生成，秒级、不重译）。若不可用"
         "（还没翻译过/没加载源文件），提示用户点主界面的「重新导出」按钮，**不要说没有导出功能**——应用有「重新导出」。\n"
-        "**用户要「开始翻译」（或“翻译这个/帮我翻译”+要求）→ 这是入口**："
-        "① 先 get_settings 看当前设置（源文件名/目标语言/输出格式/模型）；"
-        "② 若用户要求改语言/格式，先 set_setting 改；"
+        "**用户要「检查/自检/核对」（“第N页数字对不对/有没有漏译/翻译得怎么样”）→ 调 self_check**"
+        "（只读、秒级返回 findings；page 不传查全文，checks 可传子集如 ['numbers']）。\n"
+        "**用户要「局部/定点重译」（“把第3页第2块重译/翻成…”“第5页整体重译”→ 调 retranslate**"
+        "（按 flat 块索引或整页重译并写入受保护覆盖层；返回 count/indices/failed——failed 是重译失败而保留原文的块，"
+        "应如实告知用户；改完提醒 re_export）。**retranslate 是“改一处就重译那一处”，不是整篇重跑。**\n"
+        "**用户要「自定义流程」（“只查第3-8页的数字和表格，不修改”“第5页数字错了自动改”）→ 调 run_flow**"
+        "（把整句要求传 requirement：规则/模型编译成 scope+checks+auto_fix。auto_fix=True 且重译通道可用时"
+        "会**就地修正**审计发现的问题块并写回覆盖层（返回 fixed/remaining）；否则只读审计。传 name 可命名沉淀为本会话流程）。\n"
+        "**用户要「开始翻译」（或“翻译这个/帮我翻译”）→ 走标准流程**："
+        "① 先 get_settings 看当前设置（源文件名/目标语言/输出格式/模型）；② 若用户要求改语言/格式，先 set_setting 改；"
         "③ 把用户的具体要求（如“第3页公司名翻成Bank”“只翻第2-5页”）作为 requirement 传给 run_translate，"
-        "**不要自己复述“即将开始”而不启动**；"
-        "④ 运行中需要用户决定时 AI 会提问。若没选源文件/模型不可用，提示用户先选好再试。"
+        "**不要自己复述“即将开始”而不启动**；④ 运行中需要用户决定时 AI 会提问。"
+        "**注意：标准流程只做“翻译+导出+完成报告”，不会自动问“是否自检/是否导出”**——"
+        "翻译完成后应用直接给出报告；用户要是想“额外核对/自检”，**是另一个动作**，用上面的 self_check/run_flow 单独触发，"
+        "**不要假设或复述“翻完会自动自检”**。若没选源文件/模型不可用，提示用户先选好再试。"
     )
 
 
@@ -422,7 +442,7 @@ AGENT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "render_page": "把当前处理到该页的译文渲染成 PNG 供视觉自检（检查溢出/越线/密度）",
     "preview_page": "在预览窗口显示指定页面（供用户查看），可聚焦某区域/块",
     "detect_page_skew": "检测某扫描页文本的整体倾斜角（度）：返回 {page, skew_degrees, recommended, decision, reason}；若 recommended 且已接入问答通道，会向用户询问是否做几何校正并把决定记入状态。扫描件翻译前可先调用它判断是否需要（低风险定向）几何校正——它只检测/询问、不修改原 PDF",
-    "ask_user": "向用户提问并等待回答（关键决策/歧义/术语确认）",
+    "ask_user": "向用户提一个清晰的自然语言问题并等待回答（用户用一句话自由回答；options 只是可选的提示文字，不作为按钮）——关键决策/歧义/术语确认时用",
 }
 
 #: The interaction-chat tool descriptions (``chat_tools.py``), keyed by tool name.
@@ -437,5 +457,8 @@ CHAT_TOOL_DESCRIPTIONS: dict[str, str] = {
     "apply_annotation": "按预览中用户框选的区域改写/删除对应块（用 read_page 拿到的 bbox）。",
     "re_export": "用当前已加载 PDF 上一次的成功译文，重新导出（应用本次对话/标注里已有的修改；不重新翻译、秒级）。",
     "run_translate": "用**当前设置**开始翻译（把用户的具体要求作为 requirement 传入，会随运行注入到 AI 编排层）。控制权交给翻译流水线，完成在主窗口日志/进度提示。",
+    "self_check": "对当前已翻译的 PDF 跑**确定性质检**（只读、不重译、不改动）：残留/漏译/数字保真/表格完整性/版面五类。用户说“检查第N页的数字/有没有漏译/数字对不对/翻译得怎么样”时调用；page 不传则查全文，checks 可传子集（如只查数字 ['numbers']）。返回 {checks_requested, checks, issues, clean}，issues 是带 check 标签的问题清单，clean 为是否无问题。",
+    "run_flow": "把用户的一句话要求**编译成一个自定义流程**并执行（路径 A 参数化）：如“自检第3到第8页只查数字和表格，不修改”→ 解析页范围/检查子集/是否只读；如“第5页数字错了自动改”→ 会**就地修正**审计发现的问题块并写回覆盖层。可传 name 把该流程**登记为命名流程**（本次会话内可复用）。默认只读审计；auto_fix=True 且重译通道可用时才写回覆盖层。",
+    "retranslate": "**局部/定点重译**指定的块并写入受保护覆盖层（不用整篇重跑）：传 page 与（可选的扁平块）indices；indices 不传则重译整页所有可翻译块；返回 {count, indices, translated:{index:text}, failed:[...]}。failed 是重译失败而**保留原文**的块（数字/代码块被自动跳过，不属于失败），应如实转告用户。改完提醒用户用 re_export 生成最新译文。",
     "set_setting": "修改翻译设置项（key 为 target_language 或 output_type，value 为语言名/输出格式键 translated_pdf|bilingual_pdf|markdown|plain_text），下次运行生效。",
 }

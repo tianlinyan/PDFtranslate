@@ -464,6 +464,10 @@ class TranslateWorker(QObject):
             ).run()
         finally:
             self._agent_state = None
+        # The completion report (decoupled from any self-check prompt) is surfaced so
+        # the user sees what was done; the self-check is triggered on demand via chat.
+        if state.summary:
+            self.log.emit(state.summary)
         translated = list(doc.blocks)
         n_changed = 0
         for idx, entry in (state.out_doc or {}).items():

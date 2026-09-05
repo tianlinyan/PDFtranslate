@@ -58,6 +58,28 @@ class ScaleRectTest(unittest.TestCase):
         self.assertAlmostEqual(20.0, out[1])
 
 
+class ClampPanTest(unittest.TestCase):
+    """Left-drag pan clamp: the zoomed image stays reachable / on-screen."""
+
+    def test_no_pan_when_image_fits(self):
+        # Image exactly fits the viewport (e.g. at fit-to-window) → no pan room.
+        self.assertEqual((0.0, 0.0), preview.clamp_pan(100, -50, 800, 600, 800, 600))
+
+    def test_pan_clamped_to_overshoot(self):
+        # Zoomed image 1200x900 in an 800x600 viewport → pan limited to ±200 x, ±150 y.
+        dx, dy = preview.clamp_pan(500, -500, 1200, 900, 800, 600)
+        self.assertEqual(200.0, dx)
+        self.assertEqual(-150.0, dy)
+
+    def test_pan_within_bounds_is_preserved(self):
+        # A small drag inside the allowed overshoot is kept as-is.
+        self.assertEqual((50.0, -30.0), preview.clamp_pan(50, -30, 1200, 900, 800, 600))
+
+    def test_one_axis_fits_other_overflows(self):
+        # Viewport 800x600; zoomed image 800x900 → no x pan, y pans by ±150.
+        self.assertEqual((0.0, 100.0), preview.clamp_pan(40, 100, 800, 900, 800, 600))
+
+
 class PreviewBridgeTest(unittest.TestCase):
     """The worker↔GUI channel: payload round-trip and timeout."""
 

@@ -5,9 +5,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from translate_app import agent
+from translate_app import agent, translator
 from translate_app.agent import flow_steps as fs, user_flows as uf
+from translate_app.settings import ModelConfig
 
 
 class CompileFromUserTest(unittest.TestCase):
@@ -35,6 +37,14 @@ class CompileFromUserTest(unittest.TestCase):
         self.assertEqual("self_check_page", spec.base)
         self.assertIsNone(spec.checks)
         self.assertIsNone(spec.scope)
+
+    def test_aliases_do_not_match_unrelated_words(self):
+        # Bare single-char aliases ("数"/"表") were removed: 数据/代表 etc. must NOT
+        # be misread as a numbers/table audit.
+        self.assertIsNone(agent.compile_from_user("自检数据完整性").checks)
+        self.assertIsNone(agent.compile_from_user("检查数据的准确性").checks)
+        self.assertEqual(["table"], agent.compile_from_user("只查表格").checks)
+        self.assertEqual(["numbers"], agent.compile_from_user("只查数字").checks)
 
     def test_ai_slot_filler_builds_spec(self):
         # AI-driven: an injected LLM interprets the requirement into FlowSpec fields,
@@ -140,6 +150,101 @@ class PersistenceTest(unittest.TestCase):
     def test_load_ignores_corrupt_file(self):
         (Path(self._tmp.name) / "broken.json").write_text("{not json", encoding="utf-8")
         self.assertEqual({}, agent.load_user_flow_specs())   # no crash, skipped
+
+
+class MemoryOnlyPersistenceTest(unittest.TestCase):
+    """Without ``PDFTRANSLATE_FLOWS_DIR``, promotion is memory-only (no implicit disk write)."""
+
+    def setUp(self):
+        self._old = os.environ.pop(uf._FLOW_DIR_ENV, None)
+        self._saved = dict(uf.USER_FLOW_SPECS)
+        uf.USER_FLOW_SPECS.clear()
+
+    def tearDown(self):
+        uf.USER_FLOW_SPECS.clear()
+        uf.USER_FLOW_SPECS.update(self._saved)
+        if self._old is not None:
+            os.environ[uf._FLOW_DIR_ENV] = self._old
+
+    def test_save_is_memory_only_and_load_returns_empty(self):
+        spec = agent.FlowSpec(base="self_check_page", checks=["numbers"])
+        agent.save_flow_spec("mem_only", spec)
+        self.assertIn("mem_only", uf.USER_FLOW_SPECS)
+        self.assertEqual({}, agent.load_user_flow_specs())   # no disk read when unconfigured
+        self.assertIsNotNone(agent.get_user_flow("mem_only"))   # still resolvable in memory
+
+
+class FlowCompilerTest(unittest.TestCase):
+    """AI slot-filling (``make_llm_flow_compiler``) — Path A's flexible branch."""
+
+    def test_parse_flow_json_strips_fences_and_prose(self):
+        self.assertEqual(
+            {"base": "self_check_page", "checks": ["numbers"]},
+            uf._parse_flow_json('```json\n{"base":"self_check_page","checks":["numbers"]}\n```'))
+        self.assertEqual({"scope": [2, 3]}, uf._parse_flow_json('好的：{"scope": [2, 3]}'))
+        self.assertEqual({}, uf._parse_flow_json("no json here"))
+        self.assertEqual({}, uf._parse_flow_json('["not", "an", "object"]'))
+
+    def test_make_llm_flow_compiler_fills_spec(self):
+        class _Msg:
+            content = '{"base": "self_check_page", "checks": ["numbers", "table"], "scope": [2, 3]}'
+
+        class _Resp:
+            choices = [type("_C", (), {"message": _Msg()})()]
+
+        class _Client:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def chat(self):
+                return self
+
+            @property
+            def completions(self):
+                return self
+
+            def create(self, **kw):
+                self.calls.append(kw)
+                return _Resp()
+
+        client = _Client()
+        model = ModelConfig(id="m", name="m", type="openai",
+                            endpoint="http://127.0.0.1:9/v1", model="mock")
+        with mock.patch.object(translator, "OpenAI", lambda **_k: client):
+            compiler = uf.make_llm_flow_compiler(model)
+        self.assertIsNotNone(compiler)
+        data = compiler("自检第3到第4页只查数字和表格")
+        self.assertEqual(["numbers", "table"], data["checks"])
+        self.assertEqual([2, 3], data["scope"])
+        # A temperature-0 translation-side call.
+        self.assertEqual(0.0, client.calls[0]["temperature"])
+
+    def test_make_llm_flow_compiler_fails_closed(self):
+        class _Client:
+            @property
+            def chat(self):
+                return self
+
+            @property
+            def completions(self):
+                return self
+
+            def create(self, **kw):
+                raise RuntimeError("net down")
+
+        model = ModelConfig(id="m", name="m", type="openai",
+                            endpoint="http://127.0.0.1:9/v1", model="mock")
+        with mock.patch.object(translator, "OpenAI", lambda **_k: _Client()):
+            compiler = uf.make_llm_flow_compiler(model)
+        self.assertIsNotNone(compiler)
+        self.assertEqual({}, compiler("自检只查数字"))   # network error → defaults
+
+    def test_make_llm_flow_compiler_none_without_client(self):
+        model = ModelConfig(id="m", name="m", type="openai",
+                            endpoint="http://127.0.0.1:9/v1", model="mock")
+        with mock.patch.object(translator, "OpenAI", side_effect=RuntimeError("no cfg")):
+            self.assertIsNone(uf.make_llm_flow_compiler(model))
 
 
 if __name__ == "__main__":

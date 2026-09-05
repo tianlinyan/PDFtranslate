@@ -102,14 +102,27 @@ def user_flows_dir() -> Path:
     return Path.home() / ".pdftranslate" / "flows"
 
 
+def _flows_persist_enabled() -> bool:
+    """Whether user-flow specs persist to disk.
+
+    Disk persistence is **opt-in** via ``PDFTRANSLATE_FLOWS_DIR`` (mirroring
+    ``PDFTRANSLATE_CACHE_DIR`` on the translation side — tests set it to a temp dir
+    to activate).  A production run keeps promoted flows in memory only unless the
+    dir is configured, so a chat "name this flow" never writes files implicitly.
+    """
+    return bool(os.environ.get(_FLOW_DIR_ENV))
+
+
 # --------------------------------------------------------------------------
 # 1. Rule-based requirement → FlowSpec (Path A slot-filling).
 # --------------------------------------------------------------------------
 
-#: Chinese alias → check name, used to fill ``spec.checks``.
+#: Chinese alias → check name, used to fill ``spec.checks``.  Deliberately NO bare
+#: single-char aliases: "数" would also match 数据/数量/次数 and "表" would match
+#: 代表/表达/表面, silently turning an unrelated sentence into a numbers/table audit.
 _AUDIT_ALIASES: dict[str, str] = {
-    "数字": "numbers", "金额": "numbers", "数": "numbers",
-    "表格": "table", "表": "table",
+    "数字": "numbers", "金额": "numbers",
+    "表格": "table",
     "版面": "layout", "布局": "layout",
     "漏译": "missing", "残留": "residual",
 }
@@ -119,7 +132,13 @@ _SCOPE_SINGLE_RE = re.compile(r"第\s*(\d+)\s*页")
 
 
 def _parse_checks(req: str) -> list[str] | None:
-    found = [name for alias, name in _AUDIT_ALIASES.items() if alias in req]
+    # De-duplicate while preserving order: a word like 数字 matches both the
+    # "数字" alias and the bare "数" alias, and the duplicate would make
+    # ``audit_page`` run the same check twice (and report it twice).
+    found: list[str] = []
+    for alias, name in _AUDIT_ALIASES.items():
+        if alias in req and name not in found:
+            found.append(name)
     return found or None
 
 
@@ -208,6 +227,75 @@ def compile_from_user(req: str, *, default_base: str = "self_check_page",
         include_kept=("保留页也算" in r or "保留" in r and "算" in r),
         auto_fix=False if any(k in r for k in ("只查", "只读", "不修改", "不改")) else None,
     )
+
+
+#: Prompt that asks the model to fill a :class:`FlowSpec` from free text (Path A's
+#: flexible slot-filling branch — the deterministic rule parser is the offline fallback).
+_FLOW_COMPILE_PROMPT = (
+    "把下面这句话解析成一个 JSON 对象（只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏）：\n"
+    "字段（都可省略）：base = self_check_page|translate_page|export（默认 self_check_page）；"
+    "checks = 字符串数组，取值 layout/residual/missing/numbers/table；"
+    "scope = 0 起的页号整数数组；auto_fix = 布尔；include_kept = 布尔。\n"
+    "要求：{req}"
+)
+
+
+def _parse_flow_json(text: str) -> dict:
+    """Extract a JSON object from a model reply (strips code fences / surrounding prose).
+
+    Fail-closed: any malformed or non-object reply yields ``{}`` so the caller
+    degrades to defaults instead of crashing.
+    """
+    m = re.search(r"\{.*\}", str(text or ""), re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(0))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 — bad JSON degrades to defaults
+        return {}
+
+
+def make_llm_flow_compiler(model, client: Any = None,
+                           log: Callable[[str], None] | None = None):
+    """Return an AI slot-filler ``llm(req) -> dict`` for ``compile_from_user``, or ``None``.
+
+    This is Path A's flexible branch: the model reads arbitrary phrasing and fills
+    the ``FlowSpec`` fields instead of the deterministic keyword rules.  Fail-closed:
+    on a network / parse error the callback returns ``{}`` (``compile_from_user`` then
+    degrades to defaults), and when no usable client exists it returns ``None`` (the
+    caller falls back to the rule parser).  ``client`` (optional) reuses a shared
+    OpenAI client.
+    """
+    from .. import translator as _tr
+
+    if client is None:
+        try:
+            client = _tr.OpenAI(**model.client_kwargs())
+        except Exception:  # noqa: BLE001 — no client → no AI slot-filling
+            return None
+
+    def compile_req(req: str) -> dict:
+        try:
+            kwargs: dict[str, Any] = {
+                "model": model.model,
+                "temperature": 0.0,
+                "max_tokens": 512,
+                "messages": [{"role": "user",
+                              "content": _FLOW_COMPILE_PROMPT.format(req=str(req or ""))}],
+            }
+            body = model.request_params()
+            if body:
+                kwargs["extra_body"] = body
+            resp = client.chat.completions.create(**kwargs)
+            text = (getattr(resp.choices[0].message, "content", "") or "").strip()
+            return _parse_flow_json(text)
+        except Exception as exc:  # noqa: BLE001 — fail-closed to the rule parser
+            if log:
+                log(f"  流程槽填充失败：{type(exc).__name__}: {exc}（用规则解析）。")
+            return {}
+
+    return compile_req
 
 
 # --------------------------------------------------------------------------
@@ -309,14 +397,21 @@ def _atomic_write(path: Path, data: dict) -> None:
 
 
 def save_flow_spec(name: str, spec: FlowSpec, *, persist: bool = True) -> None:
-    """Stock ``spec`` under ``name``; persist to disk when the flows dir is enabled."""
+    """Stock ``spec`` under ``name`` in memory; persist to disk only when the flows dir is enabled.
+
+    ``persist=False`` is an explicit in-memory-only promotion; the default ``True``
+    is still env-gated (``_flows_persist_enabled``) so a run without
+    ``PDFTRANSLATE_FLOWS_DIR`` never writes user-flow files implicitly.
+    """
     USER_FLOW_SPECS[name] = spec
-    if persist:
+    if persist and _flows_persist_enabled():
         _atomic_write(_executor_spec_path(name), spec.to_dict())
 
 
 def load_user_flow_specs() -> dict[str, FlowSpec]:
-    """Load all promoted specs from disk (env-gated dir) into ``USER_FLOW_SPECS``."""
+    """Load promoted specs from disk (only when the flows dir is enabled) into ``USER_FLOW_SPECS``."""
+    if not _flows_persist_enabled():
+        return {}
     d = user_flows_dir()
     out: dict[str, FlowSpec] = {}
     if d.is_dir():

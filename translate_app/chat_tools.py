@@ -73,6 +73,24 @@ CHAT_TOOL_SPECS: list[dict[str, Any]] = [
            "text": {"type": "string", "description": "替换译文（action=set 时必填）"},
            "action": {"type": "string", "enum": ["set", "delete"], "default": "set"}},
           ["page", "bbox"]),
+    _tool("self_check",
+          {"page": {"type": "integer", "description": "页号（0 起）；不传则审计全文"},
+           "checks": {"type": "array", "items": {"type": "string"},
+                      "description": "检查子集：layout/residual/missing/numbers/table（默认全部）"}},
+          []),
+    _tool("retranslate",
+          {"page": {"type": "integer", "description": "页号（0 起）"},
+           "indices": {"type": "array", "items": {"type": "integer"},
+                       "description": "要重译的扁平块索引（来自 read_page）；不传则重译整页所有可翻译块"},
+           "target_lang": {"type": "string",
+                           "description": "目标语言（默认当前设置的目标语言）"}},
+          ["page"]),
+    _tool("run_flow",
+          {"requirement": {"type": "string",
+                           "description": "用户的一句话要求（如“自检第3到第8页只查数字和表格，不修改”）"},
+           "name": {"type": "string",
+                    "description": "可选：把该流程登记为命名流程（本次会话内可复用）"}},
+          ["requirement"]),
     _tool("re_export", {}, []),
     _tool("run_translate",
           {"requirement": {"type": "string",
@@ -94,20 +112,99 @@ def chat_openai_tools(names: list[str] | None = None) -> list[dict[str, Any]]:
     return [t for t in CHAT_TOOL_SPECS if t["function"]["name"] in names]
 
 
+def _audit_state(ctx) -> Any:
+    """Build a minimal ``WorkflowState`` over the persistent context for a deterministic audit.
+
+    ``out_doc`` merges the last run's committed translation with the protected
+    overlay (overlay wins), mirroring ``read_page`` — so the audit sees exactly the
+    current translation the user has, not a stale one.  Returns ``None`` when no
+    source document is available.
+    """
+    from . import agent
+
+    doc = ctx.ensure_doc()
+    if doc is None:
+        return None
+    lang = ctx.get_settings().get("target_language") or ctx.lang or "English"
+    state = agent.WorkflowState(src_path=ctx.src_path or "", lang=lang)
+    state.src_doc = doc
+    out: dict[int, dict[str, Any]] = {}
+    last = ctx.get_last_translated()
+    if last is not None:
+        for i, t in enumerate(last):
+            if str(t).strip():
+                out[i] = {"text": str(t)}
+    for idx, entry in ctx.overlay().items():
+        if isinstance(entry, dict) and str(entry.get("text", "")).strip():
+            out[int(idx)] = {"text": str(entry.get("text", ""))}
+    state.out_doc = out
+    return state
+
+
+def _run_audit(ctx, page=None, checks=None) -> dict[str, Any]:
+    """Deterministic audit of ``ctx``'s current translation; returns a chat-ready report."""
+    from . import agent
+
+    state = _audit_state(ctx)
+    if state is None:
+        return {"ok": False, "error": "没有已加载的 PDF。"}
+    report = agent.audit_page(state, page, checks)
+    issues = report.get("issues", [])
+    truncated = len(issues) > 120
+    if truncated:
+        report["issues"] = issues[:120]
+    report["truncated"] = truncated
+    return {"ok": True, **report}
+
+
+def _finding_block_indices(issues: list[dict] | None) -> list[int]:
+    """The flat block indices an audit report flags, for an in-place fix.
+
+    ``residual``/``missing``/``numbers``/``layout`` issues carry a single ``index``;
+    a ``table`` issue carries ``empty_cells`` and ``empty_text`` (each a list of
+    indices).  Deduped and returned in report order.
+    """
+    out: list[int] = []
+    seen: set[int] = set()
+    for iss in issues or []:
+        idx = iss.get("index")
+        if idx is not None:
+            i = int(idx)
+            if i not in seen:
+                seen.add(i)
+                out.append(i)
+        for key in ("empty_cells", "empty_text"):
+            for v in (iss.get(key) or []):
+                i = int(v)
+                if i not in seen:
+                    seen.add(i)
+                    out.append(i)
+    return out
+
+
 def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = None,
                     re_export: Callable[[], None] | None = None,
                     start_translate: Callable[[str], None] | None = None,
                     set_setting: Callable[[str, str], None] | None = None,
-                    log: Callable[[str], None] | None = None) -> dict[str, Callable]:
+                    llm: Callable[[str], dict] | None = None,
+                    log: Callable[[str], None] | None = None,
+                    translate_texts: Callable[[list[str], str], list[str]] | None = None,
+                    ) -> dict[str, Callable]:
     """Bind the chat tools to a live :class:`DocContext` (``ctx``).
 
     ``show_preview`` (optional, thread-safe) opens a preview page — the GUI wires it
     to the preview bridge so ``goto_page`` runs on the GUI thread.  ``re_export``
     (optional, thread-safe) re-exports the last translation with the current overlay
     edits — the GUI wires it to a signal so ``re_export`` runs on the GUI thread.
-    When ``None``, these report "通道未接线" instead of crashing.
+    ``translate_texts`` (optional) is the *translation-side* batch re-translation
+    callback ``(texts, target_language) -> list[str]`` (aligned with ``texts``); it is
+    what lets ``retranslate`` and a ``run_flow(...)`` with ``auto_fix`` actually
+    re-translate problem blocks and write the result to the protected overlay.  When
+    ``None``, those tools report "重译通道未接线" instead of crashing.  When ``None``
+    reporters are wired, these report "通道未接线" instead of crashing.
     """
     from . import pdfio
+    from . import translator as _tr
 
     def _flat_blocks() -> list:
         doc = ctx.ensure_doc()
@@ -221,6 +318,87 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         return {"ok": True, "message": "已触发重新导出（后台执行，完成会在主窗口日志/进度提示）。"}
 
+    def _flat_block_list() -> list:
+        doc = ctx.ensure_doc()
+        if doc is None:
+            return []
+        return [b for page in doc.pages for b in page]
+
+    def _target_lang(target_lang: str | None) -> str:
+        if target_lang and str(target_lang).strip():
+            return str(target_lang).strip()
+        s = ctx.get_settings()
+        return str(s.get("target_language") or ctx.lang or "English")
+
+    def _pick_translatable(cands: list[int], blocks: list) -> list[int]:
+        """Dedupe + keep in-range blocks that contain letters and are not a
+        numeric/code cell — re-translation must never rewrite a financial figure."""
+        picked: list[int] = []
+        seen: set[int] = set()
+        for raw in cands:
+            idx = int(raw)
+            if idx in seen or not (0 <= idx < len(blocks)):
+                continue
+            seen.add(idx)
+            b = blocks[idx]
+            if not _tr._needs_translation(str(b.text)) or pdfio._is_numeric_cell(str(b.text)):
+                continue
+            picked.append(idx)
+        return picked
+
+    def retranslate(page: int, indices: list[int] | None = None,
+                    target_lang: str | None = None) -> dict[str, Any]:
+        """Re-translate selected blocks on ``page`` (or every translatable one) and
+        write the result to the protected overlay — the chat's "改一处就重译那一处",
+        without a full agent run.  ``failed`` lists the blocks that kept their source
+        because the re-translation call failed or returned no usable text, so the AI
+        can tell the user exactly which blocks were not fixed.
+        """
+        if translate_texts is None:
+            return {"ok": False, "error": "重译通道未接线"}
+        doc = ctx.ensure_doc()
+        if doc is None or not (0 <= int(page) < len(doc.pages)):
+            return {"ok": False, "error": f"bad page {page}"}
+        blocks = _flat_block_list()
+        offset = sum(len(p) for p in doc.pages[: int(page)])
+        if indices is None:
+            cands = list(range(offset, offset + len(doc.pages[int(page)])))
+        else:
+            cands = [int(i) for i in indices]
+        picked = _pick_translatable(cands, blocks)
+        if not picked:
+            return {"ok": False, "error": "没有可重译的块（全部为数字/代码/空块）"}
+        lang = _target_lang(target_lang)
+        sources = [str(blocks[i].text) for i in picked]
+        try:
+            out = translate_texts(sources, lang)
+        except Exception as exc:  # noqa: BLE001 — fail-closed, keep every source
+            if log:
+                log(f"  对话重译失败：{type(exc).__name__}: {exc}")
+            return {"ok": False, "error": f"重译调用失败：{type(exc).__name__}: {exc}",
+                    "failed": picked}
+        if not isinstance(out, (list, tuple)) or len(out) != len(sources):
+            return {"ok": False, "error": "重译返回的块数与请求不符", "failed": picked}
+        written = 0
+        failed: list[int] = []
+        for i, txt in zip(picked, out):
+            new = str(txt or "").strip()
+            src = str(blocks[i].text)
+            if new and new != src:
+                ctx.set_overlay(i, new, action="set")
+                written += 1
+            else:
+                failed.append(i)
+        translated = {
+            str(i): str((ctx.get_overlay(i) or {}).get("text", "")) for i in picked
+        }
+        note = (f"重译完成：{written} 块已写入，{len(failed)} 块失败保留原文（failed={failed}）。"
+                "改完想要最新译文请用 re_export。" if failed
+                else "重译完成。改完想要最新译文请用 re_export。")
+        return {"ok": True, "page": int(page), "count": written,
+                "indices": picked, "translated": translated, "failed": failed,
+                "note": note}
+
     def run_translate(requirement: str = ""):
         """Start the translation pipeline with the current settings (the AI entry).
 
@@ -254,6 +432,131 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         return {"ok": True, "key": k, "value": str(value or "")}
 
+    def self_check(page=None, checks=None):
+        """Deterministic QA over the current translation (read-only, no re-translate)."""
+        return _run_audit(ctx, page, checks)
+
+    def run_flow(requirement="", name=None):
+        """Compile a natural-language requirement into a custom flow and run it over
+        the current document; optionally promote it.  ``auto_fix`` (from the compiled
+        spec) decides whether it is read-only audit (default when the channel is not
+        wired) or an in-place fix plus re-audit.
+
+        Path A (rule-based ``compile_from_user``): the requirement fills scope/checks/
+        auto_fix.  Only audit-type flows run here; translate/export bases are redirected
+        to the tools that can actually do them (``run_translate`` / ``re_export``).
+        """
+        from . import agent
+
+        state = _audit_state(ctx)
+        if state is None:
+            return {"ok": False, "error": "没有已加载的 PDF。"}
+        spec = agent.compile_from_user(str(requirement or ""), default_base="self_check_page",
+                                       llm=llm)
+        if spec.base == "export":
+            return {"ok": False, "base": "export",
+                    "error": "导出/重新导出请用 re_export 工具（或点主界面「重新导出」按钮）。"}
+        if spec.base == "translate_page":
+            return {"ok": False, "base": "translate_page",
+                    "error": "重译需完整翻译运行：请用 run_translate 并在要求里写清要重译的页。"}
+        if spec.base not in ("self_check_page", "ai_self_check"):
+            return {"ok": False, "base": spec.base,
+                    "error": f"该流程类型（{spec.base}）暂不能在对话中直接执行。"}
+
+        total = len(state.src_doc.pages)
+        scope = spec.scope if spec.scope is not None else list(range(total))
+        scope = [p for p in scope if 0 <= p < total]
+        checks = spec.checks
+        # ``auto_fix`` is True unless the user said 只查/只读/不修改.  It can only
+        # actually fix when a translation channel is wired; otherwise it stays read-only.
+        auto_fix = bool(spec.auto_fix) if spec.auto_fix is not None else True
+        can_fix = auto_fix and translate_texts is not None
+
+        blocks = _flat_block_list()
+        lang = _target_lang(None)
+
+        per_page: dict[str, dict[str, Any]] = {}
+        all_clean = True
+        n_issues = 0          # issues found before any fix
+        remaining = 0         # issues left after any fix
+        fixed_total = 0
+        failed_blocks: list[int] = []
+
+        for p in scope:
+            before = _run_audit(ctx, p, checks)
+            pre = len(before.get("issues", []))
+            n_issues += pre
+            fixed_on_page = 0
+            if can_fix and pre:
+                idxs = _finding_block_indices(before.get("issues", []))
+                picked = _pick_translatable(idxs, blocks)
+                if picked:
+                    sources = [str(blocks[i].text) for i in picked]
+                    try:
+                        out = translate_texts(sources, lang)
+                    except Exception as exc:  # noqa: BLE001 — fail-closed
+                        if log:
+                            log(f"  流程修正确译失败：{type(exc).__name__}: {exc}")
+                        out = None
+                    if isinstance(out, (list, tuple)) and len(out) == len(sources):
+                        for i, txt in zip(picked, out):
+                            new = str(txt or "").strip()
+                            prev = str((ctx.get_overlay(i) or {}).get("text", "")).strip()
+                            if new and new != str(blocks[i].text):
+                                ctx.set_overlay(i, new, action="set")
+                                if new != prev:
+                                    fixed_on_page += 1
+                            else:
+                                failed_blocks.append(i)
+                    else:
+                        failed_blocks.extend(picked)
+            after = _run_audit(ctx, p, checks)
+            after_issues = len(after.get("issues", []))
+            remaining += after_issues
+            per_page[str(p)] = {
+                "clean": after["clean"],
+                "issue_count": after_issues,
+                "pre_fix_issues": pre,
+                "fixed_block_count": fixed_on_page,
+            }
+            all_clean = all_clean and after["clean"]
+            fixed_total += fixed_on_page
+
+        promoted = False
+        if name and str(name).strip():
+            # Persistence is env-gated (``PDFTRANSLATE_FLOWS_DIR``): without it the
+            # spec stays in memory this session; with it, it is also written to disk.
+            agent.save_flow_spec(str(name).strip(), spec)
+            promoted = True
+
+        if can_fix:
+            mode = "fixed"
+            note = (f"就地修正完成：对 {len(scope)} 页审计，重译写入 {fixed_total} 块；"
+                    f"{len(failed_blocks)} 块重译失败保留原文（failed={failed_blocks}）。"
+                    f"修正后仍有 {remaining} 个问题。改完想要最新译文请用 re_export。")
+        else:
+            mode = "read_only"
+            note = ("只读审计完成（未改动译文）。" if auto_fix else
+                    "只读复核（按用户要求不修改译文）。")
+
+        return {
+            "ok": True,
+            "base": spec.base,
+            "checks": checks,
+            "scope": scope,
+            "pages_audited": len(scope),
+            "clean": all_clean,
+            "issue_count": n_issues,
+            "remaining_issue_count": remaining,
+            "fixed_blocks": fixed_total,
+            "failed_blocks": failed_blocks,
+            "mode": mode,
+            "per_page": per_page,
+            "auto_fix": auto_fix,
+            "promoted": promoted,
+            "note": note,
+        }
+
     return {
         "get_doc_info": get_doc_info,
         "get_settings": get_settings,
@@ -263,6 +566,9 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         "set_block_text": set_block_text,
         "delete_block_text": delete_block_text,
         "apply_annotation": apply_annotation,
+        "self_check": self_check,
+        "retranslate": retranslate,
+        "run_flow": run_flow,
         "re_export": _re_export,
         "run_translate": run_translate,
         "set_setting": set_setting_tool,

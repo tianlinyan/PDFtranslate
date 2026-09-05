@@ -83,6 +83,17 @@ class SettingsTest(unittest.TestCase):
         self.assertNotIn("concurrency", m2.extra)
         self.assertNotIn("batch_size", m2.extra)
 
+    def test_page_concurrency_parsed_with_default(self):
+        # ``page_concurrency`` is the opt-in parallel-page knob for the agent path;
+        # it defaults to 1 (sequential) and must not leak into ``extra``.
+        m = ModelConfig.from_dict({"id": "m", "endpoint": "http://x/v1", "model": "mod"})
+        self.assertEqual(m.page_concurrency, 1)
+        m2 = ModelConfig.from_dict(
+            {"id": "m", "endpoint": "http://x/v1", "model": "mod", "page_concurrency": 4}
+        )
+        self.assertEqual(m2.page_concurrency, 4)
+        self.assertNotIn("page_concurrency", m2.extra)
+
     def test_interaction_params_defaults_and_override(self):
         # The AI-interaction (agent) config is a *separate* set from translation:
         # it defaults to reasoning_effort=medium / temperature=0.6 so the

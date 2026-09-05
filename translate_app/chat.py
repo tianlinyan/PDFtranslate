@@ -27,6 +27,7 @@ from openai import OpenAI
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from . import prompts
+from . import translator as _tr
 from .settings import ModelConfig
 
 #: Bound on how many model→tool→result round-trips a single chat turn may run
@@ -210,10 +211,31 @@ class ChatWorker(QObject):
         if self._ctx is None or not self._ctx.has_source():
             return None, None
         from .chat_tools import chat_openai_tools, make_chat_tools
+        from .agent import user_flows as _uf
+
+        # AI slot-filling for ``run_flow``: reuse the chat session's own client so a
+        # per-turn flow compilation does not open a second connection pool.  ``None``
+        # (no model client) simply falls back to the deterministic rule parser.
+        llm = None
+        if self._session is not None:
+            llm = _uf.make_llm_flow_compiler(self._session.model,
+                                             client=self._session.client, log=self._log)
+
+        # Translation-side batch re-translation for ``retranslate`` / an ``auto_fix``
+        # user flow.  Reuses the chat session's client, and does NOT require vision (it
+        # re-translates text blocks — see translator.make_retranslate_batch_fn).  ``None``
+        # when no session exists yet → those tools report "重译通道未接线".
+        translate_texts = None
+        if self._session is not None:
+            translate_texts = _tr.make_retranslate_batch_fn(
+                self._session.model, client=self._session.client, log=self._log,
+                require_vision=False,
+            )
 
         tools_map = make_chat_tools(
             self._ctx, show_preview=self._show_preview, re_export=self._re_export,
-            start_translate=self._start_translate, set_setting=self._set_setting,
+            start_translate=self._start_translate, set_setting=self._set_setting, llm=llm,
+            log=self._log, translate_texts=translate_texts,
         )
 
         def executor(name: str, args: dict[str, Any]) -> Any:

@@ -149,6 +149,42 @@ class DocumentSessionTest(unittest.TestCase):
         self.assertEqual(PHASE_DONE, state.phase)
         self.assertEqual(agent.PHASE_COMPLETED, "completed")  # constant sanity
 
+    def test_translate_doc_phases_exclude_review(self):
+        # Decoupling: the standard translate flow no longer auto-runs review/self-check.
+        from translate_app.agent.flow_steps import STANDARD_FLOWS
+
+        self.assertEqual(
+            ["preprocess", "translate_normal", "special_pages", "completed"],
+            STANDARD_FLOWS["translate_doc"].scope["phases"],
+        )
+
+    def test_standard_flow_does_not_auto_review(self):
+        doc = _mixed_doc()
+        targets: list[str] = []
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            st.out_doc = st.out_doc or {}
+            st.out_doc[page] = {"text": f"T{page}"}
+            return st
+
+        def answer_handler(question, options, target):
+            # The standard flow asks only about special pages — never about review/export.
+            targets.append(target)
+            return {"value": "保留原文", "target": target}
+
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=fake_translate, answer_handler=answer_handler)
+        session.run()
+        # No review-mode / export question was asked, and the review never ran.
+        self.assertNotIn("review_mode", targets)
+        self.assertNotIn("export", targets)
+        self.assertEqual("", state.review_mode)
+        # The standard flow ended with a completion report, not a question.
+        self.assertEqual(PHASE_DONE, state.phase)
+        self.assertIn("翻译完成", state.summary)
+
     def test_progress_reports_preprocess_and_translate(self):
         doc = _mixed_doc()
         progress: list[tuple] = []
@@ -262,6 +298,9 @@ class DocumentSessionTest(unittest.TestCase):
                                   translate_page=fake_translate, answer_handler=answer_handler,
                                   audit=fake_audit)
         session.run()
+        # The self-check is decoupled from the standard translate flow: it only runs
+        # on demand.  ``_review`` here is the on-demand entry the user triggers.
+        session._review()
         # Mode asked; AI self-check re-read only the TRANSLATED pages (0, 3) and
         # skipped the special pages the user chose to keep/skip (1, 2, 4).
         self.assertEqual("ai", state.review_mode)
@@ -301,6 +340,7 @@ class DocumentSessionTest(unittest.TestCase):
                                   translate_page=fake_translate, answer_handler=answer_handler,
                                   audit=fake_audit)
         session.run()
+        session._review()   # the self-check is on-demand (decoupled from the standard flow)
         # No page had findings → the AI fix pass never ran for any translated page.
         self.assertEqual("ai", state.review_mode)
         self.assertEqual([], review_pages)
@@ -332,6 +372,7 @@ class DocumentSessionTest(unittest.TestCase):
                                   translate_page=fake_translate, answer_handler=answer_handler,
                                   audit=fake_audit)
         session.run()
+        session._review()   # the self-check is on-demand (decoupled from the standard flow)
         self.assertEqual("ai", state.review_mode)
         for i in (0, 3):   # the translated pages
             self.assertTrue(
@@ -361,6 +402,7 @@ class DocumentSessionTest(unittest.TestCase):
         session = DocumentSession(state, doc, model=object(), log=lambda m: None,
                                   translate_page=fake_translate, answer_handler=answer_handler)
         session.run()
+        session._review()   # the self-check is on-demand (decoupled from the standard flow)
         # User mode: no AI self-check ran; the export confirm answered "继续检查".
         self.assertEqual("user", state.review_mode)
         self.assertEqual([], review_pages)
@@ -426,6 +468,43 @@ class DocumentSessionTest(unittest.TestCase):
         session._translate_normal()
         self.assertEqual(agent.STATUS_NEEDS_USER, state.page(0).status)
         self.assertTrue(any("未产生任何译文" in i for i in state.page(0).issues))
+
+    def test_translate_normal_parallel_pages_when_configured(self):
+        # ``page_concurrency`` (opt-in) fans normal pages out across a thread pool;
+        # every page still lands in ``out_doc`` under its flat index and is marked
+        # DONE (fail-closed to needs_user otherwise) — the result is order-independent.
+        import threading as _th
+        from types import SimpleNamespace
+
+        pages = [[_blk(f"第{i}页正文", page=i, x0=0, y0=0, x1=60, y1=10)] for i in range(5)]
+        doc = pdfio.DocumentText(
+            pages=pages,
+            blocks=[p[0].text for p in pages],
+            block_pages=list(range(5)),
+            title="s",
+        )
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        seen: list[int] = []
+        lock = _th.Lock()
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            if "复核" in str(task):
+                return st
+            with lock:
+                seen.append(page)
+            st.out_doc = st.out_doc or {}
+            st.out_doc[page] = {"text": f"T{page}"}
+            return st
+
+        session = DocumentSession(state, doc, model=SimpleNamespace(page_concurrency=4),
+                                  log=lambda m: None, translate_page=fake_translate)
+        session._preprocess()
+        session._translate_normal()
+        self.assertEqual(sorted(seen), [0, 1, 2, 3, 4])
+        for i in range(5):
+            self.assertEqual(agent.STATUS_DONE, state.page(i).status)
+            self.assertEqual(f"T{i}", state.out_doc[i]["text"])
 
     def test_review_include_kept_includes_kept_pages(self):
         # U1 knob: ``include_kept=True`` makes the AI self-check also review pages the
