@@ -1311,6 +1311,29 @@ class StructureTest(unittest.TestCase):
         # A backend that raises on every page leaves element-less structure entries.
         self.assertTrue(all(not ps.elements for ps in dt2.page_structure))
 
+    def test_table_region_builds_struct_table(self):
+        def table_fn(page_index, page, blocks):
+            if page_index != 0 or not blocks:
+                return []
+            # A table region over the whole page; cells are flat block indices.
+            bbox = [blocks[0].x0, blocks[0].y0, blocks[-1].x1, blocks[-1].y1]
+            return [{"kind": "table", "bbox": bbox,
+                     "cells": [[0, 1], [None, 2]]}]
+        dt = pdfio.extract_structured(str(self.src), table_fn, parser="mock")
+        self.assertEqual(dt.structure_parser, "mock")
+        ps = dt.page_structure[0]
+        self.assertEqual(len(ps.tables), 1)
+        tbl = ps.tables[0]
+        self.assertEqual((tbl.rows, tbl.cols), (2, 2))
+        self.assertEqual(tbl.cells[0], [0, 1])
+        self.assertEqual(tbl.cells[1], [-1, 2])
+        self.assertTrue({0, 1, 2} <= tbl.block_ref)
+        gt = pdfio.get_table(dt, 0, 0)
+        self.assertIsNotNone(gt)
+        self.assertEqual(gt["rows"], 2)
+        # Page 1 has no table → None.
+        self.assertIsNone(pdfio.get_table(dt, 1, 0))
+
 
 class FormulaProtectionTest(unittest.TestCase):
     """B-⑤: a detected math-expression block is never translated (kept verbatim)."""

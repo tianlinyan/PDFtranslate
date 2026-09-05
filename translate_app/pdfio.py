@@ -298,24 +298,76 @@ def _point_in_bbox(block: Block, bbox: Sequence[float]) -> bool:
     return x0 <= cx <= x1 and y0 <= cy <= y1
 
 
+def _build_struct_table(
+    reg: dict, blocks: Sequence[Block], offset: int, region_inds: Sequence[int]
+) -> tuple[int, int, list[list[int]], set[int]] | None:
+    """Build a ``StructTable`` grid from a backend's ``cells`` (B-④ stage 3).
+
+    ``reg["cells"]`` is a 2D list of flat block indices (or ``None``/``-1`` for an
+    empty cell).  Returns ``(rows, cols, cells, block_ref)`` or ``None`` when no
+    usable grid is present (the region then stays a bare ``table`` element with no
+    semantic grid — the geometry path still handles it).
+    """
+    raw = reg.get("cells")
+    if not isinstance(raw, list) or not raw:
+        return None
+    grid: list[list[int]] = []
+    block_ref: set[int] = set()
+    for row in raw:
+        cells_row: list[int] = []
+        for val in row:
+            try:
+                # -1 / None mark an empty cell; otherwise a flat block index.
+                vi = int(val) if val is not None else -1
+            except (TypeError, ValueError):
+                vi = -1
+            if vi != -1 and offset <= vi < offset + len(blocks):
+                block_ref.add(vi)
+                cells_row.append(vi)
+            else:
+                cells_row.append(-1)
+        grid.append(cells_row)
+    rows = len(grid)
+    cols = max((len(r) for r in grid), default=0)
+    if rows == 0:
+        return None
+    block_ref.update(region_inds)
+    return rows, cols, grid, block_ref
+
+
 def _fuse_structure(
     page_idx: int, blocks: Sequence[Block], offset: int, regions: Sequence[dict], parser: str
 ) -> PageStructure:
-    """Turn backend regions into a ``PageStructure`` annotated with block indices."""
+    """Turn backend regions into a ``PageStructure`` annotated with block indices.
+
+    A region of kind ``table`` may carry ``cells`` (a 2D flat-block-index grid);
+    when present a ``StructTable`` is built and attached to the page's ``tables``
+    so consumers can read the semantic grid (a *reading/understanding* model, never
+    the export geometry).
+    """
     elements: list[dict] = []
+    tables: list[StructTable] = []
     for reg in regions or []:
         bbox = reg.get("bbox")
         if not bbox or len(bbox) != 4:
             continue  # a region without usable geometry is dropped (not silent harm)
         inds = sorted({offset + i for i, b in enumerate(blocks) if _point_in_bbox(b, bbox)})
-        elements.append({
-            "kind": str(reg.get("kind", "text")),
+        kind = str(reg.get("kind", "text"))
+        element = {
+            "kind": kind,
             "bbox": list(bbox),
             "level": int(reg.get("level", 0) or 0),
             "block_indices": inds,
             "parser": parser,
-        })
-    return PageStructure(page=page_idx, parser=parser, elements=elements)
+        }
+        if kind == "table":
+            built = _build_struct_table(reg, blocks, offset, inds)
+            if built is not None:
+                rows, cols, grid, block_ref = built
+                tables.append(StructTable(rows=rows, cols=cols, bbox=tuple(bbox),
+                                          cells=grid, block_ref=block_ref))
+        elements.append(element)
+    return PageStructure(page=page_idx, parser=parser, elements=elements, tables=tables)
 
 
 def build_structure(
@@ -410,6 +462,23 @@ def get_structure_summary(doc: DocumentText) -> dict:
         "table_pages": sum(1 for k in kinds if k == "table"),
         "kinds": kinds,
     }
+
+
+def get_table(doc: DocumentText, page: int, index: int = 0) -> dict | None:
+    """The semantic table at ``page`` / ``index`` as a dict (B-④ stage 3).
+
+    Returns ``{rows, cols, bbox, cells, block_ref}`` or ``None`` when there is no
+    structure or no table at that position.  Read-only — consumers (``check_table``,
+    ``get_layout``, the IR layer) join by cell → flat block index.
+    """
+    if not (0 <= page < len(doc.page_structure)):
+        return None
+    tables = doc.page_structure[page].tables
+    if not (0 <= index < len(tables)):
+        return None
+    t = tables[index]
+    return {"rows": t.rows, "cols": t.cols, "bbox": list(t.bbox),
+            "cells": t.cells, "block_ref": sorted(t.block_ref)}
 
 
 def nearest_block(blocks: Sequence["Block"], bbox) -> "Block | None":
