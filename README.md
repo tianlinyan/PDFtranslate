@@ -1,6 +1,7 @@
 # PDFtranslate
 
-> 当前版本：**v0.3.2**（版本号定义于 `translate_app/__init__.py` 的 `__version__`）
+> 当前版本：**v0.3.7**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
+> 0.3.8 方向设计见 `docs/0.3.8-方向设计.md`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
 即可把文档翻译成指定语言并保存为双语 PDF、原位翻译 PDF、Markdown 或纯文本。
@@ -46,8 +47,8 @@ python main.py "C:\path\to\doc.pdf"
 
 底部还有两个辅助按钮：**清除缓存**（清空已缓存的译文）与 **关于**（查看版本、开发者与项目主页）。
 
-> **支持的目标语种（按设计限定）**：简体中文、英语、西班牙语、法语、德语、意大利语。
-> 其余语种不在此范围内。
+> **支持的目标语种**：简体中文、英语、西班牙语、法语、德语、意大利语、俄语、日语、韩语。
+> 语言下拉框可编辑——不在此列表中的语种也会原样透传给模型。
 
 ## 模型配置 (`models.json`)
 
@@ -87,10 +88,18 @@ python main.py "C:\path\to\doc.pdf"
 * `concurrency`（可选，默认 1，即串行）：同时发送的翻译批次请求数。云 API 想
   提速可设为 2–4；本地 `llama-server` 视并行槽位可试 1–2（GPU 算力是瓶颈时
   并发收益有限，不会线性加速）。
+* `page_concurrency`（可选，默认 1，即串行）：**agent 路径**的并行**页**翻译并发数
+  （`concurrency` 是流式管线里批次级的）；云端有富余时设 2–4 可近线性加速整篇，
+  本地单卡服务端仍会串行排队。
 * `batch_size`（可选，默认 4000）：每批请求的原文字符预算。**加大批次减少
   请求次数**，能显著摊薄每个请求的固定开销（提示词处理 + 推理模型的思考），
   对本地慢模型提速最明显——只要服务端上下文放得下（如 12000）。
 * `temperature`（可选，默认 0.2）：采样温度。
+* `reasoning_effort`（可选，随请求发送）：**翻译侧**（翻译引擎/agent 决策/自检）用它；
+  llama.cpp 类服务端缺它可能 500。
+* `interaction_temperature` / `interaction_reasoning_effort`（可选，默认 0.6 / `"medium"`）：
+  **交互侧**（常驻 AI 对话 `ChatSession`）专用，与翻译侧的 `temperature`/`reasoning_effort`
+  相互独立（两套请求参数）。
 * `max_tokens`（可选）：单次请求的最大输出 token 数（缺省使用服务端默认）。
 * 其余未识别键透传给 OpenAI client 构造参数（如 `timeout`，默认 300 秒）。
 
