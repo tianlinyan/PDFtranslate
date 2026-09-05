@@ -7,8 +7,8 @@ rem PDFTRANSLATE_* variable) so every launch behaves the same and you never get
 rem surprised by a stray environment variable.  To opt into the headless IR
 rem pipeline, edit the next line to `set "PDFTRANSLATE_IR_MODE=1"` (or launch
 rem `python main.py` directly with your own environment).
-set "PDFTRANSLATE_STRUCTURE_MODE=1"
-set "PDFTRANSLATE_IR_MODE="
+rem set "PDFTRANSLATE_STRUCTURE_MODE=1"
+rem set "PDFTRANSLATE_IR_MODE=1"
 rem Optional argument: a PDF file to open on startup.
 cd /d "%~dp0"
 python main.py %*

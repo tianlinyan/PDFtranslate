@@ -6,5 +6,5 @@ bilingual PDF, an in-place (layout-preserving) translated PDF, Markdown or plain
 text.
 """
 
-__version__ = "0.3.9"
+__version__ = "0.4.0"
 __app_name__ = "PDF Translate"
