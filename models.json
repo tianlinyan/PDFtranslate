@@ -6,11 +6,14 @@
       "type": "llama-server",
       "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
       "model": "qwen3.8-27b",
-      "reasoning_effort": "none",
-      "concurrency": 2,
-      "temperature":0.3,
       "vision": true,
-      "batch_size": 8000
+      "reasoning_effort": "low",
+      "temperature": 0.2,
+      "concurrency": 2,
+      "page_concurrency": 1,
+      "batch_size": 8000,
+      "interaction_temperature": 0.6,
+      "interaction_reasoning_effort": "medium"
     },
     {
       "id": "ds4-pro",
@@ -19,7 +22,13 @@
       "endpoint": "https://api.deepseek.com/v1/chat/completions",
       "model": "deepseek-v4-flash",
       "api_key": "${DEEPSEEK_API_KEY}",
-      "tools_choice": "auto"
+      "tools_choice": "auto",
+      "temperature": 0.2,
+      "concurrency": 4,
+      "page_concurrency": 4,
+      "batch_size": 4000,
+      "interaction_temperature": 0.6,
+      "interaction_reasoning_effort": "medium"
     }
   ]
 }
