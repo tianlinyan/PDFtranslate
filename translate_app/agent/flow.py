@@ -567,13 +567,22 @@ def make_source_tools(state: WorkflowState, *, src_path=None) -> dict[str, Calla
         total = len(blocks)
         start = max(0, int(offset or 0))
         end = total if limit is None else min(total, start + max(1, int(limit)))
+        # B-④: per-block semantic kind/level when the doc carries a structure layer.
+        kind_by_idx: dict[int, tuple[str, int]] = {}
+        if src.page_structure and page < len(src.page_structure):
+            for el in src.page_structure[page].elements:
+                for idx in el.get("block_indices", []):
+                    kind_by_idx[int(idx)] = (str(el.get("kind", "text")),
+                                             int(el.get("level", 0) or 0))
         return {"page": page, "total": total,
                 "offset": start, "limit": end - start,
                 "truncated": end < total,
                 "blocks": [
                     {"index": base + i, "text": b.text, "bbox": [b.x0, b.y0, b.x1, b.y1],
                      "in_table": bool(getattr(b, "in_table", False)),
-                     "is_chart": bool(getattr(b, "is_chart", False))}
+                     "is_chart": bool(getattr(b, "is_chart", False)),
+                     "kind": kind_by_idx.get(base + i, ("text", 0))[0],
+                     "level": kind_by_idx.get(base + i, ("text", 0))[1]}
                     for i, b in enumerate(blocks[start:end])
                 ]}
 
@@ -614,7 +623,9 @@ def make_source_tools(state: WorkflowState, *, src_path=None) -> dict[str, Calla
             return {"kind": "uncertain"}
         from .. import pdfio
 
-        return {"kind": pdfio.classify_page(src.pages[page])}
+        structure = (src.page_structure[page]
+                     if src.page_structure and page < len(src.page_structure) else None)
+        return {"kind": pdfio.classify_page(src.pages[page], structure=structure)}
 
     return {"read_page": read_page, "get_layout": get_layout,
             "get_doc_info": get_doc_info, "classify_page": classify_page}

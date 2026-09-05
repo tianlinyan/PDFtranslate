@@ -1408,5 +1408,44 @@ class TranslationPromptScriptTest(unittest.TestCase):
             self.assertIn(marker, m.group(1) + (m.group(2) or ""), lang)
 
 
+class SourceToolStructureTest(unittest.TestCase):
+    """B-④: ``read_page`` / ``classify_page`` report semantic kind when structure exists."""
+
+    def _doc_with_structure(self):
+        blocks = [pdfio.Block("alpha", page=0, x0=0, y0=0, x1=100, y1=20),
+                  pdfio.Block("x^2 + y^2 = z^2", page=0, x0=0, y0=20, x1=100, y1=40)]
+        ps = pdfio.PageStructure(page=0, parser="mock", elements=[
+            {"kind": "formula", "bbox": [0, 20, 100, 40], "level": 0,
+             "block_indices": [1], "parser": "mock"},
+            {"kind": "text", "bbox": [0, 0, 100, 20], "level": 0,
+             "block_indices": [0], "parser": "mock"},
+        ])
+        return pdfio.DocumentText(pages=[blocks], blocks=[b.text for b in blocks],
+                                  block_pages=[0, 0], page_structure=[ps], structure_parser="mock")
+
+    def test_read_page_reports_kind_and_level(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = self._doc_with_structure()
+        out = agent.make_source_tools(s)["read_page"](0)
+        by_index = {b["index"]: b for b in out["blocks"]}
+        self.assertEqual(by_index[0]["kind"], "text")
+        self.assertEqual(by_index[1]["kind"], "formula")
+        self.assertEqual(by_index[1]["level"], 0)
+
+    def test_read_page_without_structure_defaults_to_text(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("hello", page=0, x0=0, y0=0, x1=10, y1=10)]], blocks=["hello"])
+        out = agent.make_source_tools(s)["read_page"](0)
+        self.assertEqual(out["blocks"][0]["kind"], "text")
+
+    def test_classify_page_passes_structure(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = self._doc_with_structure()
+        # With a formula-dominant structure the page classifies as formula.
+        out = agent.make_source_tools(s)["classify_page"](0)
+        self.assertIn(out["kind"], (pdfio.PAGE_FORMULA, pdfio.PAGE_NORMAL))
+
+
 if __name__ == "__main__":
     unittest.main()
