@@ -78,6 +78,7 @@ class TranslateWorker(QObject):
         last_translated: list[str] | None = None,
         requirements: list[str] | None = None,
         ir_mode: bool = False,
+        structure_mode: bool = False,
     ):
         super().__init__()
         self._source = source_path
@@ -126,6 +127,11 @@ class TranslateWorker(QObject):
         #: → existing export) instead of the agent/deterministic path.  Off by default;
         #: ``PDFTRANSLATE_IR_MODE`` toggles it for a run without touching the GUI.
         self._ir_mode = bool(ir_mode or os.environ.get("PDFTRANSLATE_IR_MODE"))
+        #: B-④ structure mode: extract with the deterministic geometric structure
+        #: backend (``extract_document_structured``) so the agent/IR see formula /
+        #: figure / heading / caption / table structure.  Off by default (plain text
+        #: extraction); ``PDFTRANSLATE_STRUCTURE_MODE`` toggles it.
+        self._structure_mode = bool(structure_mode or os.environ.get("PDFTRANSLATE_STRUCTURE_MODE"))
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
         # written from the GUI thread (``cancel``) and read from the worker
         # thread: the Event gives explicit, memory-model-safe signalling
@@ -154,12 +160,7 @@ class TranslateWorker(QObject):
             if self._ocr:
                 self.log.emit("已启用 OCR（自动识别原文语言），将识别无文本层的扫描页。")
             self.progress.emit(0, 0, "提取文本…")
-            doc = pdfio.extract_document_text(
-                self._source,
-                ocr=self._ocr,
-                cancel=lambda: self._cancelled.is_set(),
-                log=lambda m: self.log.emit(m),
-            )
+            doc = self._extract_doc()
             if doc.ocr_count:
                 self.log.emit(f"有 {doc.ocr_count} 个页面无文本层，已通过 OCR 提取。")
             extract_elapsed = time.monotonic() - started
@@ -270,6 +271,27 @@ class TranslateWorker(QObject):
         finally:
             # Always release the thread, whatever happened above.
             self.stopped.emit()
+
+    def _extract_doc(self) -> pdfio.DocumentText:
+        """Extract the source text, optionally with the B-④ semantic structure layer.
+
+        ``structure_mode`` uses :func:`pdfio.extract_document_structured` (the
+        deterministic geometric backend: formula / figure / heading / caption /
+        table), else the plain text extractor.  Both are fail-closed and share the
+        OCR / cancel / log paths.
+        """
+        if self._structure_mode:
+            self.log.emit("已启用语义结构（几何后端），提取并识别公式/图表/标题/表格。")
+            return pdfio.extract_document_structured(
+                self._source, ocr=self._ocr,
+                cancel=lambda: self._cancelled.is_set(),
+                log=lambda m: self.log.emit(m))
+        return pdfio.extract_document_text(
+            self._source,
+            ocr=self._ocr,
+            cancel=lambda: self._cancelled.is_set(),
+            log=lambda m: self.log.emit(m),
+        )
 
     def cancel(self) -> None:
         """Request cancellation (safe to call from the GUI thread)."""

@@ -530,5 +530,40 @@ class IrModeWorkerTest(_WorkerTestBase):
             self.assertTrue(self._worker(ir_mode=True)._ir_mode)
 
 
+class StructureModeWorkerTest(_WorkerTestBase):
+    """B-④: worker structure_mode extracts via the geometric structure backend."""
+
+    def test_structure_mode_uses_structured_extract(self):
+        doc = pdfio.DocumentText(pages=[], blocks=[])
+        with mock.patch.object(worker_module.pdfio, "extract_document_structured",
+                               return_value=doc) as m:
+            w = TranslateWorker("x.pdf", self._model("http://127.0.0.1:9/v1"),
+                                "English", "plain_text", str(self.tmp / "o.txt"),
+                                structure_mode=True)
+            out = w._extract_doc()
+            m.assert_called_once()
+            self.assertIs(out, doc)
+
+    def test_no_structure_mode_uses_plain_extract(self):
+        doc = pdfio.DocumentText(pages=[], blocks=[])
+        with mock.patch.object(worker_module.pdfio, "extract_document_text",
+                               return_value=doc) as m:
+            w = TranslateWorker("x.pdf", self._model("http://127.0.0.1:9/v1"),
+                                "English", "plain_text", str(self.tmp / "o.txt"),
+                                structure_mode=False)
+            out = w._extract_doc()
+            m.assert_called_once()
+            self.assertIs(out, doc)
+
+    def test_structure_mode_env_gated(self):
+        self.assertFalse(TranslateWorker(
+            "x.pdf", self._model("http://127.0.0.1:9/v1"), "English", "plain_text",
+            str(self.tmp / "o.txt"))._structure_mode)
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_STRUCTURE_MODE": "1"}):
+            self.assertTrue(TranslateWorker(
+                "x.pdf", self._model("http://127.0.0.1:9/v1"), "English", "plain_text",
+                str(self.tmp / "o.txt"))._structure_mode)
+
+
 if __name__ == "__main__":
     unittest.main()
