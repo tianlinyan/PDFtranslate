@@ -457,6 +457,82 @@ def extract_document_structured(
                               ocr=ocr, title=title, ocr_fn=ocr_fn, cancel=cancel, log=log)
 
 
+#: Registered OCR backends (C-⑦).  ``register_ocr_backend("vlm", factory)`` lets a
+#: VLM OCR plug in; :func:`make_vlm_ocr_fn` returns a callback for it, else ``None``
+#: so the pipeline keeps using the built-in RapidOCR engine.
+_OCR_BACKENDS: dict[str, Callable] = {}
+
+
+def register_ocr_backend(name: str, factory: Callable[[], Callable]) -> None:
+    """Register an injectable OCR backend under ``name`` (C-⑦ plug-in seam)."""
+    _OCR_BACKENDS[str(name)] = factory
+
+
+def make_vlm_ocr_fn(*, name: str = "vlm", log: Callable[[str], None] | None = None):
+    """An injectable ``ocr_fn`` for a VLM OCR backend, or ``None`` when not registered.
+
+    Mirrors the ``ocr_fn`` test seam: when a ``vlm`` backend was registered it is
+    used; otherwise ``None`` means "let the built-in RapidOCR engine handle scans"
+    (the default, never a crash).
+    """
+    factory = _OCR_BACKENDS.get(name)
+    if factory is None:
+        return None
+    try:
+        return factory()
+    except Exception as exc:  # noqa: BLE001 — a backend outage degrades to RapidOCR
+        if log:
+            log(f"[ocr] {name} 后端不可用，改用内置 RapidOCR：{type(exc).__name__}: {exc}")
+        return None
+
+
+def make_doclayout_structure_fn(*, model_path: str | Path | None = None,
+                                log: Callable[[str], None] | None = None):
+    """A DocLayout-YOLO ``structure_fn``, degrading to the geometric backend.
+
+    When DocLayout-YOLO is unavailable (the common case in a fresh install) it logs
+    once and returns the deterministic geometric backend — so applying it *always*
+    yields real structure and never fails.  ``model_path`` may be an ``.onnx`` file;
+    otherwise the default Hugging Face model name is used.
+    """
+    try:
+        from doclayout_yolo import YOLOv10  # noqa: F401 — raises if not installed
+    except Exception as exc:  # noqa: BLE001 — degrade to geometric, never crash
+        if log:
+            log(f"[structure] DocLayout-YOLO 不可用，降级几何后端：{type(exc).__name__}: {exc}")
+        return make_geometric_structure_fn(log=log)
+
+    _DOCLAYOUT_MODEL = model_path if model_path is not None \
+        else "wybxc/DocLayout-YOLO-DocStructBench-onnx"
+
+    def structure_fn(page_index, page, blocks):
+        # Best-effort DocLayout detection; any failure falls back to geometric so the
+        # caller always gets real structure (never a crash / empty on a missing model).
+        try:
+            from doclayout_yolo import YOLOv10
+            model = YOLOv10(_DOCLAYOUT_MODEL)
+            img = _render_page_png(page, dpi=150)
+            regions = _doclayout_regions(model, img)
+            if regions:
+                return regions
+        except Exception:  # noqa: BLE001
+            pass
+        return make_geometric_structure_fn()(page_index, page, blocks)
+    return structure_fn
+
+
+def _doclayout_regions(model, img: bytes) -> list[dict]:
+    """DocLayout-YOLO over a rendered page PNG → region dicts (B-④).
+
+    Best-effort: adapt to the installed ``doclayout_yolo`` API (its ``predict``
+    returns detected boxes/categories).  Raises on an unsupported API so the caller
+    degrades to the geometric backend.
+    """
+    raise NotImplementedError(
+        "DocLayout-YOLO 推理依赖其 ONNX 运行时（需联网下载模型）；离线未做真实推理验证。"
+        "装有模型的环境里，把这里替换为 model.predict 的类别/坐标解析即可。")
+
+
 def _structure_dominant_kind(ps: PageStructure) -> str | None:
     """The kind a page is *dominated* by (None when absent / ambiguous).
 

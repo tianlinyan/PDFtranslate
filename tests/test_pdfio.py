@@ -1413,6 +1413,27 @@ class GeometricStructureTest(unittest.TestCase):
         kinds = {e["kind"] for ps in dt.page_structure for e in ps.elements}
         self.assertIn("formula", kinds)
 
+    def test_doclayout_structure_fn_degrades_to_geometric(self):
+        # DocLayout-YOLO isn't installed here → the factory falls back to the
+        # geometric backend, so it still produces real structure (never empty/crash).
+        sf = pdfio.make_doclayout_structure_fn(log=lambda m: None)
+        regions = sf(0, None, self._blocks())
+        kinds = {r["kind"] for r in regions}
+        self.assertIn("formula", kinds)
+        self.assertIn("table", kinds)
+
+    def test_make_vlm_ocr_fn_degrades_and_register(self):
+        # No VLM backend registered → None (built-in RapidOCR used).
+        self.assertIsNone(pdfio.make_vlm_ocr_fn())
+        # Registering one makes the injectable ocr_fn available.
+        pdfio.register_ocr_backend("vlm", lambda: lambda page_index, page: [])
+        try:
+            fn = pdfio.make_vlm_ocr_fn()
+            self.assertTrue(callable(fn))
+            self.assertEqual(fn(0, None), [])   # a wrapped backend callable
+        finally:
+            pdfio._OCR_BACKENDS.pop("vlm", None)
+
 
 if __name__ == "__main__":
     unittest.main()
