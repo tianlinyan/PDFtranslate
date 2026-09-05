@@ -1220,5 +1220,69 @@ class SkewDetectTest(unittest.TestCase):
         self.assertIn(res["reason"], ("版面基本平正", "未检测到文本线"))
 
 
+class StructureTest(unittest.TestCase):
+    """B-④ semantic-structure layer: build_structure fuser + get_doc_info enrichment."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.src = build_sample_pdf(Path(self.tmp.name) / "struct_src.pdf", pages=2)
+
+    def _doc(self):
+        return pdfio.extract_document_text(str(self.src), ocr=False, log=lambda m: None)
+
+    def _structure_fn(self, page_index, page, blocks):
+        # A mock backend: page 0's first block is a formula; page 1's first block is a figure.
+        if not blocks:
+            return []
+        b = blocks[0]
+        if page_index == 0:
+            return [{"kind": "formula", "bbox": [b.x0, b.y0, b.x1, b.y1]}]
+        if page_index == 1:
+            return [{"kind": "figure", "bbox": [b.x0, b.y0, b.x1, b.y1],
+                     "level": 0}]
+        return []
+
+    def test_build_structure_populates_page_structure(self):
+        dt = self._doc()
+        pdfio.build_structure(str(self.src), dt, self._structure_fn, parser="mock")
+        self.assertEqual(dt.structure_parser, "mock")
+        self.assertEqual(len(dt.page_structure), dt.page_count)
+        self.assertEqual(dt.page_structure[0].elements[0]["kind"], "formula")
+        # The first block of page 0 (flat index 0) is contained in its own bbox.
+        self.assertIn(0, dt.page_structure[0].elements[0]["block_indices"])
+
+    def test_get_doc_info_includes_structure_counts_when_present(self):
+        dt = self._doc()
+        pdfio.build_structure(str(self.src), dt, self._structure_fn, parser="mock")
+        info = pdfio.get_doc_info(dt)
+        self.assertEqual(info["structure_parser"], "mock")
+        self.assertEqual(info["formula_pages"], 1)
+        self.assertEqual(info["figure_pages"], 1)
+
+    def test_get_doc_info_unchanged_without_structure(self):
+        dt = self._doc()
+        info = pdfio.get_doc_info(dt)
+        self.assertNotIn("formula_pages", info)
+        self.assertNotIn("structure_parser", info)
+        # Existing keys are unaffected.
+        self.assertEqual(info["pages"], 2)
+
+    def test_structure_dominant_kind(self):
+        ps = pdfio.PageStructure(page=0, parser="mock",
+                                 elements=[{"kind": "formula", "bbox": [0, 0, 1, 1],
+                                            "level": 0, "block_indices": [0], "parser": "mock"},
+                                           {"kind": "formula", "bbox": [0, 0, 1, 1],
+                                            "level": 0, "block_indices": [1], "parser": "mock"}])
+        self.assertEqual(pdfio._structure_dominant_kind(ps), "formula")
+        # A single formula among text is not dominant.
+        ps2 = pdfio.PageStructure(page=1, parser="mock",
+                                  elements=[{"kind": "formula", "bbox": [0, 0, 1, 1],
+                                             "level": 0, "block_indices": [0], "parser": "mock"},
+                                            {"kind": "text", "bbox": [0, 0, 1, 1],
+                                             "level": 0, "block_indices": [1], "parser": "mock"}])
+        self.assertIsNone(pdfio._structure_dominant_kind(ps2))
+
+
 if __name__ == "__main__":
     unittest.main()

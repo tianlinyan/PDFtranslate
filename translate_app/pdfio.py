@@ -106,6 +106,40 @@ class Block:
 
 
 @dataclass
+class StructTable:
+    """A semantic table recovered by a structure parser (B-④).
+
+    ``cells[r][c]`` holds the flat block index of the cell at that grid position
+    (``0`` elsewhere when the grid is partial).  This is a *reading/understanding*
+    model — it never drives the deterministic export geometry (that stays on
+    ``Block.in_table`` / ``fit_width`` / ``fit_height``).
+    """
+
+    rows: int
+    cols: int
+    bbox: tuple[float, float, float, float]
+    cells: list[list[int]] = field(default_factory=list)
+    block_ref: set[int] = field(default_factory=set)
+
+
+@dataclass
+class PageStructure:
+    """Per-page semantic structure produced by a structure parser (B-④).
+
+    ``elements`` is the page's content in reading order, each an entry
+    ``{"kind", "bbox", "level", "block_indices", "parser"}`` where ``kind`` is
+    ``text / heading / table / figure / formula / caption / note``.  This is
+    advisory metadata for the agent / prompts — it never alters the exported
+    geometry.
+    """
+
+    page: int
+    parser: str = ""
+    elements: list[dict] = field(default_factory=list)
+    tables: list[StructTable] = field(default_factory=list)
+
+
+@dataclass
 class DocumentText:
     """All extractable text from a PDF, in reading order."""
 
@@ -114,6 +148,10 @@ class DocumentText:
     block_pages: list[int] = field(default_factory=list)  # page index per block
     title: str = ""
     ocr_count: int = 0          # pages whose text came from OCR (was scanned)
+    #: Per-page semantic structure (B-④).  Empty unless `build_structure` ran;
+    #: advisory metadata, never used by the deterministic exporter.
+    page_structure: list[PageStructure] = field(default_factory=list)
+    structure_parser: str = ""   # backend name ("doclayout"/"docling"); "" = none
 
     @property
     def page_count(self) -> int:
@@ -196,7 +234,7 @@ def get_doc_info(doc: "DocumentText") -> dict[str, Any]:
     table_pages = sum(1 for k in kinds if k == PAGE_TABLE)
     uncertain_pages = sum(1 for k in kinds if k == PAGE_UNCERTAIN)
     scan_pages = doc.ocr_count
-    return {
+    info = {
         "pages": doc.page_count,
         "title": doc.title,
         "language": detect_language(doc.blocks),
@@ -207,6 +245,121 @@ def get_doc_info(doc: "DocumentText") -> dict[str, Any]:
         "uncertain_pages": uncertain_pages,
         "special_pages": chart_pages + table_pages + uncertain_pages + scan_pages,
         "block_count": len(doc.blocks),
+        "kinds": kinds,
+    }
+    if doc.page_structure:
+        # Deliberately ADDITIVE: existing counts/kinds stay; the structure layer
+        # only adds formula/figure counts + the parser name.  No existing consumer
+        # sees a changed value, so enabling a backend can't regress the audit flow.
+        info.update(get_structure_summary(doc))
+    return info
+
+
+# --------------------------------------------------------------------------
+# B-④ semantic-structure layer (optional, advisory).
+#
+# A structure parser (backend) yields per-page content *regions* with a kind; the
+# fuser below maps each region back onto the already-extracted ``Block`` list by
+# bbox, producing a ``PageStructure`` that the agent / prompts can read.  This is
+# purely metadata: the blocks' bbox / fit hints that drive export are untouched,
+# so enabling it never changes the deterministic output.  ``structure_fn`` is an
+# injectable test seam, mirroring ``ocr_fn``.
+# --------------------------------------------------------------------------
+
+#: Facade kinds a page may be dominated by (in priority order).
+_STRUCTURE_KINDS = ("formula", "figure", "table")
+
+
+def _point_in_bbox(block: Block, bbox: Sequence[float]) -> bool:
+    """True when ``block``'s centre falls inside ``bbox`` (PDF points)."""
+    cx = (block.x0 + block.x1) / 2.0
+    cy = (block.y0 + block.y1) / 2.0
+    x0, y0, x1, y1 = bbox
+    return x0 <= cx <= x1 and y0 <= cy <= y1
+
+
+def _fuse_structure(
+    page_idx: int, blocks: Sequence[Block], offset: int, regions: Sequence[dict], parser: str
+) -> PageStructure:
+    """Turn backend regions into a ``PageStructure`` annotated with block indices."""
+    elements: list[dict] = []
+    for reg in regions or []:
+        bbox = reg.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue  # a region without usable geometry is dropped (not silent harm)
+        inds = sorted({offset + i for i, b in enumerate(blocks) if _point_in_bbox(b, bbox)})
+        elements.append({
+            "kind": str(reg.get("kind", "text")),
+            "bbox": list(bbox),
+            "level": int(reg.get("level", 0) or 0),
+            "block_indices": inds,
+            "parser": parser,
+        })
+    return PageStructure(page=page_idx, parser=parser, elements=elements)
+
+
+def build_structure(
+    path: str | Path,
+    dt: DocumentText,
+    structure_fn: Callable[[int, "fitz.Page", Sequence[Block]], Sequence[dict]],
+    *,
+    parser: str = "structure",
+) -> DocumentText:
+    """Populate ``dt.page_structure`` / ``dt.structure_parser`` from a backend.
+
+    ``structure_fn(page_index, page, blocks) -> [ {kind, bbox, level?}, ... ]``
+    is the injectable seam (mirroring ``ocr_fn``).  It is called per page, so a
+    backend can be lazy and cheap; a page/backend failure degrades to that page
+    staying ``PageStructure(parser="")`` rather than aborting the document.
+    """
+    doc = fitz.open(str(path))
+    try:
+        for p in range(dt.page_count):
+            blocks = dt.pages[p] if p < len(dt.pages) else []
+            offset = sum(len(pg) for pg in dt.pages[:p])
+            try:
+                regions = structure_fn(p, doc[p], blocks)
+            except Exception:  # noqa: BLE001 — a backend failure degrades the page
+                regions = None
+            dt.page_structure.append(_fuse_structure(p, blocks, offset, regions or [], parser))
+        dt.structure_parser = parser if dt.page_structure and any(
+            ps.parser for ps in dt.page_structure
+        ) else ""
+    finally:
+        doc.close()
+    return dt
+
+
+def _structure_dominant_kind(ps: PageStructure) -> str | None:
+    """The kind a page is *dominated* by (None when absent / ambiguous).
+
+    A page is dominated by ``formula`` / ``figure`` / ``table`` when that kind has
+    at least as many regions as plain text (and a minimum of one), so a page with
+    a lone figure plus ordinary text stays ``None``.
+    """
+    if not ps or not ps.elements:
+        return None
+    counts = Counter(e["kind"] for e in ps.elements)
+    text_n = counts.get("text", 0)
+    for kind in _STRUCTURE_KINDS:
+        if counts.get(kind, 0) > text_n:
+            return kind
+    return None
+
+
+def get_structure_summary(doc: DocumentText) -> dict:
+    """A machine-readable summary of a document's semantic structure (B-④).
+
+    Returns ``{parser, formula_pages, figure_pages, table_pages, kinds}`` where
+    ``kinds`` is the per-page dominant kind (``None`` = no structure).  Empty when
+    ``build_structure`` never ran (``parser == ""``).
+    """
+    kinds = [_structure_dominant_kind(ps) for ps in doc.page_structure]
+    return {
+        "structure_parser": doc.structure_parser,
+        "formula_pages": sum(1 for k in kinds if k == "formula"),
+        "figure_pages": sum(1 for k in kinds if k == "figure"),
+        "table_pages": sum(1 for k in kinds if k == "table"),
         "kinds": kinds,
     }
 
