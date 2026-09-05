@@ -1403,7 +1403,7 @@ class TranslationPromptScriptTest(unittest.TestCase):
         # Russian / Japanese / Korean translation is anchored to that script, not English.
         for lang, marker in (("Russian", "й"), ("Japanese", "押"), ("Korean", "저장")):
             p = prompts.translation_system_prompt(lang)
-            m = re.search(r"Output:\n\[1\]\n(.+?)\n\[2\]\n(.+)\Z", p, re.S)
+            m = re.search(r"Output:\n\[\[1\]\]\n(.+?)\n\[\[2\]\]\n(.+)\Z", p, re.S)
             self.assertIsNotNone(m, lang)
             self.assertIn(marker, m.group(1) + (m.group(2) or ""), lang)
 

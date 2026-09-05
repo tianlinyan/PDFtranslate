@@ -271,32 +271,44 @@ class TranslatorTest(unittest.TestCase):
         # A model may wrap a long translation across several lines; everything
         # up to the next [n] marker belongs to that block.
         raw = (
-            "[1]\nFirst line.\nsecond line continued.\n"
-            "[2]\nSecond block."
+            "[[1]]\nFirst line.\nsecond line continued.\n"
+            "[[2]]\nSecond block."
         )
         parsed = TranslationEngine._parse_response(raw, [0, 1])
         self.assertEqual(
             parsed, ["First line. second line continued.", "Second block."]
         )
 
+    def test_citation_marker_in_block_does_not_collide(self):
+        # Regression: an academic doc's citation ``[1]`` / ``[2]`` inside a block
+        # used to collide with the single-bracket batch marker — the reply
+        # ``[1] See [1] and [2] ...`` read as a duplicate ``[1]`` and the whole
+        # batch was discarded (blocks kept as source).  The double-bracket
+        # ``[[n]]`` marker must not be confused with a bare ``[n]`` citation.
+        raw = ("[[1]]\nSee [1] and [2] for the full proof.\n"
+               "[[2]]\nThe second block.")
+        parsed = TranslationEngine._parse_response(raw, [0, 1])
+        self.assertEqual(parsed, ["See [1] and [2] for the full proof.",
+                                  "The second block."])
+
     def test_incomplete_numbered_output_is_rejected(self):
         # A response that echoes only some of the requested block numbers must be
         # rejected (treated as a malformed/transient reply for the caller to
         # retry) instead of silently filling the gaps with the original text.
-        raw = "[1]\nFirst block.\n[2]\nSecond block."  # third block missing
+        raw = "[[1]]\nFirst block.\n[[2]]\nSecond block."  # third block missing
         with self.assertRaises(ValueError):
             TranslationEngine._parse_response(raw, [0, 1, 2])
 
         # Out-of-range marker (echoes [4] for a 3-block batch) is also rejected.
         with self.assertRaises(ValueError):
-            TranslationEngine._parse_response("[1]\na\n[4]\nd", [0, 1, 2])
+            TranslationEngine._parse_response("[[1]]\na\n[[4]]\nd", [0, 1, 2])
 
     def test_duplicate_numbered_output_is_rejected(self):
         # Regression: the set-comparison used to treat ``[1]a\n[1]b\n[2]c`` as a
         # valid 2-block reply, silently returning ``["b", "c"]`` — dropping block
         # 1's first translation and caching the loss forever.  A duplicated ``[n]``
         # must be rejected the same way a missing one is.
-        raw = "[1]\nFirst.\n[1]\nFirst again.\n[2]\nSecond."
+        raw = "[[1]]\nFirst.\n[[1]]\nFirst again.\n[[2]]\nSecond."
         with self.assertRaises(ValueError):
             TranslationEngine._parse_response(raw, [0, 1])
 
@@ -304,12 +316,12 @@ class TranslatorTest(unittest.TestCase):
         # Regression: an *empty* translation (``[1]`` with no content) used to
         # parse as "" and count as success — blanking the block in the export
         # and writing "" to the cache, where it was reused forever.
-        raw = "[1]\n\n[2]\nSecond block."
+        raw = "[[1]]\n\n[[2]]\nSecond block."
         with self.assertRaises(ValueError):
             TranslationEngine._parse_response(raw, [0, 1])
 
         # Whitespace-only content is empty too.
-        raw = "[1]\n   \n[2]\nSecond block."
+        raw = "[[1]]\n   \n[[2]]\nSecond block."
         with self.assertRaises(ValueError):
             TranslationEngine._parse_response(raw, [0, 1])
 
@@ -331,7 +343,7 @@ class TranslatorTest(unittest.TestCase):
             )
             engine = TranslationEngine(model)
             engine._request_locked = (
-                lambda _p, _s: "[1]\n\n[2]\nMOCK:Second paragraph with more words here."
+                lambda _p, _s: "[[1]]\n\n[[2]]\nMOCK:Second paragraph with more words here."
             )
             blocks = list(BLOCKS[:2])
             doc_path = Path("_empty_reply.pdf")
@@ -423,7 +435,7 @@ class TranslatorTest(unittest.TestCase):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise err
-                return "[1] MOCK:Hello."
+                return "[[1]] MOCK:Hello."
 
             engine._request_locked = flaky  # type: ignore[method-assign]
             res = engine.translate_blocks(
@@ -835,10 +847,10 @@ class RetranslateBatchTest(unittest.TestCase):
     def test_parse_retranslate_batch_numbered(self):
         sources = ["甲", "乙", "丙"]
         self.assertEqual(["A", "B", "C"],
-                         translator._parse_retranslate_batch("[1]\nA\n[2]\nB\n[3]\nC", 3, sources))
+                         translator._parse_retranslate_batch("[[1]]\nA\n[[2]]\nB\n[[3]]\nC", 3, sources))
         # A missing block keeps its source (fail-closed, never blank).
         self.assertEqual(["A", "乙", "C"],
-                         translator._parse_retranslate_batch("[1]\nA\n[3]\nC", 3, sources))
+                         translator._parse_retranslate_batch("[[1]]\nA\n[[3]]\nC", 3, sources))
 
     def test_parse_retranslate_batch_unmarked(self):
         sources = ["甲", "乙", "丙"]
@@ -850,7 +862,7 @@ class RetranslateBatchTest(unittest.TestCase):
         seen = []
 
         class _Msg:
-            content = "[1]\nAlpha\n[2]\nBeta"
+            content = "[[1]]\nAlpha\n[[2]]\nBeta"
 
         class _Ch:
             message = _Msg()
@@ -876,7 +888,7 @@ class RetranslateBatchTest(unittest.TestCase):
         out = fn(["甲", "乙"], "English")
         self.assertEqual(["Alpha", "Beta"], out)
         # The numbered sources were in the prompt, one request (batch), temperature 0.
-        self.assertEqual("[1]\n甲\n\n[2]\n乙", seen[0]["messages"][0]["content"].split("：\n", 1)[-1])
+        self.assertEqual("[[1]]\n甲\n\n[[2]]\n乙", seen[0]["messages"][0]["content"].split("：\n", 1)[-1])
         self.assertEqual(0.0, seen[0]["temperature"])
         # Non-vision model → None.
         self.assertIsNone(translator.make_retranslate_batch_fn(

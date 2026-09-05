@@ -49,7 +49,7 @@ from .settings import ModelConfig
 #: Matches one ``[n]`` block in a model reply.  The block content may span
 #: several lines (some models wrap long translations); everything up to the
 #: next ``[n]`` marker (or the end of the reply) belongs to this block.
-_MULTI_BLOCK_RE = re.compile(r"(?ms)^\s*\[(\d+)\]\s*(.*?)(?=^\s*\[\d+\]\s*|\Z)")
+_MULTI_BLOCK_RE = re.compile(r"(?ms)^\s*\[\[(\d+)\]\]\s*(.*?)(?=^\s*\[\[\d+\]\]\s*|\Z)")
 
 #: Default source-character budget per batch request.  Kept modest so a single
 #: request's output stays within the model's max-token limit, and so progress
@@ -300,7 +300,7 @@ class TranslationEngine:
         # contiguous, unambiguous set to echo back (avoids misalignment when the
         # batch's global indices are sparse because some blocks were cached).
         for pos, i in enumerate(indices):
-            lines.append(f"[{pos + 1}]\n{blocks[i]}")
+            lines.append(f"[[{pos + 1}]]\n{blocks[i]}")
         return "\n\n".join(lines)
 
     @staticmethod
@@ -849,8 +849,9 @@ _RETRANSLATE_BATCH_PROMPT = (
     "若某段已是目标语言，原样输出。不要保留任何原文语言。按编号逐段输出：\n{numbered}"
 )
 
-#: Matches ``[n]`` blocks in a batch re-translate reply (same shape as the translation).
-_RETRANSLATE_BATCH_RE = re.compile(r"(?ms)^\s*\[(\d+)\]\s*(.*?)(?=^\s*\[\d+\]\s*|\Z)")
+#: Match ``[[n]]`` blocks in a batch re-translate reply (same shape as the translation;
+#: double brackets so a citation ``[1]`` inside a block never collides with the marker).
+_RETRANSLATE_BATCH_RE = re.compile(r"(?ms)^\s*\[\[(\d+)\]\]\s*(.*?)(?=^\s*\[\[\d+\]\]\s*|\Z)")
 
 
 def _parse_retranslate_batch(text: str, n: int, sources: list[str]) -> list[str]:
@@ -902,7 +903,7 @@ def make_retranslate_batch_fn(
 
     def _batch(texts: list[str], lang: str) -> list[str]:
         try:
-            numbered = "\n\n".join(f"[{i + 1}]\n{t}" for i, t in enumerate(texts))
+            numbered = "\n\n".join(f"[[{i + 1}]]\n{t}" for i, t in enumerate(texts))
             prompt = _RETRANSLATE_BATCH_PROMPT.format(lang=lang, numbered=numbered)
             kwargs: dict = {
                 "model": model.model,

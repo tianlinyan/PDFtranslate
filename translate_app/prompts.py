@@ -121,8 +121,10 @@ def translation_system_prompt(language: str, glossary: dict[str, str] | None = N
     prompt += (
         "- If a block is already entirely in the target language, output it "
         "unchanged.\n"
-        "- Preserve numbering exactly: reply as '[n] translated text' per "
-        "block, in the same order.\n"
+        "- Preserve numbering exactly: reply as '[[n]] translated text' per "
+        "block, in the same order.  Use the double-bracket [[n]] marker, never a "
+        "single [n] (a single bracket could collide with a citation/reference "
+        "like '[1]' in the document).\n"
         "- Do not merge or split blocks; output ONLY the numbered translations, "
         "with no explanations, notes or preamble.\n"
     )
@@ -135,14 +137,14 @@ def translation_system_prompt(language: str, glossary: dict[str, str] | None = N
     prompt += (
         "Example:\n"
         "Input:\n"
-        "[1]\n"
+        "[[1]]\n"
         f"{inp1}\n"
-        "[2]\n"
+        "[[2]]\n"
         f"{inp2}\n"
         "Output:\n"
-        "[1]\n"
+        "[[1]]\n"
         f"{out1}\n"
-        "[2]\n"
+        "[[2]]\n"
         f"{out2}\n"
     )
     if glossary:

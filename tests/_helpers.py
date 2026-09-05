@@ -30,8 +30,8 @@ class _MockHandler(BaseHTTPRequestHandler):
                 continue
             first = chunk.splitlines()[0].strip("[]")
             text = chunk.split("\n", 1)[1].strip() if "\n" in chunk else ""
-            lines.append(f"[{first}] MOCK:{text}")
-        content = "\n".join(lines) or "[1] MOCK:"
+            lines.append(f"[[{first}]] MOCK:{text}")
+        content = "\n".join(lines) or "[[1]] MOCK:"
         data = json.dumps({"choices": [{"message": {"role": "assistant", "content": content}}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
