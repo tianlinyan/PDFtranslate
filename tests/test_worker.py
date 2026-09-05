@@ -481,5 +481,54 @@ class OverlayApplyTest(_WorkerTestBase):
         self.assertFalse(out.exists())
 
 
+class IrModeWorkerTest(_WorkerTestBase):
+    """C-⑥: IR-mode translation in the worker (gated, default off)."""
+
+    def _worker(self, **kw) -> TranslateWorker:
+        return TranslateWorker(
+            "x.pdf", self._model("http://127.0.0.1:9/v1"), "English", "plain_text",
+            str(self.tmp / "o.txt"), agent_mode=False, **kw)
+
+    def _doc(self, texts):
+        return pdfio.DocumentText(
+            pages=[[pdfio.Block(t, 0, 0, 0, 100, 20) for t in texts]],
+            blocks=list(texts), block_pages=[0] * len(texts))
+
+    def _fake_engine(self):
+        class R:
+            def __init__(self, blocks, trans):
+                self.blocks = list(blocks)
+                self.translated = list(trans)
+                self.errors = []
+        class E:
+            def translate_blocks(self, blocks, lang, *, log=None, doc_path=None,
+                                 resume=True, extra_glossary=None):
+                trans = ["T|" + b for b in blocks]
+                return R(blocks, trans)
+        return E()
+
+    def test_run_ir_translates_and_maps_back(self):
+        w = self._worker(ir_mode=True)
+        doc = self._doc(["alpha", "beta"])
+        result = w._run_ir(doc, self._fake_engine())
+        self.assertEqual(result.translated, ["T|alpha", "T|beta"])
+
+    def test_run_ir_keeps_numeric_verbatim(self):
+        w = self._worker(ir_mode=True)
+        doc = self._doc(["alpha", "1,234.56"])
+        result = w._run_ir(doc, self._fake_engine())
+        # The numeric block is not sent to the model and stays as source.
+        self.assertEqual(result.translated[1], "1,234.56")
+        self.assertEqual(result.translated[0], "T|alpha")
+
+    def test_ir_mode_default_off_and_env_gated(self):
+        self.assertFalse(self._worker()._ir_mode)
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_IR_MODE": "1"}):
+            self.assertTrue(self._worker()._ir_mode)
+        # Explicit flag wins and is independent of the env.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            self.assertTrue(self._worker(ir_mode=True)._ir_mode)
+
+
 if __name__ == "__main__":
     unittest.main()

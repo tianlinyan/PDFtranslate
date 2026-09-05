@@ -7,6 +7,7 @@ to the main thread through Qt signals.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -76,6 +77,7 @@ class TranslateWorker(QObject):
         re_export: bool = False,
         last_translated: list[str] | None = None,
         requirements: list[str] | None = None,
+        ir_mode: bool = False,
     ):
         super().__init__()
         self._source = source_path
@@ -120,6 +122,10 @@ class TranslateWorker(QObject):
         # translation engine; a non-vision model falls back to the deterministic
         # baseline (fail-closed).
         self._agent_mode = agent_mode
+        #: C-⑥ IR mode: force the headless IR pipeline (``build_ir`` → ``translate_ir``
+        #: → existing export) instead of the agent/deterministic path.  Off by default;
+        #: ``PDFTRANSLATE_IR_MODE`` toggles it for a run without touching the GUI.
+        self._ir_mode = bool(ir_mode or os.environ.get("PDFTRANSLATE_IR_MODE"))
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
         # written from the GUI thread (``cancel``) and read from the worker
         # thread: the Event gives explicit, memory-model-safe signalling
@@ -174,7 +180,10 @@ class TranslateWorker(QObject):
             keep_original: set[int] = set()
 
             translate_started = time.monotonic()
-            if self._agent_mode and getattr(self._model, "vision", False):
+            if self._ir_mode:
+                self.log.emit("已启用 IR 管线（语义结构 + 文档级翻译 + 自适应导出）。")
+                result = self._run_ir(doc, engine)
+            elif self._agent_mode and getattr(self._model, "vision", False):
                 self.log.emit("已启用 AI 编排：采用 agent 驱动的单页视觉闭环。")
                 result = self._run_agent(doc, keep_original)
             else:
@@ -265,6 +274,27 @@ class TranslateWorker(QObject):
     def cancel(self) -> None:
         """Request cancellation (safe to call from the GUI thread)."""
         self._cancelled.set()
+
+    def _run_ir(self, doc: pdfio.DocumentText, engine: TranslationEngine) -> TranslationResult:
+        """C-⑥ IR-mode translation: build IR, translate at the IR level, map back.
+
+        The returned per-block result then flows through the normal
+        ``_apply_overlay`` / ``group_by_page`` / ``_export`` path, so overlay edits,
+        markdown/plain-text output and the preview's ``_last_pdf`` all keep working
+        unchanged.  ``translate_ir`` reuses the engine's batch path (shared client,
+        concurrency, cache) but injects document terminology (``IRDoc.terms``) and
+        keeps structural (formula/figure) and numeric blocks verbatim.
+        """
+        from . import ir as ir_mod
+
+        src_texts = list(doc.blocks)
+        doc_ir = ir_mod.build_ir(doc, lang=self._lang)
+        translate_fn = ir_mod.make_ir_translate_fn(
+            engine, doc_path=Path(self._source), log=lambda m: self.log.emit(m))
+        translated = ir_mod.translate_ir(
+            doc_ir, translate_fn, lang=self._lang, log=lambda m: self.log.emit(m))
+        out_texts = [str(translated.get(i, src_texts[i])) for i in range(len(src_texts))]
+        return TranslationResult(blocks=src_texts, translated=out_texts)
 
     def add_user_requirement(self, text: str) -> None:
         """Inject a sidebar free-text message into the running AI agent.
