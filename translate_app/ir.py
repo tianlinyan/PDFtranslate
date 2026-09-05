@@ -267,3 +267,49 @@ def make_ir_translate_fn(engine, *, doc_path: "Path | None" = None,
         )
         return list(result.translated)
     return _translate
+
+
+def per_page_from_ir(ir: IRDoc, translated: dict[int, str]) -> tuple[list[list[Block]], list[list[str]]]:
+    """Rebuild ``(pages, per_page)`` (block anchors + translations) from the IR.
+
+    This is the bridge from the IR back to the existing exporter: every block's
+    anchor (its ``Block``) is reused as the page's block list, and the IR-level
+    translation (keyed by ``src_id``) becomes that block's translation.  A block
+    with no entry (e.g. a structural / numeric block) falls back to its source.
+    """
+    pages: list[list[Block]] = []
+    per_page: list[list[str]] = []
+    for ipage in ir.pages:
+        anchors = [b.anchor for b in ipage.blocks]
+        texts = [str(translated.get(b.src_id, b.text)) for b in ipage.blocks]
+        pages.append(anchors)
+        per_page.append(texts)
+    return pages, per_page
+
+
+def save_ir(
+    src_path: str | Path,
+    out_path: str | Path,
+    ir: IRDoc,
+    translated: dict[int, str],
+    *,
+    lang: str,
+    mode: str = "translated_pdf",
+    log: Callable[[str], None] | None = None,
+) -> str:
+    """Re-export the IR translation back to a PDF (C-⑥ Stage 3).
+
+    The IR-level ``translated`` (``{src_id: text}``) is mapped back onto the
+    original anchors and handed to the *existing* exporter
+    (:func:`pdfio.save_translated_pdf` / :func:`pdfio.save_interleaved_pdf`),
+    which already does the adaptive re-anchoring — table row expansion, scan
+    band-fit, fit-to-column — so the IR path inherits every carefully-tuned fit
+    rule instead of re-implementing a typesetter.  ``mode`` is one of the
+    ``OUTPUT_TYPES`` PDF keys (``translated_pdf`` | ``bilingual_pdf``).
+    """
+    pages, per_page = per_page_from_ir(ir, translated)
+    if mode == "bilingual_pdf":
+        pdfio.save_interleaved_pdf(str(src_path), per_page, str(out_path), lang, pages=pages)
+    else:
+        pdfio.save_translated_pdf(str(src_path), pages, per_page, str(out_path), lang, log=log)
+    return str(out_path)

@@ -130,5 +130,51 @@ class TranslateIrTest(unittest.TestCase):
         self.assertEqual(engine.captured[2], {"k": "v"})
 
 
+class SaveIrTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.src = build_sample_pdf(Path(self.tmp.name) / "save_src.pdf", pages=2)
+        self.dt = pdfio.extract_document_text(str(self.src), ocr=False, log=lambda m: None)
+        self.ir = ir.build_ir(self.dt)
+
+    def _translated(self):
+        # A mock translate_fn: every translatable block becomes "T|<text>".
+        return ir.translate_ir(
+            self.ir,
+            lambda texts, *, lang, extra_glossary=None: ["T|" + t for t in texts],
+            lang="English")
+
+    def test_save_ir_in_place(self):
+        out = Path(self.tmp.name) / "out.pdf"
+        ir.save_ir(str(self.src), str(out), self.ir, self._translated(), lang="English")
+        import pymupdf as fitz
+        doc = fitz.open(str(out))
+        try:
+            self.assertEqual(doc.page_count, self.dt.page_count)
+            text = "".join(doc[i].get_text() for i in range(doc.page_count))
+            self.assertIn("T|", text)  # translations drawn back into the PDF
+        finally:
+            doc.close()
+
+    def test_save_ir_bilingual(self):
+        out = Path(self.tmp.name) / "bilingual.pdf"
+        ir.save_ir(str(self.src), str(out), self.ir, self._translated(),
+                   lang="English", mode="bilingual_pdf")
+        import pymupdf as fitz
+        doc = fitz.open(str(out))
+        try:
+            # Bilingual: each source page followed by a mirror translation page.
+            self.assertEqual(doc.page_count, self.dt.page_count * 2)
+        finally:
+            doc.close()
+
+    def test_per_page_from_ir_falls_back_to_source(self):
+        # A block without an entry keeps its source text.
+        pages, per_page = ir.per_page_from_ir(self.ir, {})
+        self.assertEqual(len(pages), len(self.ir.pages))
+        self.assertEqual(per_page[0], [b.text for b in pages[0]])
+
+
 if __name__ == "__main__":
     unittest.main()
