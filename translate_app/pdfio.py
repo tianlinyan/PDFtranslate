@@ -303,10 +303,11 @@ def _build_struct_table(
 ) -> tuple[int, int, list[list[int]], set[int]] | None:
     """Build a ``StructTable`` grid from a backend's ``cells`` (B-④ stage 3).
 
-    ``reg["cells"]`` is a 2D list of flat block indices (or ``None``/``-1`` for an
-    empty cell).  Returns ``(rows, cols, cells, block_ref)`` or ``None`` when no
-    usable grid is present (the region then stays a bare ``table`` element with no
-    semantic grid — the geometry path still handles it).
+    ``reg["cells"]`` is a 2D list of **page-local** block indices (``0..len(blocks)-1``;
+    ``None``/``-1`` marks an empty cell).  ``offset`` is added so the returned
+    ``cells``/``block_ref`` use flat indices.  Returns ``(rows, cols, cells, block_ref)``
+    or ``None`` when no usable grid is present (the region then stays a bare ``table``
+    element with no semantic grid — the geometry path still handles it).
     """
     raw = reg.get("cells")
     if not isinstance(raw, list) or not raw:
@@ -317,13 +318,16 @@ def _build_struct_table(
         cells_row: list[int] = []
         for val in row:
             try:
-                # -1 / None mark an empty cell; otherwise a flat block index.
+                # -1 / None mark an empty cell; otherwise a *page-local* block index
+                # (0..len(blocks)-1).  The fuser adds ``offset`` so cells are stored as
+                # flat index in :class:`StructTable`.  A backend need not know the flat
+                # offset, so it can build a grid from the page alone.
                 vi = int(val) if val is not None else -1
             except (TypeError, ValueError):
                 vi = -1
-            if vi != -1 and offset <= vi < offset + len(blocks):
-                block_ref.add(vi)
-                cells_row.append(vi)
+            if vi != -1 and 0 <= vi < len(blocks):
+                block_ref.add(offset + vi)
+                cells_row.append(offset + vi)
             else:
                 cells_row.append(-1)
         grid.append(cells_row)
@@ -430,6 +434,29 @@ def extract_structured(
     return dt
 
 
+def extract_document_structured(
+    path: str | Path,
+    *,
+    parser: str = "geo",
+    ocr: bool = False,
+    title: str | None = None,
+    ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
+    cancel: Callable[[], bool] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> DocumentText:
+    """One-call entry that *runs the semantic layer* on a PDF (B-④/B-⑤).
+
+    Uses the deterministic geometric backend (:func:`make_geometric_structure_fn`) —
+    formula / figure / heading / caption / table detection with no model or GPU — so
+    ``page_structure``, ``classify_page`` formula/figure kinds, ``get_structure`` /
+    ``get_table`` and IR ``build_ir`` all get non-empty structure out of the box.
+    Same fail-closed guarantee as :func:`extract_structured` (a backend outage
+    degrades to a plain extraction).
+    """
+    return extract_structured(path, make_geometric_structure_fn(), parser=parser,
+                              ocr=ocr, title=title, ocr_fn=ocr_fn, cancel=cancel, log=log)
+
+
 def _structure_dominant_kind(ps: PageStructure) -> str | None:
     """The kind a page is *dominated* by (None when absent / ambiguous).
 
@@ -479,6 +506,100 @@ def get_table(doc: DocumentText, page: int, index: int = 0) -> dict | None:
     t = tables[index]
     return {"rows": t.rows, "cols": t.cols, "bbox": list(t.bbox),
             "cells": t.cells, "block_ref": sorted(t.block_ref)}
+
+
+#: A caption line: short, a figure/table label, not bold (so a bold *title* is a
+#: heading, not a caption).
+_CAPTION_RE = re.compile(r"^\s*(?:(?:图|表)\s*\d+|Fig(?:ure)?\.?\s*\d+|Table\.?\s*\d+|图|Fig\.?|Table\.?)\b",
+                        re.IGNORECASE)
+
+
+def make_geometric_structure_fn(*, log: Callable[[str], None] | None = None):
+    """A deterministic, offline ``structure_fn`` built from existing heuristics (B-④/B-⑤).
+
+    This is what lets the semantic layer *actually run* on any PDF with no model / GPU:
+    it detects, from the extracted blocks alone,
+    * **formula** — :func:`_is_formula_block` (B-⑤);
+    * **figure** — org-chart / architecture nodes (``_is_vertical_label`` / ``is_chart``);
+    * **heading** — bold single-line, non-table blocks (level by font-size rank);
+    * **caption** — short figure/table label lines (not bold);
+    * **table** — ``in_table`` blocks clustered into a row/col grid (``cells`` = page-local);
+    everything else stays ordinary ``text`` (the fuser's default).
+
+    Returns a callable ``structure_fn(page_index, page, blocks) -> [ {kind, bbox, level?,
+    cells?} ]`` that :func:`build_structure` / :func:`extract_structured` accept.
+    """
+    def structure_fn(page_index: int, page, blocks: Sequence[Block]) -> list[dict]:
+        regions: list[dict] = []
+
+        def _bbox(items: Sequence[int]) -> list[float]:
+            xs0 = min(blocks[i].x0 for i in items)
+            ys0 = min(blocks[i].y0 for i in items)
+            xs1 = max(blocks[i].x1 for i in items)
+            ys1 = max(blocks[i].y1 for i in items)
+            return [xs0, ys0, xs1, ys1]
+
+        # 1) Formulas (single-block regions).
+        for i, b in enumerate(blocks):
+            try:
+                if _is_formula_block(str(b.text)):
+                    regions.append({"kind": "formula", "bbox": [b.x0, b.y0, b.x1, b.y1]})
+            except Exception:  # noqa: BLE001 — a mis-detected block is left as text
+                continue
+
+        # 2) Chart / architecture figure: group all node labels into one region.
+        chart_idx = [i for i, b in enumerate(blocks)
+                     if getattr(b, "is_chart", False) or _is_vertical_label(b)]
+        if chart_idx:
+            regions.append({"kind": "figure", "bbox": _bbox(chart_idx),
+                            "block_indices": chart_idx})
+
+        # 3) Headings: bold single-line non-table blocks, level by size rank.
+        bold_sizes = sorted({b.size for i, b in enumerate(blocks)
+                             if i not in chart_idx and getattr(b, "bold", False)
+                             and b.single_line and not getattr(b, "in_table", False)})
+        for i, b in enumerate(blocks):
+            if i in chart_idx:
+                continue
+            if getattr(b, "bold", False) and b.single_line and not getattr(b, "in_table", False):
+                level = sum(1 for s in bold_sizes if s > b.size) + 1
+                regions.append({"kind": "heading", "level": level,
+                                "bbox": [b.x0, b.y0, b.x1, b.y1]})
+
+        # 4) Table: cluster ``in_table`` blocks into a row/col grid (page-local cells).
+        table_idx = [i for i, b in enumerate(blocks) if getattr(b, "in_table", False)]
+        if table_idx:
+            rows: list[list[int]] = []
+            for i in table_idx:
+                cy = (blocks[i].y0 + blocks[i].y1) / 2.0
+                for row in rows:
+                    if abs(((blocks[row[0]].y0 + blocks[row[0]].y1) / 2.0) - cy) <= 5.0:
+                        row.append(i)
+                        break
+                else:
+                    rows.append([i])
+            for row in rows:
+                row.sort(key=lambda i: blocks[i].x0)
+            ncols = max((len(r) for r in rows), default=0)
+            cells: list[list[int]] = []
+            ridx = 0
+            for row in rows:
+                cells_row = [-1] * ncols
+                for col, i in enumerate(row):
+                    cells_row[col] = i  # page-local index
+                cells.append(cells_row)
+                ridx += 1
+            regions.append({"kind": "table", "bbox": _bbox(table_idx), "cells": cells})
+
+        # 5) Captions: short figure/table labels (not bold, not a table cell).
+        for i, b in enumerate(blocks):
+            if i in chart_idx or getattr(b, "bold", False) or getattr(b, "in_table", False):
+                continue
+            t = str(b.text).strip()
+            if len(t) <= 60 and _CAPTION_RE.match(t):
+                regions.append({"kind": "caption", "bbox": [b.x0, b.y0, b.x1, b.y1]})
+        return regions
+    return structure_fn
 
 
 def nearest_block(blocks: Sequence["Block"], bbox) -> "Block | None":

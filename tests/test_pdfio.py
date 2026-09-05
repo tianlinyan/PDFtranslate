@@ -1352,5 +1352,67 @@ class FormulaProtectionTest(unittest.TestCase):
         self.assertEqual(res["missing_count"], 0)
 
 
+class GeometricStructureTest(unittest.TestCase):
+    """The deterministic geometric structure backend (B-④/B-⑤ 'actually runs' offline)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _blocks(self):
+        # formula (2 math symbols), bold heading, one table with a label + an amount.
+        return [
+            pdfio.Block("x^2 + y^2 = z^2", page=0, x0=0, y0=0, x1=100, y1=20),
+            pdfio.Block("资产负债表", page=0, x0=0, y0=20, x1=100, y1=36,
+                        bold=True, single_line=True),
+            pdfio.Block("资产", page=0, x0=0, y0=40, x1=50, y1=60, in_table=True),
+            pdfio.Block("1,234.56", page=0, x0=50, y0=40, x1=100, y1=60, in_table=True),
+        ]
+
+    def _rich_doc(self):
+        blocks = self._blocks()
+        return pdfio.DocumentText(pages=[blocks], blocks=[b.text for b in blocks],
+                                  block_pages=[0, 0, 0, 0])
+
+    def test_geometric_structure_fn_detects_kinds(self):
+        sf = pdfio.make_geometric_structure_fn()
+        regions = sf(0, None, self._blocks())
+        kinds = {r["kind"] for r in regions}
+        self.assertIn("formula", kinds)
+        self.assertIn("heading", kinds)
+        self.assertIn("table", kinds)
+        tbl = next(r for r in regions if r["kind"] == "table")
+        self.assertTrue(tbl["cells"])   # a row/col grid was built
+
+    def test_build_structure_and_get_table_run_geometric(self):
+        dt = self._rich_doc()
+        src = build_sample_pdf(Path(self.tmp.name) / "geo.pdf", pages=1)
+        pdfio.build_structure(str(src), dt, pdfio.make_geometric_structure_fn(), parser="geo")
+        self.assertEqual(dt.structure_parser, "geo")
+        self.assertTrue(dt.page_structure and dt.page_structure[0].elements)
+        # The semantic table is now readable through get_table.
+        gt = pdfio.get_table(dt, 0, 0)
+        self.assertIsNotNone(gt)
+        self.assertEqual(gt["rows"], 1)
+        self.assertEqual(len(gt["cells"][0]), 2)
+        # get_doc_info reports the structure parser once present.
+        info = pdfio.get_doc_info(dt)
+        self.assertEqual(info["structure_parser"], "geo")
+
+    def test_extract_document_structured_runs_on_real_pdf(self):
+        # A real PDF with a formula-ish line: the one-call entry finds it.
+        import pymupdf as fitz
+        src = Path(self.tmp.name) / "formula.pdf"
+        d = fitz.open()
+        p = d.new_page(width=300, height=200)
+        p.insert_text((72, 80), "x^2 + y^2 = z^2", fontsize=12)
+        d.save(str(src))
+        d.close()
+        dt = pdfio.extract_document_structured(str(src), parser="geo")
+        self.assertEqual(dt.structure_parser, "geo")
+        kinds = {e["kind"] for ps in dt.page_structure for e in ps.elements}
+        self.assertIn("formula", kinds)
+
+
 if __name__ == "__main__":
     unittest.main()
