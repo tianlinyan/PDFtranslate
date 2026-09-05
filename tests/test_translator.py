@@ -884,6 +884,20 @@ class RetranslateBatchTest(unittest.TestCase):
                                        endpoint="http://127.0.0.1:9", model="m"))))
 
 
+class NeedsTranslationFormulaTest(unittest.TestCase):
+    """B-⑤: a detected formula block never needs translation (kept verbatim)."""
+
+    def test_needs_translation_skips_formula(self):
+        self.assertTrue(translator._needs_translation("hello world"))
+        self.assertFalse(translator._needs_translation("x^2 + y^2 = z^2"))
+        self.assertFalse(translator._needs_translation("∫_0^∞ e^{-x^2} dx = √π"))
+        self.assertFalse(translator._needs_translation("1,234.56"))
+
+    def test_needs_translation_keeps_prose_and_units(self):
+        self.assertTrue(translator._needs_translation("营业收入 合计"))
+        self.assertTrue(translator._needs_translation("GB/T 33436-2016"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -31,7 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from openai import (
     APIStatusError,
@@ -43,6 +43,7 @@ from openai import (
 )
 
 from . import prompts
+from .control import ControlSignal
 from .settings import ModelConfig
 
 #: Matches one ``[n]`` block in a model reply.  The block content may span
@@ -96,7 +97,7 @@ LogFn = Callable[[str], None]
 CancelFn = Callable[[], bool]
 
 
-class TranslationCancelled(Exception):
+class TranslationCancelled(ControlSignal):
     """Raised when a user cancels an in-flight translation."""
 
 
@@ -207,8 +208,18 @@ def _block_hash(text: str) -> str:
 
 
 def _needs_translation(text: str) -> bool:
-    """Return True if ``text`` contains letters and thus needs translation."""
-    return bool(_LETTERS_RE.search(text))
+    """Return True if ``text`` contains letters and thus needs translation.
+
+    A detected *formula* block (``pdfio._is_formula_block``) is deliberately
+    False: a math expression is content, not prose, so it is never sent to the
+    model and always exports verbatim.  ``pdfio`` is imported lazily because
+    ``pdfio`` imports this module (``from .translator import TranslationCancelled``);
+    a top-level ``from . import pdfio`` here would be circular.
+    """
+    if not _LETTERS_RE.search(text):
+        return False
+    from . import pdfio as _pdfio  # lazy: avoid pdfio↔translator circular import
+    return not _pdfio._is_formula_block(str(text))
 
 
 def _sleep_interruptible(seconds: float, cancel: CancelFn) -> None:
@@ -265,9 +276,13 @@ def clear_translation_cache() -> int:
 class TranslationEngine:
     """Wraps one AI model and translates a list of text blocks."""
 
-    def __init__(self, model: ModelConfig):
+    def __init__(self, model: ModelConfig, client: Any = None):
         self.model = model
-        self.client = OpenAI(**model.client_kwargs())
+        # A shared client may be injected so the agent layer can reuse ONE OpenAI
+        # client across the engine, the re-translate fns and the ``decide`` loop
+        # (fewer HTTP connection pools, cheaper connection setup) instead of each
+        # call site opening its own.
+        self.client = client if client is not None else OpenAI(**model.client_kwargs())
         # Guards the shared translation cache while batches complete concurrently.
         self._cache_lock = threading.Lock()
         # The cache *file* is rewritten by several finishing batches; serialize
@@ -785,18 +800,19 @@ _RETRANSLATE_PROMPT = (
 
 
 def make_retranslate_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
+    model: ModelConfig, log: Callable[[str], None] | None = None, client: Any = None
 ) -> Callable[[str, str], str] | None:
     """Return a direct single-text re-translation callback, or ``None`` if disabled.
 
     Signature ``(text, target_language) -> str``: sends one block to the model
     with a "translate only, never leave the source language" prompt (cache and
     number-protocol bypassed).  Best-effort — any failure returns the original
-    text, so a correction never makes a cell worse.
+    text, so a correction never makes a cell worse.  ``client`` (optional) reuses
+    a shared OpenAI client so the agent loop opens one connection pool, not several.
     """
     if not model.vision:
         return None
-    client = OpenAI(**model.client_kwargs())
+    client = client or OpenAI(**model.client_kwargs())
 
     def _retranslate(text: str, lang: str) -> str:
         try:
@@ -862,7 +878,8 @@ def _parse_retranslate_batch(text: str, n: int, sources: list[str]) -> list[str]
 
 
 def make_retranslate_batch_fn(
-    model: ModelConfig, log: Callable[[str], None] | None = None
+    model: ModelConfig, log: Callable[[str], None] | None = None, client: Any = None,
+    *, require_vision: bool = True,
 ) -> Callable[[list[str], str], list[str]] | None:
     """Return a direct *batch* re-translation callback, or ``None`` if disabled.
 
@@ -870,11 +887,18 @@ def make_retranslate_batch_fn(
     texts are sent in ONE numbered request, bypassing the translation cache, so the AI
     self-check can re-translate several problem blocks at once instead of one
     ``chat.completions`` per block.  Best-effort — a block that fails or is missed
-    keeps its source, so a correction never makes a cell worse.
+    keeps its source, so a correction never makes a cell worse.  ``client`` (optional)
+    reuses a shared OpenAI client so the agent loop opens one connection pool, not several.
+
+    ``require_vision`` defaults to True (the agent's visual self-check genuinely needs
+    a vision model).  The interaction-chat path passes ``require_vision=False``: it
+    re-translates *text* blocks (pure text→text) and must work even when the chosen
+    model is not visual, so the chat can honour "把第 3 页第 2 块重译一下" without a
+    full agent run.
     """
-    if not model.vision:
+    if require_vision and not model.vision:
         return None
-    client = OpenAI(**model.client_kwargs())
+    client = client or OpenAI(**model.client_kwargs())
 
     def _batch(texts: list[str], lang: str) -> list[str]:
         try:
