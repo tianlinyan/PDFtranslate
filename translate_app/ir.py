@@ -76,33 +76,27 @@ def _style_of(block: Block) -> dict:
             "bold": block.bold, "color": block.color}
 
 
-def _role_of(block: Block, structure: pdfio.PageStructure | None) -> tuple[str, int]:
+def _role_of(src_id: int, structure: pdfio.PageStructure | None) -> tuple[str, int]:
     """``(role, level)`` for a block, derived from the structure when present.
 
-    Without a structure the role is an ordinary ``text`` (a heading is *not*
-    guessed here — that stays heuristic and risk-free; the structure layer is the
-    authoritative source for formula / figure / caption).
+    Joins by *flat index membership* in an element's ``block_indices`` (the same the
+    ``read_page`` tool uses), so the two readers never disagree on a block's kind.
+    Without a structure the role is ordinary ``text``.
     """
     if structure is None:
         return "text", 0
-    # Join by flat index: the block's role comes from the element that claimed it.
     for el in structure.elements:
-        if block is not None:
-            # ``block`` carries its own page; match via the element's block_indices
-            # is done by src_id below (block itself is the anchor).  We re-derive
-            # role from the element whose bbox holds this block's centre.
-            if pdfio._point_in_bbox(block, el["bbox"]):
-                return str(el.get("kind", "text")), int(el.get("level", 0) or 0)
+        if src_id in el.get("block_indices", []):
+            return str(el.get("kind", "text")), int(el.get("level", 0) or 0)
     return "text", 0
 
 
-def _table_index_of(block: Block, structure: pdfio.PageStructure | None, page: int) -> int:
-    """The index into ``structure.tables`` claiming ``block`` (0 = none)."""
+def _table_index_of(src_id: int, structure: pdfio.PageStructure | None, page: int) -> int:
+    """The index into ``structure.tables`` claiming ``src_id`` (0 = none)."""
     if structure is None:
         return 0
     for ti, tbl in enumerate(structure.tables):
-        # Match by the block's centre against the table bbox.
-        if pdfio._point_in_bbox(block, tbl.bbox):
+        if src_id in tbl.block_ref:
             return ti + 1
     return 0
 
@@ -119,6 +113,7 @@ def build_ir(doc: DocumentText, *, lang: str = "", parser: str | None = None) ->
     ir = IRDoc(title=doc.title, lang=lang or pdfio.detect_language(doc.blocks),
                parser=parser if parser is not None else doc.structure_parser)
     group_counter = 0
+    table_group: dict[tuple, int] = {}   # (page, table_ref) -> unique group id
 
     for p, blocks in enumerate(doc.pages):
         structure = doc.page_structure[p] if p < len(doc.page_structure) else None
@@ -138,17 +133,21 @@ def build_ir(doc: DocumentText, *, lang: str = "", parser: str | None = None) ->
         last_group_was_table = False
         for i, b in enumerate(blocks):
             src_id = offset + i
-            role, level = _role_of(b, structure)
-            table_ref = _table_index_of(b, structure, p)
+            role, level = _role_of(src_id, structure)
+            table_ref = _table_index_of(src_id, structure, p)
             style = _style_of(b)
-            in_table = table_ref > 0
+            in_table = table_ref > 0 or bool(getattr(b, "in_table", False))
 
             if in_table:
-                # Every cell of a table shares that table's group (a table is one unit).
-                group_id = 1000 + table_ref  # table groups stay above prose groups
-                group_counter = max(group_counter, group_id)
+                # Every cell of a table shares that table's group; group ids are
+                # unique per (page, table) so two pages' tables never collide.
+                key = (p, table_ref) if table_ref else (p, id(b))
+                if key not in table_group:
+                    group_counter += 1
+                    table_group[key] = group_counter
+                group_id = table_group[key]
                 last_group_was_table = True
-                if role == "text":
+                if role in ("text", "table"):
                     role = "table_cell"
             else:
                 # Group a run of same-style prose (a paragraph the extractor split).
@@ -232,8 +231,10 @@ def infer_terms(ir: IRDoc, *, max_terms: int = 80) -> list[str]:
             if is_structural_role(b.role) or _is_verbatim(b.anchor):
                 continue
             t = str(b.text)
-            for m in re.finditer(r"[\u4e00-\u9fff]{2,4}", t):
-                cjk[m.group(0)] += 1
+            for m in re.finditer(r"[\u4e00-\u9fff]+", t):
+                run = m.group(0)
+                if 2 <= len(run) <= 4:   # a term is short; a long CJK run is prose
+                    cjk[run] += 1
             for w in re.findall(r"\b[A-Z][a-z]{2,}\b|\b[A-Z]{3,}\b", t):
                 latin[w] += 1
     cands = [t for t, n in cjk.items() if n >= 2]
@@ -276,8 +277,15 @@ def translate_ir(
         terms = infer_terms(ir)
         if terms:
             got = translate_fn(terms, lang=lang, extra_glossary={})
-            if len(got) == len(terms):
-                glossary = {s: str(t) for s, t in zip(terms, got) if str(t).strip()}
+            if len(got) != len(terms):
+                if log:
+                    log(f"[ir] 术语批量返回 {len(got)} 条，与 {len(terms)} 条候选不符，跳过术语注入。")
+            else:
+                # Only keep a term whose translation actually differs (a model that
+                # fails and echoes the source would otherwise pin `s -> s`, suppressing
+                # that term's normal translation in the main batch).
+                glossary = {s: str(t) for s, t in zip(terms, got)
+                            if str(t).strip() and str(t).strip() != s}
                 ir.terms = glossary
     requests: list[tuple[int, str]] = []
     out: dict[int, str] = {}
@@ -297,23 +305,55 @@ def translate_ir(
     return out
 
 
+class _BoundTranslate:
+    """A callable ``translate_fn`` that also surfaces the last batch's ``errors``.
+
+    ``translate_ir`` only sees a callable, but the worker needs to know which blocks
+    failed every retry (so it can warn instead of silently exporting the source).
+    """
+
+    def __init__(self, fn: Callable[..., Sequence[str]], errors: list):
+        self._fn = fn
+        self._errors = errors
+
+    def __call__(self, texts: Sequence[str], *, lang: str,
+                 extra_glossary: dict[str, str] | None = None):
+        return self._fn(texts, lang=lang, extra_glossary=extra_glossary)
+
+    @property
+    def last_errors(self) -> list:
+        return list(self._errors)
+
+
 def make_ir_translate_fn(engine, *, doc_path: "Path | None" = None,
-                         log: Callable[[str], None] | None = None):
+                         log: Callable[[str], None] | None = None,
+                         cancel: Callable[[], bool] | None = None,
+                         on_progress: Callable[[int, int], None] | None = None,
+                         resume: bool = True,
+                         keep_original: "set[int] | None" = None):
     """Bind a real ``TranslationEngine`` as a ``translate_fn`` for :func:`translate_ir`.
 
     The returned callable does one ``translate_blocks`` for all texts in a single
     batch (with ``extra_glossary`` merged over the on-disk glossary), sharing the
-    engine's client / concurrency / cache.  ``doc_path`` enables the on-disk
-    glossary and cache keying.
+    engine's client / concurrency / cache.  Unlike the deterministic path it used to
+    drop ``cancel`` / ``on_progress`` / ``errors`` / ``resume`` / ``keep_original``
+    — this now forwards them so a user cancellation interrupts the in-flight request
+    (not just after a full batch), progress is reported, and failed batches surface
+    via :attr:`_BoundTranslate.last_errors`.
     """
+    errors: list = []
+
     def _translate(texts: Sequence[str], *, lang: str,
                    extra_glossary: dict[str, str] | None = None):
         result = engine.translate_blocks(
             list(texts), lang, log=log or (lambda m: None),
-            doc_path=doc_path, resume=False, extra_glossary=extra_glossary,
+            on_progress=on_progress, cancel=cancel, doc_path=doc_path,
+            resume=resume, keep_original=keep_original, extra_glossary=extra_glossary,
         )
+        errors[:] = list(getattr(result, "errors", None) or [])
         return list(result.translated)
-    return _translate
+
+    return _BoundTranslate(_translate, errors)
 
 
 def per_page_from_ir(ir: IRDoc, translated: dict[int, str]) -> tuple[list[list[Block]], list[list[str]]]:
@@ -354,6 +394,8 @@ def save_ir(
     rule instead of re-implementing a typesetter.  ``mode`` is one of the
     ``OUTPUT_TYPES`` PDF keys (``translated_pdf`` | ``bilingual_pdf``).
     """
+    if mode not in ("translated_pdf", "bilingual_pdf"):
+        raise ValueError(f"save_ir 仅支持 PDF 输出，收到 {mode!r}")
     pages, per_page = per_page_from_ir(ir, translated)
     if mode == "bilingual_pdf":
         pdfio.save_interleaved_pdf(str(src_path), per_page, str(out_path), lang, pages=pages)

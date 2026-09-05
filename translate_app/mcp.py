@@ -32,7 +32,8 @@ def make_mcp_tools(translate_fn: Callable[..., Sequence[str]]) -> dict[str, Call
                        output_type: str = "translated_pdf",
                        output_path: str | None = None) -> dict:
         if output_type not in ("translated_pdf", "bilingual_pdf"):
-            return {"ok": False, "error": f"未知输出格式：{output_type!r}"}
+            return {"ok": False,
+                    "error": f"暂不支持的输出格式 {output_type!r}（仅 translated_pdf / bilingual_pdf）"}
         try:
             out, doc_ir, translated = run_ir_pipeline(
                 Path(path), lang=target_language, translate_fn=translate_fn,

@@ -1434,6 +1434,26 @@ class GeometricStructureTest(unittest.TestCase):
         finally:
             pdfio._OCR_BACKENDS.pop("vlm", None)
 
+    def test_get_table_page1_uses_flat_offset(self):
+        # A table on page 1 must produce *flat* cells (offset added): page-local
+        # index 0/1 become flat 2/3 when page 0 has 2 blocks.
+        def structure_fn(page_index, page, blocks):
+            if page_index != 1 or not blocks:
+                return []
+            bbox = [blocks[0].x0, blocks[0].y0, blocks[-1].x1, blocks[-1].y1]
+            return [{"kind": "table", "bbox": bbox, "cells": [[0, 1]]}]
+        p0 = [pdfio.Block("a", page=0, x0=0, y0=0, x1=10, y1=10),
+              pdfio.Block("b", page=0, x0=0, y0=10, x1=10, y1=20)]
+        p1 = [pdfio.Block("c", page=1, x0=0, y0=0, x1=50, y1=20, in_table=True),
+              pdfio.Block("d", page=1, x0=50, y0=0, x1=100, y1=20, in_table=True)]
+        dt = pdfio.DocumentText(pages=[p0, p1], blocks=["a", "b", "c", "d"],
+                                block_pages=[0, 0, 1, 1])
+        src = build_sample_pdf(Path(self.tmp.name) / "off.pdf", pages=2)
+        pdfio.build_structure(str(src), dt, structure_fn, parser="mock")
+        gt = pdfio.get_table(dt, 1, 0)
+        self.assertIsNotNone(gt)
+        self.assertEqual(gt["cells"][0], [2, 3])   # page-local 0,1 + offset 2
+
 
 if __name__ == "__main__":
     unittest.main()

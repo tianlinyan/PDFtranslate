@@ -501,8 +501,9 @@ class IrModeWorkerTest(_WorkerTestBase):
                 self.translated = list(trans)
                 self.errors = []
         class E:
-            def translate_blocks(self, blocks, lang, *, log=None, doc_path=None,
-                                 resume=True, extra_glossary=None):
+            def translate_blocks(self, blocks, lang, *, log=None, on_progress=None,
+                                 cancel=None, doc_path=None, resume=True,
+                                 keep_original=None, extra_glossary=None):
                 trans = ["T|" + b for b in blocks]
                 return R(blocks, trans)
         return E()

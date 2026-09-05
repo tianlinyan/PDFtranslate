@@ -137,7 +137,12 @@ def _make_judge_fn(model_id: str):
     sys_prompt = ("你是译文质量评审。比较源代码与译文，就【忠实度/术语一致/可读性】给 0-100 分。"
                   "只输出一个 0-100 的数字，不要任何其它文字。")
     request_params = model.request_params() if hasattr(model, "request_params") else {}
-    temperature = getattr(model, "temperature", 0.0)
+    # LLM-as-judge must be deterministic and must NOT invoke tool selection, and the
+    # model's own request_params (reasoning_effort etc.) belong in ``extra_body``.
+    request_params.pop("tool_choice", None)
+    request_params.pop("tools", None)
+    body = dict(request_params)
+    kwargs = {"extra_body": body} if body else {}
 
     def judge_fn(page: int, src_text: str, tgt_text: str) -> float:
         resp = client.chat.completions.create(
@@ -146,8 +151,8 @@ def _make_judge_fn(model_id: str):
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": f"源文：\n{src_text[:4000]}\n\n译文：\n{tgt_text[:4000]}"},
             ],
-            temperature=temperature,
-            **request_params,
+            temperature=0.0,
+            **kwargs,
         )
         content = (resp.choices[0].message.content or "0")
         m = _re.search(r"(\d{1,3}(?:\.\d+)?)", content)

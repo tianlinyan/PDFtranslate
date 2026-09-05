@@ -494,6 +494,12 @@ def interpret_decision(answer: Any) -> str:
     v = str(answer or "").strip().lower()
     if any(k in v for k in ("跳过", "略过", "停")) or v.startswith("skip") or v in ("skipped", "none"):
         return "skip"
+    # "保留公式/图表并翻译说明/图注/文字" explicitly asks to translate the prose /
+    # captions while KEEPING the structural blocks.  On a special page that is
+    # ``translate`` (the engine keeps formula / figure / chart blocks verbatim), so it
+    # must NOT be swallowed by the lone "保留" keep-match below.
+    if "保留" in v and any(k in v for k in ("翻译", "译", "说明", "图注", "表注", "文字", "标题")):
+        return "translate"
     if any(k in v for k in ("保留", "原样", "不动", "不翻", "别译", "不用", "维持")):
         return "keep"
     if any(k in v for k in ("翻译", "ocr", "转成", "译成", "换成")) or v.startswith("translate"):

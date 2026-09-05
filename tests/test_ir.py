@@ -115,19 +115,41 @@ class TranslateIrTest(unittest.TestCase):
         class FakeEngine:
             def __init__(self):
                 self.captured = None
-            def translate_blocks(self, blocks, lang, *, log=None, doc_path=None,
-                                 resume=True, extra_glossary=None):
-                self.captured = (lang, doc_path, extra_glossary)
+            def translate_blocks(self, blocks, lang, *, log=None, on_progress=None,
+                                 cancel=None, doc_path=None, resume=True,
+                                 keep_original=None, extra_glossary=None,
+                                 errors=None):
+                self.captured = (lang, doc_path, extra_glossary, on_progress, cancel, keep_original)
                 class R: pass
                 r = R()
                 r.translated = ["T|" + b for b in blocks]
+                r.errors = [["bad"]]
                 return r
         engine = FakeEngine()
-        fn = ir.make_ir_translate_fn(engine, doc_path=Path("/x"), log=lambda m: None)
+        fn = ir.make_ir_translate_fn(engine, doc_path=Path("/x"), log=lambda m: None,
+                                     on_progress=lambda d, t: None,
+                                     cancel=lambda: False, keep_original={0})
         out = fn(["a", "b"], lang="English", extra_glossary={"k": "v"})
         self.assertEqual(out, ["T|a", "T|b"])
         self.assertEqual(engine.captured[1], Path("/x"))
         self.assertEqual(engine.captured[2], {"k": "v"})
+        # The factory forwards cancel / progress / keep_original and surfaces errors.
+        self.assertTrue(callable(engine.captured[3]))    # on_progress
+        self.assertTrue(callable(engine.captured[4]))    # cancel
+        self.assertEqual(engine.captured[5], {0})
+        self.assertEqual(fn.last_errors, [["bad"]])
+
+    def test_save_ir_rejects_non_pdf_mode(self):
+        from translate_app import ir as ir_mod
+        import pymupdf as fitz
+        from translate_app.pdfio import DocumentText, Block
+        src = Path(tempfile.mkdtemp()) / "x.pdf"
+        d = fitz.open(); d.new_page(); d.save(str(src)); d.close()
+        dt = DocumentText(pages=[[Block("a", 0, 0, 0, 10, 10)]], blocks=["a"])
+        doc_ir = ir_mod.build_ir(dt)
+        with self.assertRaises(ValueError):
+            ir_mod.save_ir(str(src), str(Path(tempfile.mkdtemp()) / "o.pdf"),
+                           doc_ir, {0: "b"}, lang="English", mode="markdown")
 
 
 class InferTermsTest(unittest.TestCase):

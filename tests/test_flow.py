@@ -260,6 +260,20 @@ class RegistryTest(unittest.TestCase):
         for answer, want in cases.items():
             self.assertEqual(want, agent.interpret_decision(answer), answer)
 
+    def test_interpret_decision_keep_but_translate_captions(self):
+        # "保留公式/图表并翻译说明/图注" -> translate (the engine keeps structural
+        # blocks verbatim, so translate = translate the prose/caption only).  This must
+        # NOT be swallowed by the lone "保留" keep-match.
+        cases = {"保留公式并翻译说明": "translate",
+                 "保留图表并翻译图注": "translate",
+                 "保留公式并译文字": "translate",
+                 "保留原文": "keep",
+                 "翻译图注": "translate",
+                 "整页翻译": "translate",
+                 "跳过": "skip"}
+        for answer, want in cases.items():
+            self.assertEqual(want, agent.interpret_decision(answer), answer)
+
     def test_self_check_page_step_kinds_in_order(self):
         # The audit→fix→re-audit rounds live inside ONE ``LoopStep`` (until clean, up to
         # ``max_iter``): a fix that leaves residual issues is fixed again on the next

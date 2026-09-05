@@ -312,11 +312,20 @@ class TranslateWorker(QObject):
         src_texts = list(doc.blocks)
         doc_ir = ir_mod.build_ir(doc, lang=self._lang)
         translate_fn = ir_mod.make_ir_translate_fn(
-            engine, doc_path=Path(self._source), log=lambda m: self.log.emit(m))
+            engine, doc_path=Path(self._source), log=lambda m: self.log.emit(m),
+            cancel=lambda: self._cancelled.is_set(),
+            on_progress=lambda d, t: self.progress.emit(d, t, "翻译中…"),
+            resume=True,
+        )
+        # IR-level translation with document-level terminology (infer=True: extract
+        # and translate repeated terms once, then inject as the cross-page glossary).
         translated = ir_mod.translate_ir(
-            doc_ir, translate_fn, lang=self._lang, log=lambda m: self.log.emit(m))
+            doc_ir, translate_fn, lang=self._lang,
+            log=lambda m: self.log.emit(m), infer=True)
         out_texts = [str(translated.get(i, src_texts[i])) for i in range(len(src_texts))]
-        return TranslationResult(blocks=src_texts, translated=out_texts)
+        result = TranslationResult(blocks=src_texts, translated=out_texts)
+        result.errors = list(translate_fn.last_errors)
+        return result
 
     def add_user_requirement(self, text: str) -> None:
         """Inject a sidebar free-text message into the running AI agent.

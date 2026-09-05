@@ -351,12 +351,25 @@ def _fuse_structure(
     """
     elements: list[dict] = []
     tables: list[StructTable] = []
+    claimed: set[int] = set()   # already-claimed flat indices (single assignment)
     for reg in regions or []:
         bbox = reg.get("bbox")
         if not bbox or len(bbox) != 4:
             continue  # a region without usable geometry is dropped (not silent harm)
-        inds = sorted({offset + i for i, b in enumerate(blocks) if _point_in_bbox(b, bbox)})
         kind = str(reg.get("kind", "text"))
+        # Honour a backend-provided ``block_indices`` (page-local) when present —
+        # e.g. the geometric backend pinpoints a chart's node labels precisely —
+        # otherwise derive them from the bbox.  Either way a block is claimed by
+        # the FIRST region that takes it, so ``read_page`` and the IR ``_role_of``
+        # never disagree on one block's kind.
+        raw_inds = reg.get("block_indices", None)
+        if isinstance(raw_inds, list) and raw_inds:
+            inds_raw = sorted({int(x) for x in raw_inds if int(x) >= 0})
+            inds = sorted({offset + x for x in inds_raw if x < len(blocks)})
+        else:
+            inds = sorted({offset + i for i, b in enumerate(blocks) if _point_in_bbox(b, bbox)})
+        inds = [x for x in inds if x not in claimed]
+        claimed.update(inds)
         element = {
             "kind": kind,
             "bbox": list(bbox),
@@ -390,6 +403,7 @@ def build_structure(
     """
     doc = fitz.open(str(path))
     try:
+        dt.page_structure = []   # idempotent: rebuild from scratch on each call
         for p in range(dt.page_count):
             blocks = dt.pages[p] if p < len(dt.pages) else []
             offset = sum(len(pg) for pg in dt.pages[:p])
