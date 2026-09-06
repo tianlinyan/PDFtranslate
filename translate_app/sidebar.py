@@ -11,12 +11,14 @@ from __future__ import annotations
 import threading
 from typing import Callable
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -121,6 +123,49 @@ class _AskRow(QWidget):
         box.addWidget(field)
 
 
+class _ChatInput(QPlainTextEdit):
+    """A plain-text chat input that wraps and auto-grows to ~``max_lines`` lines.
+
+    Enter submits (without Shift); Shift+Enter inserts a newline.  The box grows with
+    its content up to ``max_lines``, then keeps that height and scrolls internally —
+    the classic multi-line chat input.  Emits :attr:`submitted` on Enter.
+    """
+
+    submitted = pyqtSignal()
+
+    def __init__(self, max_lines: int = 3, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._max_lines = max(1, int(max_lines))
+        self.setPlaceholderText("随时提问或给要求…（Enter 发送，Shift+Enter 换行）")
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.textChanged.connect(self._resize_to_content)
+        self._resize_to_content()
+
+    def keyPressEvent(self, event) -> None:
+        if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+            self.submitted.emit()
+            return
+        super().keyPressEvent(event)
+
+    def _resize_to_content(self) -> None:
+        # Grow with the WRAPPED content up to ``max_lines``; beyond that keep the
+        # capped height (the scrollbar handles overflow).  ``document().size()`` is
+        # unreliable for wrapped text, so count the visual lines per block layout.
+        line_h = self.fontMetrics().height()
+        margin = 2 * int(self.document().documentMargin())
+        total_lines = 0
+        block = self.document().begin()
+        while block.isValid():
+            lay = block.layout()
+            total_lines += lay.lineCount() if lay is not None else 1
+            block = block.next()
+        lines = min(self._max_lines, max(1, total_lines))
+        self.setFixedHeight(line_h * lines + margin + 4)
+
+
 class SidebarChat(QWidget):
     """Non-blocking AI chat sidebar: log + free-text input + agent questions."""
 
@@ -138,11 +183,12 @@ class SidebarChat(QWidget):
         self._log.setReadOnly(True)
         self._log.setPlaceholderText("AI 对话记录…")
 
-        self._input = QLineEdit()
-        self._input.setPlaceholderText("随时提问或给要求…")
-        self._input.returnPressed.connect(self._send)
+        self._input = _ChatInput()
+        self._input.submitted.connect(self._send)
         self.send_btn = QPushButton("发送")
         self.send_btn.clicked.connect(self._send)
+        # Match the send button to the taller multi-line input (it grows with it).
+        self.send_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
 
         self._asks_box = QWidget()
         self._asks_box.setMinimumHeight(44)   # keep agent-question buttons visible
@@ -151,7 +197,7 @@ class SidebarChat(QWidget):
 
         input_row = QHBoxLayout()
         input_row.addWidget(self._input, 1)
-        input_row.addWidget(send_btn)
+        input_row.addWidget(self.send_btn)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._log, 1)
@@ -221,7 +267,7 @@ class SidebarChat(QWidget):
             self.cancelRequested.emit()
             self.set_busy(False)
             return
-        text = self._input.text().strip()
+        text = self._input.toPlainText().strip()
         if not text:
             return
         self._input.clear()
