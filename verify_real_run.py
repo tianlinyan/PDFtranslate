@@ -12,7 +12,7 @@ import fitz
 
 sys.path.insert(0, ".")
 from translate_app import pdfio
-from translate_app.settings import ModelConfig
+from translate_app.settings import load_models
 from translate_app.translator import TranslationEngine
 
 SRC = "annual report - Mintai Commercial Bank 2025.pdf"
@@ -23,8 +23,7 @@ font = fitz.Font("cjk")
 
 
 def main():
-    raw = json.load(open("models.json", encoding="utf-8"))["models"]
-    model = ModelConfig.from_dict(next(m for m in raw if m["id"] == "qwen3.8"))
+    model = next(m for m in load_models() if m.id == "qwen3.8-local")
     print("model:", model.name, model.endpoint)
 
     dt = pdfio.extract_document_text(SRC, ocr=True, log=lambda s: None)

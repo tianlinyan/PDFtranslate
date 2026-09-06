@@ -242,15 +242,9 @@ def infer_terms(ir: IRDoc, *, max_terms: int | None = None) -> list[str]:
                 latin[w] += 1
     cands = [t for t, n in cjk.items() if n >= _INFER_MIN_FREQ]
     cands += [w for w, n in latin.items() if n >= _INFER_MIN_FREQ]
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in cands:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
-        if len(out) >= (max_terms or _INFER_MAX_TERMS):
-            break
-    return out
+    # ``cands`` is already unique (CJK runs and Latin words are disjoint key sets),
+    # so de-duplication is redundant; just cap the count.
+    return cands[:(max_terms or _INFER_MAX_TERMS)]
 
 
 def translate_ir(

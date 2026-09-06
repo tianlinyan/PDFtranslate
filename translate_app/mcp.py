@@ -18,6 +18,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Sequence
 
+from . import __version__
+
 
 def make_mcp_tools(translate_fn: Callable[..., Sequence[str]]) -> dict[str, Callable]:
     """The headless PDFtranslate tools exposed over MCP (plain callables).
@@ -63,12 +65,13 @@ def make_mcp_tools(translate_fn: Callable[..., Sequence[str]]) -> dict[str, Call
 
 
 def create_mcp_server(translate_fn: Callable[..., Sequence[str]], *,
-                      name: str = "pdftranslate", version: str = "0.3.8"):
+                      name: str = "pdftranslate", version: str | None = None):
     """Wrap :func:`make_mcp_tools` in an MCP ``FastMCP`` server (A-①).
 
     Lazily imports ``mcp``; when unavailable (or the ``mcp`` package is missing),
     returns ``None`` so the caller can report "MCP 未安装" instead of failing.
     """
+    version = __version__ if version is None else version
     try:
         from mcp.server.fastmcp import FastMCP
     except ImportError:

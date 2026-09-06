@@ -21,7 +21,7 @@ import pymupdf as fitz
 sys.path.insert(0, ".")
 from translate_app import pdfio, prompts
 from translate_app.agent import flow, WorkflowState
-from translate_app.settings import ModelConfig
+from translate_app.settings import load_models
 from translate_app.translator import TranslationEngine, _needs_translation
 
 SRC = "test_mintai_sample.pdf"
@@ -36,8 +36,7 @@ state = None
 
 def _load():
     global model, state
-    raw = json.load(open("models.json", encoding="utf-8"))["models"]
-    model = ModelConfig.from_dict(next(m for m in raw if m["id"] == "qwen3.8"))
+    model = next(m for m in load_models() if m.id == "qwen3.8-local")
     print("model:", model.name, model.endpoint, "vision=", bool(getattr(model, "vision", False)))
     dt = pdfio.extract_document_text(SRC, ocr=False, log=lambda m: print("  [ext]", m))
     state = flow.WorkflowState(SRC, TARGET)
