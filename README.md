@@ -1,6 +1,6 @@
 # PDFtranslate
 
-> 当前版本：**v0.4.1**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
+> 当前版本：**v0.4.2**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
 > 各阶段性设计见 `docs/`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
@@ -105,7 +105,7 @@ python main.py "C:\path\to\doc.pdf"
 
 > 一份**调优过、带全字段**的样板见 `models.example.json`。
 
-## 调优建议（0.4.1）
+## 调优建议（0.4.2）
 
 **按场景配 `models.json`**
 
@@ -138,7 +138,7 @@ python main.py "C:\path\to\doc.pdf"
   按模型提高并发数和/或加大 `batch_size`（减少请求次数），进度条仍按已完成
   块数实时更新。
 * **跳过无文字块**：页码、分隔线等纯数字/符号块不发送给模型，原样保留。
-* **语义结构 / IR 开关（0.4.1，默认关）**：`PDFTRANSLATE_STRUCTURE_MODE=1` 让提取带
+* **语义结构 / IR 开关（0.4.2，默认关）**：`PDFTRANSLATE_STRUCTURE_MODE=1` 让提取带
   语义结构（公式/图/标题/图注/表格，几何后端、离线无模型）；`PDFTRANSLATE_IR_MODE=1`
   让翻译走 **IR 文档级管线**（`build_ir→translate_ir→导出`，无交互批处理，公式/数字保真、
   术语跨页一致）。二者默认都关、行为不变；设置后需**新开终端**才生效。
