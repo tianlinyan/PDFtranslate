@@ -8,7 +8,7 @@
       "model": "qwen3.8-27b",
       "vision": true,
       "reasoning_effort": "low",
-      "temperature": 0.3,
+      "temperature": 0.2,
       "concurrency": 1,
       "page_concurrency": 1,
       "batch_size": 8000,
