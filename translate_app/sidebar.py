@@ -140,8 +140,9 @@ class _ChatInput(QPlainTextEdit):
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.textChanged.connect(self._resize_to_content)
-        self._resize_to_content()
+        # A FIXED ~3-row tall input: it visibly holds 3 lines even when empty, wraps
+        # long text, and scrolls internally for more.
+        self.setFixedHeight(self._height_for(self._max_lines))
 
     def keyPressEvent(self, event) -> None:
         if (event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
@@ -150,20 +151,9 @@ class _ChatInput(QPlainTextEdit):
             return
         super().keyPressEvent(event)
 
-    def _resize_to_content(self) -> None:
-        # Grow with the WRAPPED content up to ``max_lines``; beyond that keep the
-        # capped height (the scrollbar handles overflow).  ``document().size()`` is
-        # unreliable for wrapped text, so count the visual lines per block layout.
-        line_h = self.fontMetrics().height()
-        margin = 2 * int(self.document().documentMargin())
-        total_lines = 0
-        block = self.document().begin()
-        while block.isValid():
-            lay = block.layout()
-            total_lines += lay.lineCount() if lay is not None else 1
-            block = block.next()
-        lines = min(self._max_lines, max(1, total_lines))
-        self.setFixedHeight(line_h * lines + margin + 4)
+    def _height_for(self, lines: int) -> int:
+        return int(lines * self.fontMetrics().height()
+                   + 2 * self.document().documentMargin() + 4)
 
 
 class SidebarChat(QWidget):
