@@ -558,6 +558,64 @@ class TranslatorTest(unittest.TestCase):
             for chunk in chunks:
                 self.assertEqual(len(chunk), 1)
 
+    def test_max_blocks_per_batch_caps_chunk_size(self):
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+                batch_size=10_000,        # char budget is plenty
+                max_blocks_per_batch=3,   # but cap blocks at 3 per request
+            )
+            engine = TranslationEngine(model)
+            chunks = engine._make_chunks(BLOCKS, index_filter=lambda _i: True)
+            # Every chunk honours the block-count cap; total blocks preserved.
+            self.assertTrue(all(len(c) <= 3 for c in chunks))
+            self.assertEqual(sorted(sum(chunks, [])), list(range(len(BLOCKS))))
+
+    def test_batch_splits_on_misalignment_and_recovers_single(self):
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            calls: list[int] = []
+            # Multi-block batches come back misaligned (missing the last marker) →
+            # the engine splits them; single blocks come back fine.
+            def fake_request(prompt: str, _system: str) -> str:
+                n = prompt.count("[[")
+                calls.append(n)
+                if n == 1:
+                    return "[[1]] OK-ONE"
+                return "".join(f"[[{i}]] x{i}\n" for i in range(1, n))  # 缺最后一块
+            engine._request_locked = fake_request
+            translated, ok = engine._translate_batch(
+                [0, 1], ["a", "b"], "English", log=lambda m: None,
+                cancel=lambda: False, retry_delays=(0, 0), abort=None, glossary=None)
+            self.assertTrue(ok)
+            self.assertEqual(["OK-ONE", "OK-ONE"], translated)
+            # Degraded: first attempt 2 blocks, then two 1-block attempts.
+            self.assertIn(2, calls)
+            self.assertGreaterEqual(calls.count(1), 2)
+
+    def test_batch_keeps_source_when_even_single_block_fails(self):
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model",
+            )
+            engine = TranslationEngine(model)
+            def always_empty(_prompt: str, _system: str) -> str:
+                return "[[1]] "          # empty translation → rejected
+            engine._request_locked = always_empty
+            translated, ok = engine._translate_batch(
+                [0, 1], ["a", "b"], "English", log=lambda m: None,
+                cancel=lambda: False, retry_delays=(0, 0), abort=None, glossary=None)
+            # No loss: both blocks keep their source, and it must terminate (no infinite
+            # recursion — single blocks are the base case).
+            self.assertFalse(ok)
+            self.assertEqual(["a", "b"], translated)
+
     def test_temperature_and_max_tokens_sent(self):
         with MockServer() as server:
             model = ModelConfig(

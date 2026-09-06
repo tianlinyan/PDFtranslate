@@ -1,17 +1,18 @@
 {
   "models": [
     {
-      "id": "qwen3.8",
-      "name": "qwen3.8",
+      "id": "qwen3.8-local",
+      "name": "qwen3.8（本地）",
       "type": "llama-server",
       "endpoint": "http://192.168.0.19:8888/v1/chat/completions",
       "model": "qwen3.8-27b",
       "vision": true,
       "reasoning_effort": "low",
-      "temperature": 0.2,
-      "concurrency": 2,
+      "temperature": 0.3,
+      "concurrency": 1,
       "page_concurrency": 1,
       "batch_size": 8000,
+      "max_blocks_per_batch": 40,
       "interaction_temperature": 0.6,
       "interaction_reasoning_effort": "medium"
     },

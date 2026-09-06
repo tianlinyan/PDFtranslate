@@ -46,9 +46,9 @@ from . import prompts
 from .control import ControlSignal
 from .settings import ModelConfig
 
-#: Matches one ``[n]`` block in a model reply.  The block content may span
+#: Matches one ``[[n]]`` block in a model reply.  The block content may span
 #: several lines (some models wrap long translations); everything up to the
-#: next ``[n]`` marker (or the end of the reply) belongs to this block.
+#: next ``[[n]]`` marker (or the end of the reply) belongs to this block.
 _MULTI_BLOCK_RE = re.compile(r"(?ms)^\s*\[\[(\d+)\]\]\s*(.*?)(?=^\s*\[\[\d+\]\]\s*|\Z)")
 
 #: Default source-character budget per batch request.  Kept modest so a single
@@ -463,30 +463,80 @@ class TranslationEngine:
         abort: threading.Event | None = None,
         glossary: dict[str, str] | None = None,
     ) -> tuple[list[str], bool]:
-        """Translate one batch; returns ``(translations, ok)``.
+        """Translate one batch, auto-degrading to smaller sub-batches on failure.
 
-        ``ok`` is False when every attempt failed — the source text is then
-        preserved (content is never dropped) but must NOT be written to the
-        cache, or a transient outage would poison it permanently.
+        Tries the batch at full size (see :meth:`_translate_batch_attempt`).  If the model
+        fails to align it (missing/duplicate/empty markers) or a transient error exhausts the
+        retries, the batch is SPLIT in half and each half is translated recursively — down to
+        single blocks, which a model can reliably echo.  This keeps the fast batched path when
+        the model complies, yet never loses content: a block that still fails at single-block
+        size keeps its source.  Degradation is **per-batch, not global**: the next batch (new
+        blocks) starts again at full size, so a run never stays permanently downgraded.
+        """
+        try:
+            translated, ok, splittable = self._translate_batch_attempt(
+                indices, blocks, language, log, cancel, retry_delays, abort, glossary)
+        except (TranslationCancelled, TranslationAborted):
+            raise
+        if ok:
+            return translated, True
+        # Only split a *marker-based* failure (the model echoed some ``[[n]]`` but
+        # misaligned / left an empty translation) — smaller batches help there.  A
+        # marker-free reply (a refusal / unstructured text) must NOT be split: at
+        # single-block size the line-count fallback would accept the refusal text as
+        # a translation.  Degradation is per-batch, so the next batch recovers.
+        if splittable and len(indices) > 1:
+            mid = len(indices) // 2
+            log(f"  批量未对齐，拆分为 {mid}+{len(indices) - mid} 个子批继续（单块兜底）。")
+            left, lok = self._translate_batch(
+                indices[:mid], blocks, language, log, cancel, retry_delays, abort, glossary)
+            right, rok = self._translate_batch(
+                indices[mid:], blocks, language, log, cancel, retry_delays, abort, glossary)
+            return left + right, lok and rok
+        return translated, False
 
-        A fatal configuration error raises :class:`TranslationAborted` and sets
-        ``abort`` so the batches still queued behind it return immediately
-        instead of repeating the same doomed request.
+    def _translate_batch_attempt(
+        self,
+        indices: Sequence[int],
+        blocks: Sequence[str],
+        language: str,
+        log: LogFn,
+        cancel: CancelFn,
+        retry_delays: Sequence[float] = _TRANSIENT_RETRY_DELAYS,
+        abort: threading.Event | None = None,
+        glossary: dict[str, str] | None = None,
+    ) -> tuple[list[str], bool, bool]:
+        """Translate one batch; returns ``(translations, ok, splittable)``.
+
+        ``ok`` is False when every attempt failed — the source text is then preserved
+        (content is never dropped) but must NOT be written to the cache, or a transient
+        outage would poison it permanently.  ``splittable`` is True only when the failure was
+        a **marker-based** misalignment / empty translation (the reply echoed `[[n]]` markers
+        but got the count/text wrong): splitting into smaller sub-batches helps the model
+        there.  A **marker-free** reply (a refusal / unstructured text) is NOT splittable —
+        at single-block size the line-count fallback would accept the refusal as a
+        translation.  A transient network error is splittable too (last-resort to avoid loss).
+
+        A fatal configuration error raises :class:`TranslationAborted` and sets ``abort``
+        so the batches still queued behind it return immediately instead of repeating the
+        same doomed request.
         """
         prompt = self._build_prompt(blocks, indices)
         system = self._system_prompt(language, glossary)
         attempts = len(retry_delays) + 1
         last_error: Exception | None = None
+        last_had_markers = False
         for attempt in range(1, attempts + 1):
             if cancel():
                 raise TranslationCancelled()
             if abort is not None and abort.is_set():
                 # Another batch already hit a fatal error; this run is over.
-                return [blocks[i] for i in indices], False
+                return [blocks[i] for i in indices], False, False
             try:
                 raw = self._request_locked(prompt, system)
+                last_had_markers = bool(raw and "[[" in raw)
                 # Either returns exactly ``len(indices)`` translations or raises.
-                return self._parse_response(raw, indices), True
+                return self._parse_response(raw, indices), True, True
             except TranslationCancelled:
                 raise
             except Exception as exc:  # noqa: BLE001 — network / API errors
@@ -497,20 +547,25 @@ class TranslationEngine:
             if cancel():
                 raise TranslationCancelled()
             if abort is not None and abort.is_set():
-                return [blocks[i] for i in indices], False
+                return [blocks[i] for i in indices], False, False
             if self._is_fatal(last_error):
                 if abort is not None:
                     abort.set()
                 raise TranslationAborted(self._fatal_message(last_error))
-            if not self._is_transient(last_error):
+            # A protocol/misalignment error is not worth same-size retries — the caller
+            # splits into smaller sub-batches.  Any other non-transient error also gives
+            # up; a transient network error retries below.
+            if isinstance(last_error, ValueError) or not self._is_transient(last_error):
                 break
             if attempt < attempts:
                 log(f"  重试 {attempt}/{attempts}: {last_error}")
                 _sleep_interruptible(retry_delays[attempt - 1], cancel)
         if last_error:
-            log(f"  批次失败，保留原文: {last_error}")
-        # Preserve the source text for every block in the failed batch.
-        return [blocks[i] for i in indices], False
+            log(f"  批次未通过: {last_error}")
+        # Preserve the source text for every block in the failed batch.  A marker-free
+        # reply (refusal) is never worth splitting.
+        splittable = not (isinstance(last_error, ValueError) and not last_had_markers)
+        return [blocks[i] for i in indices], False, splittable
 
 
     def translate_blocks(
@@ -739,9 +794,10 @@ class TranslationEngine:
         blocks: Sequence[str],
         index_filter: Callable[[int], bool] | None = None,
     ) -> list[list[int]]:
-        """Split indices into chunks that fit the model's character budget."""
+        """Split indices into chunks that respect the character budget AND block-count cap."""
         index_filter = index_filter or (lambda _i: True)
         budget = max(1, int(self.model.batch_size or _CHAR_BUDGET))
+        max_blocks = max(1, int(getattr(self.model, "max_blocks_per_batch", 0) or 25))
         chunks: list[list[int]] = []
         current: list[int] = []
         current_chars = 0
@@ -749,7 +805,7 @@ class TranslationEngine:
             if not index_filter(i):
                 continue
             size = len(block) + len(str(i)) + 6
-            if current and (current_chars + size > budget):
+            if current and (current_chars + size > budget or len(current) >= max_blocks):
                 chunks.append(current)
                 current = []
                 current_chars = 0
@@ -849,9 +905,10 @@ _RETRANSLATE_BATCH_PROMPT = (
     "若某段已是目标语言，原样输出。不要保留任何原文语言。按编号逐段输出：\n{numbered}"
 )
 
-#: Match ``[[n]]`` blocks in a batch re-translate reply (same shape as the translation;
-#: double brackets so a citation ``[1]`` inside a block never collides with the marker).
-_RETRANSLATE_BATCH_RE = re.compile(r"(?ms)^\s*\[\[(\d+)\]\]\s*(.*?)(?=^\s*\[\[\d+\]\]\s*|\Z)")
+#: Match ``[[n]]`` blocks in a batch re-translate reply — the exact same protocol as
+#: :data:`_MULTI_BLOCK_RE` (double brackets so a citation ``[1]`` inside a block never
+#: collides with the marker), so the reply parser is shared, not re-declared.
+_RETRANSLATE_BATCH_RE = _MULTI_BLOCK_RE
 
 
 def _parse_retranslate_batch(text: str, n: int, sources: list[str]) -> list[str]:

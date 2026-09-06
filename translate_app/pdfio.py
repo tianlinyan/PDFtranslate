@@ -457,18 +457,75 @@ def extract_document_structured(
     ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
     cancel: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
+    concurrency: int = 1,
 ) -> DocumentText:
     """One-call entry that *runs the semantic layer* on a PDF (B-④/B-⑤).
 
-    Uses the deterministic geometric backend (:func:`make_geometric_structure_fn`) —
-    formula / figure / heading / caption / table detection with no model or GPU — so
-    ``page_structure``, ``classify_page`` formula/figure kinds, ``get_structure`` /
-    ``get_table`` and IR ``build_ir`` all get non-empty structure out of the box.
-    Same fail-closed guarantee as :func:`extract_structured` (a backend outage
+    ``parser`` selects the backend: ``"geo"`` (default) → the deterministic geometric
+    backend (:func:`make_geometric_structure_fn`) — formula / figure / heading /
+    caption / table detection with no model or GPU; ``"doclayout"`` → DocLayout-YOLO
+    when available via :func:`make_doclayout_structure_fn`, degrading to the geometric
+    backend otherwise.  Either way the chosen name is *reported* on the result
+    (``DocumentText.structure_parser``) and never aborts the run (a backend outage
     degrades to a plain extraction).
+
+    ``concurrency`` (>1, and only for the ``doclayout`` backend) runs the per-page
+    DocLayout inference in a **process pool** — each page in its own process with its own
+    ONNX Runtime session.  Thread-parallelism does NOT scale a single ONNX session (its
+    intra-op pool serialises concurrent ``predict`` calls), so this is the knob that
+    actually uses multiple cores for a many-page PDF.  Default 1 = sequential (unchanged).
     """
-    return extract_structured(path, make_geometric_structure_fn(), parser=parser,
-                              ocr=ocr, title=title, ocr_fn=ocr_fn, cancel=cancel, log=log)
+    requested = parser
+    if parser == "doclayout":
+        try:
+            from doclayout_yolo import YOLOv10  # noqa: F401 — importability check
+            import_ok = True
+        except Exception:  # noqa: BLE001 — not installed → geometric, report "geo"
+            import_ok = False
+        if not import_ok:
+            parser = "geo"
+    else:
+        import_ok = False
+    # Parallel DocLayout path (process pool).  Falls back to the sequential path below
+    # when it produced no region at all (likely a child-side model issue) or errored.
+    if parser == "doclayout" and import_ok and concurrency > 1:
+        try:
+            dt = extract_document_text(path, title=title, ocr=ocr, ocr_fn=ocr_fn,
+                                       cancel=cancel, log=log)
+            if _structure_parallel_doclayout(path, dt, int(concurrency), log):
+                return dt
+        except Exception as exc:  # noqa: BLE001 — fall back to sequential
+            if log:
+                log(f"[structure] DocLayout 并行解析失败，回落串行：{type(exc).__name__}: {exc}")
+    if import_ok:
+        structure_fn = make_doclayout_structure_fn(log=log)
+    else:
+        structure_fn = make_geometric_structure_fn()
+        parser = "geo"
+    dt = extract_structured(path, structure_fn, parser=parser,
+                            ocr=ocr, title=title, ocr_fn=ocr_fn, cancel=cancel, log=log)
+    if requested == "doclayout" and import_ok and not getattr(structure_fn, "_used_doclayout", False):
+        # Importable but the model never produced a real region (model download or a
+        # predict failure) → report honestly as geometric so the caller can tell "真正
+        # 用了 DocLayout" apart from "包能导入但实际降级".
+        dt.structure_parser = "geo"
+        if log:
+            log("[structure] DocLayout-YOLO 已导入但未产生真实区域（模型不可用/预测失败），上报为 geo。")
+    return dt
+
+
+def select_ocr_fn(backend: str | None, *, log: Callable[[str], None] | None = None):
+    """Return an injectable ``ocr_fn`` for an opt-in OCR backend, else ``None`` (RapidOCR).
+
+    ``"vlm"`` → the registered VLM OCR backend (:func:`make_vlm_ocr_fn`), or ``None``
+    when none is registered (the pipeline keeps the built-in offline RapidOCR engine).
+    Any other / empty value → ``None`` (RapidOCR).  This is the C-⑦ gate: an opt-in
+    backend is never a hard requirement — the default is always the offline engine, so
+    a missing model / backend never crashes a run.
+    """
+    if str(backend or "").strip().lower() == "vlm":
+        return make_vlm_ocr_fn(name="vlm", log=log)
+    return None
 
 
 #: Registered OCR backends (C-⑦).  ``register_ocr_backend("vlm", factory)`` lets a
@@ -500,14 +557,55 @@ def make_vlm_ocr_fn(*, name: str = "vlm", log: Callable[[str], None] | None = No
         return None
 
 
+_DEFAULT_DOCLAYOUT_REPO = "wybxc/DocLayout-YOLO-DocStructBench-onnx"
+_DEFAULT_DOCLAYOUT_FILE = "doclayout_yolo_docstructbench_imgsz1024.onnx"
+
+
+def _resolve_doclayout_model(model_path: str | Path | None,
+                             log: Callable[[str], None] | None = None) -> str:
+    """Resolve a DocLayout model to a local file path.
+
+    ``model_path`` may be a local ``.onnx`` / ``.pt`` (used as-is) or a HuggingFace
+    repo id (e.g. ``wybxc/DocLayout-YOLO-DocStructBench-onnx``) — the repo's ONNX / PT
+    model file is located and downloaded via ``huggingface_hub``.  First call downloads;
+    later calls hit the local cache.  The default repo's file name is known, so it is
+    downloaded directly (no ``list_repo_files`` round-trip).  Raises (so the caller
+    degrades) when it cannot be resolved.
+    """
+    if model_path is not None and Path(str(model_path)).exists():
+        return str(model_path)
+    repo = str(model_path) if model_path is not None else _DEFAULT_DOCLAYOUT_REPO
+
+    def _dl(r: str, f: str) -> str:
+        # Prefer the local HF cache (offline, no warning); only download on first use.
+        try:
+            return hf_hub_download(r, f, local_files_only=True)
+        except Exception:  # noqa: BLE001 — not cached yet → download once
+            return hf_hub_download(r, f)
+
+    try:
+        from huggingface_hub import HfApi, hf_hub_download
+        if repo == _DEFAULT_DOCLAYOUT_REPO:
+            return _dl(repo, _DEFAULT_DOCLAYOUT_FILE)
+        files = HfApi().list_repo_files(repo)
+        cand = [f for f in files if f.lower().endswith((".onnx", ".pt", ".pth", ".engine"))]
+        target = (cand or files)[0]
+        return _dl(repo, target)
+    except Exception as exc:  # noqa: BLE001 — a bad id / offline → caller degrades
+        if log:
+            log(f"[structure] 无法解析 DocLayout 模型 {repo!r}：{type(exc).__name__}: {exc}")
+        raise
+
+
 def make_doclayout_structure_fn(*, model_path: str | Path | None = None,
                                 log: Callable[[str], None] | None = None):
     """A DocLayout-YOLO ``structure_fn``, degrading to the geometric backend.
 
-    When DocLayout-YOLO is unavailable (the common case in a fresh install) it logs
-    once and returns the deterministic geometric backend — so applying it *always*
-    yields real structure and never fails.  ``model_path`` may be an ``.onnx`` file;
-    otherwise the default Hugging Face model name is used.
+    ``model_path`` may be a local ``.onnx``/``.pt`` or a HuggingFace repo id (resolved
+    to a local file via :func:`_resolve_doclayout_model`; first use downloads).  When the
+    package or the model is unavailable it loads the model once at construction, logs, and
+    returns the deterministic geometric backend — so applying it *always* yields real
+    structure and never fails.
     """
     try:
         from doclayout_yolo import YOLOv10  # noqa: F401 — raises if not installed
@@ -516,35 +614,207 @@ def make_doclayout_structure_fn(*, model_path: str | Path | None = None,
             log(f"[structure] DocLayout-YOLO 不可用，降级几何后端：{type(exc).__name__}: {exc}")
         return make_geometric_structure_fn(log=log)
 
-    _DOCLAYOUT_MODEL = model_path if model_path is not None \
-        else "wybxc/DocLayout-YOLO-DocStructBench-onnx"
+    try:
+        local = _resolve_doclayout_model(model_path, log)
+        model = YOLOv10(local, task="detect")
+    except Exception as exc:  # noqa: BLE001 — model load failure → degrade
+        if log:
+            log(f"[structure] DocLayout 模型加载失败，降级几何后端：{type(exc).__name__}: {exc}")
+        return make_geometric_structure_fn(log=log)
 
     def structure_fn(page_index, page, blocks):
         # Best-effort DocLayout detection; any failure falls back to geometric so the
         # caller always gets real structure (never a crash / empty on a missing model).
         try:
-            from doclayout_yolo import YOLOv10
-            model = YOLOv10(_DOCLAYOUT_MODEL)
             img = _render_page_png(page, dpi=150)
-            regions = _doclayout_regions(model, img)
+            regions = _doclayout_regions(model, img, dpi=150)
             if regions:
+                structure_fn._used_doclayout = True  # real DocLayout regions flowed
                 return regions
         except Exception:  # noqa: BLE001
             pass
         return make_geometric_structure_fn()(page_index, page, blocks)
+    #: Whether the DocLayout model actually produced at least one region (vs degraded to
+    #: geometric).  ``extract_document_structured`` reads this to report ``structure_parser``
+    #: honestly — "importable" alone is not "actually used".
+    structure_fn._used_doclayout = False
     return structure_fn
 
 
-def _doclayout_regions(model, img: bytes) -> list[dict]:
+def _doclayout_regions(model, img: bytes, dpi: int = 150) -> list[dict]:
     """DocLayout-YOLO over a rendered page PNG → region dicts (B-④).
 
-    Best-effort: adapt to the installed ``doclayout_yolo`` API (its ``predict``
-    returns detected boxes/categories).  Raises on an unsupported API so the caller
-    degrades to the geometric backend.
+    ``img`` is the page PNG bytes rendered at ``dpi`` (see :func:`_render_page_png`);
+    the model returns boxes in that image's pixel space, which this maps back to PDF
+    points (``pdf = px * 72 / dpi``) so the fuser compares them with block bboxes.
+    Device comes from ``PDFTRANSLATE_DOCLAYOUT_DEVICE`` (default ``"cpu"`` — safe on any
+    host; GPU users set it to e.g. ``"cuda:0"``).  Best-effort: any failure raises so
+    the caller degrades to the geometric backend (never a crash / empty).
     """
-    raise NotImplementedError(
-        "DocLayout-YOLO 推理依赖其 ONNX 运行时（需联网下载模型）；离线未做真实推理验证。"
-        "装有模型的环境里，把这里替换为 model.predict 的类别/坐标解析即可。")
+    import numpy as np
+    import cv2
+
+    arr = cv2.imdecode(np.frombuffer(img, np.uint8), cv2.IMREAD_COLOR)
+    if arr is None:
+        raise ValueError("DocLayout-YOLO: cannot decode page PNG.")
+    res = model.predict(arr, imgsz=1024, conf=0.2, task="detect", device=_doclayout_device())
+    if not res:
+        return []
+    r = res[0]
+    names = getattr(r, "names", None) or getattr(model, "names", None) or {}
+    return _doclayout_parse_results(r, names, dpi)
+
+
+#: DocLayout category → canonical project kind.  Only formula/figure/table drive a page
+#: dominance decision; the rest become ordinary text/heading/caption metadata.  Class
+#: names come from the DocStructBench model: title / plain text / abandon / figure /
+#: figure_caption / table / table_caption / table_footnote / isolate_formula /
+#: formula_caption.  ``abandon`` (blank/noise boxes) is dropped in the parser.
+_DOCLAYOUT_KIND_MAP = {
+    "text": "text",
+    "plain text": "text",
+    "paragraph": "text",
+    "header": "text",
+    "footer": "text",
+    "reference": "text",
+    "list": "text",
+    "abstract": "text",
+    "index": "text",
+    "title": "heading",
+    "section_header": "heading",
+    "subsection_header": "heading",
+    "subtitle": "heading",
+    "figure": "figure",
+    "image": "figure",
+    "chart": "figure",
+    "diagram": "figure",
+    "figure_caption": "caption",
+    "table_caption": "caption",
+    "formula_caption": "caption",
+    "table_footnote": "caption",
+    "caption": "caption",
+    "table": "table",
+    "isolate_formula": "formula",
+    "equation": "formula",
+    "formula": "formula",
+}
+
+#: DocLayout categories that are noise / blank boxes and must not become text regions.
+_DOCLAYOUT_SKIP = {"abandon", "abandoned", "ignore", "none"}
+
+
+def _doclayout_device() -> str:
+    """Device for DocLayout-YOLO inference (``PDFTRANSLATE_DOCLAYOUT_DEVICE``, default CPU)."""
+    return os.environ.get("PDFTRANSLATE_DOCLAYOUT_DEVICE", "cpu") or "cpu"
+
+
+def _doclayout_parse_results(result, names, dpi: int = 150) -> list[dict]:
+    """Turn a DocLayout-YOLO ``Results`` into project region dicts (pure, testable).
+
+    ``names`` maps class index → category name (``result.names`` / ``model.names``).
+    Boxes are in the rendered image's pixel space; they are scaled to PDF points by
+    ``72 / dpi``.  Unknown categories default to ``text``, so a mis-named model never
+    yields an unexpected kind.
+    """
+    import numpy as np
+
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or getattr(boxes, "xyxy", None) is None:
+        return []
+    xyxy = boxes.xyxy.cpu().numpy()
+    if len(xyxy) == 0:
+        return []
+    cls = np.asarray(boxes.cls.cpu().numpy(), dtype=int)
+    names = dict(names or {})
+    scale = 72.0 / dpi
+    regions: list[dict] = []
+    for i in range(len(xyxy)):
+        row = xyxy[i]
+        if len(row) < 4:
+            continue  # defensive: a malformed row is dropped, never crashes
+        x0, y0, x1, y1 = (float(v) * scale for v in row[:4])
+        name = str(names.get(int(cls[i]), "")).strip().lower()
+        if name in _DOCLAYOUT_SKIP:
+            continue  # abandon / noise boxes never become text regions
+        kind = _DOCLAYOUT_KIND_MAP.get(name, "text")
+        regions.append({"kind": kind, "bbox": [x0, y0, x1, y1]})
+    return regions
+
+
+#: Per-process DocLayout model cache for the cross-page parallel structure worker.  Each
+#: worker process loads its own session once (the small model ~72MB) and reuses it across
+#: pages; a per-process session avoids the onnxruntime intra-op contention that defeats
+#: thread-level parallelism (measured: thread-parallel gave ~0.97x, process-parallel is
+#: what actually uses multiple cores for independent page inferences).
+_STRUCTURE_WORKER_MODEL = None
+_STRUCTURE_WORKER_CFG = None
+
+
+def _doclayout_structure_worker(task):
+    """Process-pool worker: run DocLayout over one page PNG → ``(page_index, regions)``.
+
+    ``task`` is ``(page_index, png_bytes, model_path, dpi)``.  Loads (or reuses) a
+    per-process model session.  Fail-closed: on any error returns ``(page_index, [])`` so
+    the page is reported as having no DocLayout structure (never crashes a worker).
+    """
+    global _STRUCTURE_WORKER_MODEL, _STRUCTURE_WORKER_CFG
+    page_index, png, model_path, dpi = task
+    try:
+        if _STRUCTURE_WORKER_MODEL is None or _STRUCTURE_WORKER_CFG != (model_path,):
+            from doclayout_yolo import YOLOv10
+            local = _resolve_doclayout_model(model_path)
+            _STRUCTURE_WORKER_MODEL = YOLOv10(local, task="detect")
+            _STRUCTURE_WORKER_CFG = (model_path,)
+        regions = _doclayout_regions(_STRUCTURE_WORKER_MODEL, png, dpi=dpi)
+        return (page_index, regions or [])
+    except Exception:  # noqa: BLE001 — a worker outage yields no regions, never crashes
+        return (page_index, [])
+
+
+def _structure_parallel_doclayout(path, dt, concurrency, log) -> bool:
+    """Run DocLayout structure across pages in parallel (process pool).
+
+    Thread-parallelism does NOT scale a single ONNX Runtime session (its intra-op thread
+    pool serialises concurrent ``predict`` calls); running each page in its own process
+    with its own session is what actually uses multiple cores for independent pages.
+    Pages are rendered to PNG in the parent (cheap), dispatched to ``concurrency``
+    workers, and the resulting regions are fused back into ``dt.page_structure`` in
+    order.  Returns ``True`` when at least one page yielded DocLayout regions.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    import pymupdf as fitz
+
+    dpi = 150
+    doc = fitz.open(str(path))
+    try:
+        tasks = []
+        for p in range(dt.page_count):
+            try:
+                png = _render_page_png(doc[p], dpi=dpi)
+            except Exception:  # noqa: BLE001 — an unrenderable page yields no structure
+                png = b""
+            tasks.append((p, png, None, dpi))
+    finally:
+        doc.close()
+
+    results: dict[int, list] = {}
+    if tasks:
+        with ProcessPoolExecutor(max_workers=concurrency) as ex:
+            for page_index, regions in ex.map(_doclayout_structure_worker, tasks):
+                results[page_index] = regions
+
+    any_doclayout = False
+    dt.page_structure = []
+    for p in range(dt.page_count):
+        blocks = dt.pages[p] if p < len(dt.pages) else []
+        offset = sum(len(pg) for pg in dt.pages[:p])
+        regions = results.get(p) or []
+        if regions:
+            any_doclayout = True
+        dt.page_structure.append(
+            _fuse_structure(p, blocks, offset, regions, "doclayout"))
+    dt.structure_parser = "doclayout" if any_doclayout else ""
+    return any_doclayout
 
 
 def _structure_dominant_kind(ps: PageStructure) -> str | None:
@@ -1356,21 +1626,27 @@ def _is_numeric_cell(text: str) -> bool:
 
 #: Characters typical of a math / formula expression (operators, relations,
 #: radicals, sub/superscript marks).
-_FMATH_CHARS = frozenset("=+−-×÷±∑∏∫√∞≈≠≤≥→←↑↓^_")
-#: A relation / radical / power mark that turns a bare operator list into an
-#: expression (an equation, an integral, a root, an exponent).
-_FMATH_EXPR_RE = re.compile(r"[=≈≤≥]|[∑∫√]|[\^_]")
-#: A formula block is short (a formula sits on one line, never a run-on paragraph).
-_FMATH_MAX_LEN = 80
+_FMATH_CHARS = frozenset("=+−-×÷±∑∏∫√∞≈≠≤≥≡→←↑↓^_/()|")
+#: A relation / function / radical / power mark that turns a bare operator list into
+#: an expression (an equation, a function, an integral, a root, an exponent).
+_FMATH_EXPR_RE = re.compile(r"[=≈≤≥≡]|[∑∫√π]|[\^_]|exp\(|log\(|\bln\b|\bsin\b|\bcos\b|\btan\b")
+#: A formula block is short (a formula sits on one line, never a run-on paragraph;
+#: kept well under a prose paragraph that merely cites ``T = 1.0`` etc., which the
+#: older ``80``-char cap still accepted).
+_FMATH_MAX_LEN = 70
 
 
 def _is_formula_block(text: str) -> bool:
     """Conservative detector for a *math expression* block (B-⑤).
 
     ``True`` only when the block is short, contains no CJK, is dense in math
-    operators/relations and carries an equation mark (``=``/``≈``/relational),
-    a radical (``∑``/``∫``/``√``) or a power/subscript (``^``/``_``) — i.e. a real
-    expression, not a prose sentence that happens to contain a stray operator.
+    operators/relations AND carries an equation structure — a relation (``=``/
+    ``≡``/``≈``/``≤``) together with a fraction / function / power (``∑``/``∫``/
+    ``√``/``exp(``/``^``/``_``), or is very operator-dense.  This recognises the
+    display-equation fragments a LaTeX paper splits into lines (``P_orig(y|x;T)=``,
+    ``exp(z_i/T)``, ``argsort(z)≡argsort(z/T)``) that the older ``≥3 math chars``
+    test missed (they carry only 1–2 operators).  Prose that merely contains a
+    stray ``=`` is still left as ordinary text (translated).
 
     *Conservative by design*: a cell we are not sure about is left as ordinary
     text (translated) rather than wrongly protected — the cost of a false
@@ -1382,9 +1658,21 @@ def _is_formula_block(text: str) -> bool:
     if len(t) > _FMATH_MAX_LEN:
         return False
     sym = sum(1 for c in t if c in _FMATH_CHARS)
-    if sym < 3:
+    if sym < 2:
         return False
-    return bool(_FMATH_EXPR_RE.search(t))
+    # A genuine expression is *dense* in math operators; prose that merely cites a
+    # value ("(T = 0.59)", "L ≈0.066") is sparse (~0.10) and must not be protected.
+    density = sym / max(1, len(t))
+    # A genuine expression needs a relation AND a fraction/function/power; a
+    # fragment (e.g. a numerator ``exp(zi/T)`` with no ``=``) is formula when it is
+    # clearly a function/fraction and rich in operators.
+    has_relation = bool(re.search(r"[=≈≤≥≡]", t))
+    has_frac_func_pow = bool(re.search(r"[∑∫√π]|[\^_]|exp\(|log\(|/\s*[a-zA-Z]", t))
+    if not has_relation:
+        return has_frac_func_pow and sym >= 3 and density >= 0.12
+    if not has_frac_func_pow and sym < 3:
+        return False
+    return bool(_FMATH_EXPR_RE.search(t)) and density >= 0.12
 
 
 def _cluster_ocr_rows(items: Sequence[tuple], ytol: float = 4.5) -> list[list[tuple]]:
@@ -2141,6 +2429,16 @@ def _break_between(base: dict, prev: dict, cur: dict) -> bool:
         abs(cur["y0"] - prev["y0"]) <= max(1.0, 0.4 * base["size"])
         and (cur["x0"] > prev["x1"] + 1.0 or prev["x0"] > cur["x1"] + 1.0)
     ):
+        return True
+    # A line whose horizontal CENTRE has jumped far from the previous line's
+    # centre (> ~0.55× this line's width, with a small absolute floor) is a
+    # different COLUMN (left↔right on a 2-column page).  Inter-column lines
+    # stream close in y, so the y-gap / style checks above don't fire; without
+    # this they merge into one full-width block whose translation is drawn
+    # across the page and collides with its neighbour column.
+    cur_cx = (cur["x0"] + cur["x1"]) / 2.0
+    prev_cx = (prev["x0"] + prev["x1"]) / 2.0
+    if abs(cur_cx - prev_cx) > max(24.0, 0.55 * (cur["x1"] - cur["x0"])):
         return True
     return False
 

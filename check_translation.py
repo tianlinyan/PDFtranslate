@@ -227,7 +227,17 @@ def _snippet(text: str, width: int = 60) -> str:
 
 
 def _has_cjk(text: str) -> bool:
-    return any("一" <= c <= "鿿" for c in text)
+    # A value that literally contains CJK chars, OR a language NAME denoting a CJK
+    # script (``Simplified Chinese`` is ASCII but its script is CJK).  Without the
+    # name branch, a Chinese-target run was treated as Western and every intended
+    # Chinese translation was falsely reported as "残留中文".
+    t = str(text or "").lower()
+    if any("一" <= c <= "鿿" for c in t):
+        return True
+    return any(k in t for k in (
+        "chinese", "中文", "汉语", "普通话",
+        "japanese", "日语", "korean", "韩语", "한국어", "日本語",
+    ))
 
 
 def _is_scan_like_text(text: str) -> bool:

@@ -137,6 +137,29 @@ class SettingsTest(unittest.TestCase):
         m = ModelConfig(id="m", name="m", type="openai", endpoint="", model="mod")
         self.assertEqual(m.endpoint_warnings(), [])
 
+    def test_enable_thinking_sent_in_both_params(self):
+        m = ModelConfig.from_dict({
+            "id": "q", "name": "q", "type": "llama-server",
+            "endpoint": "http://x/v1/chat/completions", "model": "qwen3.8-27b",
+            "reasoning_effort": "low", "enable_thinking": False,
+        })
+        self.assertFalse(m.enable_thinking)
+        # The toggle is a first-class field (not dumped into ``extra``) and is carried
+        # by BOTH the translation and interaction parameter sets.
+        self.assertEqual(m.request_params()["enable_thinking"], False)
+        self.assertIn("enable_thinking", m.interaction_request_params())
+        self.assertIn("reasoning_effort", m.request_params())
+        self.assertEqual(m.extra, {})
+
+    def test_enable_thinking_absent_omits(self):
+        m = ModelConfig.from_dict({
+            "id": "q", "name": "q", "type": "llama-server",
+            "endpoint": "http://x/v1", "model": "q", "reasoning_effort": "low",
+        })
+        self.assertIsNone(m.enable_thinking)
+        self.assertNotIn("enable_thinking", m.request_params())
+        self.assertNotIn("enable_thinking", m.interaction_request_params())
+
 
 if __name__ == "__main__":
     unittest.main()

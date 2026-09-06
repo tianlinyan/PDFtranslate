@@ -1345,11 +1345,58 @@ class FormulaProtectionTest(unittest.TestCase):
         self.assertFalse(pdfio._is_formula_block("3,702,726,474.45"))
         self.assertFalse(pdfio._is_formula_block("营业收入 合计"))
 
+    def test_formula_detector_recognises_display_equation_fragments(self):
+        # B-⑤ regression: a LaTeX paper splits a display equation into short line
+        # fragments (``P_orig(y|x;T)=``, ``exp(z_i/T)``, ``argsort(z)≡…``) that the
+        # old ``≥3 math chars`` test missed (they carry only 1–2 operators).
+        self.assertTrue(pdfio._is_formula_block("Porig(yi|x; T) ="))
+        self.assertTrue(pdfio._is_formula_block("exp(zi/T)"))
+        self.assertTrue(pdfio._is_formula_block("argsort(z) ≡ argsort(z/T)"))
+        # Prose / data that merely contains a relation is NOT a formula.
+        self.assertFalse(pdfio._is_formula_block("T = 1.0, TTR = 0.400"))
+
     def test_formula_not_reported_missing(self):
         from translate_app.eval import measure_complete
         from translate_app.pdfio import Block
         res = measure_complete([Block("x^2 + y^2 = z^2", 0, 0, 0, 100, 20)], [""])
         self.assertEqual(res["missing_count"], 0)
+
+
+class ColumnGapBreakTest(unittest.TestCase):
+    """A 2-column page must not merge left and right lines into one full-width block."""
+
+    @staticmethod
+    def _ln(x0, x1, y0, y1, text):
+        return {"x0": x0, "x1": x1, "y0": y0, "y1": y1, "text": text,
+                "size": 10.0, "bold": False, "color": 0}
+
+    def test_cross_column_lines_break_even_when_y_close(self):
+        # A right-column line followed by a left-column line at a *close* y (PyMuPDF's
+        # line stream interleaves columns by y) must start a new block — otherwise they
+        # merge into a full-width block whose translation is drawn across the page.
+        base = self._ln(55, 289, 69, 79, "left one")
+        prev = self._ln(307, 541, 123, 133, "right col line")
+        cur = self._ln(55, 289, 128, 138, "left col next")
+        self.assertTrue(pdfio._break_between(base, prev, cur))
+
+    def test_same_column_lines_join(self):
+        base = self._ln(55, 289, 80, 90, "left one")
+        prev = self._ln(55, 289, 92, 102, "left two")
+        cur = self._ln(55, 289, 104, 114, "left three")
+        self.assertFalse(pdfio._break_between(base, prev, cur))
+
+    def test_no_full_width_blocks_on_two_column_page(self):
+        # Use the two-column fixture end-to-end: extraction must not yield a block
+        # spanning both columns.
+        with tempfile.TemporaryDirectory() as d:
+            pdf = build_two_column_pdf(Path(d) / "two.pdf")
+            dt = pdfio.extract_document_text(pdf, ocr=False, log=lambda m: None)
+            # page 0 is a clean 2-column page (left ~60..215, right ~315..480).
+            blocks = dt.pages[0]
+            page_w = 595.0
+            for b in blocks:
+                self.assertLess((b.x1 - b.x0), page_w * 0.6,
+                                f"block {b.text[:30]!r} spans too wide: {b.x0:.0f}..{b.x1:.0f}")
 
 
 class GeometricStructureTest(unittest.TestCase):

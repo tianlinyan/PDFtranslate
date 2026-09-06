@@ -489,6 +489,30 @@ class LlmDecideAndPageLoopTest(unittest.TestCase):
         short = [{"role": "system", "content": "s"}, {"role": "user", "content": "x"}]
         self.assertEqual(short, _window_messages(short))
 
+    def test_window_messages_char_budget_prunes_oldest(self):
+        # The count window alone can't bound tokens: a few full-page ``read_page`` tool
+        # results exceed a small local model's context.  The char-budget safety net drops
+        # oldest WHOLE rounds (cut at a user boundary) so the decide request stays under
+        # ``_DECIDE_CHAR_BUDGET`` and keeps the freshest observation.
+        from translate_app.agent.flow import (
+            _DECIDE_CHAR_BUDGET, _msg_text, _window_messages,
+        )
+        big = "x" * 20000   # each tool result ~20k chars → 4 rounds ≈ 80k chars
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(4):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": "",
+                         "tool_calls": [{"id": f"t{i}", "type": "function",
+                                         "function": {"name": "f", "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": f"t{i}", "content": big})
+        msgs.append({"role": "user", "content": "final obs"})
+        w = _window_messages(msgs)
+        self.assertEqual("system", w[0]["role"])
+        self.assertEqual("final obs", w[-1]["content"])     # freshest observation kept
+        self.assertLess(sum(len(_msg_text(m)) for m in w), _DECIDE_CHAR_BUDGET)
+        self.assertIsInstance(w[1]["role"], str)
+        self.assertEqual("user", w[1]["role"])              # cut at a user boundary
+
     def test_make_source_tools_read_page_is_read_only(self):
         s = agent.WorkflowState("a.pdf", "English")
         s.src_doc = pdfio.DocumentText(

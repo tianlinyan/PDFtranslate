@@ -324,7 +324,27 @@ def _page_translation_counts(state: WorkflowState, page_index: int) -> tuple[int
 #: re-sent the per-request payload would grow with the round count, so a grid-heavy page
 #: would pay roughly O(rounds²) in total tokens.  Window to a bounded, protocol-valid
 #: tail so the model keeps the recent context without re-reading all prior rounds.
-_DECIDE_HISTORY_CAP = 60
+#: Kept small: a dense page's ``read_page`` result alone is thousands of tokens, so a wide
+#: window of full-page reads blows past a small local model's context (400 exceed_context_size).
+_DECIDE_HISTORY_CAP = 24
+
+#: Rough serialized-text-char budget for one ``decide`` request (safety net on top of the
+#: message-count window).  Content is mixed CJK/ASCII, where a char is ≈ a token at worst
+#: (CJK), so capping chars here keeps the request inside a small context window even when
+#: the count window alone would not (a handful of full-page ``read_page`` results).  Images
+#: ride as ``image_url`` and are budgeted separately but bounded (one page image).
+_DECIDE_CHAR_BUDGET = 40000
+
+
+def _msg_text(m: dict) -> str:
+    """Best-effort text of a message for length budgeting (image parts excluded)."""
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(str(p.get("text", ""))
+                        for p in c if isinstance(p, dict) and p.get("type") == "text")
+    return ""
 
 
 def _window_messages(messages: list[dict], cap: int = _DECIDE_HISTORY_CAP) -> list[dict]:
@@ -338,13 +358,31 @@ def _window_messages(messages: list[dict], cap: int = _DECIDE_HISTORY_CAP) -> li
     The freshest observation and the current tool response are always retained.
     """
     if len(messages) <= cap:
-        return messages
-    keep = messages[:1]                       # the system prompt always stays
-    tail = messages[1:]
-    start = max(0, len(tail) - (cap - 1))
-    while start > 0 and tail[start]["role"] != "user":
-        start -= 1
-    return keep + tail[start:]
+        window = list(messages)
+    else:
+        keep = messages[:1]                       # the system prompt always stays
+        tail = messages[1:]
+        start = max(0, len(tail) - (cap - 1))
+        while start > 0 and tail[start]["role"] != "user":
+            start -= 1
+        window = keep + tail[start:]
+    # Char-budget safety net: a handful of full-page ``read_page`` results can exceed the
+    # count window's bound.  Drop oldest WHOLE rounds (cutting at a user boundary) until
+    # the retained text fits; always keep at least the freshest observation.
+    if sum(len(_msg_text(m)) for m in window) <= _DECIDE_CHAR_BUDGET:
+        return window
+    head = window[:1]
+    tail = window[1:]
+    drop = 0
+    while drop < len(tail) and \
+            sum(len(_msg_text(m)) for m in head + tail[drop:]) > _DECIDE_CHAR_BUDGET:
+        drop += 1
+        while drop < len(tail) and tail[drop]["role"] != "user":
+            drop += 1
+    kept = head + tail[drop:]
+    if not any(m["role"] == "user" for m in kept):
+        kept = head + tail[-1:]                   # keep the freshest observation at minimum
+    return kept
 
 
 def make_llm_decide(model, *, task: str, image_provider=None,
@@ -456,10 +494,13 @@ def make_llm_decide(model, *, task: str, image_provider=None,
                 "messages": _window_messages(messages),
             }
             body: dict[str, Any] = {}
-            # ``reasoning_effort`` (translation-side, e.g. "low" for llama.cpp) is a
-            # model-specific body extra; send it via ``extra_body``.
+            # ``reasoning_effort`` (translation-side, e.g. "low" for llama.cpp) and the
+            # Qwen3 ``enable_thinking`` toggle are model-specific body extras; send them
+            # via ``extra_body``.
             if model.reasoning_effort:
                 body["reasoning_effort"] = model.reasoning_effort
+            if getattr(model, "enable_thinking", None) is not None:
+                body["enable_thinking"] = model.enable_thinking
             if body:
                 kwargs["extra_body"] = body
             resp = client.chat.completions.create(**kwargs)
@@ -1468,6 +1509,7 @@ class DocumentSession:
         render_handler: Callable[[int, str], bytes | None] | None = None,
         audit: Callable[..., dict[str, Any]] | None = None,
         interpret: Callable[[str, str], str] | None = None,
+        intent_llm: Callable[[str, list[str]], str] | None = None,
         include_kept: bool = False,
         max_steps_per_page: int = 24,
     ) -> None:
@@ -1490,6 +1532,11 @@ class DocumentSession:
         #: user's special-page answer (incl. free text) — an AI interpretation; defaults to
         #: the flexible ``interpret_decision`` matcher when not injected.
         self.interpret = interpret
+        #: M1 intent slot-fill: ``intent_llm(text, choices) -> str`` reads the user's free
+        #: text onto one of the allowed discrete choices (review mode / export).  Injected
+        #: by the worker (or a test) via :func:`make_llm_intent_fill`; when ``None`` the
+        #: deterministic keyword matcher decides.  This is a *decision*, never a chat tool.
+        self.intent_llm = intent_llm
         #: M4 (U1 knob): when True the AI self-check also reviews pages the user chose to
         #: keep/skip (default False — those carry the source verbatim, so re-checking them
         #: would wrongly try to translate the intentionally-kept original).
@@ -1808,22 +1855,32 @@ class DocumentSession:
         value = (val or {}).get("value") if isinstance(val, dict) else val
         return str(value or "").strip()
 
-    @staticmethod
-    def _classify_choice(answer: str, kind: str) -> str:
+    def _classify_choice(self, answer: str, kind: str) -> str:
         """Map a free-text answer onto a discrete choice (used where a specific
         decision channel isn't wired).
 
         Now that choices are posed as natural-language questions and answered in free
         text, a keyword read (rather than exact-button matching) decides the intent —
-        e.g. "我自己来检查" → user, "先别导，我再看看" → continue.
+        e.g. "我自己来检查" → user, "先别导，我再看看" → continue.  An injected
+        ``self.intent_llm`` (AI reading the user's free text) wins when it returns one of
+        the allowed choices; a malformed AI result degrades to the keyword matcher.
         """
-        v = str(answer or "").strip().lower()
+        v = str(answer or "").strip()
+        allowed = {"review_mode": ("ai", "user"), "export": ("continue", "export")}.get(kind, ())
+        if self.intent_llm is not None and allowed:
+            try:
+                d = str(self.intent_llm(v, list(allowed)) or "").strip().lower()
+                if d in allowed:
+                    return d
+            except Exception:  # noqa: BLE001 — a bad AI read degrades to the keyword matcher
+                pass
+        v2 = v.lower()
         if kind == "review_mode":
-            if any(k in v for k in ("手动", "自己", "我来", "我来看", "人工", "自己的")):
+            if any(k in v2 for k in ("手动", "自己", "我来", "我来看", "人工", "自己的")):
                 return "user"
             return "ai"
         if kind == "export":
-            if any(k in v for k in ("继续", "再检查", "再看看", "先不", "先别", "不导", "稍后", "暂不")):
+            if any(k in v2 for k in ("继续", "再检查", "再看看", "先不", "先别", "不导", "稍后", "暂不")):
                 return "continue"
             return "export"
         return v

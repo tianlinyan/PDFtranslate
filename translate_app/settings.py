@@ -38,11 +38,21 @@ class ModelConfig:
     api_key: str | None = field(default=None, repr=False)
     tools_choice: str | None = None
     reasoning_effort: str | None = None
+    #: Qwen3-style thinking toggle, sent via ``extra_body`` (``enable_thinking``).  ``None``
+    #: = not sent (server default); ``False`` disables the reasoning/thinking stage.  Some
+    #: servers (e.g. a Qwen3 llama.cpp/ollama endpoint) ignore this, so disabling thinking
+    #: is best-effort rather than guaranteed.
+    enable_thinking: bool | None = None
     temperature: float | None = None   # sampling temperature (None → engine default)
     max_tokens: int | None = None      # per-request max completion tokens (None → server default)
     concurrency: int = 1               # parallel batch requests per translation run
     page_concurrency: int = 1          # parallel PAGE translation in the agent path (1 = sequential)
     batch_size: int = 4000             # source-character budget per batch request
+    #: Max *blocks* per batch request, in addition to the ``batch_size`` char budget.  A
+    #: local model on a very large batch (dozens of blocks) may fail to echo exactly N
+    #: ``[[n]]`` markers (missing or extra), forcing a retry; capping the block count keeps
+    #: batching fast while staying inside the model's reliable marker-count range.
+    max_blocks_per_batch: int = 25
     #: When true, the model may be used to *review* an OCR-rebuilt scanned page:
     #: the original page and the reconstruction are sent to it, and its text
     #: corrections and layout hints are applied / surfaced (geometry untouched).
@@ -75,6 +85,10 @@ class ModelConfig:
             api_key=(str(item["api_key"]) if item.get("api_key") else None),
             tools_choice=item.get("tools_choice"),
             reasoning_effort=(item.get("reasoning_effort") or None),
+            enable_thinking=(
+                bool(item["enable_thinking"])
+                if item.get("enable_thinking") is not None else None
+            ),
             temperature=(
                 float(item["temperature"])
                 if item.get("temperature") not in (None, "")
@@ -86,6 +100,7 @@ class ModelConfig:
             concurrency=int(item.get("concurrency") or 1),
             page_concurrency=int(item.get("page_concurrency") or 1),
             batch_size=int(item.get("batch_size") or 4000),
+            max_blocks_per_batch=int(item.get("max_blocks_per_batch") or 25),
             vision=bool(item.get("vision", False)),
             interaction_temperature=(
                 float(item["interaction_temperature"])
@@ -106,11 +121,13 @@ class ModelConfig:
         "api_key",
         "tools_choice",
         "reasoning_effort",
+        "enable_thinking",
         "temperature",
         "max_tokens",
         "concurrency",
         "page_concurrency",
         "batch_size",
+        "max_blocks_per_batch",
         "vision",
         "interaction_temperature",
         "interaction_reasoning_effort",
@@ -127,6 +144,8 @@ class ModelConfig:
         params: dict[str, Any] = {}
         if self.reasoning_effort:
             params["reasoning_effort"] = self.reasoning_effort
+        if self.enable_thinking is not None:
+            params["enable_thinking"] = self.enable_thinking
         if self.tools_choice:
             params["tool_choice"] = self.tools_choice
         return params
@@ -143,6 +162,8 @@ class ModelConfig:
         params: dict[str, Any] = {}
         if self.interaction_reasoning_effort:
             params["reasoning_effort"] = self.interaction_reasoning_effort
+        if self.enable_thinking is not None:
+            params["enable_thinking"] = self.enable_thinking
         return params
 
     def _resolved_api_key(self) -> str | None:

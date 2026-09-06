@@ -127,11 +127,15 @@ class TranslateWorker(QObject):
         #: → existing export) instead of the agent/deterministic path.  Off by default;
         #: ``PDFTRANSLATE_IR_MODE`` toggles it for a run without touching the GUI.
         self._ir_mode = bool(ir_mode or os.environ.get("PDFTRANSLATE_IR_MODE"))
-        #: B-④ structure mode: extract with the deterministic geometric structure
-        #: backend (``extract_document_structured``) so the agent/IR see formula /
-        #: figure / heading / caption / table structure.  Off by default (plain text
-        #: extraction); ``PDFTRANSLATE_STRUCTURE_MODE`` toggles it.
-        self._structure_mode = bool(structure_mode or os.environ.get("PDFTRANSLATE_STRUCTURE_MODE"))
+        #: B-④ structure mode: extract with a structure backend (``extract_document_structured``)
+        #: so the agent/IR see formula / figure / heading / caption / table structure.
+        #: Off by default (plain text extraction); ``PDFTRANSLATE_STRUCTURE_MODE`` toggles it.
+        #: ``PDFTRANSLATE_STRUCTURE_PARSER`` (``geo`` default / ``doclayout`` opt-in) selects the
+        #: backend, and setting it to ``doclayout`` also implies structure mode (one-variable
+        #: enable).  A missing DocLayout backend degrades to geometric — never a crash.
+        self._structure_parser = (os.environ.get("PDFTRANSLATE_STRUCTURE_PARSER") or "geo")
+        self._structure_mode = bool(structure_mode or os.environ.get("PDFTRANSLATE_STRUCTURE_MODE")
+                                    or self._structure_parser == "doclayout")
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
         # written from the GUI thread (``cancel``) and read from the worker
         # thread: the Event gives explicit, memory-model-safe signalling
@@ -278,17 +282,31 @@ class TranslateWorker(QObject):
         ``structure_mode`` uses :func:`pdfio.extract_document_structured` (the
         deterministic geometric backend: formula / figure / heading / caption /
         table), else the plain text extractor.  Both are fail-closed and share the
-        OCR / cancel / log paths.
+        OCR / cancel / log paths.  ``PDFTRANSLATE_STRUCTURE_PARSER`` (``geo`` default /
+        ``doclayout`` opt-in) selects the structure backend; ``PDFTRANSLATE_OCR_BACKEND``
+        (``rapidocr`` default / ``vlm`` opt-in) selects an injectable OCR backend.  Both
+        degrade to the deterministic default when the opt-in backend is unavailable —
+        an opt-in AI backend is never a hard requirement.
         """
+        parser = self._structure_parser
+        #: B-④/page-parallel structure extraction (DocLayout only): number of worker
+        #: processes for the cross-page DocLayout inference.  Default 1 = sequential;
+        #: ``PDFTRANSLATE_STRUCTURE_CONCURRENCY`` sets it (e.g. the CPU core count) to make
+        #: a many-page PDF's DocLayout use multiple cores.
+        structure_conc = max(1, int(os.environ.get("PDFTRANSLATE_STRUCTURE_CONCURRENCY", "1") or "1"))
+        ocr_fn = pdfio.select_ocr_fn(os.environ.get("PDFTRANSLATE_OCR_BACKEND"),
+                                     log=lambda m: self.log.emit(m))
         if self._structure_mode:
-            self.log.emit("已启用语义结构（几何后端），提取并识别公式/图表/标题/表格。")
+            self.log.emit(f"已启用语义结构（{parser} 后端），提取并识别公式/图表/标题/表格。")
             return pdfio.extract_document_structured(
-                self._source, ocr=self._ocr,
+                self._source, parser=parser, ocr=self._ocr, ocr_fn=ocr_fn,
+                concurrency=structure_conc,
                 cancel=lambda: self._cancelled.is_set(),
                 log=lambda m: self.log.emit(m))
         return pdfio.extract_document_text(
             self._source,
             ocr=self._ocr,
+            ocr_fn=ocr_fn,
             cancel=lambda: self._cancelled.is_set(),
             log=lambda m: self.log.emit(m),
         )
@@ -521,7 +539,8 @@ class TranslateWorker(QObject):
                 show_preview=self._show_preview,
                 render_handler=self.render_page_for_agent,
                 interpret=agent_mod.make_llm_interpret(self._model, log=self.log.emit),
-                max_steps_per_page=48,
+                intent_llm=agent_mod.make_llm_intent_fill(self._model, log=self.log.emit),
+                max_steps_per_page=96,
             ).run()
         finally:
             self._agent_state = None
