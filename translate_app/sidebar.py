@@ -42,6 +42,10 @@ class AnswerBridge(QObject):
         self._ev = threading.Event()
         self._value: dict | None = None
         self._last_q: str = ""
+        #: (a) Whether an agent question is currently awaiting the user's answer.  The
+        #: answer is typed in the MAIN chat input and routed here (not a separate row).
+        self._pending: bool = False
+        self.pending_target: str = ""
         # A user decision must NOT silently skip: ``timeout=None`` (default) waits until
         # the user answers.  An old 600s timeout made the flow proceed as "未选择" and
         # stacked a second question row.  ``cancel`` (optional) is polled so a worker
@@ -52,6 +56,7 @@ class AnswerBridge(QObject):
     def answer(self, value, target: str = "") -> None:
         """GUI side: the user answered (value is the chosen option or free text)."""
         self._value = {"value": value, "target": target}
+        self._pending = False
         if self._last_q:
             self.exchangeMade.emit(self._last_q, str(value or ""), target)
         self._ev.set()
@@ -66,12 +71,15 @@ class AnswerBridge(QObject):
         self._value = None
         self._ev.clear()
         self._last_q = str(question or "")
+        self._pending = True
+        self.pending_target = target
         self.showQuestion.emit(question, list(options or []), target)
         if self._cancel is None:
             self._ev.wait(self._timeout)          # None → block until answered
         else:
             while not self._ev.wait(0.1):
                 if self._cancel():
+                    self._pending = False
                     return None
         return self._value
 
@@ -83,6 +91,11 @@ class AnswerBridge(QObject):
     def clear(self) -> None:
         self._value = None
         self._ev.clear()
+        self._pending = False
+
+    def is_pending(self) -> bool:
+        """Whether an agent question is currently awaiting the user's answer."""
+        return self._pending
 
 
 class _AskRow(QWidget):
@@ -158,13 +171,13 @@ class SidebarChat(QWidget):
         self._log.ensureCursorVisible()
 
     def show_question(self, question: str, options: list[str], target: str) -> None:
-        """Display an agent question as a natural-language prompt and collect the
-        answer in free text (no buttons).  ``options`` is carried for the interpreter
-        but is not rendered — the user answers in plain language."""
+        """(a) Surface an agent question as an AI message in the conversation.
+
+        The answer is typed in the MAIN chat input (``_on_user_message`` routes it back
+        to the flow as the answer) — no separate button row.  ``options`` is carried for
+        the interpreter but is not rendered; the user answers in plain language.
+        """
         self.add_message("ai", question)
-        row = _AskRow(target)
-        row.chosen.connect(self._on_chosen)
-        self._asks_layout.addWidget(row)
 
     def _on_chosen(self, value, target: str) -> None:
         self.add_message("我", str(value))

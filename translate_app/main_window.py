@@ -475,6 +475,14 @@ class MainWindow(QWidget):
         The conversation lives only in the sidebar; the main window shows the flow
         status + AI tool/operation logs, not the chat text.
         """
+        # (a) A flow question is pending (special-page / skew / review-mode): the user's
+        # message IS the answer — route it back to the flow (unblocking the worker)
+        # instead of sending it to the chat model.  Checked FIRST so an answer like
+        # "第3页" is not swallowed by the preview-command reader.
+        if self.answer_bridge.is_pending() and text.strip():
+            self.agent_sidebar.add_message("我", str(text).strip())
+            self.answer_bridge.answer(str(text).strip(), self.answer_bridge.pending_target)
+            return
         # M5 preview-navigation commands drive the preview window directly.
         if self._maybe_preview_command(text):
             return

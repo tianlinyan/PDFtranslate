@@ -52,6 +52,49 @@ class AnswerBridgeTest(unittest.TestCase):
         bridge.set_cancel(cancel.is_set)
         self.assertIsNotNone(bridge._cancel)
 
+    def test_is_pending_tracks_question_lifecycle(self):
+        bridge = AnswerBridge()
+        self.assertFalse(bridge.is_pending())
+        result: dict = {}
+
+        def asker():
+            result["v"] = bridge.ask("q", ["a"], "x")
+
+        t = threading.Thread(target=asker, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.1)
+            self.assertTrue(bridge.is_pending())        # question is up, awaiting answer
+            self.assertEqual("x", bridge.pending_target)
+            bridge.answer("keep", "x")
+            t.join(timeout=2)
+            self.assertFalse(bridge.is_pending())       # answered → no longer pending
+            self.assertEqual({"value": "keep", "target": "x"}, result["v"])
+        finally:
+            t.join(timeout=1)
+
+    def test_cancel_clears_pending(self):
+        # A cancelled ask returns None AND clears the pending flag, so the next user
+        # message is not wrongly routed as an answer.
+        cancel = threading.Event()
+        bridge = AnswerBridge(cancel=cancel.is_set)
+        result: dict = {}
+
+        def asker():
+            result["v"] = bridge.ask("q", ["a"])
+
+        t = threading.Thread(target=asker, daemon=True)
+        t.start()
+        try:
+            time.sleep(0.1)
+            self.assertTrue(bridge.is_pending())
+            cancel.set()
+            t.join(timeout=2)
+            self.assertIsNone(result["v"])
+            self.assertFalse(bridge.is_pending())
+        finally:
+            t.join(timeout=1)
+
 
 if __name__ == "__main__":
     unittest.main()
