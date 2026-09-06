@@ -289,18 +289,12 @@ class TranslateWorker(QObject):
         an opt-in AI backend is never a hard requirement.
         """
         parser = self._structure_parser
-        #: B-④/page-parallel structure extraction (DocLayout only): number of worker
-        #: processes for the cross-page DocLayout inference.  Default 1 = sequential;
-        #: ``PDFTRANSLATE_STRUCTURE_CONCURRENCY`` sets it (e.g. the CPU core count) to make
-        #: a many-page PDF's DocLayout use multiple cores.
-        structure_conc = max(1, int(os.environ.get("PDFTRANSLATE_STRUCTURE_CONCURRENCY", "1") or "1"))
         ocr_fn = pdfio.select_ocr_fn(os.environ.get("PDFTRANSLATE_OCR_BACKEND"),
                                      log=lambda m: self.log.emit(m))
         if self._structure_mode:
             self.log.emit(f"已启用语义结构（{parser} 后端），提取并识别公式/图表/标题/表格。")
             return pdfio.extract_document_structured(
                 self._source, parser=parser, ocr=self._ocr, ocr_fn=ocr_fn,
-                concurrency=structure_conc,
                 cancel=lambda: self._cancelled.is_set(),
                 log=lambda m: self.log.emit(m))
         return pdfio.extract_document_text(
@@ -539,7 +533,6 @@ class TranslateWorker(QObject):
                 show_preview=self._show_preview,
                 render_handler=self.render_page_for_agent,
                 interpret=agent_mod.make_llm_interpret(self._model, log=self.log.emit),
-                intent_llm=agent_mod.make_llm_intent_fill(self._model, log=self.log.emit),
                 max_steps_per_page=96,
             ).run()
         finally:

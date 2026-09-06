@@ -1509,7 +1509,6 @@ class DocumentSession:
         render_handler: Callable[[int, str], bytes | None] | None = None,
         audit: Callable[..., dict[str, Any]] | None = None,
         interpret: Callable[[str, str], str] | None = None,
-        intent_llm: Callable[[str, list[str]], str] | None = None,
         include_kept: bool = False,
         max_steps_per_page: int = 24,
     ) -> None:
@@ -1532,11 +1531,6 @@ class DocumentSession:
         #: user's special-page answer (incl. free text) — an AI interpretation; defaults to
         #: the flexible ``interpret_decision`` matcher when not injected.
         self.interpret = interpret
-        #: M1 intent slot-fill: ``intent_llm(text, choices) -> str`` reads the user's free
-        #: text onto one of the allowed discrete choices (review mode / export).  Injected
-        #: by the worker (or a test) via :func:`make_llm_intent_fill`; when ``None`` the
-        #: deterministic keyword matcher decides.  This is a *decision*, never a chat tool.
-        self.intent_llm = intent_llm
         #: M4 (U1 knob): when True the AI self-check also reviews pages the user chose to
         #: keep/skip (default False — those carry the source verbatim, so re-checking them
         #: would wrongly try to translate the intentionally-kept original).
@@ -1861,26 +1855,15 @@ class DocumentSession:
 
         Now that choices are posed as natural-language questions and answered in free
         text, a keyword read (rather than exact-button matching) decides the intent —
-        e.g. "我自己来检查" → user, "先别导，我再看看" → continue.  An injected
-        ``self.intent_llm`` (AI reading the user's free text) wins when it returns one of
-        the allowed choices; a malformed AI result degrades to the keyword matcher.
+        e.g. "我自己来检查" → user, "先别导，我再看看" → continue.
         """
-        v = str(answer or "").strip()
-        allowed = {"review_mode": ("ai", "user"), "export": ("continue", "export")}.get(kind, ())
-        if self.intent_llm is not None and allowed:
-            try:
-                d = str(self.intent_llm(v, list(allowed)) or "").strip().lower()
-                if d in allowed:
-                    return d
-            except Exception:  # noqa: BLE001 — a bad AI read degrades to the keyword matcher
-                pass
-        v2 = v.lower()
+        v = str(answer or "").strip().lower()
         if kind == "review_mode":
-            if any(k in v2 for k in ("手动", "自己", "我来", "我来看", "人工", "自己的")):
+            if any(k in v for k in ("手动", "自己", "我来", "我来看", "人工", "自己的")):
                 return "user"
             return "ai"
         if kind == "export":
-            if any(k in v2 for k in ("继续", "再检查", "再看看", "先不", "先别", "不导", "稍后", "暂不")):
+            if any(k in v for k in ("继续", "再检查", "再看看", "先不", "先别", "不导", "稍后", "暂不")):
                 return "continue"
             return "export"
         return v

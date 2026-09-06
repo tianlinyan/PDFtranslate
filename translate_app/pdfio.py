@@ -457,7 +457,6 @@ def extract_document_structured(
     ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
     cancel: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
-    concurrency: int = 1,
 ) -> DocumentText:
     """One-call entry that *runs the semantic layer* on a PDF (B-④/B-⑤).
 
@@ -468,12 +467,6 @@ def extract_document_structured(
     backend otherwise.  Either way the chosen name is *reported* on the result
     (``DocumentText.structure_parser``) and never aborts the run (a backend outage
     degrades to a plain extraction).
-
-    ``concurrency`` (>1, and only for the ``doclayout`` backend) runs the per-page
-    DocLayout inference in a **process pool** — each page in its own process with its own
-    ONNX Runtime session.  Thread-parallelism does NOT scale a single ONNX session (its
-    intra-op pool serialises concurrent ``predict`` calls), so this is the knob that
-    actually uses multiple cores for a many-page PDF.  Default 1 = sequential (unchanged).
     """
     requested = parser
     if parser == "doclayout":
@@ -486,17 +479,6 @@ def extract_document_structured(
             parser = "geo"
     else:
         import_ok = False
-    # Parallel DocLayout path (process pool).  Falls back to the sequential path below
-    # when it produced no region at all (likely a child-side model issue) or errored.
-    if parser == "doclayout" and import_ok and concurrency > 1:
-        try:
-            dt = extract_document_text(path, title=title, ocr=ocr, ocr_fn=ocr_fn,
-                                       cancel=cancel, log=log)
-            if _structure_parallel_doclayout(path, dt, int(concurrency), log):
-                return dt
-        except Exception as exc:  # noqa: BLE001 — fall back to sequential
-            if log:
-                log(f"[structure] DocLayout 并行解析失败，回落串行：{type(exc).__name__}: {exc}")
     if import_ok:
         structure_fn = make_doclayout_structure_fn(log=log)
     else:
@@ -741,82 +723,6 @@ def _doclayout_parse_results(result, names, dpi: int = 150) -> list[dict]:
     return regions
 
 
-#: Per-process DocLayout model cache for the cross-page parallel structure worker.  Each
-#: worker process loads its own session once (the small model ~72MB) and reuses it across
-#: pages; a per-process session avoids the onnxruntime intra-op contention that defeats
-#: thread-level parallelism (measured: thread-parallel gave ~0.97x, process-parallel is
-#: what actually uses multiple cores for independent page inferences).
-_STRUCTURE_WORKER_MODEL = None
-_STRUCTURE_WORKER_CFG = None
-
-
-def _doclayout_structure_worker(task):
-    """Process-pool worker: run DocLayout over one page PNG → ``(page_index, regions)``.
-
-    ``task`` is ``(page_index, png_bytes, model_path, dpi)``.  Loads (or reuses) a
-    per-process model session.  Fail-closed: on any error returns ``(page_index, [])`` so
-    the page is reported as having no DocLayout structure (never crashes a worker).
-    """
-    global _STRUCTURE_WORKER_MODEL, _STRUCTURE_WORKER_CFG
-    page_index, png, model_path, dpi = task
-    try:
-        if _STRUCTURE_WORKER_MODEL is None or _STRUCTURE_WORKER_CFG != (model_path,):
-            from doclayout_yolo import YOLOv10
-            local = _resolve_doclayout_model(model_path)
-            _STRUCTURE_WORKER_MODEL = YOLOv10(local, task="detect")
-            _STRUCTURE_WORKER_CFG = (model_path,)
-        regions = _doclayout_regions(_STRUCTURE_WORKER_MODEL, png, dpi=dpi)
-        return (page_index, regions or [])
-    except Exception:  # noqa: BLE001 — a worker outage yields no regions, never crashes
-        return (page_index, [])
-
-
-def _structure_parallel_doclayout(path, dt, concurrency, log) -> bool:
-    """Run DocLayout structure across pages in parallel (process pool).
-
-    Thread-parallelism does NOT scale a single ONNX Runtime session (its intra-op thread
-    pool serialises concurrent ``predict`` calls); running each page in its own process
-    with its own session is what actually uses multiple cores for independent pages.
-    Pages are rendered to PNG in the parent (cheap), dispatched to ``concurrency``
-    workers, and the resulting regions are fused back into ``dt.page_structure`` in
-    order.  Returns ``True`` when at least one page yielded DocLayout regions.
-    """
-    from concurrent.futures import ProcessPoolExecutor
-    import pymupdf as fitz
-
-    dpi = 150
-    doc = fitz.open(str(path))
-    try:
-        tasks = []
-        for p in range(dt.page_count):
-            try:
-                png = _render_page_png(doc[p], dpi=dpi)
-            except Exception:  # noqa: BLE001 — an unrenderable page yields no structure
-                png = b""
-            tasks.append((p, png, None, dpi))
-    finally:
-        doc.close()
-
-    results: dict[int, list] = {}
-    if tasks:
-        with ProcessPoolExecutor(max_workers=concurrency) as ex:
-            for page_index, regions in ex.map(_doclayout_structure_worker, tasks):
-                results[page_index] = regions
-
-    any_doclayout = False
-    dt.page_structure = []
-    for p in range(dt.page_count):
-        blocks = dt.pages[p] if p < len(dt.pages) else []
-        offset = sum(len(pg) for pg in dt.pages[:p])
-        regions = results.get(p) or []
-        if regions:
-            any_doclayout = True
-        dt.page_structure.append(
-            _fuse_structure(p, blocks, offset, regions, "doclayout"))
-    dt.structure_parser = "doclayout" if any_doclayout else ""
-    return any_doclayout
-
-
 def _structure_dominant_kind(ps: PageStructure) -> str | None:
     """The kind a page is *dominated* by (None when absent / ambiguous).
 
@@ -831,7 +737,6 @@ def _structure_dominant_kind(ps: PageStructure) -> str | None:
     for kind in _STRUCTURE_KINDS:
         if counts.get(kind, 0) > text_n:
             return kind
-    return None
 
 
 def get_structure_summary(doc: DocumentText) -> dict:

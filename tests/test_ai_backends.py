@@ -66,24 +66,6 @@ class ExtractStructuredBackendTest(unittest.TestCase):
         self.assertEqual("geo", res.structure_parser)
 
 
-class ConcurrencyParamTest(unittest.TestCase):
-    def test_concurrency_ignored_for_geo(self):
-        # concurrency only applies to the doclayout backend; the geo path stays sequential
-        # and still reports "geo".
-        with patch.object(pdfio, "extract_structured", side_effect=_capture_structured):
-            res = pdfio.extract_document_structured("x.pdf", parser="geo", concurrency=4)
-        self.assertEqual("geo", res.structure_parser)
-
-    def test_concurrency_doclayout_unavailable_reports_geo(self):
-        # doclayout + concurrency>1 but the package is absent → falls to the geometric
-        # sequential path and reports "geo" (never tries to spawn processes).
-        with patch.dict(sys.modules, {"doclayout_yolo": None}), \
-             patch.object(pdfio, "extract_structured", side_effect=_capture_structured) as es:
-            res = pdfio.extract_document_structured("x.pdf", parser="doclayout", concurrency=4)
-        self.assertEqual("geo", res.structure_parser)
-        es.assert_called_once()   # went through the sequential extract_structured path
-
-
 class SelectOcrFnTest(unittest.TestCase):
     def test_default_backends_return_none(self):
         self.assertIsNone(pdfio.select_ocr_fn(None))

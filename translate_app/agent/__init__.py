@@ -49,7 +49,6 @@ from .flow import (
     run_agent_run,
     run_page_visual,
 )
-from .intent import make_llm_intent_fill
 from .flow_steps import (
     STANDARD_FLOWS,
     AgentStep,
@@ -131,7 +130,6 @@ __all__ = [
     "make_llm_decide",
     "make_llm_flow_compiler",
     "make_llm_interpret",
-    "make_llm_intent_fill",
     "make_page_executors",
     "make_source_tools",
     "run_agent_run",
