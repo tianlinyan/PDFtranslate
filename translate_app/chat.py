@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 from typing import Any, Callable
 
 from openai import OpenAI
@@ -53,8 +54,24 @@ class ChatSession:
     def __init__(self, model: ModelConfig, log: Callable[[str], None] | None = None) -> None:
         self.model = model
         self.log = log
-        self.client = OpenAI(**model.client_kwargs())
+        self.client = self._new_client()
         self.history: list[dict[str, Any]] = []
+
+    def _new_client(self):
+        return OpenAI(**self.model.client_kwargs())
+
+    def refresh_client(self) -> None:
+        """Close the current client and mint a fresh one.
+
+        Used to abort an in-flight ``chat.completions.create`` (closing the httpx
+        client raises on the blocked call) while preserving ``history`` for the next
+        turn.
+        """
+        try:
+            self.client.close()
+        except Exception:  # noqa: BLE001 — best-effort close
+            pass
+        self.client = self._new_client()
 
     def reply(
         self,
@@ -188,6 +205,7 @@ class ChatWorker(QObject):
     ask_requested = pyqtSignal(str, object, object)   # text, ModelConfig, image_bytes|None
     reply_ready = pyqtSignal(str)
     error = pyqtSignal(str)
+    cancelled = pyqtSignal(str)   # the in-flight reply was aborted by the user ("取消")
     #: (b) A flow-time agent Q&A, noted into the live session's history (queued).
     record_exchange_requested = pyqtSignal(str, str, str)   # question, answer, target
 
@@ -200,6 +218,8 @@ class ChatWorker(QObject):
         super().__init__()
         self._log = log or (lambda m: None)
         self._session: ChatSession | None = None
+        #: Aborts the in-flight reply (the sidebar's "取消").  Cleared on each ask.
+        self._cancel_ev = threading.Event()
         #: Optional persistent document context (``DocContext``) whose tools the
         #: interaction model may call.  ``show_preview`` is a thread-safe channel to
         #: open a preview page; ``re_export`` re-exports the last translation with the
@@ -272,13 +292,38 @@ class ChatWorker(QObject):
         if model is None:
             self.error.emit("没有可用的 AI 模型，无法对话。")
             return
+        self._cancel_ev.clear()
         try:
             session = self._ensure_session(model)
             tools, executor = self._build_tools()
-            reply = session.reply(str(text), tools=tools, executor=executor, image=image)
+            # Abort an in-flight reply on "取消": a watchdog closes the client (which
+            # raises on the blocked create) while preserving history for the next turn.
+            done = threading.Event()
+
+            def _watchdog():
+                while not done.wait(0.1):
+                    if self._cancel_ev.is_set():
+                        session.refresh_client()
+                        return
+
+            threading.Thread(target=_watchdog, daemon=True).start()
+            try:
+                reply = session.reply(str(text), tools=tools, executor=executor, image=image)
+            finally:
+                done.set()
+            if self._cancel_ev.is_set():
+                self.cancelled.emit("已取消")
+                return
             self.reply_ready.emit(reply)
         except Exception as exc:  # noqa: BLE001 — best-effort, never crash the thread
-            self._log(f"  对话请求失败：{type(exc).__name__}: {exc}")
+            if self._cancel_ev.is_set():
+                self.cancelled.emit("已取消")
+            else:
+                self._log(f"  对话请求失败：{type(exc).__name__}: {exc}")
+
+    def cancel_current(self) -> None:
+        """Abort the in-flight reply (triggered by the sidebar's "取消" / Enter)."""
+        self._cancel_ev.set()
 
     @pyqtSlot(str, str, str)
     def _record_exchange(self, question: str, answer: str, target: str = "") -> None:

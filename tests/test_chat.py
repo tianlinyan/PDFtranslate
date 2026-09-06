@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from PyQt6.QtCore import Qt
+
 from translate_app import chat
 from translate_app.doc_context import DocContext
 from translate_app.settings import ModelConfig
@@ -240,6 +242,42 @@ class ChatWorkerTest(unittest.TestCase):
         worker.ask("你好", None)
         self.assertEqual(1, len(errors))
         self.assertIn("没有可用的 AI 模型", errors[0])
+
+    def test_cancel_aborts_in_flight_reply(self):
+        # The sidebar "取消" aborts an in-flight reply (closing the client raises on
+        # the blocked create) and surfaces ``cancelled`` instead of an error.
+        import threading as _th
+
+        closed = _th.Event()
+
+        class _BlockingClient:
+            def close(self):
+                closed.set()
+
+            @property
+            def chat(self):
+                return self
+
+            @property
+            def completions(self):
+                return self
+
+            def create(self, **kwargs):
+                closed.wait(5)
+                raise RuntimeError("client closed (aborted)")
+
+        seen: list = []
+        worker = chat.ChatWorker()
+        # DirectConnection: the emit happens on the ''ask'' thread and the test does
+        # not run a Qt event loop, so force a synchronous (direct) delivery.
+        worker.cancelled.connect(seen.append, Qt.ConnectionType.DirectConnection)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: _BlockingClient()):
+            t = _th.Thread(target=lambda: worker.ask("你好", _model()), daemon=True)
+            t.start()
+            _th.Event().wait(0.2)      # let the ask reach the blocking create
+            worker.cancel_current()
+            t.join(timeout=3)
+        self.assertEqual(["已取消"], seen)
 
     def test_ask_with_document_runs_tools(self):
         # A loaded document hands the chat model its tools; a tool call executes

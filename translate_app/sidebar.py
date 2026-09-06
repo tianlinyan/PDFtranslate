@@ -126,10 +126,14 @@ class SidebarChat(QWidget):
 
     userMessage = pyqtSignal(str)               # user typed a message
     answerChosen = pyqtSignal(object, str)      # value, target
+    #: User pressed "取消" (or Enter) while the AI was replying → abort the in-flight reply.
+    cancelRequested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumWidth(300)
+        #: Whether the AI is replying (so the send button becomes "取消").
+        self._busy = False
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setPlaceholderText("AI 对话记录…")
@@ -137,8 +141,8 @@ class SidebarChat(QWidget):
         self._input = QLineEdit()
         self._input.setPlaceholderText("随时提问或给要求…")
         self._input.returnPressed.connect(self._send)
-        send_btn = QPushButton("发送")
-        send_btn.clicked.connect(self._send)
+        self.send_btn = QPushButton("发送")
+        self.send_btn.clicked.connect(self._send)
 
         self._asks_box = QWidget()
         self._asks_box.setMinimumHeight(44)   # keep agent-question buttons visible
@@ -203,8 +207,20 @@ class SidebarChat(QWidget):
         if show:
             self.add_message("我", text)
         self.userMessage.emit(text)
+        self.set_busy(True)
+
+    def set_busy(self, busy: bool) -> None:
+        """Toggle the send button: "发送" when idle, "取消" while the AI is replying."""
+        self._busy = bool(busy)
+        self.send_btn.setText("取消" if self._busy else "发送")
 
     def _send(self) -> None:
+        # While the AI is replying, Send becomes Cancel (classic chat "stop generating"):
+        # pressing it (or Enter) aborts the in-flight reply instead of sending more text.
+        if self._busy:
+            self.cancelRequested.emit()
+            self.set_busy(False)
+            return
         text = self._input.text().strip()
         if not text:
             return

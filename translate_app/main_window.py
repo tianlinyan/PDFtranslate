@@ -375,6 +375,9 @@ class MainWindow(QWidget):
         self._chat_worker.ask_requested.connect(self._chat_worker.ask)
         self._chat_worker.reply_ready.connect(self._on_chat_reply)
         self._chat_worker.error.connect(self._on_chat_error)
+        self._chat_worker.cancelled.connect(self._on_chat_cancelled)
+        # Sidebar "取消" (or Enter while the AI is replying) aborts the in-flight reply.
+        self.agent_sidebar.cancelRequested.connect(self._chat_worker.cancel_current)
         self._chat_thread.start()
 
         left = QWidget()
@@ -482,9 +485,11 @@ class MainWindow(QWidget):
         if self.answer_bridge.is_pending() and text.strip():
             self.agent_sidebar.add_message("我", str(text).strip())
             self.answer_bridge.answer(str(text).strip(), self.answer_bridge.pending_target)
+            self.agent_sidebar.set_busy(False)   # routed as an answer, no chat turn
             return
         # M5 preview-navigation commands drive the preview window directly.
         if self._maybe_preview_command(text):
+            self.agent_sidebar.set_busy(False)   # preview command, not a chat turn
             return
         # Best-effort: inject the free-text requirement into the running agent so
         # its next decision sees it (a no-op if no agent run is active).
@@ -507,9 +512,16 @@ class MainWindow(QWidget):
     def _on_chat_reply(self, reply: str) -> None:
         """The interaction model answered; show it only in the sidebar."""
         self.agent_sidebar.add_message("ai", reply)
+        self.agent_sidebar.set_busy(False)
 
     def _on_chat_error(self, err: str) -> None:
         self.agent_sidebar.add_message("ai", f"（对话失败：{err}）")
+        self.agent_sidebar.set_busy(False)
+
+    def _on_chat_cancelled(self, msg: str) -> None:
+        """The user aborted the in-flight reply; show it and clear the busy state."""
+        self.agent_sidebar.set_busy(False)
+        self.agent_sidebar.add_notice(str(msg or "已取消"))
 
     def _show_preview(self, page: int, what: str = "source") -> None:
         """Open the preview window for ``page``; framed sends go to the bridge."""
