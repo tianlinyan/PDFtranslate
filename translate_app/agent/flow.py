@@ -1510,6 +1510,7 @@ class DocumentSession:
         audit: Callable[..., dict[str, Any]] | None = None,
         interpret: Callable[[str, str], str] | None = None,
         include_kept: bool = False,
+        scope: list[int] | None = None,
         max_steps_per_page: int = 24,
     ) -> None:
         self.state = state
@@ -1535,6 +1536,8 @@ class DocumentSession:
         #: keep/skip (default False — those carry the source verbatim, so re-checking them
         #: would wrongly try to translate the intentionally-kept original).
         self.include_kept = include_kept
+        #: U1 scope: translate / negotiate only these 0-based pages (None = all).
+        self.scope = scope
         self.max_steps_per_page = max_steps_per_page
 
     #: phase-name → phase constant, used to set ``state.phase`` as the plan advances.
@@ -1652,7 +1655,8 @@ class DocumentSession:
             self.log(f"  第 {i + 1} 页翻译失败：{rs.error}（保留原文）。")
 
     def _translate_normal(self) -> None:
-        normal = [i for i, t in self.state.triage.items() if t.kind == "normal"]
+        normal = [i for i, t in self.state.triage.items()
+                  if t.kind == "normal" and (self.scope is None or i in self.scope)]
         total = len(normal)
         if not total:
             self.log("  未发现正常文本页，跳过批量翻译。")
@@ -1701,7 +1705,8 @@ class DocumentSession:
             self.progress(done, total, "翻译正常页")
 
     def _special_pages(self) -> None:
-        special = [i for i, t in self.state.triage.items() if t.kind != "normal"]
+        special = [i for i, t in self.state.triage.items()
+                   if t.kind != "normal" and (self.scope is None or i in self.scope)]
         if not special:
             self.log("  无特殊页。")
             return

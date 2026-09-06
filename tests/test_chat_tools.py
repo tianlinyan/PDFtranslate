@@ -332,7 +332,7 @@ class ChatToolsTest(_CtxTest):
     def test_run_translate_requires_source(self):
         # No source PDF loaded → the tool must fail-closed, not report success while
         # nothing actually starts.
-        tools = chat_tools.make_chat_tools(DocContext(), start_translate=lambda _r: None)
+        tools = chat_tools.make_chat_tools(DocContext(), start_translate=lambda _r, _scope=None: None)
         res = tools["run_translate"]()
         self.assertFalse(res["ok"])
         self.assertIn("源文件", res["error"])
@@ -340,7 +340,7 @@ class ChatToolsTest(_CtxTest):
     def test_run_translate_calls_channel_with_requirement(self):
         calls: list = []
         tools = chat_tools.make_chat_tools(self.ctx,
-                                           start_translate=lambda req: calls.append(req))
+                                           start_translate=lambda req, _scope=None: calls.append(req))
         res = tools["run_translate"]("第3页公司名翻成Bank")
         self.assertTrue(res["ok"])
         self.assertEqual(["第3页公司名翻成Bank"], calls)
@@ -407,17 +407,28 @@ class ChatToolsTest(_CtxTest):
         self.assertEqual(1, res["pages_audited"])
         self.assertIn("issue_count", res)
 
-    def test_run_flow_redirects_translate_base(self):
-        res = self.tools["run_flow"]("重译第2页")
-        self.assertFalse(res["ok"])
+    def test_run_flow_dispatches_translate_base(self):
+        # "重译第2页" now *dispatches* to translation with the compiled page scope,
+        # instead of being rejected — the console defines WHAT to translate.
+        calls: list = []
+        tools = chat_tools.make_chat_tools(
+            self.ctx, log=lambda m: None,
+            start_translate=lambda req, scope=None: calls.append((req, scope)))
+        res = tools["run_flow"]("重译第2页")
+        self.assertTrue(res["ok"], res)
         self.assertEqual("translate_page", res["base"])
-        self.assertIn("run_translate", res["error"])
+        self.assertEqual([1], res["scope"])          # "第2页" → 0-based [1]
+        self.assertEqual(("重译第2页", [1]), calls[0])
 
-    def test_run_flow_redirects_export_base(self):
-        res = self.tools["run_flow"]("重新导出")
-        self.assertFalse(res["ok"])
+    def test_run_flow_dispatches_export_base(self):
+        # "重新导出" now dispatches to re_export (no re-translate), instead of rejecting.
+        calls: list = []
+        tools = chat_tools.make_chat_tools(
+            self.ctx, log=lambda m: None, re_export=lambda: calls.append(True))
+        res = tools["run_flow"]("重新导出")
+        self.assertTrue(res["ok"], res)
         self.assertEqual("export", res["base"])
-        self.assertIn("re_export", res["error"])
+        self.assertTrue(calls)
 
     def test_run_flow_promotes_named_flow_in_memory(self):
         from translate_app.agent import user_flows as uf

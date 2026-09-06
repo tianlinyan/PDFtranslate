@@ -32,6 +32,7 @@ from .state import (
 )
 from .tools import (
     AGENT_TOOLS,
+    TOOL_CATALOG,
     ToolDef,
     agent_openai_tools,
     by_name,
@@ -81,6 +82,7 @@ from .user_flows import (
 
 __all__ = [
     "AGENT_TOOLS",
+    "TOOL_CATALOG",
     "AgentResult",
     "AgentStep",
     "Budget",

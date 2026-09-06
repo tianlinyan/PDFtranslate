@@ -21,96 +21,16 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from . import prompts
+from .agent.tool_catalog import catalog_for, to_openai_schema
 
 #: Valid ``output_type`` values for ``set_setting`` (mirrors ``worker.OUTPUT_TYPES``).
 _OUTPUT_TYPE_KEYS = frozenset({"translated_pdf", "bilingual_pdf", "markdown", "plain_text"})
 
-
-def _tool(name: str, properties: dict[str, dict], required: list[str]) -> dict[str, Any]:
-    # The tool's ``description`` is prompt text, authored centrally in
-    # ``translate_app.prompts`` (``CHAT_TOOL_DESCRIPTIONS``), not here.
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": prompts.CHAT_TOOL_DESCRIPTIONS[name],
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            },
-        },
-    }
-
-
 #: The chat tool schemas (OpenAI ``tools`` array).  The chat model only ever sees
-#: these — a subset of the translation agent's registry, chosen for the persistent
-#: context (no draw / page / verify tools yet).
-CHAT_TOOL_SPECS: list[dict[str, Any]] = [
-    _tool("get_doc_info", {}, []),
-    _tool("get_settings", {}, []),
-    _tool("classify_page",
-          {"page": {"type": "integer", "description": "页号（0 起）"}}, ["page"]),
-    _tool("get_structure",
-          {"page": {"type": "integer", "description": "页号（0 起）"}}, ["page"]),
-    _tool("get_table",
-          {"page": {"type": "integer", "description": "页号（0 起）"},
-           "index": {"type": "integer", "description": "该页语义表格序号（默认 0）"}},
-          ["page"]),
-    _tool("read_page",
-          {"page": {"type": "integer", "description": "页号（0 起）"}}, ["page"]),
-    _tool("goto_page",
-          {"page": {"type": "integer", "description": "页号（0 起）"},
-           "what": {"type": "string", "enum": ["source", "translation"],
-                    "description": "显示原文页还是译文页，默认 source"}},
-          ["page"]),
-    _tool("set_block_text",
-          {"index": {"type": "integer", "description": "扁平块索引（来自 read_page）"},
-           "text": {"type": "string"}},
-          ["index", "text"]),
-    _tool("delete_block_text",
-          {"index": {"type": "integer", "description": "扁平块索引（来自 read_page）"}},
-          ["index"]),
-    _tool("apply_annotation",
-          {"page": {"type": "integer"},
-           "bbox": {"type": "array", "items": {"type": "number"},
-                    "description": "标注框 [x0,y0,x1,y1]，PDF 点"},
-           "text": {"type": "string", "description": "替换译文（action=set 时必填）"},
-           "action": {"type": "string", "enum": ["set", "delete"], "default": "set"}},
-          ["page", "bbox"]),
-    _tool("self_check",
-          {"page": {"type": "integer", "description": "页号（0 起）；不传则审计全文"},
-           "checks": {"type": "array", "items": {"type": "string"},
-                      "description": "检查子集：layout/residual/missing/numbers/table（默认全部）"}},
-          []),
-    _tool("retranslate",
-          {"page": {"type": "integer", "description": "页号（0 起）"},
-           "indices": {"type": "array", "items": {"type": "integer"},
-                       "description": "要重译的扁平块索引（来自 read_page）；不传则重译整页所有可翻译块"},
-           "target_lang": {"type": "string",
-                           "description": "目标语言（默认当前设置的目标语言）"}},
-          ["page"]),
-    _tool("run_flow",
-          {"requirement": {"type": "string",
-                           "description": "用户的一句话要求（如“自检第3到第8页只查数字和表格，不修改”）"},
-           "name": {"type": "string",
-                    "description": "可选：把该流程登记为命名流程（本次会话内可复用）"}},
-          ["requirement"]),
-    _tool("re_export", {}, []),
-    _tool("run_translate",
-          {"requirement": {"type": "string",
-                           "description": "用户的具体要求（可选，如\"第3页公司名翻成Bank\"），会随运行注入 AI 编排层"}},
-          []),
-    _tool("set_setting",
-          {"key": {"type": "string", "enum": ["target_language", "output_type"],
-                   "description": "要改的设置项：target_language（目标语言名）或 output_type（输出格式键）"},
-           "value": {"type": "string",
-                     "description": "语言名（如 French）；output_type 取 translated_pdf / bilingual_pdf / markdown / plain_text"}},
-          ["key", "value"]),
-]
-
-
+#: the ``"chat"``-audience subset of the single tool catalog (see
+#: ``agent.tool_catalog``) -- chosen for the persistent context, no draw / page /
+#: verify tools.
+CHAT_TOOL_SPECS: list[dict[str, Any]] = [to_openai_schema(t) for t in catalog_for("chat")]
 def chat_openai_tools(names: list[str] | None = None) -> list[dict[str, Any]]:
     """Return the OpenAI ``tools`` array (optionally filtered by ``names``)."""
     if names is None:
@@ -190,7 +110,7 @@ def _finding_block_indices(issues: list[dict] | None) -> list[int]:
 
 def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = None,
                     re_export: Callable[[], None] | None = None,
-                    start_translate: Callable[[str], None] | None = None,
+                    start_translate: Callable[[str, list | None], None] | None = None,
                     set_setting: Callable[[str, str], None] | None = None,
                     llm: Callable[[str], dict] | None = None,
                     log: Callable[[str], None] | None = None,
@@ -445,8 +365,17 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": "请先选择一个 PDF 源文件（点「打开 PDF…」或拖入窗口）。"}
         if start_translate is None:
             return {"ok": False, "error": "开始翻译通道未接线"}
+        # U1: a page range in the requirement (e.g. "只翻第2-5页") becomes the run's
+        # page scope, so the console defines WHAT to translate and the pipeline limits
+        # itself to those pages (None = the whole document).
+        from . import agent as _agent
         try:
-            start_translate(str(requirement or ""))
+            page_scope = _agent.compile_from_user(
+                str(requirement or ""), default_base="translate_page").scope
+        except Exception:  # noqa: BLE001 — a bad parse degrades to the whole document
+            page_scope = None
+        try:
+            start_translate(str(requirement or ""), page_scope)
         except Exception as exc:  # noqa: BLE001 — fail-closed
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         return {"ok": True, "message": "已触发开始翻译（按当前设置后台执行；完成会在主窗口日志/进度提示）。"}
@@ -477,9 +406,10 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         spec) decides whether it is read-only audit (default when the channel is not
         wired) or an in-place fix plus re-audit.
 
-        Path A (rule-based ``compile_from_user``): the requirement fills scope/checks/
-        auto_fix.  Only audit-type flows run here; translate/export bases are redirected
-        to the tools that can actually do them (``run_translate`` / ``re_export``).
+        Path A (rule-based ``compile_from_user``): the requirement fills base/scope/checks/
+        auto_fix.  The compiled ``base`` dispatches the execution: translate / special-page
+        flows start the pipeline (with the spec's page scope), export re-exports (no
+        re-translate), and audit flows run the deterministic checks in place.
         """
         from . import agent
 
@@ -488,12 +418,26 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": "没有已加载的 PDF。"}
         spec = agent.compile_from_user(str(requirement or ""), default_base="self_check_page",
                                        llm=llm)
+        # U1: 编译出的 base 决定"翻译 / 导出 / 审计"三种执行 —— 用同一套"定义流程"机制。
+        if spec.base in ("translate_page", "translate_normal", "special_pages", "special_page"):
+            # 翻译/特殊页：按 scope 启动翻译流水线（scope 缺省 = 整篇）。
+            if start_translate is None:
+                return {"ok": False, "base": spec.base, "error": "开始翻译通道未接线"}
+            try:
+                start_translate(str(requirement or ""), spec.scope)
+            except Exception as exc:  # noqa: BLE001 — fail-closed
+                return {"ok": False, "base": spec.base, "error": f"{type(exc).__name__}: {exc}"}
+            return {"ok": True, "base": spec.base, "scope": spec.scope,
+                    "message": "已触发翻译（按当前要求后台执行；完成会在主窗口日志/进度提示）。"}
         if spec.base == "export":
-            return {"ok": False, "base": "export",
-                    "error": "导出/重新导出请用 re_export 工具（或点主界面「重新导出」按钮）。"}
-        if spec.base == "translate_page":
-            return {"ok": False, "base": "translate_page",
-                    "error": "重译需完整翻译运行：请用 run_translate 并在要求里写清要重译的页。"}
+            # 导出/重新导出：复用 re_export（用上次译文 + 当前 overlay 重写，不重译）。
+            if re_export is None:
+                return {"ok": False, "base": "export", "error": "重新导出通道未接线"}
+            try:
+                re_export()
+            except Exception as exc:  # noqa: BLE001 — fail-closed
+                return {"ok": False, "base": "export", "error": f"{type(exc).__name__}: {exc}"}
+            return {"ok": True, "base": "export", "message": "已触发重新导出（后台执行）。"}
         if spec.base not in ("self_check_page", "ai_self_check"):
             return {"ok": False, "base": spec.base,
                     "error": f"该流程类型（{spec.base}）暂不能在对话中直接执行。"}

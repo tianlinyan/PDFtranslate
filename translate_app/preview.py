@@ -511,7 +511,7 @@ class PreviewBridge(QObject):
     #: Thread-safe channels for the chat AI's translate-entry tools: emitted from
     #: the chat worker thread, queued to the GUI where they trigger the pipeline
     #: start (with an optional user requirement) / a setting change.
-    translateRequested = pyqtSignal(str)        # requirement
+    translateRequested = pyqtSignal(str, object)   # requirement, page_scope
     setSettingRequested = pyqtSignal(str, object)  # key, value
 
     def __init__(self, parent: QObject | None = None, timeout: float = 120.0) -> None:

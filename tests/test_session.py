@@ -51,6 +51,20 @@ def _mixed_doc():
     return doc
 
 
+def _scope_doc():
+    """Normal pages 0-2 + one scan page (3) → tests the U1 ``scope`` page filter."""
+    pages = [
+        [_blk("A", page=0, x0=0, y0=0, x1=60, y1=10)],
+        [_blk("B", page=1, x0=0, y0=0, x1=60, y1=10)],
+        [_blk("C", page=2, x0=0, y0=0, x1=60, y1=10)],
+        [_blk("S", page=3, x0=0, y0=0, x1=60, y1=10, ocr=True)],
+    ]
+    doc = pdfio.DocumentText(pages=pages, blocks=["A", "B", "C", "S"],
+                             block_pages=[0, 1, 2, 3], title="t")
+    doc.ocr_count = 1
+    return doc
+
+
 class DocInfoTriageTest(unittest.TestCase):
     def test_detect_language(self):
         self.assertEqual("zh", pdfio.detect_language(["中文内容", "你好"]))
@@ -468,6 +482,26 @@ class DocumentSessionTest(unittest.TestCase):
         session._translate_normal()
         self.assertEqual(agent.STATUS_NEEDS_USER, state.page(0).status)
         self.assertTrue(any("未产生任何译文" in i for i in state.page(0).issues))
+
+    def test_translate_normal_honors_scope(self):
+        # U1 scope (from the console's FlowSpec) limits which pages get translated:
+        # pages 1-2 translate, pages 0 and 3 (scan/special) are untouched.
+        doc = _scope_doc()
+        translated: list[int] = []
+
+        def fake_translate(st, page, _model, *, task, **kw):
+            translated.append(page)
+            st.out_doc = st.out_doc or {}
+            st.out_doc[page] = {"text": f"T{page}"}
+            return st
+
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=fake_translate, scope=[1, 2])
+        session._preprocess()
+        session._translate_normal()
+        self.assertEqual([1, 2], sorted(translated))
 
     def test_translate_normal_parallel_pages_when_configured(self):
         # ``page_concurrency`` (opt-in) fans normal pages out across a thread pool;

@@ -154,6 +154,20 @@ class ChatSessionTest(unittest.TestCase):
         roles = [h["role"] for h in session.history]
         self.assertEqual(["user", "assistant", "user", "assistant"], roles)
 
+    def test_record_exchange_notes_flow_qa_into_history(self):
+        # (b) A flow-time agent question + the user's answer is recorded into the
+        # console's history, so the console and the flow share one coherent thread.
+        with mock.patch.object(chat, "OpenAI", lambda **_k: _FakeClient("re", [])):
+            session = chat.ChatSession(_model())
+        session.record_exchange("特殊页 chart 怎么处理？", "保留原文", "page:1")
+        self.assertEqual(["assistant", "user"], [h["role"] for h in session.history])
+        self.assertIn("特殊页 chart", session.history[0]["content"])
+        self.assertIn("page:1", session.history[0]["content"])
+        self.assertEqual("保留原文", session.history[1]["content"])
+        # An empty answer (e.g. a cancelled ask) is skipped, not recorded.
+        session.record_exchange("q", "", "page:2")
+        self.assertEqual(2, len(session.history))
+
     def test_reply_runs_tool_loop_and_feeds_results_back(self):
         # The model calls two tools, then returns a plain reply.  Each tool result
         # must be fed back as a ``tool`` role message and the loop must stop on the

@@ -77,6 +77,7 @@ class TranslateWorker(QObject):
         re_export: bool = False,
         last_translated: list[str] | None = None,
         requirements: list[str] | None = None,
+        page_scope: list[int] | None = None,
         ir_mode: bool = False,
         structure_mode: bool = False,
     ):
@@ -105,6 +106,8 @@ class TranslateWorker(QObject):
         #: User requirements seeded into the agent at start (from the "开始翻译+要求"
         #: chat entry).  ``add_user_requirement`` appends more live, during a run.
         self._requirements: list[str] = list(requirements or [])
+        #: U1 scope: translate / negotiate only these 0-based pages (None = all).
+        self._page_scope: list[int] | None = list(page_scope) if page_scope else None
         #: The PDF this run exported (set only for a PDF output type).  The preview
         #: window's "译文" side renders from THIS after the run — the exported
         #: translation — while a live run shows the in-progress translation (below).
@@ -533,12 +536,14 @@ class TranslateWorker(QObject):
                 show_preview=self._show_preview,
                 render_handler=self.render_page_for_agent,
                 interpret=agent_mod.make_llm_interpret(self._model, log=self.log.emit),
+                scope=self._page_scope,
                 max_steps_per_page=96,
             ).run()
         finally:
             self._agent_state = None
         # The completion report (decoupled from any self-check prompt) is surfaced so
         # the user sees what was done; the self-check is triggered on demand via chat.
+        self._report = state.summary or ""
         if state.summary:
             self.log.emit(state.summary)
         translated = list(doc.blocks)

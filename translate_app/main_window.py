@@ -350,6 +350,9 @@ class MainWindow(QWidget):
         # modal dialog — a modal would cover the preview the user is looking at.
         self.answer_bridge.showQuestion.connect(self.agent_sidebar.show_question)
         self.agent_sidebar.answerChosen.connect(self.answer_bridge.answer)
+        # (b) Share a flow-time Q&A with the console conversation (recorded into its
+        # history) so the console and the flow keep one coherent thread.
+        self.answer_bridge.exchangeMade.connect(self._record_chat_exchange)
         self.agent_sidebar.userMessage.connect(self._on_user_message)
 
         # --- Persistent AI chat (free-text conversation with the interaction model) ---
@@ -727,12 +730,14 @@ class MainWindow(QWidget):
         """
         self.agent_sidebar.send_message("开始翻译")
 
-    def _start(self, requirement: str = "") -> None:
+    def _start(self, requirement: str = "", page_scope: list[int] | None = None) -> None:
         """Start the translation pipeline (the "开始翻译" entry, button or AI tool).
 
         ``requirement`` is an optional user requirement supplied by the AI's
-        ``run_translate`` tool; it is seeded into the run's workflow state so the
-        translation agent sees it from the first decision.
+        ``run_translate`` / ``run_flow`` tools; it is seeded into the run's workflow
+        state so the translation agent sees it from the first decision.
+        ``page_scope`` (optional) limits the run to these 0-based pages (None = all),
+        so the console can define a scoped translation flow.
         """
         requirement = str(requirement or "").strip()
         if self._thread is not None:
@@ -790,6 +795,7 @@ class MainWindow(QWidget):
             agent_mode=True,
             overlay=self.doc_ctx.overlay(),
             requirements=[requirement] if requirement else None,
+            page_scope=page_scope,
         ))
 
     def _launch_worker(self, worker: TranslateWorker) -> None:
@@ -959,6 +965,10 @@ class MainWindow(QWidget):
             self._last_output_type = getattr(worker, "_output_type", "")
         else:
             self._last_pdf = None
+        # Gap1: feed the run's result back to the console surface so the user sees a
+        # clear completion summary in the sidebar (the console can then follow up).
+        if worker is not None and getattr(worker, "_report", ""):
+            self.agent_sidebar.add_notice(worker._report)
 
     def _on_error(self, msg: str) -> None:
         # Settle the progress bar (it may be stuck in the busy state) and mark
@@ -970,6 +980,10 @@ class MainWindow(QWidget):
         # Show only the headline in the dialog (the log keeps the full detail).
         headline = next((ln for ln in msg.splitlines() if ln.strip()), "翻译失败")
         QMessageBox.critical(self, "翻译失败", headline)
+
+    def _record_chat_exchange(self, question: str, answer: str, target: str = "") -> None:
+        """(b) Forward a flow-time Q&A to the console's conversation history."""
+        self._chat_worker.record_exchange_requested.emit(question, answer, target)
 
     def _open_output(self) -> None:
         if not self._last_output:

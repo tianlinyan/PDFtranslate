@@ -136,6 +136,22 @@ class ChatSession:
         self.history.append({"role": "assistant", "content": reply})
         return reply
 
+    def record_exchange(self, question: str, answer: str, target: str = "") -> None:
+        """(b) Note a flow-time agent question + the user's answer into ``history``.
+
+        The flow asks the user through ``AnswerBridge`` (a separate channel from the
+        chat); recording the exchange here lets the console's next turn see it and
+        keep one coherent thread with the flow, instead of two disconnected surfaces.
+        Empty answer (e.g. a cancelled ask) is skipped.
+        """
+        q = str(question or "").strip()
+        a = str(answer or "").strip()
+        if not q or not a:
+            return
+        prefix = f"（流程询问 {target}）" if target else "（流程询问）"
+        self.history.append({"role": "assistant", "content": f"{prefix}{q}"})
+        self.history.append({"role": "user", "content": a})
+
     def _call(self, *, tools: list[dict[str, Any]] | None) -> Any:
         """One chat-completions call using the interaction parameter set."""
         system_prompt = prompts.chat_system_prompt()
@@ -172,6 +188,8 @@ class ChatWorker(QObject):
     ask_requested = pyqtSignal(str, object, object)   # text, ModelConfig, image_bytes|None
     reply_ready = pyqtSignal(str)
     error = pyqtSignal(str)
+    #: (b) A flow-time agent Q&A, noted into the live session's history (queued).
+    record_exchange_requested = pyqtSignal(str, str, str)   # question, answer, target
 
     def __init__(self, log: Callable[[str], None] | None = None,
                  ctx: Any | None = None,
@@ -261,4 +279,10 @@ class ChatWorker(QObject):
             self.reply_ready.emit(reply)
         except Exception as exc:  # noqa: BLE001 — best-effort, never crash the thread
             self._log(f"  对话请求失败：{type(exc).__name__}: {exc}")
+
+    @pyqtSlot(str, str, str)
+    def _record_exchange(self, question: str, answer: str, target: str = "") -> None:
+        """(b) Note a flow-time Q&A into the live session's history (queued)."""
+        if self._session is not None:
+            self._session.record_exchange(question, answer, target)
             self.error.emit(f"{type(exc).__name__}: {exc}")
