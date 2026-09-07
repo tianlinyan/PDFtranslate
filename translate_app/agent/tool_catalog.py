@@ -51,11 +51,16 @@ class ToolDef:
     destructive: bool = False
     returns: str = ""
     audience: frozenset[str] = field(default_factory=lambda: frozenset({"agent"}))
+    #: The tool-tier taxonomy (see docs / CLAUDE.md): every catalog entry is a
+    #: **原子工具** (``"atomic"``) — a single-purpose, irreducible operation.  Higher
+    #: tiers live on ``Flow`` (``"process"`` / ``"composite"``).
+    tier: str = "atomic"
 
 
 def _tool(name: str, description: str, properties: dict[str, dict], required: list[str],
           category: str, *, target: str = "output", destructive: bool = False,
-          returns: str = "", audience: tuple[str, ...] = ("agent",)) -> ToolDef:
+          returns: str = "", audience: tuple[str, ...] = ("agent",),
+          tier: str = "atomic") -> ToolDef:
     return ToolDef(
         name=name,
         description=description,
@@ -69,6 +74,7 @@ def _tool(name: str, description: str, properties: dict[str, dict], required: li
         destructive=destructive,
         returns=returns,
         audience=frozenset(audience),
+        tier=tier,
     )
 
 
@@ -98,6 +104,27 @@ def to_openai_schema(t: ToolDef) -> dict[str, Any]:
 def catalog_for(audience: str) -> list[ToolDef]:
     """The tool definitions visible to a side (``"agent"`` or ``"chat"``)."""
     return [t for t in TOOL_CATALOG if audience in t.audience]
+
+
+#: Tool tiers (the app single-request taxonomy).  Catalog entries are always atomic;
+#: ``Flow`` adds the two higher tiers.
+TIER_ATOMIC = "atomic"
+TIER_PROCESS = "process"
+TIER_COMPOSITE = "composite"
+TASK_TIERS = (TIER_ATOMIC, TIER_PROCESS, TIER_COMPOSITE)
+
+
+def atomic_tool_names() -> set[str]:
+    """Every atomic-tool name (all audiences), for a Path-B plan validator."""
+    return {t.name for t in TOOL_CATALOG if t.tier == TIER_ATOMIC}
+
+
+def tool_tier(name: str) -> str:
+    """The tier of a named atomic tool (``"atomic"``, or ``""`` when unknown)."""
+    for t in TOOL_CATALOG:
+        if t.name == name:
+            return t.tier
+    return ""
 
 
 #: The one catalog — EVERY tool the AI may expose, keyed by side via ``audience``.
@@ -271,6 +298,14 @@ TOOL_CATALOG: list[ToolDef] = [
            "what": {"type": "string", "enum": ["source", "translation"],
                     "description": "显示原文页还是译文页，默认 source"}},
           ["page"], CAT_UI, audience=("chat",)),
+    _tool("render_page",
+          "把当前 PDF 的某一页渲染成图片返回（视觉观察）：what=translation 渲染当前译文页"
+          "（盖掉原文、画上译文；无译文则回落原文页），what=source 渲染原文页。用于让模型直接「看」"
+          "某页的版面/译文效果（如自检溢出/越线、看图注与图表）。",
+          {"page": {"type": "integer", "description": "页号（0 起）"},
+           "what": {"type": "string", "enum": ["source", "translation"],
+                    "description": "渲染原文页还是当前译文页（默认 translation）"}},
+          ["page"], CAT_READ, target="source", audience=("chat",)),
     _tool("set_block_text",
           "把某块的译文直接置为指定文本（数字/代码块会被拒绝；写的是受保护的译文层）。",
           {"index": {"type": "integer", "description": "扁平块索引（来自 read_page）"},
@@ -307,6 +342,12 @@ TOOL_CATALOG: list[ToolDef] = [
     _tool("re_export",
           "用当前已加载 PDF 上一次的成功译文，重新导出（应用本次对话/标注里已有的修改；不重新翻译、秒级）。",
           {}, [], CAT_CONTENT, audience=("chat",)),
+    _tool("run_plan",
+          "把用户的一句话要求**分解成按顺序执行的若干任务**并依次实施（AI 自由组合）：可混合调用单个工具"
+          "（读/改/核/设置）与标准流程（翻译一页/整篇/特殊页/自检/导出）。如“先检查第3-8页数字，再导出”。"
+          "返回每步结果 {tier, name, params, ok}；某步失败会停止并说明是哪个任务。",
+          {"requirement": {"type": "string", "description": "用户的一句话要求（会分解成任务序列）"}},
+          ["requirement"], CAT_CONTENT, audience=("chat",)),
     _tool("run_translate",
           "用**当前设置**开始翻译（把用户的具体要求作为 requirement 传入，会随运行注入到 AI 编排层）。控制权交给翻译流水线，完成在主窗口日志/进度提示。",
           {"requirement": {"type": "string", "description": "用户的具体要求（可选，如\"第3页公司名翻成Bank\"），会随运行注入 AI 编排层"}},

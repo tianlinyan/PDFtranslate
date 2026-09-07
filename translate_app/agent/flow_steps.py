@@ -37,6 +37,7 @@ Step semantics
 
 from __future__ import annotations
 
+import inspect
 import re
 import time
 from dataclasses import dataclass, field
@@ -45,6 +46,22 @@ from typing import Any, Callable
 from ..control import ControlSignal
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([\w.-]+)\s*\}\}")
+
+
+def _cond_accepts_params(cond: Callable) -> bool:
+    """Whether a flow-branch ``cond`` wants ``(rs, params)`` instead of just ``(rs)``.
+
+    Existing single-argument conditions keep working (they branch only on the run
+    state); a two-argument condition can also read the resolved ``params`` (e.g. a
+    ``negotiate`` knob inside a ``ForEachPage`` body).
+    """
+    try:
+        sig = inspect.signature(cond)
+        n = sum(1 for p in sig.parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+        return n >= 2
+    except (TypeError, ValueError):
+        return False
 
 
 def _resolve(value: Any, params: dict[str, Any]) -> Any:
@@ -167,6 +184,10 @@ class Flow:
     params: dict[str, Any] = field(default_factory=dict)
     guards: dict[str, Any] = field(default_factory=dict)
     scope: dict[str, Any] = field(default_factory=dict)
+    #: ``"process"`` — one independent function built from atomic tools; ``"composite"``
+    #: — several process tools ordered into a complete translation process.  (See the
+    #: tier taxonomy in CLAUDE.md; atomic tools carry their own ``tier``.)
+    tier: str = "process"
 
 
 @dataclass
@@ -326,7 +347,9 @@ class _Executor:
             i += 1
 
     def _if(self, step: IfStep, rs: FlowRunState, params: dict[str, Any]) -> None:
-        branch = step.then if step.cond(rs) else (step.else_ or [])
+        cond = step.cond
+        branch = step.then if (cond(rs, params) if _cond_accepts_params(cond) else cond(rs)) \
+            else (step.else_ or [])
         self.run(branch, rs, params)
 
     def _foreach_page(self, step: ForEachPage, rs: FlowRunState,
@@ -525,6 +548,7 @@ def make_translate_normal() -> Flow:
     return Flow(
         name="translate_normal",
         description="按阅读序逐页翻译所有正常文本页。",
+        tier="composite",
         params={"pages": [], "lang": "", "kind": None},
         steps=[
             ForEachPage(pages="{{pages}}", body=[
@@ -548,14 +572,29 @@ def make_special_page() -> Flow:
 
 
 def make_special_pages() -> Flow:
-    """P4 special_pages: loop over every non-normal page and ask the user."""
+    """P4 special_pages: loop over every non-normal page — auto-translate by default.
+
+    This matches ``DocumentSession._special_pages``: scan / chart / uncertain /
+    formula / figure pages are translated automatically (no per-page user prompt).
+    Negotiation (``UserStep``) is opt-in via the ``negotiate`` knob, which routes each
+    page through the ``special_page`` ask flow instead.
+    """
     return Flow(
         name="special_pages",
-        description="逐特殊页询问用户处理方式（翻译/保留/跳过）。",
-        params={"pages": [], "lang": "", "kind": "scan"},
+        description="逐特殊页默认自动翻译；negotiate=True 时改为逐页询问用户。",
+        tier="composite",
+        params={"pages": [], "lang": "", "kind": "scan", "negotiate": False},
         steps=[
             ForEachPage(pages="{{pages}}", body=[
-                UserStep(question=_special_question_builder, target="page:{{page}}"),
+                IfStep(
+                    cond=lambda rs, params: not bool(params.get("negotiate", False)),
+                    then=[
+                        AgentStep(task=_page_task_builder, page="{{page}}", image=True),
+                    ],
+                    else_=[
+                        UserStep(question=_special_question_builder, target="page:{{page}}"),
+                    ],
+                ),
             ]),
         ],
         guards={"protect": True},
@@ -578,8 +617,10 @@ def make_translate_doc() -> Flow:
     """
     return Flow(
         name="translate_doc",
-        description="整篇翻译标准流程：正常页→特殊页协商→完成报告。复核/自检按用户自定义要求另行触发。",
-        params={"normal_pages": [], "special_pages": [], "lang": ""},
+        description="整篇翻译标准流程：正常页→特殊页（默认自动翻译，negotiate=True 时逐页协商）→完成报告。"
+                    "复核/自检按用户自定义要求另行触发。",
+        tier="composite",
+        params={"normal_pages": [], "special_pages": [], "lang": "", "negotiate": False},
         # The top-level phase ORDER, declared as data so ``DocumentSession.run`` is a thin
         # dispatcher over it (rather than a hardcoded call sequence).  Preprocess stays a
         # prerequisite (it computes the page sets the steps below need).
@@ -589,7 +630,15 @@ def make_translate_doc() -> Flow:
                 AgentStep(task=_page_task_builder, page="{{page}}", image=True),
             ]),
             ForEachPage(pages="{{special_pages}}", body=[
-                UserStep(question=_special_question_builder, target="page:{{page}}"),
+                IfStep(
+                    cond=lambda rs, params: not bool(params.get("negotiate", False)),
+                    then=[
+                        AgentStep(task=_page_task_builder, page="{{page}}", image=True),
+                    ],
+                    else_=[
+                        UserStep(question=_special_question_builder, target="page:{{page}}"),
+                    ],
+                ),
             ]),
         ],
     )
@@ -600,6 +649,7 @@ def make_ai_self_check() -> Flow:
     return Flow(
         name="ai_self_check",
         description="对每个已译页跑确定性审计并就地修正（跳过用户保留/跳过的页）。",
+        tier="composite",
         params={"pages": [], "checks": None, "auto_fix": True, "max_iter": 3},
         steps=[
             ForEachPage(pages="{{pages}}", body=make_self_check_page().steps),
@@ -620,3 +670,14 @@ STANDARD_FLOWS: dict[str, Flow] = {
     "ai_self_check": make_ai_self_check(),
     "export": make_export(),
 }
+
+
+def flow_tier(name: str) -> str:
+    """The tier of a registered flow (``"process"`` / ``"composite"``), or ``""``."""
+    f = STANDARD_FLOWS.get(name)
+    return f.tier if f is not None else ""
+
+
+def registered_flow_tiers() -> dict[str, str]:
+    """``{flow_name: tier}`` for every registered flow (Path-B plan validation)."""
+    return {n: f.tier for n, f in STANDARD_FLOWS.items()}

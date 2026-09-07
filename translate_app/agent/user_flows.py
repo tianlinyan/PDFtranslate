@@ -35,7 +35,13 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Callable
 
-from .flow_steps import Flow, STANDARD_FLOWS, ForEachPage, ToolStep
+from .flow_steps import (
+    Flow, STANDARD_FLOWS, ForEachPage, ToolStep, run_flow,
+    flow_tier, registered_flow_tiers,
+)
+from .tool_catalog import (
+    atomic_tool_names, TIER_ATOMIC, TIER_PROCESS, TIER_COMPOSITE,
+)
 
 
 @dataclass
@@ -326,6 +332,10 @@ def build_flow(spec: FlowSpec) -> Flow:
     # compiled flow's params consistent for a caller that builds a session from it.
     if spec.include_kept:
         flow.params["include_kept"] = True
+    # Pass any extra knob (e.g. a ``negotiate`` flag for ``special_pages``) straight
+    # through to the cloned flow's params.
+    for k, v in (spec.extra or {}).items():
+        flow.params[k] = v
     if spec.scope is not None:
         pages = [int(p) for p in spec.scope]
         if spec.base in _PER_PAGE_BASES and len(pages) > 1:
@@ -433,3 +443,219 @@ def get_user_flow(name: str) -> Flow:
     if spec is None:
         raise KeyError(f"未知用户流程：{name!r}")
     return build_flow(spec)
+
+
+# --------------------------------------------------------------------------
+# 5. Path B — an AI-composed task PLAN (自由分解：要求 → 多个异构任务).
+# --------------------------------------------------------------------------
+
+@dataclass
+class Task:
+    """One planned action the AI decomposed a requirement into.
+
+    ``tier`` selects the execution machinery: ``"atomic"`` (a single catalog tool we
+    call directly), ``"process"`` (one independent ``Flow``), or ``"composite"`` (a
+    top-level translation flow).  ``name`` is a tool name (atomic) or a registered
+    flow name (process/composite); ``params`` are that action's arguments.
+    """
+
+    tier: str = TIER_ATOMIC
+    name: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"tier": self.tier, "name": self.name, "params": dict(self.params)}
+
+
+@dataclass
+class Plan:
+    """An ordered list of :class:`Task` (the AI's decomposition of one requirement)."""
+
+    tasks: list[Task] = field(default_factory=list)
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"tasks": [t.to_dict() for t in self.tasks], "note": self.note}
+
+
+def _parse_plan_json(text: str) -> dict:
+    """Extract a JSON object from a model reply (strips fences / surrounding prose)."""
+    m = re.search(r"\{.*\}", str(text or ""), re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(0))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 — bad JSON degrades to an empty plan
+        return {}
+
+
+def _validate_plan(data: dict | None) -> Plan:
+    """Validate an AI plan into a :class:`Plan`, dropping unknown/malformed tasks.
+
+    The registry is authoritative: a task's ``tier`` is taken from the known tool /
+    flow (whatever the model said is advisory), and a name that is neither a known
+    atomic tool nor a registered flow is dropped.  A plan with zero surviving tasks is
+    returned as-is so the caller can fall back to Path A.
+    """
+    data = data or {}
+    tiers = registered_flow_tiers()
+    atomic = atomic_tool_names()
+    raw_tasks = data.get("tasks")
+    tasks: list[Task] = []
+    if isinstance(raw_tasks, list):
+        for raw in raw_tasks:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "")
+            params = dict(raw.get("params")) if isinstance(raw.get("params"), dict) else {}
+            if name in tiers:
+                tier = tiers[name]                 # flow -> its real tier
+            elif name in atomic:
+                tier = TIER_ATOMIC                 # a single atomic tool
+            else:
+                continue                           # unknown name -> drop
+            tasks.append(Task(tier=tier, name=name, params=params))
+    return Plan(tasks=tasks, note=str(data.get("note", "")))
+
+
+def _spec_to_task_params(spec: FlowSpec, req: str = "") -> dict[str, Any]:
+    """The runnable params a :class:`FlowSpec` implies (for a Path-A-backed task)."""
+    p: dict[str, Any] = {}
+    if spec.checks is not None:
+        p["checks"] = list(spec.checks)
+    if spec.auto_fix is not None:
+        p["auto_fix"] = bool(spec.auto_fix)
+    if spec.scope is not None:
+        p["scope"] = list(spec.scope)
+    if spec.page is not None:
+        p["page"] = int(spec.page)
+    if spec.lang:
+        p["lang"] = spec.lang
+    if spec.kind is not None:
+        p["kind"] = spec.kind
+    if spec.output_type:
+        p["output_type"] = spec.output_type
+    if spec.include_kept:
+        p["include_kept"] = True
+    p.update(spec.extra or {})
+    if req:
+        p["requirement"] = req
+    return p
+
+
+def _task_from_spec(spec: FlowSpec, req: str = "") -> Task:
+    """Map a :class:`FlowSpec` (Path A) onto a single :class:`Task` (Path-B fallback)."""
+    tier = flow_tier(spec.base) or TIER_PROCESS
+    return Task(tier=tier, name=spec.base, params=_spec_to_task_params(spec, req))
+
+
+def compile_plan(req: str, *, llm: Callable[[str], dict] | None = None) -> Plan:
+    """Turn a requirement into a :class:`Plan` of ordered, mixed-tier tasks.
+
+    Path B (``llm`` injected): the model returns ``{"tasks":[{tier,name,params}], "note"}``;
+    it is validated (unknown names dropped) and used when at least one task survives.
+    ``llm=None``/empty → Path A: a single task derived from ``compile_from_user`` (the
+    deterministic rule parser).  This is the offline fallback so Path B never crashes on
+    a bad model reply.
+    """
+    r = str(req or "").strip()
+    if llm is not None:
+        try:
+            data = llm(r) or {}
+        except Exception:  # noqa: BLE001 — a failing/fake LLM degrades to Path A
+            data = {}
+        plan = _validate_plan(data)
+        if plan.tasks:
+            return plan
+    spec = compile_from_user(r, default_base="self_check_page", llm=None)
+    return Plan(tasks=[_task_from_spec(spec, req=r)])
+
+
+def run_plan(plan: Plan, *, dispatch: Callable[[Task], dict],
+             log: Callable[[str], None] | None = None,
+             cancel: Callable[[], bool] | None = None) -> dict:
+    """Execute a :class:`Plan` in order, delegating each task to ``dispatch(task)->dict``.
+
+    ``dispatch`` returns a dict that must carry ``ok`` (the chat/agent channel decides
+    how a tier/name runs).  Fail-closed: the first task that reports ``ok=False`` (or
+    raises) stops the plan and returns the partial ``results`` so the caller can tell
+    the user exactly which step failed.
+    """
+    results: list[dict[str, Any]] = []
+    executed = 0
+    for task in plan.tasks:
+        if cancel is not None and cancel():
+            return {"ok": False, "error": "已取消", "executed": executed, "results": results}
+        label = f"[{task.tier}:{task.name}]"
+        if log:
+            log(f"  计划执行：{label} {task.params}")
+        try:
+            out = dict(dispatch(task) or {})
+        except Exception as exc:  # noqa: BLE001 — fail-closed per task
+            if log:
+                log(f"  计划任务失败：{label} {type(exc).__name__}: {exc}")
+            out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        executed += 1
+        ok = bool(out.get("ok", True))
+        results.append({"tier": task.tier, "name": task.name, "params": dict(task.params),
+                        "ok": ok, **out})
+        if not ok:
+            return {"ok": False, "executed": executed, "results": results,
+                    "error": f"任务 {task.name} 失败：{out.get('error', '')}"}
+    return {"ok": True, "executed": executed, "results": results}
+
+
+#: Prompt that asks the model to decompose a requirement into an ordered task plan
+#: (Path B's flexible branch — the deterministic ``compile_plan`` fallback is offline).
+_PLAN_COMPILE_PROMPT = (
+    "把下面这句要求分解成**按顺序执行**的若干任务，输出一个 JSON 对象（只输出一个 JSON 对象，"
+    "不要任何解释、不要 markdown 代码围栏）：\n"
+    '{"tasks":[{"tier":"atomic|process|composite","name":"<工具或流程名>","params":{}}],"note":"<一句话说明>"}\n'
+    "tier=atomic → 单个工具：read_page/classify_page/get_doc_info/get_structure/get_table/get_settings/"
+    "goto_page/set_block_text/delete_block_text/apply_annotation/retranslate/self_check/set_setting/re_export。\n"
+    "tier=process 或 composite → 标准流程名：translate_page/translate_normal/special_pages/special_page/"
+    "preprocess/export/self_check_page/ai_self_check/translate_doc。\n"
+    "params 是该任务所需参数（如 page/indices/checks/scope/target_lang/requirement）。\n"
+    "要求：{req}"
+)
+
+
+def make_llm_plan_compiler(model, client: Any = None,
+                           log: Callable[[str], None] | None = None):
+    """Return an AI plan decompiler ``llm(req) -> dict`` (Path B), or ``None``.
+
+    Fail-closed: on a network / parse error the callback returns ``{}``
+    (``compile_plan`` then falls back to Path A), and with no usable client it returns
+    ``None`` (the caller uses the rule fallback).  ``client`` (optional) reuses a shared
+    OpenAI client.
+    """
+    from .. import translator as _tr
+
+    if client is None:
+        try:
+            client = _tr.OpenAI(**model.client_kwargs())
+        except Exception:  # noqa: BLE001 — no client → no AI decompilation
+            return None
+
+    def compile_req(req: str) -> dict:
+        try:
+            kwargs: dict[str, Any] = {
+                "model": model.model,
+                "temperature": 0.0,
+                "max_tokens": 768,
+                "messages": [{"role": "user",
+                              "content": _PLAN_COMPILE_PROMPT.format(req=str(req or ""))}],
+            }
+            body = model.request_params()
+            if body:
+                kwargs["extra_body"] = body
+            resp = client.chat.completions.create(**kwargs)
+            text = (getattr(resp.choices[0].message, "content", "") or "").strip()
+            return _parse_plan_json(text)
+        except Exception as exc:  # noqa: BLE001 — fail-closed to the rule parser
+            if log:
+                log(f"  计划分解失败：{type(exc).__name__}: {exc}（用规则解析）。")
+            return {}
+
+    return compile_req

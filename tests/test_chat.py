@@ -205,6 +205,37 @@ class ChatSessionTest(unittest.TestCase):
         self.assertEqual("auto", first["tool_choice"])
         self.assertTrue(first["tools"])
 
+    def test_reply_reinjects_tool_image_for_vision_model(self):
+        # A tool result carrying ``image`` is stripped from the tool text message and
+        # re-injected as an ``image_url`` user message (a fresh visual observation).
+        def executor(name, args):
+            return {"ok": True, "page": 1, "image": b"\x89PNG\x0d\x0a\x1a\x0a"}
+
+        responses = [
+            _FakeToolResp([_FakeToolCall("render_page", {"page": 0})], ""),
+            _FakeToolResp(None, "我看完了"),
+        ]
+        client = _FakeToolClient(responses)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: client):
+            session = chat.ChatSession(_model(vision=True))
+        reply = session.reply(
+            "第1页翻得怎么样",
+            tools=[{"type": "function", "function": {"name": "render_page", "parameters": {}}}],
+            executor=executor,
+        )
+        self.assertEqual("我看完了", reply)
+        # The tool text message has the image stripped (no base64/blob noise).
+        tool_msg = [h for h in session.history if h.get("role") == "tool"][0]
+        self.assertNotIn("image", tool_msg["content"])
+        # A fresh user observation carries the image as image_url.
+        user_msgs = [h for h in session.history if h.get("role") == "user"]
+        obs = user_msgs[-1]["content"] if user_msgs else None
+        self.assertIsInstance(obs, list)
+        self.assertIn("image_url", [c.get("type") for c in obs if isinstance(c, dict)])
+        url = next(c["image_url"]["url"] for c in obs
+                   if isinstance(c, dict) and c.get("type") == "image_url")
+        self.assertTrue(url.startswith("data:image/png;base64,"))
+
     def test_reply_with_tools_but_no_executor_returns_error_result(self):
         # A tool call with no executor never crashes; the result says so and the
         # loop passes it back for the model to see.

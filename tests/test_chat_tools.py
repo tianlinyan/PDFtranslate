@@ -89,9 +89,9 @@ class ChatToolsTest(_CtxTest):
     def test_tools_expose_expected_set(self):
         self.assertEqual({
             "get_doc_info", "get_settings", "classify_page", "get_structure", "get_table",
-            "read_page", "goto_page", "set_block_text", "delete_block_text",
+            "read_page", "render_page", "goto_page", "set_block_text", "delete_block_text",
             "apply_annotation", "re_export", "run_translate", "set_setting",
-            "self_check", "run_flow", "retranslate",
+            "self_check", "run_flow", "retranslate", "run_plan",
         }, self._tool_names())
 
     def test_chat_semantic_tools_reported_by_specs(self):
@@ -210,6 +210,70 @@ class ChatToolsTest(_CtxTest):
         self.assertGreater(res["failed_blocks"], [])
         self.assertGreater(res["remaining_issue_count"], 0)
         self.assertFalse(res["clean"], res)
+
+    # ---- run_plan: Path B decomposes a requirement into mixed-tier tasks ----
+
+    def test_run_plan_rule_fallback_executes_audit_task(self):
+        # No plan_llm → the deterministic rule parser yields one audit task.
+        res = self.tools["run_plan"]("自检只查数字，第1页")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(1, len(res["results"]))
+        r0 = res["results"][0]
+        self.assertEqual("self_check_page", r0["name"])
+        self.assertEqual("process", r0["tier"])
+        self.assertTrue(r0["ok"])
+
+    def test_run_plan_with_ai_decomposed_tasks(self):
+        # A wired plan_llm lets the AI compose an ordered, mixed-tier task list
+        # (atomic read, then a process self-check); each step runs and reports.
+        import translate_app.chat_tools as ct
+        fake_plan_llm = lambda req: {"tasks": [
+            {"tier": "atomic", "name": "read_page", "params": {"page": 0}},
+            {"tier": "process", "name": "self_check_page",
+             "params": {"page": 0, "checks": ["numbers"]}},
+        ], "note": "先读再查"}
+        tools = ct.make_chat_tools(self.ctx, plan_llm=fake_plan_llm)
+        res = tools["run_plan"]("先读第1页，再查数字")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(["read_page", "self_check_page"],
+                         [r["name"] for r in res["results"]])
+        self.assertEqual("atomic", res["results"][0]["tier"])
+        self.assertTrue(res["results"][0]["ok"])
+        self.assertEqual("process", res["results"][1]["tier"])
+        self.assertTrue(res["results"][1]["ok"])
+
+    def test_run_plan_stops_on_a_failed_step(self):
+        import translate_app.chat_tools as ct
+        fake_plan_llm = lambda req: {"tasks": [
+            {"tier": "atomic", "name": "run_plan", "params": {}},   # not nestable
+            {"tier": "process", "name": "self_check_page", "params": {"page": 0}},
+        ]}
+        tools = ct.make_chat_tools(self.ctx, plan_llm=fake_plan_llm)
+        res = tools["run_plan"]("先嵌套一个计划")
+        self.assertFalse(res["ok"], res)
+        self.assertEqual(1, len(res["results"]))
+        self.assertIn("不能在计划内嵌套调用", res["error"])
+
+    def test_render_page_returns_image(self):
+        # The chat's ``render_page`` renders a page to PNG (a vision observation).
+        res = self.tools["render_page"](0, what="source")
+        self.assertTrue(res["ok"], res)
+        self.assertIsInstance(res.get("image"), bytes)
+        self.assertTrue(res["image"].startswith(b"\x89PNG"))
+
+    def test_run_plan_lifts_task_image_to_top_level(self):
+        # A plan step that renders a page lifts its image to the plan result, so the
+        # chat loop re-injects it as a fresh visual observation.
+        import translate_app.chat_tools as ct
+        fake_plan_llm = lambda req: {"tasks": [
+            {"tier": "atomic", "name": "render_page",
+             "params": {"page": 0, "what": "source"}},
+        ]}
+        tools = ct.make_chat_tools(self.ctx, plan_llm=fake_plan_llm)
+        res = tools["run_plan"]("渲染第1页看看")
+        self.assertTrue(res["ok"], res)
+        self.assertIsInstance(res.get("image"), bytes)
+        self.assertTrue(res["image"].startswith(b"\x89PNG"))
 
     def test_get_doc_info(self):
         info = self.tools["get_doc_info"]()

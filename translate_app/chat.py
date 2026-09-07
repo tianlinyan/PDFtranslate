@@ -119,6 +119,7 @@ class ChatSession:
                     for tc in tcs
                 ],
             })
+            pending_image: bytes | None = None
             for tc in tcs:
                 name = tc.function.name
                 try:
@@ -128,10 +129,31 @@ class ChatSession:
                 if not isinstance(args, dict):
                     args = {}
                 result = {"error": "该模型未执行工具"} if executor is None else executor(name, args)
+                shown = result
+                img = result.get("image") if isinstance(result, dict) else None
+                if isinstance(result, dict):
+                    # An image-bearing tool result rides as ``image_url`` (never as
+                    # base64 text) — strip it here and re-inject below for the model.
+                    shown = {k: v for k, v in result.items()
+                             if k != "image" and not isinstance(v, (bytes, bytearray))}
+                if img is not None and getattr(self.model, "vision", False) \
+                        and isinstance(img, (bytes, bytearray)):
+                    pending_image = bytes(img)
                 self.history.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
-                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                    "content": json.dumps(shown, ensure_ascii=False, default=str),
+                })
+            if pending_image is not None:
+                # Re-inject a tool-returned image as a fresh visual observation so a
+                # vision model actually "sees" the rendered/annotated page (mirrors
+                # ``make_llm_decide``), rather than getting a base64 blob in text.
+                self.history.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "（下面是工具返回的页面图。）"},
+                        {"type": "image_url", "image_url": {"url": _png_data_url(pending_image)}},
+                    ],
                 })
         # The model kept calling tools past the cap: give it one last chance to
         # answer plainly (no more tool calls) instead of looping forever — but
@@ -255,9 +277,14 @@ class ChatWorker(QObject):
         # per-turn flow compilation does not open a second connection pool.  ``None``
         # (no model client) simply falls back to the deterministic rule parser.
         llm = None
+        plan_llm = None
         if self._session is not None:
             llm = _uf.make_llm_flow_compiler(self._session.model,
                                              client=self._session.client, log=self._log)
+            # Path B: the AI decomposes a requirement into an ordered task plan.  ``None``
+            # (no client) falls back to a single deterministic rule-derived task.
+            plan_llm = _uf.make_llm_plan_compiler(self._session.model,
+                                                  client=self._session.client, log=self._log)
 
         # Translation-side batch re-translation for ``retranslate`` / an ``auto_fix``
         # user flow.  Reuses the chat session's client, and does NOT require vision (it
@@ -273,7 +300,7 @@ class ChatWorker(QObject):
         tools_map = make_chat_tools(
             self._ctx, show_preview=self._show_preview, re_export=self._re_export,
             start_translate=self._start_translate, set_setting=self._set_setting, llm=llm,
-            log=self._log, translate_texts=translate_texts,
+            plan_llm=plan_llm, log=self._log, translate_texts=translate_texts,
         )
 
         def executor(name: str, args: dict[str, Any]) -> Any:

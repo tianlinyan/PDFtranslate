@@ -122,25 +122,29 @@ class DocumentSessionTest(unittest.TestCase):
                                   cancel=cancel)
         return state, session
 
-    def test_translates_normal_pages_first_then_marks_special(self):
+    def test_translates_normal_pages_first_then_special_by_default(self):
         doc = _mixed_doc()
         calls: list[int] = []
+
+        def _flat_offsets(st, page):
+            return range(sum(len(p) for p in st.src_doc.pages[:page]),
+                         sum(len(p) for p in st.src_doc.pages[:page + 1]))
 
         def fake_translate(st, page, _model, *, task, **kw):
             if "复核" in str(task):
                 return st   # the M4 review pass is separate; this test checks the translate phase
             calls.append(page)
             st.out_doc = st.out_doc or {}
-            st.out_doc[page] = {"text": f"T{page}"}
+            for j in _flat_offsets(st, page):
+                st.out_doc[j] = {"text": f"T{page}"}
             return st
 
         state, session = self._session(doc, fake_translate)
         session.run()
 
-        # Both normal pages (index 0 and the text-layer table page 3) were translated
-        # in the normal phase; the special pages (scan/chart/uncertain) were not.
-        self.assertEqual([0, 3], calls)
-        self.assertNotIn("T1", [str(v.get("text")) for v in (state.out_doc or {}).values()])
+        # Normal pages (0 and the text-layer table page 3) translate first, then every
+        # special page (scan/chart/uncertain) auto-translates — no prompt by default.
+        self.assertEqual([0, 3, 1, 2, 4], calls)
         # Phase reached DONE.
         self.assertEqual(PHASE_DONE, state.phase)
         # Doc info + triage populated by preprocess.
@@ -151,10 +155,11 @@ class DocumentSessionTest(unittest.TestCase):
         self.assertEqual("chart", state.triage[2].kind)
         self.assertEqual("normal", state.triage[3].kind)   # non-scanned table → normal
         self.assertEqual("uncertain", state.triage[4].kind)
-        # Only the special pages are flagged needs_user + a decision marker.
+        # All pages are translated (special pages defaulted to translate, decided).
         for i in (1, 2, 4):
-            self.assertEqual(agent.STATUS_NEEDS_USER, state.page(i).status)
+            self.assertEqual(agent.STATUS_DONE, state.page(i).status)
             self.assertTrue(state.triage[i].decided)
+            self.assertEqual("translate", state.triage[i].decision)
 
     def test_phases_advance_to_done(self):
         doc = _mixed_doc()
@@ -182,7 +187,8 @@ class DocumentSessionTest(unittest.TestCase):
             return st
 
         def answer_handler(question, options, target):
-            # The standard flow asks only about special pages — never about review/export.
+            # The standard flow asks nothing about special pages anymore (they auto-
+            # translate), and never about review/export.
             targets.append(target)
             return {"value": "保留原文", "target": target}
 
@@ -219,11 +225,9 @@ class DocumentSessionTest(unittest.TestCase):
         with self.assertRaises(TranslationCancelled):
             session.run()
 
-    def test_special_pages_ask_and_translate_on_request(self):
+    def test_special_pages_translate_by_default(self):
         doc = _small_special_doc()
         calls: list[int] = []
-        answers: list[tuple] = []
-        shows: list[tuple] = []
 
         def fake_translate(st, page, _model, *, task, **kw):
             if "复核" in str(task):
@@ -233,29 +237,19 @@ class DocumentSessionTest(unittest.TestCase):
             st.out_doc[page] = {"text": f"T{page}"}
             return st
 
-        def answer_handler(question, options, target):
-            answers.append((question, options, target))
-            return {"value": "OCR并翻译", "target": target}
-
         state = agent.WorkflowState(src_path="a.pdf", lang="English")
         state.src_doc = doc
         session = DocumentSession(state, doc, model=object(), log=lambda m: None,
-                                  translate_page=fake_translate, answer_handler=answer_handler,
-                                  show_preview=lambda p, w: shows.append((p, w)))
+                                  translate_page=fake_translate)
         session.run()
-        # Normal page 0 first, then the special scan page 1 (translated per user).
+        # Normal page 0 first, then the special scan page 1 (auto-translated).
         self.assertEqual([0, 1], calls)
-        # The scan page's preview was shown and the user was asked.
-        self.assertEqual([(1, "source")], shows)
-        q, opts, _t = answers[0]
-        self.assertIn("扫描件", q)
-        self.assertIn("OCR并翻译", opts)
-        # The negotiation is recorded as user-confirmed and the page done.
-        self.assertTrue(any(op.tool == "ask_user" and op.user_confirmed for op in state.ops))
+        # No per-page user prompt / preview was issued; the special page is done.
+        self.assertFalse(any(op.tool == "ask_user" for op in state.ops))
         self.assertEqual("translate", state.triage[1].decision)
         self.assertEqual(agent.STATUS_DONE, state.page(1).status)
 
-    def test_special_pages_keep_when_no_answer_handler(self):
+    def test_special_pages_translate_without_answer_handler(self):
         doc = _small_special_doc()
         calls: list[int] = []
 
@@ -269,13 +263,12 @@ class DocumentSessionTest(unittest.TestCase):
 
         state, session = self._session(doc, fake_translate)
         session.run()
-        # Only the normal page translated; the scan page is conservatively kept.
-        self.assertEqual([0], calls)
-        self.assertEqual("keep", state.triage[1].decision)
-        self.assertEqual(agent.STATUS_NEEDS_USER, state.page(1).status)
-        # The ask op is recorded but NOT user-confirmed (no channel answered).
-        ask_op = next(op for op in state.ops if op.tool == "ask_user")
-        self.assertFalse(ask_op.user_confirmed)
+        # The special scan page is auto-translated even without an answer channel.
+        self.assertEqual([0, 1], calls)
+        self.assertEqual("translate", state.triage[1].decision)
+        self.assertEqual(agent.STATUS_DONE, state.page(1).status)
+        # No ask_user op was recorded (nothing was negotiated).
+        self.assertFalse(any(op.tool == "ask_user" for op in state.ops))
 
     def test_review_phase_ai_self_check_then_export(self):
         doc = _mixed_doc()
@@ -315,12 +308,12 @@ class DocumentSessionTest(unittest.TestCase):
         # The self-check is decoupled from the standard translate flow: it only runs
         # on demand.  ``_review`` here is the on-demand entry the user triggers.
         session._review()
-        # Mode asked; AI self-check re-read only the TRANSLATED pages (0, 3) and
-        # skipped the special pages the user chose to keep/skip (1, 2, 4).
+        # Mode asked; every page was translated (special pages auto-translate), so the
+        # AI self-check re-reads all of them — no page was kept to be skipped.
         self.assertEqual("ai", state.review_mode)
-        self.assertEqual([0, 3], review_pages)
+        self.assertEqual([0, 1, 2, 3, 4], review_pages)
         # Each translated page was audited (found an issue) then re-audited (clean).
-        self.assertEqual({0: 2, 3: 2}, audit_calls)
+        self.assertEqual({0: 2, 1: 2, 2: 2, 3: 2, 4: 2}, audit_calls)
         self.assertIn("review_mode", answers)
         self.assertIn("export", answers)
         self.assertEqual(PHASE_DONE, state.phase)

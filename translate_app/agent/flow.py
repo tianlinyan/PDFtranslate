@@ -1710,71 +1710,32 @@ class DocumentSession:
         if not special:
             self.log("  无特殊页。")
             return
-        self.log(f"  [特殊页] 共 {len(special)} 页，将逐页与用户协商处理。")
+        self.log(f"  [特殊页] 共 {len(special)} 页，默认自动翻译。")
         for i in special:
             if self.cancel():
                 raise _tr.TranslationCancelled()
             t = self.state.triage[i]
             ps = self.state.page(i)
             kind = t.kind
-            question, options = prompts.special_page_question(i, kind)
-            # Show the pending original page so the user can look at it while the
-            # question is up (non-blocking; the answer below is what blocks).
-            self.log(f"  [特殊页] 第 {i + 1} 页（{kind}）请在预览查看，并在【侧栏】选择处理方式…")
-            if self.show_preview is not None:
-                try:
-                    self.show_preview(i, "source")
-                except Exception:  # noqa: BLE001 — preview is cosmetic
-                    pass
-            # Drive the negotiation through the registered ``special_page`` flow (a
-            # UserStep ask); the decision is then interpreted by the phase (AI-injectable
-            # via ``self.interpret``, else the flexible ``interpret_decision`` matcher),
-            # which also executes the translate/keep/skip.
-            decision, raw = "keep", ""
-            if self.answer_handler is not None:
-                try:
-                    rs = run_flow(STANDARD_FLOWS["special_page"],
-                                  ask=self.answer_handler, cancel=self.cancel,
-                                  log=self.log,
-                                  params={"page": i, "kind": kind, "lang": self.state.lang})
-                    if rs.ok:
-                        ans = rs.result.get(f"user:page:{i}") or {}
-                        raw = ans.get("value") if isinstance(ans, dict) else ans
-                        decision = self._interpret_answer(raw, kind)
-                    else:
-                        self.log(f"  特殊页问答未完成：{rs.error}（按保留原文处理）。")
-                except FlowCancelled:
-                    raise _tr.TranslationCancelled()
-                except Exception as exc:  # noqa: BLE001 — fail-closed to retain
-                    self.log(f"  特殊页问答失败：{type(exc).__name__}: {exc}（按保留原文处理）。")
-            else:
-                self.log(f"  （无问答通道，第 {i + 1} 特殊页按保留原文处理。）")
-            # A pending question is interruptible by "取消" (the answer bridge polls it);
-            # a cancelled ask returns ``None`` — treat that as a real cancellation, not as
-            # "保留原文", so the whole run aborts instead of silently continuing.
-            if self.cancel():
-                raise _tr.TranslationCancelled()
+            # No per-page user prompt by default: scan / chart / uncertain / formula /
+            # figure pages are translated automatically, like normal pages.  A user
+            # requirement (e.g. "第5页图表保留原文") is seeded into ``state.requirements``
+            # where the translation agent reads it and may still use ``ask_user`` for a
+            # genuinely ambiguous decision mid-translation.
+            self.log(f"  [特殊页] 第 {i + 1} 页（{kind}）默认翻译。")
             t.decided = True
-            t.decision = decision
-            ps.issues.append(f"特殊页（{kind}）按用户意见：{decision}")
-            self.state.record_op(
-                tool="ask_user", args={"question": question, "options": options, "answer": raw},
-                target=f"page:{i}", reason=f"特殊页 {kind} 协商",
-                user_confirmed=self.answer_handler is not None,
-            )
-            if decision == "translate":
-                ok = self._translate_special_page(i, kind)
-                if ok:
-                    ps.status = STATUS_DONE
-                    self.state.record_op(
-                        tool="translate_block", args={"page": i}, target=f"page:{i}",
-                        reason=f"特殊页 {kind} 按用户意见翻译", user_confirmed=True,
-                    )
-                else:
-                    ps.status = STATUS_NEEDS_USER
-                    ps.issues.append(f"特殊页（{kind}）翻译失败，保留原文。")
+            t.decision = "translate"
+            ps.issues.append(f"特殊页（{kind}）默认翻译")
+            ok = self._translate_special_page(i, kind)
+            if ok:
+                ps.status = STATUS_DONE
+                self.state.record_op(
+                    tool="translate_block", args={"page": i}, target=f"page:{i}",
+                    reason=f"特殊页 {kind} 自动翻译", user_confirmed=False,
+                )
             else:
-                ps.status = STATUS_NEEDS_USER   # keep / skip → left as the source
+                ps.status = STATUS_NEEDS_USER
+                ps.issues.append(f"特殊页（{kind}）翻译失败，保留原文。")
         self.log(f"  [特殊页] 全部 {len(special)} 页处理完毕。")
 
     def _interpret_answer(self, answer: Any, kind: str) -> str:

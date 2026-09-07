@@ -336,5 +336,105 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(2, rs.applied.count("agent:3"))
 
 
+class SpecialPagesTierTest(unittest.TestCase):
+    """Part B alignment: the registered ``special_pages`` flow auto-translates by
+    default and negotiates only when the ``negotiate`` knob is on."""
+
+    def _run(self, *, negotiate):
+        asked: list = []
+        agents: list = []
+
+        def ask(question, options, target):
+            asked.append((question, options, target))
+            return {"value": "保留原文", "target": target}
+
+        def run_agent(*, task, page, **kw):
+            agents.append(page)
+            return {"ok": True, "page": page}
+
+        rs = agent.run_flow(agent.STANDARD_FLOWS["special_pages"],
+                            run_agent=run_agent, ask=ask,
+                            params={"pages": [1, 4], "negotiate": negotiate})
+        return rs, asked, agents
+
+    def test_special_pages_auto_translate_by_default(self):
+        rs, asked, agents = self._run(negotiate=False)
+        self.assertTrue(rs.ok)
+        self.assertEqual([1, 4], agents)          # auto-translation agent loop ran
+        self.assertEqual([], asked)               # never asked the user
+
+    def test_special_pages_negotiates_when_knob_set(self):
+        rs, asked, agents = self._run(negotiate=True)
+        self.assertTrue(rs.ok)
+        self.assertEqual([], agents)              # negotiation, no agent loop
+        self.assertEqual(2, len(asked))
+        self.assertEqual(["page:1", "page:4"], [t for _, _, t in asked])
+
+
+class PathBPlanTest(unittest.TestCase):
+    """Path B: the AI decomposes a requirement into an ordered, mixed-tier plan."""
+
+    def test_compile_plan_rule_fallback_single_task(self):
+        from translate_app.agent import user_flows as uf
+
+        plan = uf.compile_plan("自检只查数字，第3到第8页")
+        self.assertEqual(1, len(plan.tasks))
+        t = plan.tasks[0]
+        self.assertEqual("self_check_page", t.name)
+        self.assertEqual("process", t.tier)
+        self.assertEqual([2, 3, 4, 5, 6, 7], t.params["scope"])
+        self.assertEqual(["numbers"], t.params["checks"])
+
+    def test_validate_plan_drops_unknown_and_reinfers_tier(self):
+        from translate_app.agent import user_flows as uf
+
+        plan = uf._validate_plan({"tasks": [
+            {"tier": "atomic", "name": "read_page", "params": {"page": 0}},
+            {"name": "self_check_page", "params": {"page": 1}},          # tier inferred
+            {"tier": "atomic", "name": "translate_doc", "params": {}},    # mislabeled, re-infers
+            {"tier": "process", "name": "nonexistent"},                    # dropped
+        ], "note": "x"})
+        self.assertEqual(["read_page", "self_check_page", "translate_doc"],
+                         [t.name for t in plan.tasks])
+        self.assertEqual(["atomic", "process", "composite"], [t.tier for t in plan.tasks])
+
+    def test_run_plan_executes_in_order_and_stops_on_failure(self):
+        from translate_app.agent import user_flows as uf
+
+        calls: list[str] = []
+        plan = uf.Plan(tasks=[
+            uf.Task(tier="atomic", name="read_page", params={"page": 0}),
+            uf.Task(tier="process", name="self_check_page", params={"page": 1}),
+        ])
+
+        def dispatch(task):
+            calls.append(task.name)
+            if task.name == "self_check_page":
+                return {"ok": False, "error": "boom"}
+            return {"ok": True, "x": task.params["page"]}
+
+        res = uf.run_plan(plan, dispatch=dispatch)
+        self.assertFalse(res["ok"])
+        self.assertEqual(["read_page", "self_check_page"], calls)
+        self.assertEqual(2, res["executed"])
+        self.assertEqual("任务 self_check_page 失败：boom", res["error"])
+
+    def test_run_plan_stops_and_never_calls_after_failure(self):
+        from translate_app.agent import user_flows as uf
+
+        calls: list[str] = []
+        plan = uf.Plan(tasks=[
+            uf.Task(tier="atomic", name="a", params={}),
+            uf.Task(tier="atomic", name="b", params={}),
+        ])
+
+        def dispatch(task):
+            calls.append(task.name)
+            return {"ok": False, "error": f"sorry {task.name}"}
+
+        res = uf.run_plan(plan, dispatch=dispatch)
+        self.assertEqual(["a"], calls)      # stopped after the first failure
+
+
 if __name__ == "__main__":
     unittest.main()
