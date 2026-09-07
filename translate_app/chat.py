@@ -44,6 +44,44 @@ _CHAT_MAX_TOKENS = 1024
 #: blank bubble.
 _EMPTY_REPLY = "（模型未返回内容，请重试或换种说法。）"
 
+#: Max chat messages (incl. the current user turn) handed to the model per call.  The
+#: console history grows unbounded across turns, and a small local context (e.g. 50k)
+#: overflows once history + image tokens pile up (``exceed_context_size_error``).
+#: Window the tail to a recent, protocol-valid budget that always keeps one full
+#: tool loop (≤ ``_MAX_TOOL_ROUNDS`` rounds) intact.
+_CHAT_HISTORY_CAP = 32
+
+#: A preview "发送" screenshot is a full page at render DPI; a vision model bills
+#: large image tokens for it and a small local context can blow past its limit.
+#: Downscale the long edge to this many px before attaching / re-injecting.
+_CHAT_IMAGE_MAX = 1024
+
+
+def _downscale_png(png: bytes, max_side: int = _CHAT_IMAGE_MAX) -> bytes:
+    """Shrink a PNG to ``max_side`` on the long edge (Pillow), cutting image tokens.
+
+    A preview screenshot can be ~1.9k×2.5k px; a vision model charges a lot of image
+    tokens for it, which on a small local context triggers ``exceed_context_size_error``.
+    Returns the original bytes on any failure (never crashes the chat turn).
+    """
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        im = Image.open(BytesIO(png))
+        w, h = im.size
+        if w <= max_side and h <= max_side:
+            return png
+        scale = max_side / max(w, h)
+        im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                       Image.LANCZOS)
+        out = BytesIO()
+        im.save(out, format="PNG")
+        return out.getvalue()
+    except Exception:  # noqa: BLE001 — a bad image shrinks to the original bytes
+        return png
+
 
 def _png_data_url(png: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(png).decode()
@@ -96,7 +134,8 @@ class ChatSession:
         if image and getattr(self.model, "vision", False):
             content: Any = [
                 {"type": "text", "text": message},
-                {"type": "image_url", "image_url": {"url": _png_data_url(image)}},
+                {"type": "image_url", "image_url": {"url": _png_data_url(
+                    _downscale_png(image, _CHAT_IMAGE_MAX))}},
             ]
         else:
             content = message
@@ -174,7 +213,8 @@ class ChatSession:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "（下面是工具返回的页面图。）"},
-                        {"type": "image_url", "image_url": {"url": _png_data_url(pending_image)}},
+                        {"type": "image_url", "image_url": {"url": _png_data_url(
+                            _downscale_png(pending_image, _CHAT_IMAGE_MAX))}},
                     ],
                 })
         # The model kept calling tools past the cap: give it one last chance to
@@ -213,12 +253,30 @@ class ChatSession:
         self.history.append({"role": "assistant", "content": f"{prefix}{q}"})
         self.history.append({"role": "user", "content": a})
 
+    def _window_history(self) -> list[dict[str, Any]]:
+        """A bounded, protocol-valid recent window of ``self.history``.
+
+        The console history grows unbounded across turns; a small local context
+        overflows (``exceed_context_size_error``) once history + image tokens pile up.
+        Keep the last ``_CHAT_HISTORY_CAP`` messages, then trim to a leading ``user``
+        turn so the role sequence the model sees stays valid for the chat API.
+        """
+        msgs = self.history
+        if len(msgs) <= _CHAT_HISTORY_CAP:
+            return list(msgs)
+        msgs = msgs[-_CHAT_HISTORY_CAP:]
+        while msgs and msgs[0].get("role") != "user":
+            msgs = msgs[1:]
+        if not msgs:  # degenerate — fall back to the raw tail
+            msgs = self.history[-_CHAT_HISTORY_CAP:]
+        return list(msgs)
+
     def _call(self, *, tools: list[dict[str, Any]] | None) -> Any:
         """One chat-completions call using the interaction parameter set."""
         system_prompt = prompts.chat_system_prompt()
         if tools:
             system_prompt += prompts.chat_tool_hint()
-        messages = [{"role": "system", "content": system_prompt}] + self.history
+        messages = [{"role": "system", "content": system_prompt}] + self._window_history()
         kwargs: dict[str, Any] = {
             "model": self.model.model,
             "temperature": float(getattr(self.model, "interaction_temperature", 0.6)),

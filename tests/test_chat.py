@@ -265,6 +265,51 @@ class ChatSessionTest(unittest.TestCase):
         reply = session.reply("第二页有问题，修改一下")
         self.assertEqual("已检查完第2页，第3块数字有误，已重译并通过。", reply)
 
+    def test_window_history_caps_and_starts_at_user(self):
+        # The window keeps at most ``_CHAT_HISTORY_CAP`` messages and always starts at
+        # a ``user`` turn, so the role sequence a small-context model sees stays valid.
+        s = chat.ChatSession(_model())
+        s.history = [
+            {"role": ("user" if i % 3 == 0 else ("assistant" if i % 3 == 1 else "tool")),
+             "content": f"m{i}"}
+            for i in range(40)
+        ]
+        w = s._window_history()
+        self.assertLessEqual(len(w), chat._CHAT_HISTORY_CAP)
+        self.assertEqual("user", w[0]["role"])
+        # A short history passes through untouched.
+        self.assertEqual(3, len(s._window_history()[:3]))
+
+    def test_call_sends_bounded_window(self):
+        seen: list = []
+        client = _FakeClient("ok", seen)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: client):
+            session = chat.ChatSession(_model())
+        # Pre-fill history far beyond the cap, then send a fresh message.
+        session.history = [{"role": "user", "content": f"old{i}"} for i in range(60)]
+        session.reply("新消息")
+        msgs = seen[0]["messages"]           # [system, ...windowed...]
+        self.assertLessEqual(len(msgs), 1 + chat._CHAT_HISTORY_CAP)
+
+    def test_downscale_png_shrinks_large_image(self):
+        from io import BytesIO
+
+        from PIL import Image
+
+        def _png(w, h):
+            im = Image.new("RGB", (w, h))
+            buf = BytesIO()
+            im.save(buf, format="PNG")
+            return buf.getvalue()
+
+        small = chat._downscale_png(_png(2000, 1000), 1024)
+        self.assertLessEqual(max(Image.open(BytesIO(small)).size), 1024)
+        # A small image is returned unchanged.
+        tiny = _png(100, 50)
+        self.assertEqual(chat._downscale_png(tiny, 1024), tiny)
+        # A corrupt payload degrades to the original bytes (never crashes).
+        self.assertEqual(chat._downscale_png(b"not-a-png", 1024), b"not-a-png")
+
     def test_reply_with_tools_but_no_executor_returns_error_result(self):
         # A tool call with no executor never crashes; the result says so and the
         # loop passes it back for the model to see.
