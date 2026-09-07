@@ -52,6 +52,7 @@ class ParsePreviewCommandTest(unittest.TestCase):
         self.assertEqual(("goto", 0, None), parse_preview_command("第 1 页"))
 
     def test_goto_with_side_and_chinese_numeral(self):
+        self.assertEqual(("goto", 1, "translation"), parse_preview_command("打开译文第二页"))
         self.assertEqual(("goto", 2, "translation"), parse_preview_command("打开译文第三页"))
         self.assertEqual(("goto", 2, "translation"), parse_preview_command("预览译文第三页"))
         self.assertEqual(("goto", 1, "source"), parse_preview_command("预览原文第二页"))

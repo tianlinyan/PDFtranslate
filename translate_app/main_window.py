@@ -530,14 +530,19 @@ class MainWindow(QWidget):
             return
         import pymupdf as fitz
 
+        shown_what = "source"
         if what == "translation":
             # Show the translated output: after a run this renders from the exported
             # PDF (the real translation); during a live agent run it shows the
-            # in-progress translation.  Falls back to the source page when neither is
-            # available (e.g. an in-place page the user chose to keep).
+            # in-progress translation; with a cached last run it draws the in-place
+            # translation.  Only when none is available does it fall back to the
+            # source page — and then it must be labelled 原文, not 译文.
             png = self._render_translation_preview(page)
             if not png:
                 png = self._render_source_preview(page)
+                self._append_log("  [预览] 该页暂无译文可显示，已回退到原文页。")
+            else:
+                shown_what = "translation"
         else:
             png = self._render_source_preview(page)
         if not png:
@@ -551,11 +556,12 @@ class MainWindow(QWidget):
             self._preview_win = win
         # Remember the page + side so a later re-open (the "预览" button) shows the
         # same page and the same source/translation as the AI's command, instead of
-        # always page 0 / source.
+        # always page 0 / source.  Remember the ACTUAL side shown so a later
+        # "下一页" keeps showing what is really on screen (not a mislabeled side).
         self._preview_current_page = page
-        self._preview_current_what = what
+        self._preview_current_what = shown_what
         win.set_page_info(page, self._page_count())
-        prefix = "预览（原文）" if what == "source" else "预览（译文）"
+        prefix = "预览（译文）" if shown_what == "translation" else "预览（原文）"
         win.setWindowTitle(f"{prefix} · 第 {page + 1} 页")
         # A fresh popup resets size/zoom and re-docks the window; an in-place refresh
         # (prev/next/jump inside the window) keeps the user's resized window, zoomed
@@ -641,7 +647,9 @@ class MainWindow(QWidget):
         Priority: (1) the exported PDF (the real translated output — this is what the
         user wants to see after a run, and what fixes the "preview shows only the
         source" bug); (2) the worker's in-progress translation during a live agent
-        run.  The caller falls back to the source page when this returns ``None``.
+        run; (3) an in-place translation drawn from the cached doc + last run (so the
+        "译文" side still works for Markdown/text output or a re-open).  The caller
+        falls back to the source page when this returns ``None``.
         """
         pdf_path = self._last_pdf
         if pdf_path and Path(pdf_path).exists():
@@ -650,7 +658,62 @@ class MainWindow(QWidget):
         worker = self._worker
         if worker is not None:
             return worker.render_translation(page)
-        return None
+        return self._render_cached_translation_preview(page)
+
+    def _render_cached_translation_preview(self, page: int) -> bytes | None:
+        """Render an in-place translation from the cached doc + last run's text.
+
+        ``None`` when there is no cached translation for this page (so the caller
+        falls back to the source, and the caller should label it honestly).  Only runs
+        when the last run's translation is still in the document context — it never
+        triggers a lazy document extraction (which could OCR on the GUI thread).
+        """
+        if self.doc_ctx.get_last_translated() is None and not self.doc_ctx.overlay():
+            return None
+        doc = self.doc_ctx.ensure_doc()
+        if doc is None or not (0 <= int(page) < len(doc.pages)):
+            return None
+        last = self.doc_ctx.get_last_translated()
+        overlay = self.doc_ctx.overlay()
+
+        def _text(idx: int) -> str:
+            entry = overlay.get(idx)
+            if isinstance(entry, dict) and str(entry.get("text", "")).strip():
+                return str(entry.get("text", ""))
+            if last is not None and idx < len(last) and str(last[idx]).strip():
+                return str(last[idx])
+            return ""
+
+        offset = sum(len(p) for p in doc.pages[: int(page)])
+        to_draw = [(b, _text(offset + i)) for i, b in enumerate(doc.pages[int(page)])]
+        to_draw = [(b, t) for b, t in to_draw if t and t != str(b.text)]
+        if not to_draw:
+            return None
+        import pymupdf as fitz
+
+        try:
+            fdoc = fitz.open(str(self._source))
+            try:
+                page_obj = fdoc[int(page)]
+                font = pdfio._CJK_FONT
+                for b, _t in to_draw:
+                    if not getattr(b, "ocr", False) and not getattr(b, "is_chart", False):
+                        page_obj.add_redact_annot(fitz.Rect(b.x0, b.y0, b.x1, b.y1))
+                page_obj.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                )
+                for b, t in to_draw:
+                    if getattr(b, "ocr", False):
+                        page_obj.draw_rect(fitz.Rect(b.x0 - 0.5, b.y0 - 0.5,
+                                                      b.x1 + 0.5, b.y1 + 0.5),
+                                           color=None, fill=(1, 1, 1))
+                    pdfio._draw_translated_block(page_obj, font, b, t)
+                return pdfio._render_page_png(page_obj, dpi=200)
+            finally:
+                fdoc.close()
+        except Exception:  # noqa: BLE001 — a bad page must not crash the preview
+            return None
 
     def _translation_output_page(self, page: int, kind: str) -> int:
         """Map a source ``page`` to its page index in the exported PDF.
