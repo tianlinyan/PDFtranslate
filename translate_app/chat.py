@@ -39,6 +39,11 @@ _MAX_TOOL_ROUNDS = 8
 #: Default output cap for a chat reply (the translation config may raise it).
 _CHAT_MAX_TOKENS = 1024
 
+#: Shown when the interaction model returns an *entirely empty* reply (no tool call
+#: and no text) even after a single gentle nudge — the sidebar must never show a
+#: blank bubble.
+_EMPTY_REPLY = "（模型未返回内容，请重试或换种说法。）"
+
 
 def _png_data_url(png: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(png).decode()
@@ -96,14 +101,31 @@ class ChatSession:
         else:
             content = message
         self.history.append({"role": "user", "content": content})
+        empty_rescued = False
         for _ in range(_MAX_TOOL_ROUNDS):
             resp = self._call(tools=tools)
             msg = resp.choices[0].message
             tcs = getattr(msg, "tool_calls", None)
             if not tcs:
                 reply = (getattr(msg, "content", None) or "").strip()
-                self.history.append({"role": "assistant", "content": reply})
-                return reply
+                if reply:
+                    self.history.append({"role": "assistant", "content": reply})
+                    return reply
+                # The model ended this round with neither a tool call nor any text —
+                # usually because it treated the last tool result as the answer and
+                # "stopped" silently.  Nudge once; if it still stammers blank, fall
+                # back to a clear placeholder so the sidebar never shows an empty
+                # bubble.
+                if not empty_rescued:
+                    empty_rescued = True
+                    self.history.append({
+                        "role": "user",
+                        "content": "（你刚才没有返回任何文字。请用一句话总结刚才的检查/修改结果，"
+                                   "或告诉我下一步该做什么。）",
+                    })
+                    continue
+                self.history.append({"role": "assistant", "content": _EMPTY_REPLY})
+                return _EMPTY_REPLY
             self.history.append({
                 "role": "assistant",
                 "content": str(getattr(msg, "content", "") or ""),

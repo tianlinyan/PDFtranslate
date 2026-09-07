@@ -236,6 +236,35 @@ class ChatSessionTest(unittest.TestCase):
                    if isinstance(c, dict) and c.get("type") == "image_url")
         self.assertTrue(url.startswith("data:image/png;base64,"))
 
+    def test_reply_rescues_empty_model_response(self):
+        # Model returns empty text with no tool call → nudge once; still empty → the
+        # clear fallback placeholder (the sidebar must never show a blank bubble).
+        responses = [
+            _FakeToolResp(None, ""),   # empty, no tool call → rescue nudge
+            _FakeToolResp(None, ""),   # still empty → fallback
+        ]
+        client = _FakeToolClient(responses)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: client):
+            session = chat.ChatSession(_model())
+        reply = session.reply("第二页有问题，修改一下")
+        self.assertEqual(chat._EMPTY_REPLY, reply)
+        nudges = [h for h in session.history if h.get("role") == "user"
+                  and isinstance(h.get("content"), str)
+                  and h["content"].startswith("（你刚才没有返回任何文字")]
+        self.assertTrue(nudges)
+
+    def test_reply_recovers_after_empty_then_answers(self):
+        # A single empty reply is rescued; the next non-empty reply is returned.
+        responses = [
+            _FakeToolResp(None, ""),
+            _FakeToolResp(None, "已检查完第2页，第3块数字有误，已重译并通过。"),
+        ]
+        client = _FakeToolClient(responses)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: client):
+            session = chat.ChatSession(_model())
+        reply = session.reply("第二页有问题，修改一下")
+        self.assertEqual("已检查完第2页，第3块数字有误，已重译并通过。", reply)
+
     def test_reply_with_tools_but_no_executor_returns_error_result(self):
         # A tool call with no executor never crashes; the result says so and the
         # loop passes it back for the model to see.
