@@ -374,16 +374,22 @@ class SpecialPagesTierTest(unittest.TestCase):
 class PathBPlanTest(unittest.TestCase):
     """Path B: the AI decomposes a requirement into an ordered, mixed-tier plan."""
 
-    def test_compile_plan_rule_fallback_single_task(self):
+    def test_compile_plan_without_llm_does_not_degrade(self):
+        # Path B is the AI free-composition entry: with no model it must NOT fall back
+        # to a deterministic single task — it returns an empty plan (caller refuses).
         from translate_app.agent import user_flows as uf
 
         plan = uf.compile_plan("自检只查数字，第3到第8页")
-        self.assertEqual(1, len(plan.tasks))
-        t = plan.tasks[0]
-        self.assertEqual("self_check_page", t.name)
-        self.assertEqual("process", t.tier)
-        self.assertEqual([2, 3, 4, 5, 6, 7], t.params["scope"])
-        self.assertEqual(["numbers"], t.params["checks"])
+        self.assertEqual([], plan.tasks)
+
+        # With a model that yields tasks, validate them (registry authoritative).
+        plan2 = uf.compile_plan("自检第1页",
+                                llm=lambda _r: {"tasks": [
+                                    {"tier": "process", "name": "self_check_page",
+                                     "params": {"page": 0, "checks": ["numbers"]}},
+                                ]})
+        self.assertEqual(1, len(plan2.tasks))
+        self.assertEqual("self_check_page", plan2.tasks[0].name)
 
     def test_validate_plan_drops_unknown_and_reinfers_tier(self):
         from translate_app.agent import user_flows as uf

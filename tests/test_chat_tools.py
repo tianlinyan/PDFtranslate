@@ -213,15 +213,12 @@ class ChatToolsTest(_CtxTest):
 
     # ---- run_plan: Path B decomposes a requirement into mixed-tier tasks ----
 
-    def test_run_plan_rule_fallback_executes_audit_task(self):
-        # No plan_llm → the deterministic rule parser yields one audit task.
+    def test_run_plan_refuses_without_model(self):
+        # No plan_llm (no model / no AI decompiler) → run_plan must NOT degrade to a
+        # deterministic single task; it refuses loudly instead.
         res = self.tools["run_plan"]("自检只查数字，第1页")
-        self.assertTrue(res["ok"], res)
-        self.assertEqual(1, len(res["results"]))
-        r0 = res["results"][0]
-        self.assertEqual("self_check_page", r0["name"])
-        self.assertEqual("process", r0["tier"])
-        self.assertTrue(r0["ok"])
+        self.assertFalse(res["ok"], res)
+        self.assertIn("需要模型在线", res["error"])
 
     def test_run_plan_with_ai_decomposed_tasks(self):
         # A wired plan_llm lets the AI compose an ordered, mixed-tier task list

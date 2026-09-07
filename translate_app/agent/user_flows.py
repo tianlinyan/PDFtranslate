@@ -37,10 +37,10 @@ from typing import Any, Callable
 
 from .flow_steps import (
     Flow, STANDARD_FLOWS, ForEachPage, ToolStep, run_flow,
-    flow_tier, registered_flow_tiers,
+    registered_flow_tiers,
 )
 from .tool_catalog import (
-    atomic_tool_names, TIER_ATOMIC, TIER_PROCESS, TIER_COMPOSITE,
+    atomic_tool_names, TIER_ATOMIC,
 )
 
 
@@ -519,57 +519,24 @@ def _validate_plan(data: dict | None) -> Plan:
     return Plan(tasks=tasks, note=str(data.get("note", "")))
 
 
-def _spec_to_task_params(spec: FlowSpec, req: str = "") -> dict[str, Any]:
-    """The runnable params a :class:`FlowSpec` implies (for a Path-A-backed task)."""
-    p: dict[str, Any] = {}
-    if spec.checks is not None:
-        p["checks"] = list(spec.checks)
-    if spec.auto_fix is not None:
-        p["auto_fix"] = bool(spec.auto_fix)
-    if spec.scope is not None:
-        p["scope"] = list(spec.scope)
-    if spec.page is not None:
-        p["page"] = int(spec.page)
-    if spec.lang:
-        p["lang"] = spec.lang
-    if spec.kind is not None:
-        p["kind"] = spec.kind
-    if spec.output_type:
-        p["output_type"] = spec.output_type
-    if spec.include_kept:
-        p["include_kept"] = True
-    p.update(spec.extra or {})
-    if req:
-        p["requirement"] = req
-    return p
-
-
-def _task_from_spec(spec: FlowSpec, req: str = "") -> Task:
-    """Map a :class:`FlowSpec` (Path A) onto a single :class:`Task` (Path-B fallback)."""
-    tier = flow_tier(spec.base) or TIER_PROCESS
-    return Task(tier=tier, name=spec.base, params=_spec_to_task_params(spec, req))
-
-
 def compile_plan(req: str, *, llm: Callable[[str], dict] | None = None) -> Plan:
-    """Turn a requirement into a :class:`Plan` of ordered, mixed-tier tasks.
+    """Decompose a requirement into a :class:`Plan` of ordered, mixed-tier tasks.
 
-    Path B (``llm`` injected): the model returns ``{"tasks":[{tier,name,params}], "note"}``;
-    it is validated (unknown names dropped) and used when at least one task survives.
-    ``llm=None``/empty → Path A: a single task derived from ``compile_from_user`` (the
-    deterministic rule parser).  This is the offline fallback so Path B never crashes on
-    a bad model reply.
+    This is the **free-composition** (Path B) entry.  It deliberately does NOT degrade
+    to a deterministic single task: when ``llm`` is ``None`` (no model / no usable
+    client) it returns an empty :class:`Plan`, and the caller must refuse — the chat
+    ``run_plan`` tool reports "需要模型在线" instead of silently running a rule-parsed
+    fallback.  A model reply that yields no valid tasks also yields an empty plan, so
+    the caller refuses rather than inventing a fallback.
     """
     r = str(req or "").strip()
-    if llm is not None:
-        try:
-            data = llm(r) or {}
-        except Exception:  # noqa: BLE001 — a failing/fake LLM degrades to Path A
-            data = {}
-        plan = _validate_plan(data)
-        if plan.tasks:
-            return plan
-    spec = compile_from_user(r, default_base="self_check_page", llm=None)
-    return Plan(tasks=[_task_from_spec(spec, req=r)])
+    if llm is None:
+        return Plan(note="")
+    try:
+        data = llm(r) or {}
+    except Exception:  # noqa: BLE001 — a bad/failing model reply -> empty plan (refuse)
+        data = {}
+    return _validate_plan(data)
 
 
 def run_plan(plan: Plan, *, dispatch: Callable[[Task], dict],
@@ -607,7 +574,8 @@ def run_plan(plan: Plan, *, dispatch: Callable[[Task], dict],
 
 
 #: Prompt that asks the model to decompose a requirement into an ordered task plan
-#: (Path B's flexible branch — the deterministic ``compile_plan`` fallback is offline).
+#: (Path B's flexible branch — the caller refuses when no model is available, rather
+#: than falling back to a deterministic single task).
 _PLAN_COMPILE_PROMPT = (
     "把下面这句要求分解成**按顺序执行**的若干任务，输出一个 JSON 对象（只输出一个 JSON 对象，"
     "不要任何解释、不要 markdown 代码围栏）：\n"
@@ -625,9 +593,11 @@ def make_llm_plan_compiler(model, client: Any = None,
                            log: Callable[[str], None] | None = None):
     """Return an AI plan decompiler ``llm(req) -> dict`` (Path B), or ``None``.
 
-    Fail-closed: on a network / parse error the callback returns ``{}``
-    (``compile_plan`` then falls back to Path A), and with no usable client it returns
-    ``None`` (the caller uses the rule fallback).  ``client`` (optional) reuses a shared
+    Fail-closed **without degrading**: on a network / parse error the callback returns
+    ``{}`` (``compile_plan`` yields an empty plan, so the caller refuses), and with no
+    usable client it returns ``None`` — the chat ``run_plan`` tool then reports
+    "需要模型在线" instead of running a rule-parsed fallback.  ``client`` (optional)
+    reuses a shared
     OpenAI client.
     """
     from .. import translator as _tr

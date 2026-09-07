@@ -700,6 +700,12 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
 
         if not ctx.has_source():
             return {"ok": False, "error": "请先选择一个 PDF 源文件（点「打开 PDF…」或拖入窗口）。"}
+        # Path B is the AI *free-composition* entry — it must not silently degrade to a
+        # deterministic single task when no model is wired.  Refuse loudly instead.
+        if plan_llm is None:
+            return {"ok": False,
+                    "error": "run_plan（AI 自由组合）需要模型在线；当前没有可用模型，无法自由分解。"
+                             "请先在主窗口选择并配置模型（models.json）。"}
         plan = _agent.compile_plan(str(requirement or ""), llm=plan_llm)
         if not plan.tasks:
             return {"ok": False,
