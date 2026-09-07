@@ -14,6 +14,7 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QTextCursor
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -164,6 +165,8 @@ class MainWindow(QWidget):
         #: until the next chat send, so it is sent to the AI together with the user's
         #: typed text.  Cleared after it is consumed.
         self._pending_image: bytes | None = None
+        #: Whether the sidebar is currently streaming an AI reply (a live bubble is open).
+        self._chat_streaming = False
         #: True once the window's controls are fully built; guards ``_refresh_chat_settings``
         #: from running during ``__init__`` (before the model/type combos exist).
         self._settings_ready = False
@@ -276,6 +279,20 @@ class MainWindow(QWidget):
         form.addRow("输出格式", self._type_combo)
         form.addRow("保存到", path_row)
 
+        # --- 翻译管线：IR 文档级管线（可选，默认关） ---
+        # OCR / 智能编排已交由 AI 自动处理、不再暴露开关；但 IR 是一条独立的
+        # 确定性翻译管线（无交互、公式/数字保真、术语跨页一致），可作为用户选项。
+        self._ir_check = QCheckBox("IR 文档级管线（无交互批处理、公式/数字保真、术语跨页一致）")
+        self._ir_check.setToolTip(
+            "勾选后翻译走 IR 文档级管线（build_ir → translate_ir → 自适应导出），"
+            "跳过 AI 单页视觉编排；公式/图/数字原样保留、术语跨页一致，"
+            "但无特殊页协商 / 自检 / 预览。\n"
+            "也可用环境变量 PDFTRANSLATE_IR_MODE=1 在启动时强制开启（优先级更高、无法在此关闭）。"
+        )
+        self._ir_check.setChecked(bool(prefs.get("ir_mode", False)))
+        self._ir_check.toggled.connect(self._persist_ir_mode)
+        form.addRow("翻译管线", self._ir_check)
+
         # --- 智能编排 + 扫描页识别：已交由 AI 自动处理，不再提供开关 ---
         # v0.3 起默认由 agent 视觉闭环驱动全流程翻译；扫描页自动触发 OCR（按页无文本层才识别），
         # 具体翻译/保留由 agent 与特殊页协商决定，因此主界面不再暴露这两个选项。
@@ -374,6 +391,7 @@ class MainWindow(QWidget):
         self._chat_worker.moveToThread(self._chat_thread)
         self._chat_worker.ask_requested.connect(self._chat_worker.ask)
         self._chat_worker.reply_ready.connect(self._on_chat_reply)
+        self._chat_worker.reply_chunk.connect(self._on_chat_reply_chunk)
         self._chat_worker.error.connect(self._on_chat_error)
         self._chat_worker.cancelled.connect(self._on_chat_cancelled)
         # Sidebar "取消" (or Enter while the AI is replying) aborts the in-flight reply.
@@ -481,9 +499,11 @@ class MainWindow(QWidget):
         # (a) A flow question is pending (special-page / skew / review-mode): the user's
         # message IS the answer — route it back to the flow (unblocking the worker)
         # instead of sending it to the chat model.  Checked FIRST so an answer like
-        # "第3页" is not swallowed by the preview-command reader.
+        # "第3页" is not swallowed by the preview-command reader.  The "我" bubble was
+        # already rendered by ``SidebarChat.send_message(show=True)`` (the only emitter
+        # of ``userMessage``), so do NOT add it again here — that made the same user
+        # message appear twice.
         if self.answer_bridge.is_pending() and text.strip():
-            self.agent_sidebar.add_message("我", str(text).strip())
             self.answer_bridge.answer(str(text).strip(), self.answer_bridge.pending_target)
             self.agent_sidebar.set_busy(False)   # routed as an answer, no chat turn
             return
@@ -509,17 +529,36 @@ class MainWindow(QWidget):
             else:
                 self._chat_worker.ask_requested.emit(text, model, None)
 
+    def _on_chat_reply_chunk(self, chunk: str) -> None:
+        """A streamed chunk of the in-progress reply: open a live bubble, then append."""
+        if not self._chat_streaming:
+            self._chat_streaming = True
+            self.agent_sidebar.begin_ai_message()
+        self.agent_sidebar.append_ai_text(chunk)
+
     def _on_chat_reply(self, reply: str) -> None:
         """The interaction model answered; show it only in the sidebar."""
-        self.agent_sidebar.add_message("ai", reply)
+        if self._chat_streaming:
+            # The reply was already streamed into a live bubble; finalize it with the
+            # full text (idempotent — the streamed text equals ``reply``).
+            self.agent_sidebar.finish_ai_message(str(reply))
+            self._chat_streaming = False
+        else:
+            self.agent_sidebar.add_message("ai", reply)
         self.agent_sidebar.set_busy(False)
 
     def _on_chat_error(self, err: str) -> None:
+        if self._chat_streaming:
+            self.agent_sidebar.end_ai_message()
+            self._chat_streaming = False
         self.agent_sidebar.add_message("ai", f"（对话失败：{err}）")
         self.agent_sidebar.set_busy(False)
 
     def _on_chat_cancelled(self, msg: str) -> None:
         """The user aborted the in-flight reply; show it and clear the busy state."""
+        if self._chat_streaming:
+            self.agent_sidebar.end_ai_message()
+            self._chat_streaming = False
         self.agent_sidebar.set_busy(False)
         self.agent_sidebar.add_notice(str(msg or "已取消"))
 
@@ -876,6 +915,7 @@ class MainWindow(QWidget):
             answer_handler=self.answer_bridge.ask,
             show_preview=self.preview_bridge.show_page,
             agent_mode=True,
+            ir_mode=self._ir_check.isChecked(),
             overlay=self.doc_ctx.overlay(),
             requirements=[requirement] if requirement else None,
             page_scope=page_scope,
@@ -921,6 +961,7 @@ class MainWindow(QWidget):
                     "model_id": model_id,
                     "language": language,
                     "output_type": output_key,
+                    "ir_mode": bool(self._ir_check.isChecked()),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )
@@ -929,6 +970,22 @@ class MainWindow(QWidget):
                 # A silently lost preference is invisible until the next launch;
                 # say so (this runs after the log is cleared for the new run).
                 self._append_log(f"  警告：用户偏好保存失败（{reason}），本次设置不会被记住。")
+        except Exception:
+            pass
+
+    def _persist_ir_mode(self, checked: bool) -> None:
+        """Save the IR-mode checkbox the moment it is toggled.
+
+        Unlike the combo-based prefs (saved when a run starts), a checkbox is
+        toggled well before any run, so persist it here too — otherwise the toggle
+        is only remembered after the next successful run.
+        """
+        try:
+            prefs = load_prefs()
+            prefs["ir_mode"] = bool(checked)
+            reason = save_prefs(prefs)
+            if reason and hasattr(self, "_log"):
+                self._append_log(f"  警告：用户偏好保存失败（{reason}），IR 开关不会被记住。")
         except Exception:
             pass
 

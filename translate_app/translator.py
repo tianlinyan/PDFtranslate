@@ -379,7 +379,12 @@ class TranslationEngine:
             # to the cache, where it would be reused forever.  Reject it so the
             # caller retries (and, once retries are exhausted, keeps the source).
             if any(not t for t in result):
-                raise ValueError("模型回复中存在空译文块，无法对齐")
+                empty = [p + 1 for p in range(len(result)) if not result[p]]
+                raise ValueError(
+                    "模型回复中存在空译文块（第 "
+                    + ", ".join(str(n) for n in empty)
+                    + " 块），无法对齐"
+                )
             return result
 
 
@@ -406,6 +411,51 @@ class TranslationEngine:
                 f"（期望 {len(indices)} 行，实际 {len(lines)} 行），无法对齐"
             )
         return list(lines)
+
+    @staticmethod
+    def _page_label(indices: Sequence[int], block_pages: Sequence[int] | None) -> str:
+        """Human-readable page range for a batch of flat block indices.
+
+        ``block_pages`` maps each block position to its 0-based page; ``indices``
+        are positions in the same block list.  Returns ``""`` when no page map is
+        available (or it does not line up), so callers can log without it.  UI
+        pages are 1-based, so a 0-based ``block_pages[i]`` becomes ``第 N+1 页``.
+        """
+        if not block_pages or not indices:
+            return ""
+        try:
+            pages = [block_pages[i] for i in indices]
+        except IndexError:
+            return ""
+        lo, hi = min(pages), max(pages)
+        if lo == hi:
+            return f"第 {lo + 1} 页"
+        return f"第 {lo + 1}-{hi + 1} 页"
+
+    @staticmethod
+    def _snippet(text: str, limit: int = 30) -> str:
+        """A compact, safe source-text locator: the first ``limit`` collapsed chars.
+
+        Used to anchor a batch / block to a real piece of the document so a user can
+        find the offending page and text.  Whitespace (incl. newlines) is collapsed,
+        the result is truncated, and an ellipsis marks the cut — so a block that is
+        itself a table row or a multi-line paragraph still yields one clean line.
+        """
+        t = " ".join(str(text).split())
+        if not t:
+            return ""
+        return t[:limit] + ("…" if len(t) > limit else "")
+
+    def _batch_snippet(self, indices: Sequence[int], blocks: Sequence[str]) -> str:
+        """A ``，原文: "..."`` locator for the batch's first block (or ``""``).
+
+        The first block is used as a stable anchor: it identifies *which* batch on
+        the page the failure belongs to, so a user can jump to that page and text.
+        """
+        if not indices:
+            return ""
+        s = self._snippet(blocks[indices[0]])
+        return f'，原文: "{s}"' if s else ""
 
     @staticmethod
     def _is_transient(exc: Exception) -> bool:
@@ -462,6 +512,7 @@ class TranslationEngine:
         retry_delays: Sequence[float] = _TRANSIENT_RETRY_DELAYS,
         abort: threading.Event | None = None,
         glossary: dict[str, str] | None = None,
+        block_pages: Sequence[int] | None = None,
     ) -> tuple[list[str], bool]:
         """Translate one batch, auto-degrading to smaller sub-batches on failure.
 
@@ -475,7 +526,7 @@ class TranslationEngine:
         """
         try:
             translated, ok, splittable = self._translate_batch_attempt(
-                indices, blocks, language, log, cancel, retry_delays, abort, glossary)
+                indices, blocks, language, log, cancel, retry_delays, abort, glossary, block_pages)
         except (TranslationCancelled, TranslationAborted):
             raise
         if ok:
@@ -487,11 +538,14 @@ class TranslationEngine:
         # a translation.  Degradation is per-batch, so the next batch recovers.
         if splittable and len(indices) > 1:
             mid = len(indices) // 2
-            log(f"  批量未对齐，拆分为 {mid}+{len(indices) - mid} 个子批继续（单块兜底）。")
+            label = self._page_label(indices, block_pages)
+            loc = f"（{label}）" if label else ""
+            snip = self._batch_snippet(indices, blocks) if indices else ""
+            log(f"  批量未对齐{loc}{snip}，拆分为 {mid}+{len(indices) - mid} 个子批继续（单块兜底）。")
             left, lok = self._translate_batch(
-                indices[:mid], blocks, language, log, cancel, retry_delays, abort, glossary)
+                indices[:mid], blocks, language, log, cancel, retry_delays, abort, glossary, block_pages)
             right, rok = self._translate_batch(
-                indices[mid:], blocks, language, log, cancel, retry_delays, abort, glossary)
+                indices[mid:], blocks, language, log, cancel, retry_delays, abort, glossary, block_pages)
             return left + right, lok and rok
         return translated, False
 
@@ -505,6 +559,7 @@ class TranslationEngine:
         retry_delays: Sequence[float] = _TRANSIENT_RETRY_DELAYS,
         abort: threading.Event | None = None,
         glossary: dict[str, str] | None = None,
+        block_pages: Sequence[int] | None = None,
     ) -> tuple[list[str], bool, bool]:
         """Translate one batch; returns ``(translations, ok, splittable)``.
 
@@ -561,7 +616,10 @@ class TranslationEngine:
                 log(f"  重试 {attempt}/{attempts}: {last_error}")
                 _sleep_interruptible(retry_delays[attempt - 1], cancel)
         if last_error:
-            log(f"  批次未通过: {last_error}")
+            label = self._page_label(indices, block_pages)
+            loc = f"（{label}）" if label else ""
+            snip = self._batch_snippet(indices, blocks) if indices else ""
+            log(f"  批次未通过{loc}{snip}: {last_error}")
         # Preserve the source text for every block in the failed batch.  A marker-free
         # reply (refusal) is never worth splitting.
         splittable = not (isinstance(last_error, ValueError) and not last_had_markers)
@@ -580,6 +638,7 @@ class TranslationEngine:
         retry_delays: Sequence[float] = _TRANSIENT_RETRY_DELAYS,
         keep_original: set[int] | None = None,
         extra_glossary: dict[str, str] | None = None,
+        block_pages: Sequence[int] | None = None,
     ) -> TranslationResult:
         """Translate ``blocks`` into ``target_language``.
 
@@ -727,6 +786,7 @@ class TranslationEngine:
                             retry_delays,
                             abort,
                             glossary,
+                            block_pages,
                         ): chunk
                         for chunk in chunks
                     }
@@ -760,7 +820,10 @@ class TranslationEngine:
                                 _persist_cache(snapshot, seq)
                         else:
                             for i in chunk:
-                                result.errors.append(f"块 {i + 1} 翻译失败，保留原文")
+                                label = self._page_label([i], block_pages)
+                                loc = f"（{label}）" if label else ""
+                                snip = self._batch_snippet([i], blocks) if blocks else ""
+                                result.errors.append(f"块 {i + 1} 翻译失败，保留原文{loc}{snip}")
                         done += len(chunk)
                         progress(done, n)
             finally:

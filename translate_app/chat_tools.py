@@ -215,7 +215,7 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
                 "kind": kind_by_idx.get(idx, ("text", 0))[0],
                 "level": kind_by_idx.get(idx, ("text", 0))[1],
             })
-        return {"page": page, "blocks": blocks}
+        return {"page": page, "page_number": page + 1, "blocks": blocks}
 
     def goto_page(page: int, what: str = "source") -> dict[str, Any]:
         if show_preview is None:
@@ -559,6 +559,14 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         state = _audit_state(ctx)
         if state is None:
             return {"ok": False, "error": "没有已加载的 PDF。"}
+        # run_flow compiles a user's *free-text* requirement into a custom flow — that
+        # interpretation is AI-driven.  It must NOT silently fall back to deterministic
+        # keyword rules when no model is wired; refuse loudly instead (mirrors
+        # ``run_plan``).  A user who just wants 重新导出 uses the ``re_export`` tool.
+        if llm is None:
+            return {"ok": False,
+                    "error": "run_flow（自定义流程）需要模型在线；当前没有可用模型，无法解读要求。"
+                             "请先在主窗口选择并配置模型（models.json）。"}
         spec = agent.compile_from_user(str(requirement or ""), default_base="self_check_page",
                                        llm=llm)
         # U1: 编译出的 base 决定"翻译 / 导出 / 审计"三种执行 —— 用同一套"定义流程"机制。

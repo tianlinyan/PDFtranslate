@@ -213,6 +213,7 @@ class TranslateWorker(QObject):
                     cancel=lambda: self._cancelled.is_set(),
                     doc_path=Path(self._source),
                     keep_original=keep_original,
+                    block_pages=doc.block_pages,
                 )
             translate_elapsed = time.monotonic() - translate_started
 

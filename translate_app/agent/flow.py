@@ -1150,6 +1150,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
             sources, lang, log=log, cancel=cancel,
             doc_path=Path(state.src_path),
             extra_glossary=state.user_decisions.get("terminology") or {},
+            block_pages=[src_doc.block_pages[i] for i in picked],
         )
         failed: set[int] = set()
         for err in (result.errors or []):

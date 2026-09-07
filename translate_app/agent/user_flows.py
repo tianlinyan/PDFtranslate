@@ -296,9 +296,9 @@ def make_llm_flow_compiler(model, client: Any = None,
             resp = client.chat.completions.create(**kwargs)
             text = (getattr(resp.choices[0].message, "content", "") or "").strip()
             return _parse_flow_json(text)
-        except Exception as exc:  # noqa: BLE001 — fail-closed to the rule parser
+        except Exception as exc:  # noqa: BLE001 — fail-closed (no rule fallback)
             if log:
-                log(f"  流程槽填充失败：{type(exc).__name__}: {exc}（用规则解析）。")
+                log(f"  流程槽填充失败：{type(exc).__name__}: {exc}（以默认流程继续）。")
             return {}
 
     return compile_req
@@ -623,9 +623,9 @@ def make_llm_plan_compiler(model, client: Any = None,
             resp = client.chat.completions.create(**kwargs)
             text = (getattr(resp.choices[0].message, "content", "") or "").strip()
             return _parse_plan_json(text)
-        except Exception as exc:  # noqa: BLE001 — fail-closed to the rule parser
+        except Exception as exc:  # noqa: BLE001 — fail-closed (no rule fallback)
             if log:
-                log(f"  计划分解失败：{type(exc).__name__}: {exc}（用规则解析）。")
+                log(f"  计划分解失败：{type(exc).__name__}: {exc}（返回空计划，调用方拒绝）。")
             return {}
 
     return compile_req

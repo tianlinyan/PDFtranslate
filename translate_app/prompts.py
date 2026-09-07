@@ -188,6 +188,8 @@ def agent_tool_policy() -> str:
     return (
         "\n\n【工具功能与用法】先观察、再修改、最后校验；读过的页别重读；改完必须校验；"
         "某工具返回 ok=false 先读 error 判断原因、别盲目重试；index 一律用 read_page 的**扁平 index**（写回就靠它）。"
+        "**页码规则（必须一致）**：工具参数里的 `page` 是 **0 起**（第 1 页 = page 0）；"
+        "但你在任务/回复中向用户提到页码时**一律说「第 N+1 页」**（page 0 → 第 1 页），**绝不说“第 0 页”**。\n"
         "各工具的返回值见其 schema，这里只补关键差异：\n"
         "① 观察（只读原文，绝不改写）：read_page（含扁平 index，超大页可 offset/limit 分页；块可带 kind/level——"
         "formula/figure 是结构内容、应保留原文，caption/heading 照常翻译并按 level 处理）、get_layout、get_doc_info、"
@@ -383,6 +385,9 @@ def chat_tool_hint() -> str:
         "\n\n【可用工具】用户要看/改/导出/开始翻译当前 PDF 时再调用；纯闲聊不要用。"
         "读/导航/改工具（get_doc_info、classify_page、read_page、goto_page、set_block_text、"
         "delete_block_text、apply_annotation）的功能见各工具说明，这里只讲入口规则：\n"
+        "**页码规则（必须一致）**：工具参数里的 `page` 是 **0 起**（第 1 页 = page 0）；"
+        "但你向用户说明页码时，**一律说「第 N+1 页」**（如 page 0 → 第 1 页、page 1 → 第 2 页），"
+        "**绝不说“第 0 页”**——用户看到的 UI 是 1 起的「第 N 页」。\n"
         "**用户要最新译文 → 直接调 re_export**（用当前修改重新生成，秒级、不重译）。若不可用"
         "（还没翻译过/没加载源文件），提示用户点主界面的「重新导出」按钮，**不要说没有导出功能**——应用有「重新导出」。\n"
         "**用户要「检查/自检/核对」（“第N页数字对不对/有没有漏译/翻译得怎么样”）→ 调 self_check**"

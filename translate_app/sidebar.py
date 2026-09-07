@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import html
 import threading
 from typing import Callable
 
@@ -169,6 +170,9 @@ class SidebarChat(QWidget):
         self.setMinimumWidth(300)
         #: Whether the AI is replying (so the send button becomes "取消").
         self._busy = False
+        #: Live-streaming AI bubble state (see ``begin_ai_message`` / ``append_ai_text``).
+        self._stream_role: str | None = None
+        self._stream_text = ""
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setPlaceholderText("AI 对话记录…")
@@ -201,6 +205,48 @@ class SidebarChat(QWidget):
                f'{str(text)}</p>'
         self._log.append(html)
         # Keep the newest chat line visible.
+        self._log.moveCursor(QTextCursor.MoveOperation.End)
+        self._log.ensureCursorVisible()
+
+    # -- streaming: a live AI bubble that appends chunks as they arrive ----------
+    def begin_ai_message(self) -> None:
+        """Open a live AI bubble; streamed chunks append into it (typing effect)."""
+        self._stream_role = "ai"
+        self._stream_text = ""
+        self._log.append('<p><b style="color:#2b6cb0">AI:</b> </p>')
+        self._log.moveCursor(QTextCursor.MoveOperation.End)
+        self._log.ensureCursorVisible()
+
+    def append_ai_text(self, chunk: str) -> None:
+        """Append a streamed chunk to the open AI bubble."""
+        if self._stream_role != "ai":
+            return
+        self._stream_text += str(chunk)
+        self._update_stream_bubble()
+
+    def finish_ai_message(self, text: str | None = None) -> None:
+        """Close the AI bubble, optionally setting its final text."""
+        if self._stream_role != "ai":
+            return
+        if text is not None:
+            self._stream_text = str(text)
+            self._update_stream_bubble()
+        self._stream_role = None
+
+    def end_ai_message(self) -> None:
+        """Close the AI bubble without changing its text (error/abort path)."""
+        self._stream_role = None
+
+    def _update_stream_bubble(self) -> None:
+        if self._stream_role != "ai":
+            return
+        body = html.escape(self._stream_text).replace("\n", "<br>")
+        block = f'<p><b style="color:#2b6cb0">AI:</b> {body}</p>'
+        cursor = self._log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        self._log.setTextCursor(cursor)
+        self._log.insertHtml(block)
         self._log.moveCursor(QTextCursor.MoveOperation.End)
         self._log.ensureCursorVisible()
 

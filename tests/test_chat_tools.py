@@ -111,6 +111,21 @@ class ChatToolsTest(_CtxTest):
     def _retranslate_tools(self, translate_texts=None):
         return chat_tools.make_chat_tools(self.ctx, translate_texts=translate_texts)
 
+    def _flow_tools(self, translate_texts=None, **kw):
+        """``make_chat_tools`` with an injection so ``run_flow`` can compile a flow.
+
+        ``run_flow`` now requires a model (it refuses when ``llm`` is None, mirroring
+        ``run_plan``).  The fake ``llm`` round-trips the deterministic rule parser so
+        the audit/fix behaviour is still exercised without a real model.
+        """
+        from translate_app import agent as _agent
+
+        def fake_llm(req):
+            return _agent.compile_from_user(str(req or ""), llm=None).to_dict()
+
+        return chat_tools.make_chat_tools(self.ctx, llm=fake_llm,
+                                          translate_texts=translate_texts, **kw)
+
     def test_retranslate_requires_engine(self):
         # No translation channel wired → fail-closed, not a crash.
         res = self.tools["retranslate"](0)
@@ -175,13 +190,20 @@ class ChatToolsTest(_CtxTest):
 
     def test_run_flow_stays_read_only_when_channel_missing(self):
         # No translation channel → mode read_only (existing behaviour).
-        res = self.tools["run_flow"]("自检只查数字，第1页")
+        res = self._flow_tools()["run_flow"]("自检只查数字，第1页")
         self.assertTrue(res["ok"], res)
         self.assertEqual("read_only", res["mode"])
         self.assertEqual(0, res["fixed_blocks"])
 
+    def test_run_flow_refuses_without_model(self):
+        # No llm (no model / no AI interpreter) → run_flow must NOT degrade to the
+        # deterministic rule parser; it refuses loudly instead (mirrors run_plan).
+        res = self.tools["run_flow"]("自检第1页")
+        self.assertFalse(res["ok"], res)
+        self.assertIn("需要模型在线", res["error"])
+
     def test_run_flow_fixes_in_place_when_channel_wired(self):
-        tools = self._retranslate_tools(lambda texts, lang: ["Translated text"] * len(texts))
+        tools = self._flow_tools(translate_texts=lambda texts, lang: ["Translated text"] * len(texts))
         res = tools["run_flow"]("自检第1页残留和漏译")
         self.assertTrue(res["ok"], res)
         self.assertEqual("self_check_page", res["base"])
@@ -194,7 +216,7 @@ class ChatToolsTest(_CtxTest):
         self.assertTrue(overlay)
 
     def test_run_flow_read_only_when_spec_says_no_fix(self):
-        tools = self._retranslate_tools(lambda texts, lang: ["x"] * len(texts))
+        tools = self._flow_tools(translate_texts=lambda texts, lang: ["x"] * len(texts))
         # "不修改" → auto_fix False → read-only even though the channel is wired.
         res = tools["run_flow"]("自检第1页残留，不修改")
         self.assertTrue(res["ok"], res)
@@ -203,7 +225,7 @@ class ChatToolsTest(_CtxTest):
 
     def test_run_flow_reports_unfixable_blocks(self):
         # The model keeps the source → those blocks stay untranslated and are reported.
-        tools = self._retranslate_tools(lambda texts, lang: list(texts))
+        tools = self._flow_tools(translate_texts=lambda texts, lang: list(texts))
         res = tools["run_flow"]("自检第1页残留和漏译")
         self.assertTrue(res["ok"], res)
         self.assertEqual("fixed", res["mode"])
@@ -430,6 +452,14 @@ class ChatToolsTest(_CtxTest):
         res = self.tools["classify_page"](0)
         self.assertIn("kind", res)
 
+    def test_read_page_includes_user_page_number(self):
+        # ``read_page`` returns a 1-based ``page_number`` so the model never tells the
+        # user "第 0 页" (tools are 0-based; the UI/user-facing page is 1-based).
+        res = self.tools["read_page"](0)
+        self.assertEqual(0, res["page"])
+        self.assertEqual(1, res["page_number"])
+        self.assertTrue(res["blocks"])
+
     def test_self_check_returns_structured_report(self):
         # Nothing translated yet → the deterministic audit reports residual/missing.
         res = self.tools["self_check"](0)
@@ -460,7 +490,7 @@ class ChatToolsTest(_CtxTest):
         self.assertIn("没有已加载的 PDF", res["error"])
 
     def test_run_flow_compiles_and_audits_scope(self):
-        res = self.tools["run_flow"]("自检只查数字，第1页")
+        res = self._flow_tools()["run_flow"]("自检只查数字，第1页")
         self.assertTrue(res["ok"], res)
         self.assertEqual("self_check_page", res["base"])
         self.assertEqual(["numbers"], res["checks"])
@@ -472,8 +502,8 @@ class ChatToolsTest(_CtxTest):
         # "重译第2页" now *dispatches* to translation with the compiled page scope,
         # instead of being rejected — the console defines WHAT to translate.
         calls: list = []
-        tools = chat_tools.make_chat_tools(
-            self.ctx, log=lambda m: None,
+        tools = self._flow_tools(
+            log=lambda m: None,
             start_translate=lambda req, scope=None: calls.append((req, scope)))
         res = tools["run_flow"]("重译第2页")
         self.assertTrue(res["ok"], res)
@@ -484,8 +514,7 @@ class ChatToolsTest(_CtxTest):
     def test_run_flow_dispatches_export_base(self):
         # "重新导出" now dispatches to re_export (no re-translate), instead of rejecting.
         calls: list = []
-        tools = chat_tools.make_chat_tools(
-            self.ctx, log=lambda m: None, re_export=lambda: calls.append(True))
+        tools = self._flow_tools(log=lambda m: None, re_export=lambda: calls.append(True))
         res = tools["run_flow"]("重新导出")
         self.assertTrue(res["ok"], res)
         self.assertEqual("export", res["base"])
@@ -496,7 +525,7 @@ class ChatToolsTest(_CtxTest):
 
         saved = dict(uf.USER_FLOW_SPECS)
         try:
-            res = self.tools["run_flow"]("自检只查表格", name="my_table_check")
+            res = self._flow_tools()["run_flow"]("自检只查表格", name="my_table_check")
             self.assertTrue(res["ok"], res)
             self.assertTrue(res["promoted"])
             self.assertIn("my_table_check", uf.USER_FLOW_SPECS)

@@ -94,6 +94,29 @@ class _FakeToolClient:
         self.chat = type("_Chat", (), {"completions": _FakeToolCompletions(responses)})()
 
 
+class _StreamChunk:
+    """One SSE chunk with ``choices[0].delta`` (content or tool_calls)."""
+
+    def __init__(self, content=None, tool_calls=None):
+        delta = type("_D", (), {"content": content, "tool_calls": tool_calls})()
+        self.choices = [type("_C", (), {"delta": delta})()] if (content is not None or tool_calls) else []
+
+
+class _FakeStreamCompletions:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.seen: list = []
+
+    def create(self, **kwargs):
+        self.seen.append(kwargs)
+        return iter(self._chunks)
+
+
+class _FakeStreamClient:
+    def __init__(self, chunks):
+        self.chat = type("_Chat", (), {"completions": _FakeStreamCompletions(chunks)})()
+
+
 class ChatSessionTest(unittest.TestCase):
     def test_reply_records_history_and_uses_interaction_params(self):
         seen: list = []
@@ -264,6 +287,22 @@ class ChatSessionTest(unittest.TestCase):
             session = chat.ChatSession(_model())
         reply = session.reply("第二页有问题，修改一下")
         self.assertEqual("已检查完第2页，第3块数字有误，已重译并通过。", reply)
+
+    def test_reply_streams_content_chunks(self):
+        # With ``on_chunk`` the request is streamed: each content delta is forwarded
+        # live and the accumulated reply is returned (typing effect).
+        chunks = [_StreamChunk(content="你"),
+                  _StreamChunk(content="好"),
+                  _StreamChunk(content=" ！")]
+        client = _FakeStreamClient(chunks)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: client):
+            session = chat.ChatSession(_model())
+        got: list[str] = []
+        reply = session.reply("你好", on_chunk=got.append)
+        self.assertEqual("你好 ！", reply)
+        self.assertEqual(["你", "好", " ！"], got)
+        # The request was made as a streaming call.
+        self.assertTrue(client.chat.completions.seen[-1].get("stream"))
 
     def test_window_history_caps_and_starts_at_user(self):
         # The window keeps at most ``_CHAT_HISTORY_CAP`` messages and always starts at

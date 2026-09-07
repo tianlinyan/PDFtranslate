@@ -285,8 +285,9 @@ TOOL_CATALOG: list[ToolDef] = [
 
     # ------------------------------------------------------------------ chat 专用
     _tool("read_page",
-          "读取某页的原始文本块与当前译文，含扁平块索引（供 set_block_text 使用）与布局元数据。",
-          {"page": {"type": "integer", "description": "页号（0 起）"}}, ["page"],
+          "读取某页的原始文本块与当前译文，含扁平块索引（供 set_block_text 使用）与布局元数据。"
+          "返回 `page`（0 起）与 `page_number`（1 起）——向用户说明页码时用 `page_number`。",
+          {"page": {"type": "integer", "description": "页号（0 起；第 1 页 = 0）"}}, ["page"],
           CAT_READ, target="source", audience=("chat",)),
     _tool("get_settings",
           "返回当前应用设置快照：源文件名、目标语言、输出格式键与显示名、输出路径、模型名称/id、是否 OCR/智能编排。"
@@ -333,9 +334,10 @@ TOOL_CATALOG: list[ToolDef] = [
            "target_lang": {"type": "string", "description": "目标语言（默认当前设置的目标语言）"}},
           ["page"], CAT_CONTENT, audience=("chat",)),
     _tool("run_flow",
-          "把用户的一句话要求**编译成一个自定义流程**并执行（路径 A 参数化）：如“自检第3到第8页只查数字和表格，不修改”→ 解析页范围/检查子集/"
+          "把用户的一句话要求**编译成一个自定义流程**并执行（路径 A 参数化，需模型在线）：如“自检第3到第8页只查数字和表格，不修改”→ 解析页范围/检查子集/"
           "是否只读；如“第5页数字错了自动改”→ 会**就地修正**审计发现的问题块并写回覆盖层。可传 name 把该流程**登记为命名流程**（本次会话内可复用）。"
-          "默认只读审计；auto_fix=True 且重译通道可用时才写回覆盖层。",
+          "默认只读审计；auto_fix=True 且重译通道可用时才写回覆盖层。"
+          "注意：无可用模型时**不会降级**为规则解析，而是返回“需要模型在线”。",
           {"requirement": {"type": "string", "description": "用户的一句话要求（如“自检第3到第8页只查数字和表格，不修改”）"},
            "name": {"type": "string", "description": "可选：把该流程登记为命名流程（本次会话内可复用）"}},
           ["requirement"], CAT_CONTENT, audience=("chat",)),

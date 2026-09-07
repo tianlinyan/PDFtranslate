@@ -1,6 +1,6 @@
 # PDFtranslate
 
-> 当前版本：**v0.5.4**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
+> 当前版本：**v0.5.5**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
 > 各阶段性设计见 `docs/`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
@@ -129,6 +129,8 @@ python main.py "C:\path\to\doc.pdf"
 - `PDFTRANSLATE_STRUCTURE_MODE=1`：提取带公式/图/标题/图注/表格结构（几何后端、离线无模型）。
 - `PDFTRANSLATE_IR_MODE=1`：翻译走 **IR 文档级管线**（无交互批处理、公式/数字保真、术语跨页一致）。
 - 想要**完整交互**（特殊页协商/自检/预览）→ 把 `PDFTRANSLATE_IR_MODE` 设为空，只保留 `STRUCTURE_MODE`。
+
+> **主界面复选框**：也可以在主窗体「翻译管线」勾选 **IR 文档级管线**，效果等同 `PDFTRANSLATE_IR_MODE=1`，且勾选状态会写入 `~/.pdftranslate/prefs.json` 跨启动记住（切一刀即存）。环境变量优先级更高：若启动时已设 `PDFTRANSLATE_IR_MODE=1`，即使复选框未勾也会强制开 IR（此时在界面上关不掉，只能改环境变量）。
 
 **内部阈值（可调，已命名）**：公式检测 `_is_formula_block`（符号数/长度）、术语抽取 `infer_terms`（`_INFER_MAX_TERMS`/`_INFER_MIN_FREQ`）、图注 `_CAPTION_RE`/`_CAPTION_MAX_LEN`、几何分型等——改保守/激进就在这些常量处。
 

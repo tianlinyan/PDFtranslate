@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from openai import OpenAI
@@ -122,6 +123,7 @@ class ChatSession:
         tools: list[dict[str, Any]] | None = None,
         executor: Callable[[str, dict[str, Any]], Any] | None = None,
         image: bytes | None = None,
+        on_chunk: Callable[[str], None] | None = None,
     ) -> str:
         """Append the user message, ask the interaction model, record and return the reply.
 
@@ -142,8 +144,7 @@ class ChatSession:
         self.history.append({"role": "user", "content": content})
         empty_rescued = False
         for _ in range(_MAX_TOOL_ROUNDS):
-            resp = self._call(tools=tools)
-            msg = resp.choices[0].message
+            msg = self._call(tools=tools, on_text=on_chunk)
             tcs = getattr(msg, "tool_calls", None)
             if not tcs:
                 reply = (getattr(msg, "content", None) or "").strip()
@@ -221,8 +222,8 @@ class ChatSession:
         # answer plainly (no more tool calls) instead of looping forever — but
         # if that call fails too, fall back to the last assistant text.
         try:
-            resp = self._call(tools=None)
-            content = (getattr(resp.choices[0].message, "content", None) or "").strip()
+            msg = self._call(tools=None, on_text=on_chunk)
+            content = (getattr(msg, "content", None) or "").strip()
             if content:
                 self.history.append({"role": "assistant", "content": content})
                 return content
@@ -271,8 +272,15 @@ class ChatSession:
             msgs = self.history[-_CHAT_HISTORY_CAP:]
         return list(msgs)
 
-    def _call(self, *, tools: list[dict[str, Any]] | None) -> Any:
-        """One chat-completions call using the interaction parameter set."""
+    def _call(self, *, tools: list[dict[str, Any]] | None,
+              on_text: Callable[[str], None] | None = None) -> Any:
+        """One chat-completions call using the interaction parameter set.
+
+        When ``on_text`` is given, the request is streamed and each content delta is
+        forwarded to it (so the sidebar types out the reply live); ``tool_calls`` deltas
+        are accumulated into a reconstructed message.  With ``on_text=None`` the call is
+        non-streaming and returns the response message directly (used by tests).
+        """
         system_prompt = prompts.chat_system_prompt()
         if tools:
             system_prompt += prompts.chat_tool_hint()
@@ -293,7 +301,51 @@ class ChatSession:
         body = self.model.interaction_request_params()
         if body:
             kwargs["extra_body"] = body
-        return self.client.chat.completions.create(**kwargs)
+        if on_text is not None:
+            kwargs["stream"] = True
+        resp = self.client.chat.completions.create(**kwargs)
+        if on_text is None:
+            return resp.choices[0].message
+        # Streaming: iterate chunks, emit content deltas live, accumulate tool calls.
+        # A test/mock client may return a single non-iterable response — read it
+        # directly (streaming only real clients).
+        try:
+            stream_iter = iter(resp)
+        except TypeError:
+            _msg = resp.choices[0].message
+            _txt = getattr(_msg, "content", None)
+            if _txt and on_text:
+                on_text(str(_txt))
+            return _msg
+        content_parts: list[str] = []
+        tool_calls: dict[int, dict[str, str]] = {}
+        for chunk in stream_iter:
+            for ch in getattr(chunk, "choices", None) or []:
+                delta = getattr(ch, "delta", None)
+                if delta is None:
+                    continue
+                part = getattr(delta, "content", None)
+                if part:
+                    content_parts.append(part)
+                    on_text(part)
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    idx = int(getattr(tc, "index", 0))
+                    entry = tool_calls.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    if getattr(tc, "id", None):
+                        entry["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            entry["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            entry["args"] += fn.arguments
+        content = "".join(content_parts) or None
+        calls = [
+            SimpleNamespace(id=e["id"], type="function",
+                            function=SimpleNamespace(name=e["name"], arguments=e["args"]))
+            for _, e in sorted(tool_calls.items())
+        ]
+        return SimpleNamespace(content=content, tool_calls=calls or None)
 
 
 class ChatWorker(QObject):
@@ -306,6 +358,7 @@ class ChatWorker(QObject):
 
     ask_requested = pyqtSignal(str, object, object)   # text, ModelConfig, image_bytes|None
     reply_ready = pyqtSignal(str)
+    reply_chunk = pyqtSignal(str)   # a streamed text chunk of the in-progress reply
     error = pyqtSignal(str)
     cancelled = pyqtSignal(str)   # the in-flight reply was aborted by the user ("取消")
     #: (b) A flow-time agent Q&A, noted into the live session's history (queued).
@@ -333,6 +386,12 @@ class ChatWorker(QObject):
         self._re_export = re_export
         self._start_translate = start_translate
         self._set_setting = set_setting
+
+    def _emit_chunk(self, chunk: str) -> None:
+        """Forward a streamed text chunk to the GUI (queued) for the live bubble."""
+        c = str(chunk or "")
+        if c.strip():
+            self.reply_chunk.emit(c)
 
     def _ensure_session(self, model: ModelConfig) -> ChatSession:
         if self._session is None or self._session.model is not model:
@@ -415,7 +474,8 @@ class ChatWorker(QObject):
 
             threading.Thread(target=_watchdog, daemon=True).start()
             try:
-                reply = session.reply(str(text), tools=tools, executor=executor, image=image)
+                reply = session.reply(str(text), tools=tools, executor=executor,
+                                      image=image, on_chunk=self._emit_chunk)
             finally:
                 done.set()
             if self._cancel_ev.is_set():
