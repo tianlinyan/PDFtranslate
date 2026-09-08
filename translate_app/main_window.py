@@ -318,7 +318,7 @@ class MainWindow(QWidget):
         self._reflow_check.toggled.connect(self._persist_reflow)
 
         # --- 扫描表格重建为矢量表格（默认关闭） ---
-        self._rebuild_table_check = QCheckBox("扫描表格重建为矢量表格")
+        self._rebuild_table_check = QCheckBox("OCR表格重建为矢量表格")
         self._rebuild_table_check.setToolTip(
             "勾选后，AI 视觉识别扫描（OCR）表格的真实行/列边界，把 OCR 块重排到"
             "对应单元格（矢量表格），从而走文本层表格管线的行高扩展 + 矢线重绘，"
