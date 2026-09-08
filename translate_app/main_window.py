@@ -282,16 +282,31 @@ class MainWindow(QWidget):
         # --- 翻译管线：IR 文档级管线（可选，默认关） ---
         # OCR / 智能编排已交由 AI 自动处理、不再暴露开关；但 IR 是一条独立的
         # 确定性翻译管线（无交互、公式/数字保真、术语跨页一致），可作为用户选项。
-        self._ir_check = QCheckBox("IR 文档级管线（无交互批处理、公式/数字保真、术语跨页一致）")
+        self._ir_check = QCheckBox(
+            "IR 文档级管线（无交互批处理、段落成组、公式/数字保真、术语跨页一致）")
         self._ir_check.setToolTip(
             "勾选后翻译走 IR 文档级管线（build_ir → translate_ir → 自适应导出），"
             "跳过 AI 单页视觉编排；公式/图/数字原样保留、术语跨页一致，"
+            "并按段落成组送译（同一段落从几行合并为一条请求，译后按比例回填各行），"
             "但无特殊页协商 / 自检 / 预览。\n"
-            "也可用环境变量 PDFTRANSLATE_IR_MODE=1 在启动时强制开启（优先级更高、无法在此关闭）。"
+            "也可用环境变量 PDFTRANSLATE_IR_MODE=1 在启动时强制开启（优先级更高、无法在此关闭）；"
+            "段落成组可用 PDFTRANSLATE_IR_GROUP=0 关闭。"
         )
         self._ir_check.setChecked(bool(prefs.get("ir_mode", False)))
         self._ir_check.toggled.connect(self._persist_ir_mode)
         form.addRow("翻译管线", self._ir_check)
+
+        # --- 文档级术语（agent 路径，默认开启） ---
+        self._agent_terms_check = QCheckBox("文档级术语（跨页术语一致）")
+        self._agent_terms_check.setToolTip(
+            "勾选后，AI 编排翻译前先抽取全文高频/专有术语并统一翻译一次，"
+            "再注入每页翻译，保证人名/表头/财务术语跨页一致。\n"
+            "仅对 AI 编排（agent）路径生效；IR 文档级管线自带术语抽取，不受此项影响。"
+            "环境变量 PDFTRANSLATE_AGENT_TERMS=0 可强制关闭（优先级更高）。"
+        )
+        self._agent_terms_check.setChecked(bool(prefs.get("agent_terms", True)))
+        self._agent_terms_check.toggled.connect(self._persist_agent_terms)
+        form.addRow("术语注入", self._agent_terms_check)
 
         # --- 智能编排 + 扫描页识别：已交由 AI 自动处理，不再提供开关 ---
         # v0.3 起默认由 agent 视觉闭环驱动全流程翻译；扫描页自动触发 OCR（按页无文本层才识别），
@@ -912,6 +927,7 @@ class MainWindow(QWidget):
             show_preview=self.preview_bridge.show_page,
             agent_mode=True,
             ir_mode=self._ir_check.isChecked(),
+            agent_terms=self._agent_terms_check.isChecked(),
             overlay=self.doc_ctx.overlay(),
             requirements=[requirement] if requirement else None,
             page_scope=page_scope,
@@ -958,6 +974,7 @@ class MainWindow(QWidget):
                     "language": language,
                     "output_type": output_key,
                     "ir_mode": bool(self._ir_check.isChecked()),
+                    "agent_terms": bool(self._agent_terms_check.isChecked()),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )
@@ -982,6 +999,17 @@ class MainWindow(QWidget):
             reason = save_prefs(prefs)
             if reason and hasattr(self, "_log"):
                 self._append_log(f"  警告：用户偏好保存失败（{reason}），IR 开关不会被记住。")
+        except Exception:
+            pass
+
+    def _persist_agent_terms(self, checked: bool) -> None:
+        """Save the agent-terminology checkbox the moment it is toggled."""
+        try:
+            prefs = load_prefs()
+            prefs["agent_terms"] = bool(checked)
+            reason = save_prefs(prefs)
+            if reason and hasattr(self, "_log"):
+                self._append_log(f"  警告：用户偏好保存失败（{reason}），术语开关不会被记住。")
         except Exception:
             pass
 

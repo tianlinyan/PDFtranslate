@@ -16,6 +16,7 @@ applicable falls back to the block path.  ``build_ir`` is offline and pure.
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -198,6 +199,213 @@ def structural_groups(ir: IRDoc) -> list[list[IRBlock]]:
     return [by_group[g] for g in order]
 
 
+# --------------------------------------------------------------------------- #
+# Stage 4 — prose grouping: translate the *paragraph*, re-anchor onto its blocks
+# --------------------------------------------------------------------------- #
+
+#: A paragraph is only joined while the merged text stays below this length.
+#: Beyond it the "group" is a section, not a paragraph: it would blow the batch
+#: budget and make the back-distribution meaningless (one line's bbox cannot hold
+#: a third of a page of text).
+_MAX_PROSE_UNIT = 2400
+
+#: Sentence-ending punctuation — the preferred cut point when re-splitting a unit.
+_SENT_END = "。！？；.!?;"
+#: Characters that must never end up alone at a cut (a hyphen split reads as a
+#: broken word, a leading punctuation fragment as noise).
+_BAD_EDGE = "-－—（(《“\"'，、。．．：:；;）)》”\""
+
+#: Minimum characters a fragment keeps after the split (a fragment shorter than
+#: this is a rounding artefact, not a piece of the paragraph).
+_MIN_PIECE = 1
+
+
+def _group_prose_enabled() -> bool:
+    """Env kill-switch for prose grouping (``PDFTRANSLATE_IR_GROUP=0``)."""
+    return (os.environ.get("PDFTRANSLATE_IR_GROUP") or "1") != "0"
+
+
+def _is_cjk(ch: str) -> bool:
+    """True for a CJK ideograph (a line break between two of them carries no space)."""
+    return bool(ch) and "\u4e00" <= ch <= "\u9fff"
+
+
+def _joinable(b: IRBlock) -> bool:
+    """True when ``b`` may be merged with its same-group neighbours (plain prose).
+
+    Headings, captions, table cells, scanned (OCR) blocks, chart labels and
+    verbatim name cells all keep their own translation unit: their geometry is
+    pinned (a cell, a band, a node box), so giving the model a merged paragraph
+    would produce a text it cannot place back.
+
+    A list / enumeration entry (bullet, ``1.``, ``（一）``, ``Label:``, ``联系地址：``)
+    is also excluded — those short items translate to a *different* length than
+    their source, so re-splitting a merged paragraph back onto them by length
+    drifts the numbers / addresses across the item boundary (a real regression
+    measured on the annual-report A/B: 168 / 126 / 317500 landed on the wrong
+    block).  A short entry must be translated on its own.
+    """
+    a = b.anchor
+    return (b.role == "text" and b.group_id > 0
+            and not getattr(a, "in_table", False)
+            and not getattr(a, "ocr", False)
+            and not getattr(a, "is_chart", False)
+            and not getattr(a, "keep_original", False)
+            and not pdfio._is_entry(str(b.text)))
+
+
+def join_texts(texts: Sequence[str]) -> str:
+    """Join extracted fragments into one natural source string.
+
+    A CJK line break carries no space — joining with one injects a gap the model
+    may echo into the output — while a Latin one does.  So the separator depends
+    on the two characters the join lands between.
+    """
+    out = ""
+    for raw in texts:
+        t = str(raw)
+        if not out:
+            out = t
+            continue
+        if not t:
+            continue
+        out += "" if (_is_cjk(out[-1]) and _is_cjk(t[0])) else " "
+        out += t
+    return out
+
+
+def prose_units(blocks: Sequence[IRBlock]) -> list[list[IRBlock]]:
+    """Split translatable blocks into translation units (C-⑥ Stage 4).
+
+    Consecutive blocks that build one logical paragraph — the same ``group_id``
+    :func:`build_ir` assigns to a run of same-style prose — become a *single* unit,
+    so the model sees the whole paragraph instead of one line at a time (articles,
+    number agreement, anaphora and "如下表所示" style connectives only resolve with
+    the sentence in front of it).  Anything that must stay alone (see
+    :func:`_joinable`) is a unit of its own.
+
+    Units stay in flat block order and every block lands in exactly one unit, so
+    the result maps back onto the block indices the exporter, the overlay and the
+    audit tools key on.
+    """
+    units: list[list[IRBlock]] = []
+    for b in blocks:
+        cur = units[-1] if units else None
+        if (cur is not None and _group_prose_enabled() and _joinable(b)
+                and _joinable(cur[0]) and b.group_id == cur[0].group_id
+                and len(join_texts([x.text for x in cur] + [b.text])) <= _MAX_PROSE_UNIT):
+            cur.append(b)
+        else:
+            units.append([b])
+    return units
+
+
+def _number_split(t: str, i: int) -> bool:
+    """True when cutting ``t`` at ``i`` would break a numeric/token atom.
+
+    ``1,234.56`` split across two blocks is a corruption no exporter can undo —
+    the two halves land in different bboxes.  Same rule the drawing-time
+    ``pdfio._num_atom`` enforces, applied to the back-distribution.
+    """
+    if i <= 0 or i >= len(t):
+        return False
+    prev, nxt = t[i - 1], t[i]
+    if prev.isdigit() and nxt.isdigit():
+        return True
+    if prev.isdigit() and nxt in ".,%/‰－-":
+        return True
+    if prev in ".,%/－-" and nxt.isdigit():
+        return True
+    return False
+
+
+def _cut_cost(t: str, i: int, target: int) -> tuple[int, int]:
+    """Cost of cutting ``t`` at ``i``: (total cost, distance to the ideal offset).
+
+    Proximity to the proportional target comes first, but a cut that is a few
+    characters off *at a sentence end* beats one that lands exactly on target in
+    the middle of a word — the pieces are drawn into separate boxes, so a clean
+    boundary matters more than an exact one.
+    """
+    prev = t[i - 1]
+    nxt = t[i]
+    cost = abs(i - target)
+    if prev in _SENT_END:
+        cost -= 6
+    if prev.isspace() or nxt.isspace():
+        cost -= 3
+    if _is_cjk(prev) and _is_cjk(nxt):
+        cost -= 1                      # CJK can break anywhere; no penalty needed
+    if prev in _BAD_EDGE or nxt in _BAD_EDGE:
+        cost += 8                      # never prefer a dangling hyphen / punctuation
+    return (cost, abs(i - target))
+
+
+def _best_cut(t: str, target: int, lo: int, hi: int) -> int:
+    """The cheapest cut index in ``[lo, hi]`` that does not break a number."""
+    lo = max(1, lo)
+    hi = min(hi, len(t) - 1)
+    if lo > hi:
+        return min(max(1, target), max(1, len(t) - 1))
+    pool = [i for i in range(lo, hi + 1) if not _number_split(t, i)] or list(range(lo, hi + 1))
+    return min(pool, key=lambda i: _cut_cost(t, i, target))
+
+
+def _norm_ws(s: str) -> str:
+    """Whitespace-insensitive comparison key."""
+    return "".join(s.split())
+
+
+def split_translation(sources: Sequence[str], translated: str) -> list[str]:
+    """Back-distribute one unit's translation onto its source fragments.
+
+    The paragraph translation is cut proportionally to each fragment's source
+    length, snapped to the nearest clean boundary (sentence end > space > any
+    position) and never inside a number, so every block keeps roughly its own
+    share of the text and the existing per-block fit/export rules still apply.
+    Invariants: the pieces are non-empty (unless the source fragment itself was
+    pure whitespace), their concatenation loses no content of ``translated``, and
+    a failed batch that echoed the source hands the fragments back unchanged
+    (re-splitting the source would scramble the original line breaks).
+    """
+    src = [str(s) for s in sources]
+    k = len(src)
+    t = str(translated)
+    if k == 0:
+        return []
+    if k == 1:
+        return [t]
+    if not t.strip():
+        return src                      # never blank a paragraph because the model gave up
+    if _norm_ws(t) == _norm_ws(join_texts(src)):
+        return src                      # the batch failed and echoed the source
+    n = len(t)
+    if n < k:
+        # Too short to give every fragment something: keep it whole in the first.
+        return [t] + [""] * (k - 1)
+    weights = [max(1, len(s)) for s in src]
+    total = sum(weights)
+    cuts: list[int] = [0]
+    for idx in range(1, k):
+        target = int(round(n * sum(weights[:idx]) / total))
+        lo = cuts[-1] + _MIN_PIECE
+        hi = n - _MIN_PIECE * (k - idx)          # leave room for the remaining pieces
+        cuts.append(_best_cut(t, target, lo, hi))
+    cuts.append(n)
+    raw = [t[cuts[i]:cuts[i + 1]] for i in range(k)]
+    pieces = ["" if not p.strip() else p.strip() for p in raw]
+    # Re-insert the single space that separated two fragments across the cut —
+    # each piece is stripped independently, so a boundary space is lost and the
+    # words would run together ("revenue"|"1,234.56" → "revenue1,234.56").
+    for i in range(k - 1):
+        bi = cuts[i + 1]
+        if (pieces[i] and pieces[i + 1]
+                and not pieces[i][-1].isspace() and not pieces[i + 1][0].isspace()
+                and (t[bi - 1].isspace() or t[bi].isspace())):
+            pieces[i + 1] = " " + pieces[i + 1]
+    return pieces
+
+
 def set_terms(ir: IRDoc, glossary: dict[str, str]) -> IRDoc:
     """Store a document-level glossary on the IR (C-⑥ Stage 2).
 
@@ -247,6 +455,35 @@ def infer_terms(ir: IRDoc, *, max_terms: int | None = None) -> list[str]:
     return cands[:(max_terms or _INFER_MAX_TERMS)]
 
 
+def infer_glossary(
+    ir: IRDoc,
+    translate_fn: Callable[..., Sequence[str]],
+    *,
+    lang: str,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, str]:
+    """Extract document-level terms and translate them once → a ``{source: target}`` glossary.
+
+    The single source of the "infer terms → translate once → keep only the terms
+    that actually changed" logic, shared by :func:`translate_ir` (``infer=True``)
+    and by the interactive agent's preprocess (which injects the same glossary into
+    ``state.user_decisions["terminology"]`` so per-page block translation stays
+    terminology-consistent across pages).  A model that fails and echoes a source
+    term would otherwise pin ``s -> s`` (suppressing that term's normal translation
+    in the main pass), so only terms whose translation differs are kept.
+    """
+    terms = infer_terms(ir)
+    if not terms:
+        return {}
+    got = translate_fn(terms, lang=lang, extra_glossary={})
+    if len(got) != len(terms):
+        if log:
+            log(f"[ir] 术语批量返回 {len(got)} 条，与 {len(terms)} 条候选不符，跳过术语注入。")
+        return {}
+    return {s: str(t) for s, t in zip(terms, got)
+            if str(t).strip() and str(t).strip() != s}
+
+
 def translate_ir(
     ir: IRDoc,
     translate_fn: Callable[..., Sequence[str]],
@@ -255,6 +492,7 @@ def translate_ir(
     extra_glossary: dict[str, str] | None = None,
     log: Callable[[str], None] | None = None,
     infer: bool = False,
+    group_prose: bool | None = None,
 ) -> dict[int, str]:
     """IR-level translation → ``{src_id: translated_text}``.
 
@@ -267,38 +505,49 @@ def translate_ir(
     injects the result as the doc glossary — so cross-page terminology is pinned
     before the main pass.  The per-``src_id`` output aligns with the flat block
     list, so it drops straight into the existing ``out_doc`` / eval harness.
+
+    ``group_prose`` (default: on, env ``PDFTRANSLATE_IR_GROUP=0`` to disable) sends
+    one *paragraph* per request instead of one extracted line — see
+    :func:`prose_units` — and re-splits the answer back onto the blocks with
+    :func:`split_translation`, so block indices (the exporter / overlay / audit
+    primary keys) are untouched.
     """
     glossary = dict(ir.terms) if extra_glossary is None else dict(extra_glossary)
     blocks = [b for ipage in ir.pages for b in ipage.blocks]
     if infer and not glossary:
-        terms = infer_terms(ir)
-        if terms:
-            got = translate_fn(terms, lang=lang, extra_glossary={})
-            if len(got) != len(terms):
-                if log:
-                    log(f"[ir] 术语批量返回 {len(got)} 条，与 {len(terms)} 条候选不符，跳过术语注入。")
-            else:
-                # Only keep a term whose translation actually differs (a model that
-                # fails and echoes the source would otherwise pin `s -> s`, suppressing
-                # that term's normal translation in the main batch).
-                glossary = {s: str(t) for s, t in zip(terms, got)
-                            if str(t).strip() and str(t).strip() != s}
-                ir.terms = glossary
-    requests: list[tuple[int, str]] = []
+        glossary = infer_glossary(ir, translate_fn, lang=lang, log=log)
+        if glossary:
+            ir.terms = glossary
+    translatable: list[IRBlock] = []
     out: dict[int, str] = {}
     for b in blocks:
         if is_structural_role(b.role) or _is_verbatim(b.anchor):
             out[b.src_id] = b.text      # formula/figure/numeric → keep source
         else:
-            requests.append((b.src_id, b.text))
-    if not requests:
+            translatable.append(b)
+    if not translatable:
         return out
-    got = translate_fn([t for _, t in requests], lang=lang, extra_glossary=glossary)
-    if len(got) != len(requests):
+    use_groups = _group_prose_enabled() if group_prose is None else bool(group_prose)
+    units = prose_units(translatable) if use_groups else [[b] for b in translatable]
+    got = translate_fn([join_texts([x.text for x in u]) for u in units],
+                       lang=lang, extra_glossary=glossary)
+    if len(got) != len(units):
         raise ValueError(
-            f"translate_fn 返回 {len(got)} 条译文，与 {len(requests)} 条请求不一致")
-    for (src_id, _), t in zip(requests, got):
-        out[src_id] = str(t)
+            f"translate_fn 返回 {len(got)} 条译文，与 {len(units)} 个翻译单元不一致")
+    merged = [u for u in units if len(u) > 1]
+    if log and merged:
+        log(f"[ir] 段落级组批：{len(units)} 个翻译单元，其中 {len(merged)} 段由 "
+            f"{sum(len(u) for u in merged)} 个文本块合并翻译后回填。")
+    blanks = 0
+    for u, t in zip(units, got):
+        text = str(t)
+        pieces = split_translation([x.text for x in u], text) if len(u) > 1 else [text]
+        for x, p in zip(u, pieces):
+            if not str(p).strip():
+                blanks += 1
+            out[x.src_id] = p
+    if log and blanks:
+        log(f"[ir] 段落回填后有 {blanks} 个块分到的内容为空（整段译文已并入同段其他块）。")
     return out
 
 

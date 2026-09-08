@@ -127,6 +127,11 @@ def translation_system_prompt(language: str, glossary: dict[str, str] | None = N
         "like '[1]' in the document).\n"
         "- Do not merge or split blocks; output ONLY the numbered translations, "
         "with no explanations, notes or preamble.\n"
+        "- If the user message starts with a 【上下文参考】 section, those lines are "
+        "short fragments of the source text ADJACENT to the numbered blocks, "
+        "provided only so you can render pronouns, subjects and terminology "
+        "consistently across batch seams: never translate, echo or quote them; "
+        "output only the numbered [[n]] blocks.\n"
     )
     # Fall back to a target-script-appropriate example: a CJK target uses a Chinese
     # result (so the model is anchored to Chinese), a Latin target uses an

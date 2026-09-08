@@ -1510,6 +1510,7 @@ class DocumentSession:
         render_handler: Callable[[int, str], bytes | None] | None = None,
         audit: Callable[..., dict[str, Any]] | None = None,
         interpret: Callable[[str, str], str] | None = None,
+        infer_terms: bool = False,
         include_kept: bool = False,
         scope: list[int] | None = None,
         max_steps_per_page: int = 24,
@@ -1533,6 +1534,11 @@ class DocumentSession:
         #: user's special-page answer (incl. free text) — an AI interpretation; defaults to
         #: the flexible ``interpret_decision`` matcher when not injected.
         self.interpret = interpret
+        #: C-⑥: when True, preprocess extracts + translates document-level terms once
+        #: and injects them into ``state.user_decisions["terminology"]`` so the
+        #: per-page block translation (which reads that dict as ``extra_glossary``)
+        #: stays terminology-consistent across pages.
+        self.infer_terms = infer_terms
         #: M4 (U1 knob): when True the AI self-check also reviews pages the user chose to
         #: keep/skip (default False — those carry the source verbatim, so re-checking them
         #: would wrongly try to translate the intentionally-kept original).
@@ -1592,6 +1598,34 @@ class DocumentSession:
             f"待确认 {d.uncertain_pages} 页。"
         )
         self.progress(0, d.pages, "预处理")
+        if self.infer_terms:
+            self._inject_terminology()
+
+    def _inject_terminology(self) -> None:
+        """Extract + translate document-level terms once, then inject them for the agent.
+
+        The C-⑥ document-level terminology folded into the *interactive* path: the
+        same ``infer_terms → translate once → keep only changed`` logic the headless
+        ``translate_ir(infer=True)`` uses, but the glossary lands in
+        ``state.user_decisions["terminology"]`` — the channel ``apply_terminology``
+        already uses and every per-block translate tool reads as its extra glossary.
+        Fail-closed: an empty / mismatched term batch injects nothing.
+        """
+        from .. import ir as ir_mod
+
+        try:
+            doc_ir = ir_mod.build_ir(self.doc, lang=self.state.lang)
+            engine = _tr.TranslationEngine(self.model)
+            fn = ir_mod.make_ir_translate_fn(engine, log=self.log,
+                                             cancel=self.cancel, resume=False)
+            glossary = ir_mod.infer_glossary(doc_ir, fn, lang=self.state.lang,
+                                             log=self.log)
+        except Exception as exc:  # noqa: BLE001 — terminology is best-effort, never fatal
+            self.log(f"  术语注入跳过（{type(exc).__name__}: {exc}）。")
+            return
+        if glossary:
+            self.state.user_decisions.setdefault("terminology", {}).update(glossary)
+            self.log(f"  已注入 {len(glossary)} 条文档级术语（跨页一致）。")
 
     def _page_agent(self, page: int):
         """Bind one page's agent channel (``translate_page``) for a flow's AgentStep.

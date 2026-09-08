@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from translate_app import ir, pdfio
 from translate_app.ir import IRBlock, IRDoc, IRPage
@@ -195,6 +196,35 @@ class InferTermsTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[-1]["g"], user_glossary)
 
+    def test_infer_glossary_extracts_and_translates_once(self):
+        ir0 = self._ir()
+        def fn(texts, *, lang, extra_glossary=None):
+            return ["T|" + t for t in texts]
+        g = ir.infer_glossary(ir0, fn, lang="English")
+        self.assertEqual(g, {"Revenue": "T|Revenue"})   # only the repeated term
+
+    def test_infer_glossary_drops_unchanged_terms(self):
+        ir0 = self._ir()
+        # A model that echoes the source (fails) must not pin s -> s.
+        def fn(texts, *, lang, extra_glossary=None):
+            return list(texts)
+        self.assertEqual(ir.infer_glossary(ir0, fn, lang="English"), {})
+
+    def test_infer_glossary_length_mismatch_returns_empty(self):
+        ir0 = self._ir()
+        self.assertEqual(ir.infer_glossary(ir0, lambda *a, **k: [], lang="English"), {})
+
+    def test_infer_glossary_no_terms_returns_empty(self):
+        ir0 = IRDoc(title="t", pages=[IRPage(page=0, blocks=[
+            IRBlock(anchor=Block("hi", 0, 0, 0, 10, 10), text="hi", role="text", src_id=0),
+        ])])
+        calls = []
+        def fn(texts, *, lang, extra_glossary=None):
+            calls.append(list(texts))
+            return ["T|" + t for t in texts]
+        self.assertEqual(ir.infer_glossary(ir0, fn, lang="English"), {})
+        self.assertEqual(calls, [])   # no term batch when there are no candidates
+
 
 class SaveIrTest(unittest.TestCase):
     def setUp(self):
@@ -240,6 +270,153 @@ class SaveIrTest(unittest.TestCase):
         pages, per_page = ir.per_page_from_ir(self.ir, {})
         self.assertEqual(len(pages), len(self.ir.pages))
         self.assertEqual(per_page[0], [b.text for b in pages[0]])
+
+
+class ProseGroupingTest(unittest.TestCase):
+    """C-⑥ Stage 4: paragraph-level grouping + proportional back-distribution."""
+
+    def _page(self):
+        return IRPage(page=0, blocks=[])
+
+    def _mk(self, ipage, text, *, role="text", group=0, style=None, **anchor_kw):
+        a = Block(text, 0, 0, 0, 100, 20, **anchor_kw)
+        b = IRBlock(anchor=a, text=text, role=role, group_id=group,
+                    style=style or {}, src_id=len(ipage.blocks))
+        ipage.blocks.append(b)
+        return b
+
+    # -- join_texts -------------------------------------------------------- #
+    def test_join_texts_cjk_no_space_latin_with_space(self):
+        self.assertEqual(ir.join_texts(["你好", "世界"]), "你好世界")
+        self.assertEqual(ir.join_texts(["hello", "world"]), "hello world")
+        self.assertEqual(ir.join_texts(["你好", "world"]), "你好 world")
+        self.assertEqual(ir.join_texts(["hello", "世界"]), "hello 世界")
+        self.assertEqual(ir.join_texts([""]), "")
+        self.assertEqual(ir.join_texts(["a", "", "b"]), "a b")
+
+    # -- prose_units ------------------------------------------------------- #
+    def test_prose_units_merges_same_group_paragraph(self):
+        ip = self._page()
+        self._mk(ip, "line one", group=1)
+        self._mk(ip, "line two", group=1)
+        units = ir.prose_units(ip.blocks)
+        self.assertEqual(len(units), 1)
+        self.assertEqual(len(units[0]), 2)
+
+    def test_prose_units_splits_on_group_change_and_role(self):
+        ip = self._page()
+        self._mk(ip, "para a", group=1)
+        self._mk(ip, "para b", group=2)          # new paragraph
+        self._mk(ip, "head", role="heading", group=2, bold=True, size=16)
+        self._mk(ip, "cell", group=2, in_table=True)   # table cell stays alone
+        units = ir.prose_units(ip.blocks)
+        self.assertEqual(len(units), 4)
+
+    def test_prose_units_keeps_scan_and_keep_original_alone(self):
+        ip = self._page()
+        self._mk(ip, "scanned", group=1, ocr=True, single_line=False)
+        self._mk(ip, "name", group=1, keep_original=True)
+        units = ir.prose_units(ip.blocks)
+        self.assertEqual([len(u) for u in units], [1, 1])
+
+    def test_prose_units_group_zero_never_merges(self):
+        # A hand-built IR defaults group_id=0; only build_ir assigns real groups.
+        ip = self._page()
+        self._mk(ip, "a", group=0)
+        self._mk(ip, "b", group=0)
+        units = ir.prose_units(ip.blocks)
+        self.assertEqual([len(u) for u in units], [1, 1])
+
+    def test_prose_units_env_gated_off(self):
+        ip = self._page()
+        self._mk(ip, "a", group=1)
+        self._mk(ip, "b", group=1)
+        import os
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_IR_GROUP": "0"}, clear=False):
+            units = ir.prose_units(ip.blocks)
+        self.assertEqual([len(u) for u in units], [1, 1])
+
+    # -- split_translation -------------------------------------------------- #
+    def test_split_single_source_passthrough(self):
+        self.assertEqual(ir.split_translation(["abc"], "Edc"), ["Edc"])
+
+    def test_split_empty_translation_returns_source(self):
+        self.assertEqual(ir.split_translation(["a", "b"], "   "), ["a", "b"])
+
+    def test_split_echoed_source_returns_source(self):
+        # The batch failed and echoed the source: re-splitting it would scramble
+        # the original line breaks, so hand the fragments back unchanged.
+        joined = ir.join_texts(["hello ", "world"])
+        self.assertEqual(ir.split_translation(["hello ", "world"], joined),
+                         ["hello ", "world"])
+
+    def test_split_preserves_content_and_non_empty(self):
+        pieces = ir.split_translation(["Revenue", "and Costs", "grew"], "Revenue and Costs grew by 12%")
+        self.assertEqual(len(pieces), 3)
+        self.assertTrue(all(p.strip() for p in pieces))
+        # Concatenation (whitespace-insensitive) recovers the whole translation.
+        self.assertEqual(ir._norm_ws("".join(pieces)), ir._norm_ws("Revenue and Costs grew by 12%"))
+
+    def test_split_never_breaks_a_number(self):
+        src = ["company", "earnings"]
+        trans = "The revenue 1,234.56 is high"
+        pieces = ir.split_translation(src, trans)
+        self.assertEqual("".join(pieces), "The revenue 1,234.56 is high")
+        self.assertIn("1,234.56", "".join(pieces))  # intact, unbroken across a boundary
+
+    def test_split_proportional_first_piece_longer(self):
+        pieces = ir.split_translation(["aaaaaa", "bb"], "11111111")
+        self.assertGreaterEqual(len(pieces[0]), len(pieces[1]))
+
+    def test_split_too_short_keeps_whole_in_first(self):
+        pieces = ir.split_translation(["a", "b", "c"], "xy")
+        self.assertEqual(pieces, ["xy", "", ""])
+
+    # -- translate_ir integration ------------------------------------------- #
+    def test_translate_ir_merges_paragraph_and_maps_back(self):
+        ip = self._page()
+        self._mk(ip, "Hello world", group=1)
+        self._mk(ip, "Good to see you", group=1)
+        self._mk(ip, "1,234.56", group=1)                 # numeric → verbatim
+        self._mk(ip, "E=mc^2", role="formula", group=1)   # formula → verbatim
+        ir0 = IRDoc(title="t", block_count=4)
+        ir0.pages.append(ip)
+
+        calls: list[list[str]] = []
+
+        def fn(texts, *, lang, extra_glossary=None):
+            calls.append(list(texts))
+            return ["TRANS:" + t for t in texts]
+
+        out = ir.translate_ir(ir0, fn, lang="English")
+        self.assertEqual(len(calls), 1)
+        # Exactly one request — the two prose blocks joined as one paragraph.
+        self.assertEqual(calls[0], ["Hello world Good to see you"])
+        # Numeric and formula kept verbatim.
+        self.assertEqual(out[2], "1,234.56")
+        self.assertEqual(out[3], "E=mc^2")
+        # The paragraph translation was split back onto the two blocks (non-empty).
+        self.assertTrue(out[0])
+        self.assertTrue(out[1])
+        self.assertEqual(ir._norm_ws(out[0] + out[1]),
+                         ir._norm_ws("TRANS:Hello world Good to see you"))
+
+    def test_translate_ir_group_disabled_requests_each_block(self):
+        ip = self._page()
+        self._mk(ip, "Hello world", group=1)
+        self._mk(ip, "Good to see you", group=1)
+        ir0 = IRDoc(title="t", block_count=2)
+        ir0.pages.append(ip)
+
+        calls: list[list[str]] = []
+
+        def fn(texts, *, lang, extra_glossary=None):
+            calls.append(list(texts))
+            return ["TRANS:" + t for t in texts]
+
+        ir.translate_ir(ir0, fn, lang="English", group_prose=False)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], ["Hello world", "Good to see you"])
 
 
 if __name__ == "__main__":

@@ -589,10 +589,10 @@ class TranslatorTest(unittest.TestCase):
                     return "[[1]] OK-ONE"
                 return "".join(f"[[{i}]] x{i}\n" for i in range(1, n))  # 缺最后一块
             engine._request_locked = fake_request
-            translated, ok = engine._translate_batch(
+            translated, oks = engine._translate_batch(
                 [0, 1], ["a", "b"], "English", log=lambda m: None,
                 cancel=lambda: False, retry_delays=(0, 0), abort=None, glossary=None)
-            self.assertTrue(ok)
+            self.assertTrue(all(oks))
             self.assertEqual(["OK-ONE", "OK-ONE"], translated)
             # Degraded: first attempt 2 blocks, then two 1-block attempts.
             self.assertIn(2, calls)
@@ -608,13 +608,139 @@ class TranslatorTest(unittest.TestCase):
             def always_empty(_prompt: str, _system: str) -> str:
                 return "[[1]] "          # empty translation → rejected
             engine._request_locked = always_empty
-            translated, ok = engine._translate_batch(
-                [0, 1], ["a", "b"], "English", log=lambda m: None,
-                cancel=lambda: False, retry_delays=(0, 0), abort=None, glossary=None)
             # No loss: both blocks keep their source, and it must terminate (no infinite
             # recursion — single blocks are the base case).
-            self.assertFalse(ok)
+            translated, oks = engine._translate_batch(
+                [0, 1], ["a", "b"], "English", log=lambda m: None,
+                cancel=lambda: False, retry_delays=(0, 0), abort=None, glossary=None)
+            self.assertFalse(any(oks))
             self.assertEqual(["a", "b"], translated)
+
+    # ---- ① neighbour context -------------------------------------------------
+
+    def test_build_prompt_without_contexts_is_unchanged(self):
+        # No seams → byte-identical to the classic prompt (protocol untouched).
+        self.assertEqual(
+            "[[1]]\na\n\n[[2]]\nb",
+            TranslationEngine._build_prompt(["a", "b"], [0, 1]),
+        )
+        self.assertEqual(
+            "[[1]]\na\n\n[[2]]\nb",
+            TranslationEngine._build_prompt(["a", "b"], [0, 1], contexts=[]),
+        )
+
+    def test_build_prompt_context_section_is_first_marker_free_chunk(self):
+        prompt = TranslationEngine._build_prompt(
+            ["alpha", "beta"], [0, 1], contexts=["块1前文: …prev text"])
+        self.assertTrue(prompt.startswith(translator._CONTEXT_HEADER))
+        first_chunk = prompt.split("\n\n")[0]
+        # No [[n]] marker in the context chunk — reply alignment stays intact.
+        self.assertNotIn("[[", first_chunk)
+        # The numbered chunks are still exactly the classic blocks.
+        self.assertIn("[[1]]\nalpha", prompt)
+        self.assertIn("[[2]]\nbeta", prompt)
+
+    def test_neighbor_context_covers_only_batch_seams(self):
+        blocks = [f"sentence number {i}." for i in range(6)]
+        lines = TranslationEngine._neighbor_context(blocks, [1, 2, 3])
+        # Interior neighbours (2, 3) are in the batch → no context for them;
+        # only the edges see a seam, with batch-local numbering.
+        self.assertEqual(["块1前文: …sentence number 0.", "块3后文: sentence number 4.…"], lines)
+        # Whole document in one batch → no seams at all.
+        self.assertEqual([], TranslationEngine._neighbor_context(blocks, list(range(6))))
+
+    def test_neighbor_context_fills_gaps_around_cached_blocks(self):
+        blocks = ["alpha text.", "middle sentence.", "gamma text."]
+        # Block 1 was cached/skipped → it is a seam for BOTH batch members.
+        lines = TranslationEngine._neighbor_context(blocks, [0, 2])
+        self.assertEqual(
+            ["块1后文: middle sentence.…", "块2前文: …middle sentence."], lines)
+
+    def test_neighbor_context_skips_cross_page_and_number_neighbours(self):
+        blocks = ["intro paragraph.", "1,234.56", "target paragraph.", "next page text."]
+        pages = [0, 0, 0, 1]
+        # Neighbour 1 is a pure number (no context value); neighbour 3 is on
+        # another page (different context entirely) → both skipped.
+        self.assertEqual([], TranslationEngine._neighbor_context(blocks, [2], pages))
+
+    def test_neighbor_context_is_capped(self):
+        # Alternating gap indices → two seam lines per batch member, enough to
+        # exceed the global budget: the section must stop at _CTX_TOTAL_CHARS.
+        blocks = ["y" * 200 for _ in range(40)]
+        lines = TranslationEngine._neighbor_context(blocks, list(range(1, 40, 2)))
+        self.assertTrue(lines)
+        # Per-side snippets are truncated to the snippet budget…
+        self.assertTrue(all(
+            len(ln) <= translator._CTX_SNIPPET_CHARS + 20 for ln in lines), lines[0])
+        # …and the whole section respects the global cap.
+        self.assertLessEqual(sum(len(ln) for ln in lines), translator._CTX_TOTAL_CHARS)
+
+    def test_translate_blocks_sends_neighbor_context_at_chunk_seam(self):
+        with MockServer() as server:
+            model = ModelConfig(
+                id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+                endpoint=server.endpoint, model="mock-model", batch_size=1,
+            )
+            engine = TranslationEngine(model)
+            prompts_seen: list[str] = []
+            orig = engine._request_locked
+
+            def record(prompt: str, system: str) -> str:
+                prompts_seen.append(prompt)
+                return orig(prompt, system)
+
+            engine._request_locked = record
+            res = engine.translate_blocks(
+                ["第一段甲。", "第二段乙。", "第三段丙。"], "English",
+                doc_path=Path("_fake.pdf"))
+            self.assertEqual([], res.errors, res.errors)
+            # The middle block's single-block batch is sandwiched by two
+            # neighbours that are NOT in the request → both seams get context.
+            mid = [p for p in prompts_seen
+                   if "[[1]]\n第二段乙。" in p]
+            self.assertTrue(mid, prompts_seen)
+            self.assertIn("块1前文", mid[0])
+            self.assertIn("块1后文", mid[0])
+            # The mock ignores the marker-free context chunk and echoes the
+            # numbered blocks → alignment survives the extra section.
+            self.assertTrue(res.translated[1].startswith("MOCK:第二段乙。"), res.translated)
+
+    # ---- ④ per-block success across a split ----------------------------------
+
+    def test_partial_batch_success_caches_survivors_and_blames_only_failures(self):
+        with MockServer() as server:
+            engine = self._engine(server)
+
+            def fake_request(prompt: str, _system: str) -> str:
+                # Fail (marker present, content empty → splittable) whenever a
+                # numbered chunk contains "bravo"; single blocks are the base
+                # case, so bravo fails even alone.  Context chunks (no [[n]])
+                # are ignored, exactly like the mock.
+                bodies = []
+                for part in prompt.split("\n\n"):
+                    head, _, body = part.partition("\n")
+                    if head.strip().startswith("[["):
+                        bodies.append(body)
+                if "bravo" in bodies:
+                    return "[[1]] "
+                return "".join(
+                    f"[[{i + 1}]] OK-{t}\n" for i, t in enumerate(bodies))
+
+            engine._request_locked = fake_request
+            blocks = ["alpha", "bravo", "charlie", "delta"]
+            res = engine.translate_blocks(blocks, "English", doc_path=Path("_fake.pdf"))
+            # Survivors of the split are applied; only bravo keeps its source.
+            self.assertEqual(["OK-alpha", "bravo", "OK-charlie", "OK-delta"],
+                             res.translated, res.errors)
+            self.assertEqual(1, len(res.errors), res.errors)
+            self.assertIn("块 2", res.errors[0])
+            # Survivors were CACHED: a fresh engine with an always-failing
+            # transport still returns the recovered translations from disk.
+            engine2 = self._engine(server)
+            engine2._request_locked = lambda _p, _s: ""
+            res2 = engine2.translate_blocks(blocks, "English", doc_path=Path("_fake.pdf"))
+            self.assertEqual(["OK-alpha", "bravo", "OK-charlie", "OK-delta"],
+                             res2.translated, res2.errors)
 
     def test_temperature_and_max_tokens_sent(self):
         with MockServer() as server:

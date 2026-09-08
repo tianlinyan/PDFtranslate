@@ -6,8 +6,10 @@ Everything is offline: ``DocumentSession`` receives an injected ``translate_page
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from translate_app import agent
+from translate_app import ir as ir_mod
 from translate_app import pdfio
 from translate_app.agent.flow import DocumentSession, PHASE_DONE, _page_translation_counts
 from translate_app.settings import ModelConfig
@@ -121,6 +123,41 @@ class DocumentSessionTest(unittest.TestCase):
                                   translate_page=translate_page, progress=progress,
                                   cancel=cancel)
         return state, session
+
+    def test_infer_terms_injects_glossary_into_user_decisions(self):
+        # C-⑥: when ``infer_terms=True`` the preprocess extracts + translates
+        # document-level terms once and writes them into the ``terminology`` channel
+        # the per-block translate tools read as their extra glossary.
+        doc = _mixed_doc()
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+
+        def fake_tp(st, page, model, *, task, **kw):
+            return st
+
+        with mock.patch.object(ir_mod, "infer_glossary",
+                               return_value={"总资产": "Total assets"}), \
+             mock.patch.object(agent.flow._tr, "TranslationEngine"):
+            session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                      translate_page=fake_tp, infer_terms=True)
+            session._preprocess()
+        self.assertEqual(state.user_decisions["terminology"], {"总资产": "Total assets"})
+
+    def test_infer_terms_fails_closed_on_glossary_error(self):
+        doc = _mixed_doc()
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+
+        def fake_tp(st, page, model, *, task, **kw):
+            return st
+
+        with mock.patch.object(ir_mod, "infer_glossary",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(agent.flow._tr, "TranslationEngine"):
+            session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                      translate_page=fake_tp, infer_terms=True)
+            session._preprocess()   # must not raise — terminology is best-effort
+        self.assertNotIn("terminology", state.user_decisions)
 
     def test_translates_normal_pages_first_then_special_by_default(self):
         doc = _mixed_doc()

@@ -512,6 +512,17 @@ class IrModeWorkerTest(_WorkerTestBase):
         w = self._worker(ir_mode=True)
         doc = self._doc(["alpha", "beta"])
         result = w._run_ir(doc, self._fake_engine())
+        # The two same-style prose blocks are one paragraph → sent as one unit
+        # "alpha beta", translated to "T|alpha beta", and split back onto the blocks
+        # (each fragment keeps the boundary space as a leading space).
+        self.assertEqual(result.translated, ["T|alpha", " beta"])
+
+    def test_run_ir_group_disabled_maps_back_one_to_one(self):
+        w = self._worker(ir_mode=True)
+        doc = self._doc(["alpha", "beta"])
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_IR_GROUP": "0"}, clear=False):
+            result = w._run_ir(doc, self._fake_engine())
+        # Grouping off → each block is its own request → exact one-to-one mapping.
         self.assertEqual(result.translated, ["T|alpha", "T|beta"])
 
     def test_run_ir_keeps_numeric_verbatim(self):
@@ -529,6 +540,15 @@ class IrModeWorkerTest(_WorkerTestBase):
         # Explicit flag wins and is independent of the env.
         with mock.patch.dict(os.environ, {}, clear=False):
             self.assertTrue(self._worker(ir_mode=True)._ir_mode)
+
+    def test_agent_terms_default_on_and_env_gated(self):
+        # C-⑥ agent terminology: on by default (unlike IR mode).
+        self.assertTrue(self._worker()._agent_terms)
+        # The GUI checkbox turning it off disables it.
+        self.assertFalse(self._worker(agent_terms=False)._agent_terms)
+        # env=0 forces it off (higher priority), even when the flag is on.
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_AGENT_TERMS": "0"}):
+            self.assertFalse(self._worker(agent_terms=True)._agent_terms)
 
 
 class StructureModeWorkerTest(_WorkerTestBase):

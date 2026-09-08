@@ -80,6 +80,7 @@ class TranslateWorker(QObject):
         page_scope: list[int] | None = None,
         ir_mode: bool = False,
         structure_mode: bool = False,
+        agent_terms: bool = True,
     ):
         super().__init__()
         self._source = source_path
@@ -139,6 +140,12 @@ class TranslateWorker(QObject):
         self._structure_parser = (os.environ.get("PDFTRANSLATE_STRUCTURE_PARSER") or "geo")
         self._structure_mode = bool(structure_mode or os.environ.get("PDFTRANSLATE_STRUCTURE_MODE")
                                     or self._structure_parser == "doclayout")
+        #: C-⑥ agent terminology: extract + translate document-level terms once in
+        #: the agent's preprocess so per-page block translation stays terminology-
+        #: consistent across pages.  On by default; the GUI checkbox sets it and
+        #: ``PDFTRANSLATE_AGENT_TERMS=0`` forces it off (higher priority).
+        self._agent_terms = bool(agent_terms) and (
+            os.environ.get("PDFTRANSLATE_AGENT_TERMS", "1") != "0")
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
         # written from the GUI thread (``cancel``) and read from the worker
         # thread: the Event gives explicit, memory-model-safe signalling
@@ -321,7 +328,11 @@ class TranslateWorker(QObject):
         markdown/plain-text output and the preview's ``_last_pdf`` all keep working
         unchanged.  ``translate_ir`` reuses the engine's batch path (shared client,
         concurrency, cache) but injects document terminology (``IRDoc.terms``) and
-        keeps structural (formula/figure) and numeric blocks verbatim.
+        keeps structural (formula/figure) and numeric blocks verbatim.  Since v0.4 it
+        also groups a paragraph into one request (same-style prose run in ``build_ir``)
+        and re-splits the answer onto the blocks proportionally, so the model sees a
+        whole paragraph instead of one line at a time (``PDFTRANSLATE_IR_GROUP=0``
+        disables the grouping, falling back to one request per block).
         """
         from . import ir as ir_mod
 
@@ -542,6 +553,7 @@ class TranslateWorker(QObject):
                 show_preview=self._show_preview,
                 render_handler=self.render_page_for_agent,
                 interpret=agent_mod.make_llm_interpret(self._model, log=self.log.emit),
+                infer_terms=self._agent_terms,
                 scope=self._page_scope,
                 max_steps_per_page=32,
             ).run()

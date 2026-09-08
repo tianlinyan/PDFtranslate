@@ -51,6 +51,18 @@ from .settings import ModelConfig
 #: next ``[[n]]`` marker (or the end of the reply) belongs to this block.
 _MULTI_BLOCK_RE = re.compile(r"(?ms)^\s*\[\[(\d+)\]\]\s*(.*?)(?=^\s*\[\[\d+\]\]\s*|\Z)")
 
+#: Header of the optional read-only context section prepended to a batch prompt
+#: (see :meth:`TranslationEngine._neighbor_context`).  The section is sent as ONE
+#: chunk with no ``[[n]]`` marker of its own, so the reply-alignment protocol is
+#: untouched; the explicit "never translate / never echo" wording — reinforced by
+#: a system-prompt rule — keeps the model from treating it as block content.
+_CONTEXT_HEADER = "【上下文参考（相邻原文片段，仅供理解语境，严禁翻译或回显）】"
+
+#: Max characters kept from each neighbour block, and a global cap on the whole
+#: context section — a pathological batch must never balloon the prompt.
+_CTX_SNIPPET_CHARS = 80
+_CTX_TOTAL_CHARS = 1200
+
 #: Default source-character budget per batch request.  Kept modest so a single
 #: request's output stays within the model's max-token limit, and so progress
 #: is reported often.  Each model may override it via ``batch_size`` — larger
@@ -71,8 +83,11 @@ _CHAR_BUDGET = 4000
 #: (XXXIII)) is never reused; to 8 when the CJK-target detection was fixed — a Chinese
 #: target used to be misclassified as Latin, wrongly appending the name-romanization
 #: rule, so Chinese-target translations cached under that wrong prompt would otherwise
-#: be reused unchanged.
-_CACHE_VERSION = 8
+#: be reused unchanged; to 9 when batch prompts gained the optional
+#: 【上下文参考】 neighbour-context section — entries cached under the old,
+#: context-free prompt are invalidated so every block is re-translated with the
+#: new seam context available.
+_CACHE_VERSION = 9
 
 #: Delay between batch attempts (seconds); injectable so tests don't sleep.
 _TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0)
@@ -294,8 +309,84 @@ class TranslationEngine:
         self._persisted_seq = 0
 
     @staticmethod
-    def _build_prompt(blocks: Sequence[str], indices: Sequence[int]) -> str:
+    def _ctx_snippet(text: str, *, tail: bool) -> str:
+        """Whitespace-collapsed neighbour fragment (last/first ``_CTX_SNIPPET_CHARS``).
+
+        Returns ``""`` for blocks without any letters — number/symbol blocks carry
+        no linguistic context and mirror ``_needs_translation``, so the prompt
+        never spends tokens on text the engine would not send for translation.
+        """
+        t = " ".join(str(text or "").split())
+        if not t or not _LETTERS_RE.search(t):
+            return ""
+        if len(t) > _CTX_SNIPPET_CHARS:
+            t = t[-_CTX_SNIPPET_CHARS:] if tail else t[:_CTX_SNIPPET_CHARS]
+        return t
+
+    @staticmethod
+    def _neighbor_context(
+        blocks: Sequence[str],
+        indices: Sequence[int],
+        block_pages: Sequence[int] | None = None,
+    ) -> list[str]:
+        """Context lines for batch blocks whose neighbour sits OUTSIDE the batch.
+
+        A batch cut mid-paragraph leaves the model translating a sentence
+        fragment with no idea what came before or after — a prime source of
+        pronoun/tense/term drift.  For every block whose previous/next block (in
+        flat reading order) is NOT part of this request, include a short snippet
+        of that neighbour so the model sees the seam.  Neighbours already in the
+        batch need no context (the model sees them in full); cross-page seams are
+        skipped (different context entirely), as are number/symbol neighbours.
+        The whole section is capped at ``_CTX_TOTAL_CHARS``.  Line numbers are
+        batch-local (``块1`` = ``[[1]]``), matching the numbered chunks.
+        """
+        in_batch = set(indices)
+        local_no = {i: pos + 1 for pos, i in enumerate(indices)}
+        lines: list[str] = []
+        budget = _CTX_TOTAL_CHARS
+        for i in indices:
+            page = (
+                block_pages[i]
+                if block_pages is not None and i < len(block_pages)
+                else None
+            )
+            for nb, tail in ((i - 1, True), (i + 1, False)):
+                if nb < 0 or nb >= len(blocks) or nb in in_batch:
+                    continue
+                if (
+                    block_pages is not None
+                    and page is not None
+                    and nb < len(block_pages)
+                    and block_pages[nb] != page
+                ):
+                    continue
+                snip = TranslationEngine._ctx_snippet(blocks[nb], tail=tail)
+                if not snip:
+                    continue
+                line = (
+                    f"块{local_no[i]}前文: …{snip}" if tail
+                    else f"块{local_no[i]}后文: {snip}…"
+                )
+                if len(line) > budget:
+                    return lines
+                budget -= len(line)
+                lines.append(line)
+        return lines
+
+    @staticmethod
+    def _build_prompt(
+        blocks: Sequence[str],
+        indices: Sequence[int],
+        contexts: Sequence[str] | None = None,
+    ) -> str:
         lines = []
+        if contexts:
+            # Read-only neighbour context as ONE marker-free chunk BEFORE the
+            # numbered blocks.  The chunk itself contains no blank lines, so it
+            # survives the "\n\n" join as a single section, and with no ``[[n]]``
+            # marker inside it the reply-alignment protocol is untouched.
+            lines.append(_CONTEXT_HEADER + "\n" + "\n".join(contexts))
         # Number the blocks 1..k within this batch so the model always receives a
         # contiguous, unambiguous set to echo back (avoids misalignment when the
         # batch's global indices are sparse because some blocks were cached).
@@ -513,7 +604,7 @@ class TranslationEngine:
         abort: threading.Event | None = None,
         glossary: dict[str, str] | None = None,
         block_pages: Sequence[int] | None = None,
-    ) -> tuple[list[str], bool]:
+    ) -> tuple[list[str], list[bool]]:
         """Translate one batch, auto-degrading to smaller sub-batches on failure.
 
         Tries the batch at full size (see :meth:`_translate_batch_attempt`).  If the model
@@ -523,14 +614,20 @@ class TranslationEngine:
         the model complies, yet never loses content: a block that still fails at single-block
         size keeps its source.  Degradation is **per-batch, not global**: the next batch (new
         blocks) starts again at full size, so a run never stays permanently downgraded.
+
+        Returns ``(translations, oks)`` with BOTH lists aligned 1:1 with ``indices``.
+        ``oks[i]`` is the per-block verdict: after a split, one half may succeed while
+        the other still fails, and those survivors must be cached/applied while only
+        the genuinely failed blocks are reported (a whole-batch bool would throw away
+        the recovered work).
         """
         try:
-            translated, ok, splittable = self._translate_batch_attempt(
+            translated, oks, splittable = self._translate_batch_attempt(
                 indices, blocks, language, log, cancel, retry_delays, abort, glossary, block_pages)
         except (TranslationCancelled, TranslationAborted):
             raise
-        if ok:
-            return translated, True
+        if all(oks):
+            return translated, oks
         # Only split a *marker-based* failure (the model echoed some ``[[n]]`` but
         # misaligned / left an empty translation) — smaller batches help there.  A
         # marker-free reply (a refusal / unstructured text) must NOT be split: at
@@ -542,12 +639,12 @@ class TranslationEngine:
             loc = f"（{label}）" if label else ""
             snip = self._batch_snippet(indices, blocks) if indices else ""
             log(f"  批量未对齐{loc}{snip}，拆分为 {mid}+{len(indices) - mid} 个子批继续（单块兜底）。")
-            left, lok = self._translate_batch(
+            left, loks = self._translate_batch(
                 indices[:mid], blocks, language, log, cancel, retry_delays, abort, glossary, block_pages)
-            right, rok = self._translate_batch(
+            right, roks = self._translate_batch(
                 indices[mid:], blocks, language, log, cancel, retry_delays, abort, glossary, block_pages)
-            return left + right, lok and rok
-        return translated, False
+            return left + right, loks + roks
+        return translated, oks
 
     def _translate_batch_attempt(
         self,
@@ -560,12 +657,15 @@ class TranslationEngine:
         abort: threading.Event | None = None,
         glossary: dict[str, str] | None = None,
         block_pages: Sequence[int] | None = None,
-    ) -> tuple[list[str], bool, bool]:
-        """Translate one batch; returns ``(translations, ok, splittable)``.
+    ) -> tuple[list[str], list[bool], bool]:
+        """Translate one batch; returns ``(translations, oks, splittable)``.
 
-        ``ok`` is False when every attempt failed — the source text is then preserved
-        (content is never dropped) but must NOT be written to the cache, or a transient
-        outage would poison it permanently.  ``splittable`` is True only when the failure was
+        ``oks`` is aligned 1:1 with ``indices``: on success every entry is True; on
+        failure every entry is False and the source text is preserved (content is
+        never dropped) but must NOT be written to the cache, or a transient outage
+        would poison it permanently.  Callers merge sub-batch flags after a split so
+        recovered blocks survive even when siblings fail.
+        ``splittable`` is True only when the failure was
         a **marker-based** misalignment / empty translation (the reply echoed `[[n]]` markers
         but got the count/text wrong): splitting into smaller sub-batches helps the model
         there.  A **marker-free** reply (a refusal / unstructured text) is NOT splittable —
@@ -576,7 +676,12 @@ class TranslationEngine:
         so the batches still queued behind it return immediately instead of repeating the
         same doomed request.
         """
-        prompt = self._build_prompt(blocks, indices)
+        # Neighbour context: seams at the batch edges (cached/skipped blocks and
+        # chunk boundaries) would otherwise leave the model translating fragments
+        # blind.  Recomputed per attempt, so after a split the sub-batch sees its
+        # own — narrower — seams.
+        contexts = self._neighbor_context(blocks, indices, block_pages)
+        prompt = self._build_prompt(blocks, indices, contexts)
         system = self._system_prompt(language, glossary)
         attempts = len(retry_delays) + 1
         last_error: Exception | None = None
@@ -586,12 +691,12 @@ class TranslationEngine:
                 raise TranslationCancelled()
             if abort is not None and abort.is_set():
                 # Another batch already hit a fatal error; this run is over.
-                return [blocks[i] for i in indices], False, False
+                return [blocks[i] for i in indices], [False] * len(indices), False
             try:
                 raw = self._request_locked(prompt, system)
                 last_had_markers = bool(raw and "[[" in raw)
                 # Either returns exactly ``len(indices)`` translations or raises.
-                return self._parse_response(raw, indices), True, True
+                return self._parse_response(raw, indices), [True] * len(indices), True
             except TranslationCancelled:
                 raise
             except Exception as exc:  # noqa: BLE001 — network / API errors
@@ -602,7 +707,7 @@ class TranslationEngine:
             if cancel():
                 raise TranslationCancelled()
             if abort is not None and abort.is_set():
-                return [blocks[i] for i in indices], False, False
+                return [blocks[i] for i in indices], [False] * len(indices), False
             if self._is_fatal(last_error):
                 if abort is not None:
                     abort.set()
@@ -623,7 +728,7 @@ class TranslationEngine:
         # Preserve the source text for every block in the failed batch.  A marker-free
         # reply (refusal) is never worth splitting.
         splittable = not (isinstance(last_error, ValueError) and not last_had_markers)
-        return [blocks[i] for i in indices], False, splittable
+        return [blocks[i] for i in indices], [False] * len(indices), splittable
 
 
     def translate_blocks(
@@ -797,17 +902,23 @@ class TranslationEngine:
                             raise TranslationCancelled()
                         chunk = futures[fut]
                         try:
-                            translated, ok = fut.result()
+                            translated, oks = fut.result()
                         except (TranslationCancelled, TranslationAborted):
                             raise
                         except Exception as exc:  # noqa: BLE001 — defensive; the
                             # batch already swallows errors, this catches the rest
                             log(f"  批次异常，保留原文: {exc}")
-                            translated, ok = [blocks[i] for i in chunk], False
-                        if ok:
+                            translated, oks = [blocks[i] for i in chunk], [False] * len(chunk)
+                        # Per-block verdict: after a split one sub-batch may have
+                        # recovered while siblings still failed.  Cache/apply the
+                        # survivors (they are real translations) and report ONLY
+                        # the failed blocks — discarding a successful half would
+                        # re-lose recovered work and mis-accuse every block.
+                        if any(oks):
                             with self._cache_lock:
-                                for i, text in zip(chunk, translated):
-                                    cache[_block_hash(blocks[i])] = text
+                                for i, text, good in zip(chunk, translated, oks):
+                                    if good:
+                                        cache[_block_hash(blocks[i])] = text
                                 snapshot = dict(cache)
                                 seq = self._cache_seq
                                 self._cache_seq += 1
@@ -818,8 +929,8 @@ class TranslationEngine:
                             # In-memory-only runs skip this entirely (no disk write).
                             if cache_path is not None:
                                 _persist_cache(snapshot, seq)
-                        else:
-                            for i in chunk:
+                        for i, good in zip(chunk, oks):
+                            if not good:
                                 label = self._page_label([i], block_pages)
                                 loc = f"（{label}）" if label else ""
                                 snip = self._batch_snippet([i], blocks) if blocks else ""
