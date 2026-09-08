@@ -81,6 +81,8 @@ class TranslateWorker(QObject):
         ir_mode: bool = False,
         structure_mode: bool = False,
         agent_terms: bool = True,
+        reflow: bool = False,
+        rebuild_table: bool = False,
     ):
         super().__init__()
         self._source = source_path
@@ -146,6 +148,13 @@ class TranslateWorker(QObject):
         #: ``PDFTRANSLATE_AGENT_TERMS=0`` forces it off (higher priority).
         self._agent_terms = bool(agent_terms) and (
             os.environ.get("PDFTRANSLATE_AGENT_TERMS", "1") != "0")
+        #: C-⑥ reflow（保守层）：文本层表格列宽按译文重分配（数字列不缩）。
+        #: 默认关闭；GUI 复选框开启，或 PDFTRANSLATE_REFLOW=1 强制开启。
+        self._reflow = bool(reflow) or (os.environ.get("PDFTRANSLATE_REFLOW") == "1")
+        #: C-⑥ 重建扫描表格为矢量表格（默认关闭）：AI 识别扫描表格的真实行/列
+        #: 边界，重建为非 OCR（矢量）表格并正常填充译文，替代「位图线重绘」。
+        self._rebuild_table = bool(rebuild_table) or (
+            os.environ.get("PDFTRANSLATE_REBUILD_TABLE") == "1")
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
         # written from the GUI thread (``cancel``) and read from the worker
         # thread: the Event gives explicit, memory-model-safe signalling
@@ -350,6 +359,13 @@ class TranslateWorker(QObject):
             doc_ir, translate_fn, lang=self._lang,
             log=lambda m: self.log.emit(m), infer=True)
         out_texts = [str(translated.get(i, src_texts[i])) for i in range(len(src_texts))]
+        # C-⑥ 缓存键细化：把段落组批切回的块级译文按块写缓存，让默认单块
+        # 模式重跑时能跨模式复用（磁盘持久化启用时生效，尽力而为）。测试
+        # 注入的 fake engine 可能没有该方法，容错跳过。
+        cache_blocks = getattr(engine, "cache_blocks", None)
+        if cache_blocks is not None:
+            cache_blocks(Path(self._source), self._lang, doc_ir.terms,
+                         list(zip(src_texts, out_texts)))
         result = TranslationResult(blocks=src_texts, translated=out_texts)
         result.errors = list(translate_fn.last_errors)
         return result
@@ -583,6 +599,53 @@ class TranslateWorker(QObject):
             self.log.emit("  AI 编排未产生翻译（模型可能无法视觉编排），输出将保留原文。")
         return TranslationResult(blocks=doc.blocks, translated=translated)
 
+    def _build_rebuild_pages(self, doc: pdfio.DocumentText) -> dict | None:
+        """AI 视觉识别扫描表格页的真实行列结构（rebuild_table + vision model 时）。
+
+        返回 ``{page_index: (rows_pts, cols_pts)}``（PDF 点），供
+        ``save_translated_pdf`` 把 OCR 表格重建为矢量表格并正常填充译文——替代
+        OCR 块几何（后者对超密集扫描报表给出一堆噪点列边缘）。无 vision model /
+        识别失败 / 无扫描表格页时返回 ``None``（回退 OCR 几何，绝不崩）。
+        """
+        if not self._rebuild_table or not getattr(self._model, "vision", False):
+            return None
+        try:
+            import fitz
+            from . import table_vision
+
+            structure: dict[int, dict] = {}
+            src = fitz.open(str(self._source))
+            try:
+                for i, blocks in enumerate(doc.pages):
+                    if not pdfio._reconstruct_ocr_tables(blocks):
+                        continue
+                    page = src[i] if i < src.page_count else None
+                    if page is None:
+                        continue
+                    png = pdfio._render_page_png(page, dpi=150)
+                    detect = table_vision.make_llm_table_structure(
+                        self._model, page_width=page.rect.width,
+                        page_height=page.rect.height,
+                        log=lambda m: self.log.emit(m))
+                    if detect is None:
+                        return None
+                    res = detect(png)
+                    # Layer-④ 验证门：重建结构若不能容纳足够多的数字块（漏列/错位
+                    # → 数字游离），fail-closed 回退普通 OCR，绝不硬输出错表。
+                    if res and pdfio.valid_rebuild(blocks, res):
+                        structure[i] = res
+            finally:
+                src.close()
+            if structure:
+                self.log.emit(
+                    f"  [table_vision] 已识别 {len(structure)} 个扫描表格页的真实行列结构，"
+                    "重建为矢量表格。")
+            return structure or None
+        except Exception as exc:  # noqa: BLE001 — 回退 OCR 几何，绝不崩
+            self.log.emit(
+                f"  [table_vision] 表格结构识别失败，回退 OCR 几何：{type(exc).__name__}: {exc}")
+            return None
+
     def _export(self, doc: pdfio.DocumentText, per_page: list[list[str]]) -> str:
         out = Path(self._output_path)
         kind = self._output_type
@@ -593,7 +656,8 @@ class TranslateWorker(QObject):
         elif kind == "translated_pdf":
             pdfio.save_translated_pdf(
                 self._source, doc.pages, per_page, out, self._lang,
-                log=self.log.emit,
+                log=self.log.emit, reflow=self._reflow,
+                rebuild_pages=self._build_rebuild_pages(doc),
             )
         elif kind == "markdown":
             pdfio.save_markdown(

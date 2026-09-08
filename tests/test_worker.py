@@ -550,6 +550,21 @@ class IrModeWorkerTest(_WorkerTestBase):
         with mock.patch.dict(os.environ, {"PDFTRANSLATE_AGENT_TERMS": "0"}):
             self.assertFalse(self._worker(agent_terms=True)._agent_terms)
 
+    def test_reflow_default_off_and_env_gated(self):
+        # C-⑥ reflow（保守层）默认关（与 agent_terms 相反）。
+        self.assertFalse(self._worker()._reflow)
+        self.assertTrue(self._worker(reflow=True)._reflow)
+        # env=1 forces it on.
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_REFLOW": "1"}):
+            self.assertTrue(self._worker()._reflow)
+
+    def test_rebuild_table_default_off_and_env_gated(self):
+        # C-⑥ 扫描表格重建为矢量表格（默认关）。
+        self.assertFalse(self._worker()._rebuild_table)
+        self.assertTrue(self._worker(rebuild_table=True)._rebuild_table)
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_REBUILD_TABLE": "1"}):
+            self.assertTrue(self._worker()._rebuild_table)
+
 
 class StructureModeWorkerTest(_WorkerTestBase):
     """B-④: worker structure_mode extracts via the geometric structure backend."""

@@ -419,9 +419,9 @@ class PdfioTest(unittest.TestCase):
         shifts, new_bottoms, grid, bboxes = pdfio._compute_table_layout(
             tables, mapping, blocks, trans, font
         )
-        row0 = next(bi for bi, (_ti, r) in mapping.items() if r == 0)
-        row1 = next(bi for bi, (_ti, r) in mapping.items() if r == 1)
-        row2 = next(bi for bi, (_ti, r) in mapping.items() if r == 2)
+        row0 = next(bi for bi, (_ti, r, _c) in mapping.items() if r == 0)
+        row1 = next(bi for bi, (_ti, r, _c) in mapping.items() if r == 1)
+        row2 = next(bi for bi, (_ti, r, _c) in mapping.items() if r == 2)
         # Top row is undisturbed; the lower rows move down because row 1 grows.
         self.assertEqual(shifts[row0], 0.0)
         self.assertGreaterEqual(shifts[row1], 0.0)
@@ -433,6 +433,115 @@ class PdfioTest(unittest.TestCase):
         self.assertTrue(any(g[0] == "v" for g in grid))
         # The whole original table is flagged for removal (stale grid lines).
         self.assertEqual(len(bboxes), 1)
+
+    def test_rebalance_table_columns_widens_long_column_and_keeps_total_width(self):
+        # C-⑥ reflow（保守层）：长译文列借用相邻短列的空白，表格总宽不变。
+        font = fitz.Font("cjk")
+        rows = [[fitz.Rect(60, 200, 150, 220), fitz.Rect(150, 200, 250, 220)]]
+        tables = [{"bbox": fitz.Rect(60, 200, 250, 220), "rows": rows,
+                   "col_edges": [60, 150, 250]}]
+        blocks, trans = [], []
+        blocks.append(pdfio.Block(text="项目", page=0, x0=60, y0=200, x1=150, y1=220, size=9.0))
+        trans.append("A very long translated header that definitely exceeds the narrow column width")
+        blocks.append(pdfio.Block(text="备注", page=0, x0=150, y0=200, x1=250, y1=220, size=9.0))
+        trans.append("ok")
+        mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
+        col_boxes, new_edges = pdfio._rebalance_table_columns(tables, mapping, blocks, trans, font)
+        # Long column（列 0）widens: its bbox right edge moves past the old 150.
+        self.assertGreater(col_boxes[0][1], 150.0)
+        # Short column（列 1）narrows: its bbox left edge moves right past 150.
+        self.assertGreater(col_boxes[1][0], 150.0)
+        # Total width preserved.
+        self.assertAlmostEqual(new_edges[0][-1] - new_edges[0][0], 190.0, delta=0.5)
+
+    def test_rebalance_table_columns_never_shrinks_numeric_column(self):
+        font = fitz.Font("cjk")
+        rows = [[fitz.Rect(60, 200, 150, 220), fitz.Rect(150, 200, 250, 220)]]
+        tables = [{"bbox": fitz.Rect(60, 200, 250, 220), "rows": rows,
+                   "col_edges": [60, 150, 250]}]
+        blocks, trans = [], []
+        blocks.append(pdfio.Block(text="项目", page=0, x0=60, y0=200, x1=150, y1=220, size=9.0))
+        trans.append("A very long translated header that definitely exceeds the narrow column width")
+        blocks.append(pdfio.Block(text="1,234.56", page=0, x0=150, y0=200, x1=250, y1=220, size=9.0))
+        trans.append("1,234.56")
+        mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
+        col_boxes, _new_edges = pdfio._rebalance_table_columns(tables, mapping, blocks, trans, font)
+        # 数字列不缩：bbox 保持原列边界（150+2, 250-2）。
+        self.assertAlmostEqual(col_boxes[1][0], 152.0, delta=0.5)
+        self.assertAlmostEqual(col_boxes[1][1], 248.0, delta=0.5)
+
+    def test_rebuild_ocr_table_reanchors_blocks_to_cells(self):
+        # C-⑥ 重建为矢量表格：把 OCR 块 bbox 重排到 AI 识别的单元格边界，
+        # 走文本层表格管线的行高扩展 + 矢线重绘 + 正常填充译文。
+        blocks = [
+            pdfio.Block(text="A", page=0, x0=1, y0=1, x1=10, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="B", page=0, x0=51, y0=1, x1=60, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="C", page=0, x0=1, y0=11, x1=10, y1=19, size=9.0, ocr=True),
+            pdfio.Block(text="D", page=0, x0=51, y0=11, x1=60, y1=19, size=9.0, ocr=True),
+        ]
+        style = {"rows_pts": [0, 10, 20], "cols_pts": [0, 50, 100],
+                 "merged": [], "header_rows": [], "header_cols": [], "align": []}
+        rebuilt, tables, mapping = pdfio._rebuild_ocr_table_blocks(blocks, style)
+        # 每个块的 bbox 重排到对应 AI 单元格（含 _TABLE_CELL_PAD）。
+        self.assertAlmostEqual(rebuilt[0].x0, 2.0)     # 0 + 2
+        self.assertAlmostEqual(rebuilt[0].y0, 0.0)
+        self.assertAlmostEqual(rebuilt[0].x1, 48.0)    # 50 - 2
+        self.assertAlmostEqual(rebuilt[1].x0, 52.0)    # 50 + 2
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(len(tables[0]["rows"]), 2)    # 2 row gaps
+        self.assertEqual(len(mapping), 4)
+        # 每个块都映射到 AI 网格的单元格。
+        self.assertEqual(mapping[0], (0, 0, 0))
+        self.assertEqual(mapping[1], (0, 0, 1))
+        self.assertEqual(mapping[2], (0, 1, 0))
+        self.assertEqual(mapping[3], (0, 1, 1))
+
+    def test_rebuild_semantics_composes_grid(self):
+        # Layer-③: 重建后构建语义 StructTable（cells/merged/header），供审计。
+        blocks = [
+            pdfio.Block(text="A", page=0, x0=1, y0=1, x1=10, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="B", page=0, x0=51, y0=1, x1=60, y1=9, size=9.0, ocr=True),
+        ]
+        style = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100],
+                 "merged": [{"r": 0, "c": 0, "row_span": 1, "col_span": 2}],
+                 "header_rows": [0], "header_cols": [], "align": [], "non_text": []}
+        sem = pdfio.rebuild_semantics(blocks, style)
+        self.assertEqual(sem["rows"], 1)
+        self.assertEqual(sem["cols"], 2)
+        self.assertEqual(sem["header_rows"], [0])
+        self.assertEqual(sem["merged"], [{"r": 0, "c": 0, "row_span": 1, "col_span": 2}])
+        # 块 A/B 映射到 (0,0)/(0,1)。
+        self.assertEqual(sem["cells"][0][0], 0)
+        self.assertEqual(sem["cells"][0][1], 1)
+
+    def test_valid_rebuild_accepts_when_numerics_stay_in_cells(self):
+        # Layer-④: 数字块都映射到重建单元格 → valid_rebuild True。
+        blocks = [
+            pdfio.Block(text="1,234.56", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="label", page=0, x0=51, y0=1, x1=90, y1=9, size=9.0, ocr=True),
+        ]
+        style = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100],
+                 "merged": [], "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        self.assertTrue(pdfio.valid_rebuild(blocks, style))
+
+    def test_valid_rebuild_rejects_when_numerics_flee(self):
+        # Layer-④: 数字块无法映射到任何重建单元格 → 回退（fail-closed）。
+        blocks = [
+            pdfio.Block(text="1,234.56", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True),
+        ]
+        style = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100],
+                 "merged": [], "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        with mock.patch.object(pdfio, "_rebuild_ocr_table_blocks",
+                               return_value=([], [], {})):
+            self.assertFalse(pdfio.valid_rebuild(blocks, style))
+
+    def test_in_non_text_detects_signature_region(self):
+        # 非文本区域（签名/印章）内的块应被识别为保持原样（不重建、不翻译）。
+        non_text = [(50, 690, 550, 750, "signature")]
+        sig = pdfio.Block(text="sig", page=0, x0=100, y0=700, x1=500, y1=740, size=9.0, ocr=True)
+        self.assertTrue(pdfio._in_non_text(sig, non_text))
+        data = pdfio.Block(text="data", page=0, x0=100, y0=100, x1=200, y1=120, size=9.0, ocr=True)
+        self.assertFalse(pdfio._in_non_text(data, non_text))
 
 
 class TableCellFitTest(unittest.TestCase):
@@ -561,6 +670,21 @@ class TableCellFitTest(unittest.TestCase):
         lines, fs = pdfio._fit_block(block, font, long_name)
         self.assertGreater(len(lines), 1)
         self.assertEqual(fs, pdfio._MIN_TABLE_READABLE)
+        self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
+
+    def test_fit_block_keep_font_keeps_size_and_wraps(self):
+        # Rebuilt vector-table cell (keep_font): keep the original font size and
+        # grow the row to the wrapped line count instead of shrinking.
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="", page=0, x0=100, y0=100, x1=250, y1=120,
+            size=9.0, align="left", bold=False, single_line=True, in_table=True,
+        )
+        block = pdfio.replace(block, keep_font=True)
+        long_name = "Wenling Municipal State-owned Assets Management Co., Ltd."
+        lines, fs = pdfio._fit_block(block, font, long_name)
+        self.assertEqual(fs, 9.0)           # original font size kept, not shrunk
+        self.assertGreater(len(lines), 1)   # wrapped instead of collapsed to 3pt
         self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
 
     def test_fit_block_band_wraps_at_readable_floor_when_band_is_plenty(self):

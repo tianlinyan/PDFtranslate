@@ -308,6 +308,30 @@ class MainWindow(QWidget):
         self._agent_terms_check.toggled.connect(self._persist_agent_terms)
         form.addRow("术语注入", self._agent_terms_check)
 
+        # --- 表格列宽重排（reflow 保守层，默认关闭） ---
+        self._reflow_check = QCheckBox("表格列宽重排（文本层，默认关）")
+        self._reflow_check.setToolTip(
+            "勾选后，文本层表格的列宽按译文需求重分配：长译文列借用相邻列的空白，"
+            "数字列保持不缩，表格总宽不变。\n"
+            "只影响「仅译文/原位」PDF 的文本层（矢量线）表格；扫描件位图表格线与"
+            "双语 PDF 不受影响。环境变量 PDFTRANSLATE_REFLOW=1 可强制开启。"
+        )
+        self._reflow_check.setChecked(bool(prefs.get("reflow", False)))
+        self._reflow_check.toggled.connect(self._persist_reflow)
+        form.addRow("重排版", self._reflow_check)
+
+        # --- 扫描表格重建为矢量表格（默认关闭） ---
+        self._rebuild_table_check = QCheckBox("扫描表格重建为矢量表格（默认关）")
+        self._rebuild_table_check.setToolTip(
+            "勾选后，AI 视觉识别扫描（OCR）表格的真实行/列边界，把 OCR 块重排到"
+            "对应单元格（矢量表格），从而走文本层表格管线的行高扩展 + 矢线重绘，"
+            "译文正常填充、不再是 3-4pt 缩字。\n"
+            "需要支持视觉的模型在线。环境变量 PDFTRANSLATE_REBUILD_TABLE=1 可强制开启。"
+        )
+        self._rebuild_table_check.setChecked(bool(prefs.get("rebuild_table", False)))
+        self._rebuild_table_check.toggled.connect(self._persist_rebuild_table)
+        form.addRow("扫描重建", self._rebuild_table_check)
+
         # --- 智能编排 + 扫描页识别：已交由 AI 自动处理，不再提供开关 ---
         # v0.3 起默认由 agent 视觉闭环驱动全流程翻译；扫描页自动触发 OCR（按页无文本层才识别），
         # 具体翻译/保留由 agent 与特殊页协商决定，因此主界面不再暴露这两个选项。
@@ -928,6 +952,8 @@ class MainWindow(QWidget):
             agent_mode=True,
             ir_mode=self._ir_check.isChecked(),
             agent_terms=self._agent_terms_check.isChecked(),
+            reflow=self._reflow_check.isChecked(),
+            rebuild_table=self._rebuild_table_check.isChecked(),
             overlay=self.doc_ctx.overlay(),
             requirements=[requirement] if requirement else None,
             page_scope=page_scope,
@@ -975,6 +1001,8 @@ class MainWindow(QWidget):
                     "output_type": output_key,
                     "ir_mode": bool(self._ir_check.isChecked()),
                     "agent_terms": bool(self._agent_terms_check.isChecked()),
+                    "reflow": bool(self._reflow_check.isChecked()),
+                    "rebuild_table": bool(self._rebuild_table_check.isChecked()),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )
@@ -1010,6 +1038,28 @@ class MainWindow(QWidget):
             reason = save_prefs(prefs)
             if reason and hasattr(self, "_log"):
                 self._append_log(f"  警告：用户偏好保存失败（{reason}），术语开关不会被记住。")
+        except Exception:
+            pass
+
+    def _persist_reflow(self, checked: bool) -> None:
+        """Save the reflow checkbox the moment it is toggled."""
+        try:
+            prefs = load_prefs()
+            prefs["reflow"] = bool(checked)
+            reason = save_prefs(prefs)
+            if reason and hasattr(self, "_log"):
+                self._append_log(f"  警告：用户偏好保存失败（{reason}），重排版开关不会被记住。")
+        except Exception:
+            pass
+
+    def _persist_rebuild_table(self, checked: bool) -> None:
+        """Save the rebuild-table checkbox the moment it is toggled."""
+        try:
+            prefs = load_prefs()
+            prefs["rebuild_table"] = bool(checked)
+            reason = save_prefs(prefs)
+            if reason and hasattr(self, "_log"):
+                self._append_log(f"  警告：用户偏好保存失败（{reason}），扫描重建开关不会被记住。")
         except Exception:
             pass
 

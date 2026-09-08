@@ -367,6 +367,33 @@ class TranslatorTest(unittest.TestCase):
         loaded = translator.load_translation_cache(doc_path, "Chinese", "mock-poisoned")
         self.assertEqual({"goodhash": "译文"}, loaded)
 
+    def test_cache_blocks_seeds_per_block_cache_for_cross_mode_reuse(self):
+        # C-⑥ 缓存键细化：IR 段落组批把整段译文切回块后，按块写缓存，让
+        # 默认单块模式重跑时复用（而不是重新翻译）。
+        import hashlib
+
+        model = ModelConfig(
+            id=f"mock-{uuid.uuid4().hex[:8]}", name="mock", type="openai",
+            endpoint="http://127.0.0.1:9/v1", model="mock-model",
+        )
+        engine = TranslationEngine(model)
+        doc_path = Path("_ir_cache.pdf")
+        glossary = {"报告": "report"}
+        engine.cache_blocks(
+            doc_path, "English", glossary,
+            [("第一段甲", "Para one A"), ("第二段乙", "Para two B"),
+             ("   ", "skip me"), ("第三段丙", "   ")],
+        )
+        ghash = hashlib.sha1(
+            json.dumps(glossary, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        loaded = translator.load_translation_cache(doc_path, "English", model.id, ghash)
+        self.assertEqual(loaded[translator._block_hash("第一段甲")], "Para one A")
+        self.assertEqual(loaded[translator._block_hash("第二段乙")], "Para two B")
+        # Blank source and blank/unchanged translation are never cached.
+        self.assertNotIn(translator._block_hash("   "), loaded)
+        self.assertNotIn(translator._block_hash("第三段丙"), loaded)
+
     def test_unnumbered_reply_must_match_the_block_count(self):
         # Regression: with no [n] markers at all the parser used to map reply
         # lines onto blocks positionally and pad the rest with the source text.

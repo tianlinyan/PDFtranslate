@@ -989,6 +989,55 @@ class TranslationEngine:
             chunks.append(current)
         return chunks
 
+    def cache_blocks(
+        self,
+        doc_path: Path,
+        target_lang: str,
+        glossary: dict[str, str] | None,
+        items: Sequence[tuple[str, str]],
+    ) -> None:
+        """Best-effort: seed the on-disk per-block cache with IR-split fragments.
+
+        ``translate_ir`` translates whole paragraphs then splits the answer back
+        onto the individual blocks; those per-block fragments are *not* the keys
+        ``translate_blocks`` requested (it asked for the joined paragraph), so a
+        later default (per-block) run would re-translate them.  This writes each
+        ``(source_block, fragment)`` pair under the block's own md5 key so the
+        two modes share one cache.  Only active when disk persistence is enabled
+        (``PDFTRANSLATE_CACHE_DIR``) — production is in-memory per call, so this
+        is a no-op there.  Best-effort: a failed write is ignored (never aborts a
+        translation).
+        """
+        if not _cache_persist_enabled() or doc_path is None or not items:
+            return
+        glossary = {str(k): str(v) for k, v in (glossary or {}).items() if str(k).strip()}
+        glossary_hash = (
+            hashlib.sha1(
+                json.dumps(glossary, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:16]
+            if glossary else ""
+        )
+        cache_path = _cache_dir() / _cache_key(doc_path, target_lang, self.model.id, glossary_hash)
+        # Serialise the read-modify-write so a concurrent batch persist cannot
+        # interleave and drop this seed (the same lock the batch persist uses).
+        with self._persist_lock:
+            cache = load_translation_cache(doc_path, target_lang, self.model.id, glossary_hash)
+            changed = False
+            for src, tgt in items:
+                src_s = str(src).strip()
+                tgt = str(tgt).strip()
+                # Skip blank source (not a translatable block), blank translation,
+                # and an unchanged echo (a failed batch) — mirroring the guards in
+                # ``translate_blocks`` so nothing untranslated is ever cached.
+                if not src_s or not tgt or tgt == src_s:
+                    continue
+                key = _block_hash(str(src))
+                if cache.get(key) != tgt:
+                    cache[key] = tgt
+                    changed = True
+            if changed:
+                _write_cache(cache_path, cache)
+
 
 def _write_cache(path: Path, cache: dict[str, str]) -> str | None:
     """Best-effort *atomic* persist of the translation cache.
