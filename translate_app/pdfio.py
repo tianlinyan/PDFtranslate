@@ -1301,7 +1301,12 @@ def _ocr_cache_dir() -> Path:
 #: line.  Blocks cached by v4 deserialize to ``fit_height = 0`` (the field is
 #: new), so their wraps would be *unbounded* — translations hang over the rows
 #: below instead of stopping at the band.  They must be re-synthesized.
-_OCR_CACHE_VERSION = 5
+#:
+#: v6: handwriting-signature strokes are dropped again before the grid is built
+#: (``_drop_signature_items``).  A v5 cache still contains them as blocks, so a
+#: cached scan would keep romanizing the signature and covering the ink with the
+#: exporter's white rect — the exact behaviour the drop exists to prevent.
+_OCR_CACHE_VERSION = 6
 
 
 def _ocr_cache_path(doc_path: str | Path) -> Path:
@@ -1896,6 +1901,42 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
     return blocks, tables
 
 
+def _drop_signature_items(
+    items: list[tuple], page_height: float | None,
+    log: Callable[[str], None] | None, page_index: int,
+) -> list[tuple]:
+    """Remove handwriting-signature OCR items so the scan image is kept as-is.
+
+    A handwritten 签字 on a scanned statement (the ``法定代表人：`` /
+    ``会计机构负责人：`` rows at the form's bottom) comes through RapidOCR as an
+    item whose box spans the whole brush stroke — several times taller than the
+    ~9pt print rows — and whose text is a name (letters, no digits).  Keeping it
+    means the translation passes a pinyin romanization drawn over the area, and
+    the exporter's white cover rect hides the actual handwriting on top of it.
+    A signature is identity, not content: drop the item, nothing is translated
+    and the scan's signature stays visible.
+    """
+    if not items or page_height is None:
+        return items
+    med = statistics.median(max(0.001, it[3] - it[0]) for it in items)
+    kept: list[tuple] = []
+    dropped = 0
+    for it in items:
+        y0, _x0, _x1, y1, text = it
+        h = y1 - y0
+        if h >= max(15.0, 2.5 * med) and (y0 + y1) / 2.0 >= 0.7 * page_height:
+            if any(ch.isalpha() for ch in text) and not re.search(r"\d", text):
+                dropped += 1
+                continue
+        kept.append(it)
+    if dropped and log:
+        log(
+            f"  第 {page_index + 1} 页：检测到 {dropped} 处手写体签字，"
+            "已保留扫描原样（不翻译、不覆盖）。"
+        )
+    return kept
+
+
 def _synthesize_ocr_blocks(
     results: Sequence[tuple[list, str]], page_index: int,
     log: Callable[[str], None] | None = None,
@@ -1908,6 +1949,11 @@ def _synthesize_ocr_blocks(
     boxes form a table grid (scanned financial statements), the cells are rebuilt
     row-major with column-wide boxes and numeric columns right-aligned so the
     whole table keeps its shape instead of collapsing into a jumble.
+
+    Handwritten signature strokes are dropped first (``page_height`` gates the
+    bottom-band test, see :func:`_drop_signature_items`) — a signature is
+    identity, not content: translating it would cover the ink with a white rect
+    and a pinyin romanization.
 
     Numbers are normalized *before* the grid is reconstructed (a mangled figure
     like ``65, 334, 085.99`` would not even be recognised as a numeric cell);
@@ -1931,6 +1977,7 @@ def _synthesize_ocr_blocks(
         items.append((min(ys), min(xs), max(xs), max(ys), normalized))
     if not items:
         return []
+    items = _drop_signature_items(items, page_height, log, page_index)
     grid_blocks, _grid_tables = _reconstruct_ocr_grid(items)
     if grid_blocks:
         for b in grid_blocks:
@@ -2070,11 +2117,18 @@ def _ocr_page_blocks(
     """
     if cancel is not None and cancel():
         raise TranslationCancelled()
+    # OCR boxes live in the **unrotated cropbox** frame (the render below is the
+    # cropbox, and ``derotation_matrix`` maps back into it), so the signature
+    # detector's bottom-band test must use that frame's height: on a 90°/270° page
+    # ``page.rect`` is the rotated frame and its height is the page *width*, which
+    # would move the band to the wrong side; ``page.mediabox`` ignores a CropBox
+    # that crops the page down.
+    page_height = float(page.cropbox.height)
     if ocr_fn is not None:
         try:
             return _synthesize_ocr_blocks(
                 list(ocr_fn(page_index, page)), page_index, log,
-                page_height=page.rect.height,
+                page_height=page_height,
             )
         except TranslationCancelled:
             raise
@@ -2093,7 +2147,7 @@ def _ocr_page_blocks(
         results = _ocr_results_from_img(engine, img, zoom, page_index, log,
                                         derotate=derotate)
         return _synthesize_ocr_blocks(
-            results, page_index, log, page_height=page.rect.height
+            results, page_index, log, page_height=page_height
         )
     except TranslationCancelled:
         raise

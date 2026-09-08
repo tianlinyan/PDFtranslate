@@ -198,30 +198,147 @@ class OcrPlumbingTest(unittest.TestCase):
         )
         self.assertEqual(["a b c"], [b.text for b in blocks])
 
-    def test_signature_items_are_kept_as_blocks(self):
-        # v0.3.0: the handwritten-signature *auto-drop* is removed — the AI agent
-        # decides at runtime.  A tall name-only box now stays a block (the model
-        # may classify it as signature/keep); no "手写体签字" drop log is emitted.
+    def test_signature_items_are_dropped_from_ocr(self):
+        # A handwritten 签字 (40pt of brush ink in the bottom band, name only, no
+        # digits) must not become a block: translating it would draw a pinyin
+        # romanization over the ink and the exporter's white cover rect would hide
+        # the handwriting.  A signature is identity, not content.
         logs: list[str] = []
         blocks = pdfio._synthesize_ocr_blocks(
             [
                 ([[2.0, 100.0], [30.0, 100.0], [30.0, 109.0], [2.0, 109.0]], "项目"),
                 ([[2.0, 120.0], [30.0, 120.0], [30.0, 129.0], [2.0, 129.0]], "资产"),
                 ([[2.0, 140.0], [30.0, 140.0], [30.0, 149.0], [2.0, 149.0]], "利润"),
-                # handwritten 小波: 40pt tall, bottom band of the 800pt page — kept
+                # handwritten 小波: 40pt tall, bottom band of the 800pt page — dropped
                 ([[120.0, 700.0], [260.0, 700.0], [260.0, 740.0], [120.0, 740.0]], "小波"),
-                # tall bottom-band item WITH digits: a figure, also kept
-                ([[300.0, 690.0], [380.0, 690.0], [380.0, 715.0], [300.0, 715.0]],
-                 "V001"),
             ],
             0, log=logs.append, page_height=800.0,
         )
         texts = [b.text for b in blocks]
         self.assertIn("项目", texts)
         self.assertIn("资产", texts)
-        self.assertIn("小波", texts)
-        self.assertIn("V001", texts)
+        self.assertNotIn("小波", texts)
+        self.assertEqual(
+            1, len([m for m in logs if "手写体签字" in m]), logs
+        )
+        self.assertIn("第 1 页", [m for m in logs if "手写体签字" in m][0])
+
+    def test_tall_bottom_band_item_with_digits_is_kept(self):
+        # A tall bottom-band box that *contains digits* is a figure (seal outline,
+        # boxed caption), not a signature — it must stay a block.
+        logs: list[str] = []
+        blocks = pdfio._synthesize_ocr_blocks(
+            [
+                ([[2.0, 100.0], [30.0, 100.0], [30.0, 109.0], [2.0, 109.0]], "项目"),
+                ([[2.0, 120.0], [30.0, 120.0], [30.0, 129.0], [2.0, 129.0]], "资产"),
+                ([[2.0, 140.0], [30.0, 140.0], [30.0, 149.0], [2.0, 149.0]], "利润"),
+                ([[300.0, 690.0], [380.0, 690.0], [380.0, 715.0], [300.0, 715.0]],
+                 "V001"),
+            ],
+            0, log=logs.append, page_height=800.0,
+        )
+        self.assertIn("V001", [b.text for b in blocks])
         self.assertEqual([], [m for m in logs if "手写体签字" in m], logs)
+
+    def test_tall_name_item_outside_the_bottom_band_is_kept(self):
+        # Only the form's bottom third holds signature rows; a tall name-only box
+        # higher up the page (a stamp-sized logo caption) stays.
+        blocks = pdfio._synthesize_ocr_blocks(
+            [
+                ([[2.0, 100.0], [30.0, 100.0], [30.0, 109.0], [2.0, 109.0]], "项目"),
+                ([[2.0, 120.0], [30.0, 120.0], [30.0, 129.0], [2.0, 129.0]], "资产"),
+                ([[2.0, 140.0], [30.0, 140.0], [30.0, 149.0], [2.0, 149.0]], "利润"),
+                ([[120.0, 200.0], [260.0, 200.0], [260.0, 240.0], [120.0, 240.0]], "Logo"),
+            ],
+            0, page_height=800.0,
+        )
+        self.assertIn("Logo", [b.text for b in blocks])
+
+    def test_signature_drop_needs_the_page_height(self):
+        # Without a page height there is no bottom band to test against — the item
+        # must survive rather than be dropped on a guess.
+        blocks = pdfio._synthesize_ocr_blocks(
+            [
+                ([[2.0, 100.0], [30.0, 100.0], [30.0, 109.0], [2.0, 109.0]], "项目"),
+                ([[2.0, 120.0], [30.0, 120.0], [30.0, 129.0], [2.0, 129.0]], "资产"),
+                ([[2.0, 140.0], [30.0, 140.0], [30.0, 149.0], [2.0, 149.0]], "利润"),
+                ([[120.0, 700.0], [260.0, 700.0], [260.0, 740.0], [120.0, 740.0]], "小波"),
+            ],
+            0,
+        )
+        self.assertIn("小波", [b.text for b in blocks])
+
+    def test_dropped_signature_never_reaches_the_grid(self):
+        # The drop happens *before* grid reconstruction, so a scanned statement's
+        # signature row cannot become a table cell either.
+        blocks = pdfio._synthesize_ocr_blocks(
+            [
+                ([[2.0, 100.0], [80.0, 100.0], [80.0, 109.0], [2.0, 109.0]], "营业收入"),
+                ([[2.0, 120.0], [80.0, 120.0], [80.0, 129.0], [2.0, 129.0]], "营业成本"),
+                ([[2.0, 140.0], [80.0, 140.0], [80.0, 149.0], [2.0, 149.0]], "营业利润"),
+                ([[200.0, 100.0], [260.0, 100.0], [260.0, 109.0], [200.0, 109.0]],
+                 "1,234.56"),
+                ([[200.0, 120.0], [260.0, 120.0], [260.0, 129.0], [200.0, 129.0]],
+                 "2,345.67"),
+                ([[200.0, 140.0], [260.0, 140.0], [260.0, 149.0], [200.0, 149.0]],
+                 "3,456.78"),
+                ([[300.0, 700.0], [440.0, 700.0], [440.0, 740.0], [300.0, 740.0]], "小波"),
+            ],
+            0, page_height=800.0,
+        )
+        texts = [b.text for b in blocks]
+        self.assertIn("营业收入", texts)   # grid really was reconstructed
+        self.assertIn("1,234.56", texts)
+        self.assertNotIn("小波", texts)
+
+    def test_ocr_page_blocks_drops_signature_in_a_rotated_page(self):
+        # OCR boxes are mapped back into the unrotated frame, so the bottom-band
+        # test must use the unrotated height: on a 90° page ``page.rect.height`` is
+        # the page *width* and the band would land on the wrong side.
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        page.set_rotation(90)
+        try:
+            def ocr_fn(page_index, page):  # noqa: ARG001
+                return [
+                    ([[2.0, 10.0], [80.0, 10.0], [80.0, 19.0], [2.0, 19.0]], "项目"),
+                    ([[2.0, 30.0], [80.0, 30.0], [80.0, 39.0], [2.0, 39.0]], "资产"),
+                    ([[2.0, 50.0], [80.0, 50.0], [80.0, 59.0], [2.0, 59.0]], "利润"),
+                    ([[200.0, 150.0], [320.0, 150.0], [320.0, 190.0], [200.0, 190.0]],
+                     "Xiaobo"),
+                ]
+
+            logs: list[str] = []
+            blocks = pdfio._ocr_page_blocks(0, page, ocr_fn, None, logs.append)
+            self.assertNotIn("Xiaobo", [b.text for b in blocks])
+            self.assertEqual(1, len([m for m in logs if "手写体签字" in m]), logs)
+        finally:
+            doc.close()
+
+    def test_ocr_page_blocks_drops_signature_in_a_cropped_page(self):
+        # The render is the CropBox, so the band height must come from the cropbox:
+        # with a page cropped to 120pt of its 200pt mediabox, a stroke in the last
+        # quarter of the *visible* page is a signature — but ``page.mediabox.height``
+        # would put the 70% line at 140pt and keep it.
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        page.set_cropbox(fitz.Rect(0, 0, 400, 120))
+        try:
+            def ocr_fn(page_index, page):  # noqa: ARG001
+                return [
+                    ([[2.0, 10.0], [80.0, 10.0], [80.0, 19.0], [2.0, 19.0]], "项目"),
+                    ([[2.0, 30.0], [80.0, 30.0], [80.0, 39.0], [2.0, 39.0]], "资产"),
+                    ([[2.0, 50.0], [80.0, 50.0], [80.0, 59.0], [2.0, 59.0]], "利润"),
+                    ([[200.0, 90.0], [320.0, 90.0], [320.0, 115.0], [200.0, 115.0]],
+                     "Xiaobo"),
+                ]
+
+            logs: list[str] = []
+            blocks = pdfio._ocr_page_blocks(0, page, ocr_fn, None, logs.append)
+            self.assertNotIn("Xiaobo", [b.text for b in blocks])
+            self.assertEqual(1, len([m for m in logs if "手写体签字" in m]), logs)
+        finally:
+            doc.close()
 
     def test_needs_ocr_detects_image_and_drawing_pages(self):
         self.assertTrue(pdfio._needs_ocr(_FakePage(images=["x"])))
