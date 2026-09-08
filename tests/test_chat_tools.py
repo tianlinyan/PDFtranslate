@@ -273,6 +273,31 @@ class ChatToolsTest(_CtxTest):
         self.assertEqual(1, len(res["results"]))
         self.assertIn("不能在计划内嵌套调用", res["error"])
 
+    def test_run_plan_dispatch_translate_uses_params(self):
+        # Regression: ``_dispatch_plan_task`` read ``params`` before its first assignment
+        # (``UnboundLocalError``), so a ``run_translate`` plan step always failed instead
+        # of starting a translation mid-sequence.  A wired ``start_translate`` channel must
+        # receive the plan task's ``requirement``/``scope``.
+        import translate_app.chat_tools as ct
+        seen: dict = {}
+
+        def fake_start_translate(requirement, scope):
+            seen["requirement"] = requirement
+            seen["scope"] = scope
+
+        fake_plan_llm = lambda req: {"tasks": [
+            {"tier": "atomic", "name": "run_translate",
+             "params": {"requirement": "把第3页公司名翻成Bank", "scope": [2]}},
+        ], "note": "开始翻译"}
+        tools = ct.make_chat_tools(self.ctx, start_translate=fake_start_translate,
+                                   plan_llm=fake_plan_llm)
+        res = tools["run_plan"]("把第3页公司名翻成Bank")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual("把第3页公司名翻成Bank", seen.get("requirement"))
+        self.assertEqual([2], seen.get("scope"))
+        self.assertEqual("run_translate", res["results"][0]["name"])
+        self.assertTrue(res["results"][0]["ok"])
+
     def test_render_page_returns_image(self):
         # The chat's ``render_page`` renders a page to PNG (a vision observation).
         res = self.tools["render_page"](0, what="source")

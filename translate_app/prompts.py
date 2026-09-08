@@ -228,7 +228,10 @@ def agent_workflow() -> str:
         "恢复原文 delete_block。\n"
         "③ 校验：每改一处就复跑对应 check_*，直到 check_residual / check_missing 无问题、且（本页适用时）"
         "check_numbers / check_table / check_layout 无实质问题，才可结束。扫描表报的「字号偏小/行带受限」是物理极限，可留意但不必强修。\n"
-        "④ 收尾：整页确认满足才结束；拿不准/术语/保留还是翻译→ask_user；某工具 ok=false→先读 error 判断原因、别盲目重试。"
+        "④ 收尾：整页确认满足才结束；拿不准/术语/保留还是翻译→ask_user；某工具 ok=false→先读 error 判断原因、别盲目重试。\n"
+        "**渲染只看一次**：同一页的 render_page 仅在必要时调用一次（拿到版面/当前译文即可），"
+        "不要反复重渲染——每次都会把整页图片重新注入对话、拖慢每一步；看不清某处时优先用 read_page 的 "
+        "offset/limit 或放大局部，而不是重渲染整页。"
     )
 
 
@@ -425,6 +428,3 @@ def interpret_special_answer(answer: str, kind: str) -> str:
         "只回复一个词：translate 或 keep 或 skip，不要任何其他文字。"
     )
 
-
-#: The message the app sends to the chat on startup so the assistant greets the user.
-CHAT_GREETING = "你好"

@@ -579,7 +579,10 @@ def run_plan(plan: Plan, *, dispatch: Callable[[Task], dict],
 _PLAN_COMPILE_PROMPT = (
     "把下面这句要求分解成**按顺序执行**的若干任务，输出一个 JSON 对象（只输出一个 JSON 对象，"
     "不要任何解释、不要 markdown 代码围栏）：\n"
-    '{"tasks":[{"tier":"atomic|process|composite","name":"<工具或流程名>","params":{}}],"note":"<一句话说明>"}\n'
+    # NOTE: the JSON sample's literal braces must be doubled (``{{``/``}}``) — the prompt
+    # is fed through ``str.format`` at the call site, so a single ``{`` would be parsed as
+    # a replacement field and raise ``KeyError`` (regression: Path B AI 分解永远失败).
+    '{{"tasks":[{{"tier":"atomic|process|composite","name":"<工具或流程名>","params":{{}}}}],"note":"<一句话说明>"}}\n'
     "tier=atomic → 单个工具：read_page/classify_page/get_doc_info/get_structure/get_table/get_settings/"
     "goto_page/set_block_text/delete_block_text/apply_annotation/retranslate/self_check/set_setting/re_export。\n"
     "tier=process 或 composite → 标准流程名：translate_page/translate_normal/special_pages/special_page/"

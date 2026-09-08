@@ -495,6 +495,9 @@ class ChatWorker(QObject):
     @pyqtSlot(str, str, str)
     def _record_exchange(self, question: str, answer: str, target: str = "") -> None:
         """(b) Note a flow-time Q&A into the live session's history (queued)."""
-        if self._session is not None:
+        if self._session is None:
+            return
+        try:
             self._session.record_exchange(question, answer, target)
+        except Exception as exc:  # noqa: BLE001 — never crash the worker on a log-only path
             self.error.emit(f"{type(exc).__name__}: {exc}")

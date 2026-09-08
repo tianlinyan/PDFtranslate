@@ -390,6 +390,7 @@ class MainWindow(QWidget):
         )
         self._chat_worker.moveToThread(self._chat_thread)
         self._chat_worker.ask_requested.connect(self._chat_worker.ask)
+        self._chat_worker.record_exchange_requested.connect(self._chat_worker._record_exchange)
         self._chat_worker.reply_ready.connect(self._on_chat_reply)
         self._chat_worker.reply_chunk.connect(self._on_chat_reply_chunk)
         self._chat_worker.error.connect(self._on_chat_error)
@@ -415,11 +416,6 @@ class MainWindow(QWidget):
                 self, "模型配置", f"models.json 加载失败：\n{self._models_error}"
             )
 
-        # On startup, proactively say hi to the AI so the conversation is open and the
-        # user sees the assistant respond using the configured interaction model.
-        # ``show=False``: the greeting is a hidden prompt — the AI still receives and
-        # replies, but the "你好" is not echoed as a sidebar user bubble.
-        self.agent_sidebar.send_message(prompts.CHAT_GREETING, show=False)
         # Controls are built; start keeping the AI ``get_settings`` snapshot current.
         self._settings_ready = True
         self._refresh_chat_settings()

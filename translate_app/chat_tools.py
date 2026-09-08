@@ -637,6 +637,10 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         """Execute one path-B :class:`Task` (atomic tool or a process/composite flow)."""
         from . import agent as _agent
 
+        # ``params`` is read by the ``run_translate`` atomic branch below, so it must be
+        # bound before the first branch (a ``NameError``/``UnboundLocalError`` otherwise).
+        params = dict(task.params or {})
+
         if task.tier == "atomic":
             if task.name == "run_translate":
                 # A plan may legitimately start a translation mid-sequence.
@@ -662,7 +666,6 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return out if isinstance(out, dict) else {"ok": True, "result": out}
 
         name = task.name
-        params = dict(task.params or {})
         if name in ("translate_page", "translate_normal", "special_pages", "special_page",
                     "translate_doc", "preprocess"):
             if start_translate is None:

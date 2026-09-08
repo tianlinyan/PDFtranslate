@@ -246,6 +246,50 @@ class FlowCompilerTest(unittest.TestCase):
         with mock.patch.object(translator, "OpenAI", side_effect=RuntimeError("no cfg")):
             self.assertIsNone(uf.make_llm_flow_compiler(model))
 
+    def test_make_llm_plan_compiler_prompt_braces_do_not_break_format(self):
+        # Regression: ``_PLAN_COMPILE_PROMPT`` carries a literal JSON sample whose braces
+        # were fed through ``str.format`` and raised ``KeyError``, so Path B (AI 自由分解)
+        # returned an empty plan and never actually called the API.  Formatting the prompt
+        # must succeed and pass the raw requirement through to the model.
+        class _Msg:
+            # A valid single-task plan the decompiler parses back.
+            content = '{"tasks":[{"tier":"atomic","name":"read_page","params":{"page":0}}],"note":"ok"}'
+
+        class _Resp:
+            choices = [type("_C", (), {"message": _Msg()})()]
+
+        class _Client:
+            def __init__(self):
+                self.calls = []
+
+            @property
+            def chat(self):
+                return self
+
+            @property
+            def completions(self):
+                return self
+
+            def create(self, **kw):
+                self.calls.append(kw)
+                return _Resp()
+
+        client = _Client()
+        model = ModelConfig(id="m", name="m", type="openai",
+                            endpoint="http://127.0.0.1:9/v1", model="mock")
+        with mock.patch.object(translator, "OpenAI", lambda **_k: client):
+            compiler = uf.make_llm_plan_compiler(model)
+        self.assertIsNotNone(compiler)
+        # Must not raise (the pre-fix prompt blew up here with KeyError '"tasks"').
+        data = compiler("把第3页公司名翻成Bank")
+        self.assertEqual("read_page", data["tasks"][0]["name"])
+        # The prompt that reached the API was formatted and contains the requirement.
+        message = client.calls[0]["messages"][0]["content"]
+        self.assertIn("把第3页公司名翻成Bank", message)
+        # A plan-decompile call uses a temperature-0 request.
+        self.assertEqual(0.0, client.calls[0]["temperature"])
+        self.assertEqual(768, client.calls[0]["max_tokens"])
+
 
 if __name__ == "__main__":
     unittest.main()

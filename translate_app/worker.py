@@ -412,6 +412,11 @@ class TranslateWorker(QObject):
         per_page = pdfio.group_by_page(doc.block_pages, translated, doc.page_count)
         self.log.emit("正在生成输出文件…")
         out_path = self._export(doc, per_page)
+        # Remember the exported PDF (if any) for the preview window's "译文" side; the
+        # normal run() path does this too, and without it a re-export (which uses a fresh
+        # worker instance) would leave _last_pdf None and the preview fell back to source.
+        if self._output_type in ("translated_pdf", "bilingual_pdf"):
+            self._last_pdf = str(out_path)
         self.log.emit(f"完成：{out_path}")
         self.finished.emit(out_path)
 
@@ -538,7 +543,7 @@ class TranslateWorker(QObject):
                 render_handler=self.render_page_for_agent,
                 interpret=agent_mod.make_llm_interpret(self._model, log=self.log.emit),
                 scope=self._page_scope,
-                max_steps_per_page=96,
+                max_steps_per_page=32,
             ).run()
         finally:
             self._agent_state = None
