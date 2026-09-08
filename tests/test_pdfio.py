@@ -553,9 +553,27 @@ class PdfioTest(unittest.TestCase):
         cols, rows, col_shift, row_shift = pdfio._calibrate_table_grid(
             blocks, [100.0, 200.0, 300.0], [0.0, 10.0, 20.0])
         self.assertEqual(col_shift, 1)                 # 50 < 100 - 4 → 前插一列
-        self.assertEqual(cols, [50.0, 100.0, 200.0, 300.0])
+        self.assertEqual(cols, [50.0, 100.0, 200.0, 294.0])  # 右界收到内容右缘 290+4
         self.assertEqual(row_shift, 0)                 # y 在 AI 行跨度内
-        self.assertEqual(rows, [0.0, 10.0, 20.0])
+        self.assertEqual(rows, [0.0, 10.0, 19.0])      # 底行界收到内容底缘 15+4
+
+    def test_calibrate_table_grid_trims_overwide_right_boundary(self):
+        # 回归「表格超宽」：AI 把最右列画到页面右缘（如 592.7），而内容实际到 533，
+        # 几何校准必须把右界收回到内容右缘，而不是一味向外扩。
+        blocks = [
+            pdfio.Block(text="a", page=0, x0=50, y0=1, x1=90, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="456", page=0, x0=400, y0=1, x1=533, y1=9, size=9.0, ocr=True),
+        ]
+        cols, _rows, col_shift, _row_shift = pdfio._calibrate_table_grid(
+            blocks, [50.0, 300.0, 592.7], [0.0, 10.0, 20.0])
+        self.assertEqual(cols[-1], 537.0)      # 533 + gap(4)，不是 592.7
+        self.assertEqual(col_shift, 0)         # 右侧收回不平移列号
+        # 数字块仍映射到最右列，数字不丢。
+        style = {"rows_pts": [0.0, 10.0, 20.0], "cols_pts": cols, "merged": [],
+                 "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        rebuilt, _t, mapping = pdfio._rebuild_ocr_table_blocks(blocks, style)
+        self.assertIn(1, mapping)              # 数字块仍落在网格内
+        self.assertTrue(any(c.isdigit() for c in rebuilt[1].text))
 
     def test_calibrate_table_grid_handles_empty_blocks(self):
         # 无 OCR 块时不得因 min() 空序列抛异常：原样返回 AI 网格、平移为 0。

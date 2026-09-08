@@ -3613,15 +3613,19 @@ def _in_non_text(block, non_text) -> bool:
 
 
 def _calibrate_table_grid(blocks, ai_cols_pts, ai_rows_pts, *, gap: float = 4.0):
-    """Layer-①: fold OCR *geometry* into the AI grid, only adding a column/row the
-    AI clearly missed.
+    """Layer-①: fold OCR *geometry* into the AI grid — extend OR trim to the true
+    content extent.
 
     Vision model drops the rightmost column of a dense scan and its row count
-    drifts.  This compares the AI boundary span with the OCR geometric column/row
-    clusters (the *real* separations): the outermost geometric boundary is added
-    only when it lies beyond the AI span by more than ``gap`` — so the missed
-    2024-parent column is filled in, while an already-correct AI grid (whose AI
-    boundaries sit at/inside the geometry) is never disturbed.
+    drifts, *and* (after the prompt over-anchored to the page right edge) it can
+    push the table wider than the content.  This compares the AI boundary span
+    with the OCR geometric column/row clusters (the *real* separations): the
+    outermost geometric boundary is added only when it lies beyond the AI span by
+    more than ``gap`` — so a missed 2024-parent column is filled in — while an AI
+    boundary that sits past the content extent by more than ``gap`` is pulled back
+    to it (fixes the "table too wide", where the rightmost column became ~2× and
+    numbers ran off the page).  Boundaries lying outside the content extent are
+    dropped.
 
     Returns ``(cols_pts, rows_pts, col_shift, row_shift)``.  The shifts are how
     many boundaries were prepended on the *left/top* (0 or 1); appends on the
@@ -3642,17 +3646,25 @@ def _calibrate_table_grid(blocks, ai_cols_pts, ai_rows_pts, *, gap: float = 4.0)
     cols_pts = list(ai_cols_pts)
     col_shift = 0
     if col_hi > cols_pts[-1] + gap:
-        cols_pts.append(col_hi)
+        cols_pts.append(col_hi)            # AI 漏了最右列 → 补
+    elif cols_pts[-1] > col_hi + gap:
+        cols_pts[-1] = col_hi + gap        # AI 把表画到页面右缘 → 收回内容实际右缘
     if col_lo < cols_pts[0] - gap:
         cols_pts.insert(0, col_lo)
         col_shift = 1
+    elif cols_pts[0] > col_lo + gap:
+        cols_pts[0] = col_lo - gap
     rows_pts = list(ai_rows_pts)
     row_shift = 0
     if row_hi > rows_pts[-1] + gap:
         rows_pts.append(row_hi)
+    elif rows_pts[-1] > row_hi + gap:
+        rows_pts[-1] = row_hi + gap
     if row_lo < rows_pts[0] - gap:
         rows_pts.insert(0, row_lo)
         row_shift = 1
+    elif rows_pts[0] > row_lo + gap:
+        rows_pts[0] = row_lo - gap
     return sorted(cols_pts), sorted(rows_pts), col_shift, row_shift
 
 
