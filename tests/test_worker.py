@@ -566,6 +566,60 @@ class IrModeWorkerTest(_WorkerTestBase):
             self.assertTrue(self._worker()._rebuild_table)
 
 
+class RebuildPagesWorkerTest(_WorkerTestBase):
+    """C-⑥ 扫描表格页结构识别：客户端复用 + 每页识别 + 验证门放行。"""
+
+    def setUp(self):
+        super().setUp()
+        self._src = build_sample_pdf(self.tmp / "src.pdf", pages=2)
+
+    def _worker(self) -> TranslateWorker:
+        model = ModelConfig(
+            id="vision", name="vision", type="openai",
+            endpoint="http://127.0.0.1:9/v1", model="m", vision=True)
+        return TranslateWorker(
+            str(self._src), model, "English", "translated_pdf",
+            str(self.tmp / "o.pdf"), agent_mode=False, rebuild_table=True)
+
+    def test_build_rebuild_pages_reuses_one_client_across_pages(self):
+        # 回归：跨扫描表格页复用同一个 OpenAI 客户端——曾每页新建一个连接池。
+        doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
+        created: list = []
+
+        class FakeClient:
+            def __init__(self, **kw):
+                created.append(self)
+
+            def close(self):
+                pass
+
+        style = {"rows_pts": [0.0, 100.0], "cols_pts": [0.0, 300.0],
+                 "merged": [], "header_rows": [], "header_cols": [], "align": [],
+                 "non_text": []}
+        with mock.patch("openai.OpenAI", FakeClient), \
+                mock.patch.object(pdfio, "_reconstruct_ocr_tables",
+                                  return_value=[{"bbox": None}]), \
+                mock.patch.object(pdfio, "_render_page_png", return_value=b"png"), \
+                mock.patch.object(pdfio, "valid_rebuild", return_value=True), \
+                mock.patch("translate_app.table_vision.make_llm_table_structure",
+                           return_value=(lambda png: style)) as mk:
+            out = self._worker()._build_rebuild_pages(doc)
+        self.assertEqual(len(created), 1)       # 一个客户端，不是每页一个
+        self.assertEqual(mk.call_count, 2)      # 两页各识别一次
+        self.assertEqual(set(out), {0, 1})      # 两页都通过验证门
+
+    def test_build_rebuild_pages_off_returns_none(self):
+        # 未开启 rebuild_table 时直接返回 None（不触碰模型）。
+        model = ModelConfig(
+            id="vision", name="vision", type="openai",
+            endpoint="http://127.0.0.1:9/v1", model="m", vision=True)
+        w = TranslateWorker(
+            str(self._src), model, "English", "translated_pdf",
+            str(self.tmp / "o.pdf"), agent_mode=False, rebuild_table=False)
+        doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
+        self.assertIsNone(w._build_rebuild_pages(doc))
+
+
 class StructureModeWorkerTest(_WorkerTestBase):
     """B-④: worker structure_mode extracts via the geometric structure backend."""
 

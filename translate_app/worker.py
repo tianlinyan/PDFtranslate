@@ -611,10 +611,14 @@ class TranslateWorker(QObject):
             return None
         try:
             import fitz
+            from openai import OpenAI
+
             from . import table_vision
 
             structure: dict[int, dict] = {}
             src = fitz.open(str(self._source))
+            # 一个客户端跨所有扫描表格页复用（不再每页 new 一个连接池、也从不关闭）。
+            client = OpenAI(**self._model.client_kwargs())
             try:
                 for i, blocks in enumerate(doc.pages):
                     if not pdfio._reconstruct_ocr_tables(blocks):
@@ -625,7 +629,7 @@ class TranslateWorker(QObject):
                     png = pdfio._render_page_png(page, dpi=150)
                     detect = table_vision.make_llm_table_structure(
                         self._model, page_width=page.rect.width,
-                        page_height=page.rect.height,
+                        page_height=page.rect.height, client=client,
                         log=lambda m: self.log.emit(m))
                     if detect is None:
                         return None
@@ -636,6 +640,10 @@ class TranslateWorker(QObject):
                         structure[i] = res
             finally:
                 src.close()
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001 — 关闭失败无害
+                    pass
             if structure:
                 self.log.emit(
                     f"  [table_vision] 已识别 {len(structure)} 个扫描表格页的真实行列结构，"

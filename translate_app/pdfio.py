@@ -3612,21 +3612,6 @@ def _in_non_text(block, non_text) -> bool:
     return False
 
 
-def _merge_edges(edges, gap: float) -> list[float]:
-    """De-duplicate and join adjacent boundaries closer than ``gap`` pt.
-
-    Merges two nearly-identical boundaries to their midpoint (so a 0.1pt OCR
-    offset does not leave two coincident column/row lines) and drops the rest.
-    """
-    out: list[float] = []
-    for e in sorted(set(round(float(x), 1) for x in edges)):
-        if not out or e - out[-1] >= gap:
-            out.append(e)
-        else:
-            out[-1] = round((out[-1] + e) / 2.0, 1)
-    return out
-
-
 def _calibrate_table_grid(blocks, ai_cols_pts, ai_rows_pts, *, gap: float = 4.0):
     """Layer-①: fold OCR *geometry* into the AI grid, only adding a column/row the
     AI clearly missed.
@@ -3636,27 +3621,39 @@ def _calibrate_table_grid(blocks, ai_cols_pts, ai_rows_pts, *, gap: float = 4.0)
     clusters (the *real* separations): the outermost geometric boundary is added
     only when it lies beyond the AI span by more than ``gap`` — so the missed
     2024-parent column is filled in, while an already-correct AI grid (whose AI
-    boundaries sit at/inside the geometry) is never disturbed.  Returns the
-    possibly-extended ``(cols_pts, rows_pts)``.
+    boundaries sit at/inside the geometry) is never disturbed.
+
+    Returns ``(cols_pts, rows_pts, col_shift, row_shift)``.  The shifts are how
+    many boundaries were prepended on the *left/top* (0 or 1); appends on the
+    right/bottom do not renumber existing AI indices, but a prepend does — callers
+    that hold AI-indexed data (``align`` / ``merged`` / ``header_*``) MUST add the
+    shift or they address the wrong column/row.
     """
     items = [(b.y0, b.x0, b.x1, b.y1, str(b.text)) for b in blocks]
-    cols = _cluster_ocr_columns(items)
+    cols = _cluster_ocr_columns(items) if items else []
+    rows = _cluster_ocr_rows(items) if items else []
+    if not cols or not rows:
+        # Nothing to calibrate against: keep the AI grid exactly as recognised.
+        return list(ai_cols_pts), list(ai_rows_pts), 0, 0
     col_lo = min(min(it[1] for it in c) for c in cols)
     col_hi = max(max(it[2] for it in c) for c in cols)
-    rows = _cluster_ocr_rows(items)
     row_lo = min(min(it[0] for it in r) for r in rows)
     row_hi = max(max(it[3] for it in r) for r in rows)
     cols_pts = list(ai_cols_pts)
+    col_shift = 0
     if col_hi > cols_pts[-1] + gap:
         cols_pts.append(col_hi)
     if col_lo < cols_pts[0] - gap:
         cols_pts.insert(0, col_lo)
+        col_shift = 1
     rows_pts = list(ai_rows_pts)
+    row_shift = 0
     if row_hi > rows_pts[-1] + gap:
         rows_pts.append(row_hi)
     if row_lo < rows_pts[0] - gap:
         rows_pts.insert(0, row_lo)
-    return sorted(cols_pts), sorted(rows_pts)
+        row_shift = 1
+    return sorted(cols_pts), sorted(rows_pts), col_shift, row_shift
 
 
 def valid_rebuild(blocks, style, *, min_mapped_ratio: float = 0.8) -> bool:
@@ -3692,6 +3689,32 @@ def rebuild_semantics(blocks, style) -> dict:
     if not tables:
         return {"rows": 0, "cols": 0, "cells": [], "merged": [],
                 "header_rows": [], "header_cols": []}
+    # AI 的 ``merged`` / ``header_*`` 索引同样是**校准前**的行列号；几何校准若在
+    # 前部插了一列/行，必须整体平移，否则语义结构（合并范围、表头位置）与重建
+    # 网格错位一位。平移量与 ``_rebuild_ocr_table_blocks`` 用的是同一个校准结果。
+    _cols, _rows, col_shift, row_shift = _calibrate_table_grid(
+        blocks, list(style.get("cols_pts") or []), list(style.get("rows_pts") or []))
+
+    def _shifted(idxs, delta: int) -> list[int]:
+        out: list[int] = []
+        for v in (idxs or []):
+            try:
+                out.append(int(v) + delta)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    merged: list[dict] = []
+    for m in (style.get("merged") or []):
+        if not isinstance(m, dict):
+            continue
+        try:
+            m2 = dict(m)
+            m2["r"] = int(m.get("r", 0)) + row_shift
+            m2["c"] = int(m.get("c", 0)) + col_shift
+        except (TypeError, ValueError):
+            continue
+        merged.append(m2)
     tb = tables[0]
     nrows = len(tb["rows"])
     ncols = len(tb["col_edges"]) - 1
@@ -3703,9 +3726,9 @@ def rebuild_semantics(blocks, style) -> dict:
         "rows": nrows,
         "cols": ncols,
         "cells": cells,
-        "merged": list(style.get("merged") or []),
-        "header_rows": list(style.get("header_rows") or []),
-        "header_cols": list(style.get("header_cols") or []),
+        "merged": merged,
+        "header_rows": _shifted(style.get("header_rows"), row_shift),
+        "header_cols": _shifted(style.get("header_cols"), col_shift),
     }
 
 
@@ -3732,12 +3755,20 @@ def _rebuild_ocr_table_blocks(blocks, style):
     cols_pts = list(style["cols_pts"])
     # 第 1 层：用 OCR 几何（列/行簇）校准 AI 识别的行列边界——补漏列行、吸附到真实
     # 分隔、合并 <3pt 的噪点边界。AI 漏的最右列（2024 母公司）由此被补回。
-    cols_pts, rows_pts = _calibrate_table_grid(blocks, cols_pts, rows_pts)
-    align_by_col = {
-        int(a.get("col")): (a.get("dir") or "right")
-        for a in style.get("align", [])
-        if isinstance(a, dict) and "col" in a
-    }
+    cols_pts, rows_pts, col_shift, _row_shift = _calibrate_table_grid(
+        blocks, cols_pts, rows_pts)
+    # AI 的 ``align`` 列号是**校准前**的索引：几何校准若在最左插了一列，其后所有
+    # 列号整体右移一位，必须加 ``col_shift``——否则右对齐会套到相邻列（数字被左
+    # 对齐）。模型返回非数字列号时忽略该条，而不是让 int() 抛异常中断导出。
+    align_by_col: dict[int, str] = {}
+    for a in style.get("align", []):
+        if not (isinstance(a, dict) and "col" in a):
+            continue
+        try:
+            c_ai = int(a.get("col"))
+        except (TypeError, ValueError):
+            continue
+        align_by_col[c_ai + col_shift] = (a.get("dir") or "right")
     # 非文本区域（手写体签名/印章）：这些是身份/图案，不是表格内容——落在其中的
     # OCR 块不映射到单元格、不翻译、不覆盖，保持原位原样。
     non_text = list(style.get("non_text", []) or [])
@@ -3971,7 +4002,10 @@ def save_translated_pdf(
             #（红action 对位图无效，必须用白矩形盖）；再覆盖签名/印章区域——它们
             # 是非文本，**过滤不显示**（用户明确要求，不再"保护保留"），让重绘的
             # 矢量线 + 译文文本成为唯一内容，即转成真正的非 OCR 表格。
-            if rebuild_pages and i in rebuild_pages:
+            # 必须同时要求 ``ocr_table``：整页涂白只对「本页就是扫描位图表格」成立；
+            # 若调用方给 ``rebuild_pages`` 传了非 OCR 表格页的索引，涂白会连文本层
+            # 内容一起抹掉（防御性——生产路径只把 OCR 表格页放进去）。
+            if ocr_table and rebuild_pages and i in rebuild_pages:
                 # 转成非 OCR 表格页：覆盖整页（在页面内容流里画一个覆盖全页的白矩形，
                 # 盖掉所有原扫描位图——表格线、原文字、印章、签名），让下面重绘的矢量
                 # 线 + 译文文本成为唯一内容。删除位图资源（尽力而为），页面剩余全靠矢量。
@@ -3994,9 +4028,12 @@ def save_translated_pdf(
                     # so there is nothing to draw.
                     continue
                 if getattr(b, "keep_original", False) and getattr(b, "ocr", False):
-                    # Non-text region (handwritten signature / seal): keep the
-                    # original scan pixels verbatim — do not cover or redraw, or
-                    # the identity / imagery would be destroyed.
+                    # Non-text region (handwritten signature / seal): do not draw a
+                    # translation over it.  On the plain OCR path nothing was
+                    # covered here, so the original scan pixels stay verbatim; on a
+                    # *rebuild* page the whole page was whitened above, so the
+                    # signature/seal is intentionally gone — the user asked for
+                    # these to be filtered out, not preserved.
                     continue
                 draw_b = b
                 if j in shifts and shifts[j]:

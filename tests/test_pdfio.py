@@ -543,6 +543,86 @@ class PdfioTest(unittest.TestCase):
         data = pdfio.Block(text="data", page=0, x0=100, y0=100, x1=200, y1=120, size=9.0, ocr=True)
         self.assertFalse(pdfio._in_non_text(data, non_text))
 
+    def test_calibrate_table_grid_reports_prepended_shift(self):
+        # Layer-① 回归：几何校准在最左补了一列时，必须报告平移量（1），调用方据此
+        # 平移 AI 的 align/merged/header 索引；只补右侧列则不平移。
+        blocks = [
+            pdfio.Block(text="a", page=0, x0=50, y0=5, x1=90, y1=15, size=9.0, ocr=True),
+            pdfio.Block(text="b", page=0, x0=210, y0=5, x1=290, y1=15, size=9.0, ocr=True),
+        ]
+        cols, rows, col_shift, row_shift = pdfio._calibrate_table_grid(
+            blocks, [100.0, 200.0, 300.0], [0.0, 10.0, 20.0])
+        self.assertEqual(col_shift, 1)                 # 50 < 100 - 4 → 前插一列
+        self.assertEqual(cols, [50.0, 100.0, 200.0, 300.0])
+        self.assertEqual(row_shift, 0)                 # y 在 AI 行跨度内
+        self.assertEqual(rows, [0.0, 10.0, 20.0])
+
+    def test_calibrate_table_grid_handles_empty_blocks(self):
+        # 无 OCR 块时不得因 min() 空序列抛异常：原样返回 AI 网格、平移为 0。
+        cols, rows, col_shift, row_shift = pdfio._calibrate_table_grid(
+            [], [1.0, 2.0], [3.0, 4.0])
+        self.assertEqual(cols, [1.0, 2.0])
+        self.assertEqual(rows, [3.0, 4.0])
+        self.assertEqual((col_shift, row_shift), (0, 0))
+
+    def test_rebuild_align_follows_column_when_calibration_prepends(self):
+        # 回归：几何校准在最左补列后，AI 说的「第 1 列右对齐」必须仍落到真正含该
+        # 数字块的那一列（重建后的第 2 列），而不是错位到相邻列。
+        blocks = [
+            pdfio.Block(text="甲乙", page=0, x0=50, y0=1, x1=90, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="456", page=0, x0=210, y0=1, x1=290, y1=9, size=9.0, ocr=True),
+        ]
+        style = {"rows_pts": [0.0, 10.0, 20.0], "cols_pts": [100.0, 200.0, 300.0],
+                 "align": [{"col": 1, "dir": "right"}], "merged": [],
+                 "header_rows": [0], "header_cols": [], "non_text": []}
+        rebuilt, _tables, mapping = pdfio._rebuild_ocr_table_blocks(blocks, style)
+        self.assertEqual(mapping[1], (0, 0, 2))        # 数字块落到重建的第 2 列
+        self.assertEqual(rebuilt[1].align, "right")    # 仍右对齐（曾错到 col 1）
+        self.assertEqual(rebuilt[0].align, "left")     # 前插列不是 AI 指定的右对齐列
+
+    def test_rebuild_semantics_shifts_header_and_merge_after_prepend(self):
+        # 回归：几何校准前插列后，merged/header_cols 索引必须一起平移，否则审计
+        # 看到的合并范围/表头位置会错位一位。
+        blocks = [
+            pdfio.Block(text="x", page=0, x0=50, y0=5, x1=90, y1=15, size=9.0, ocr=True),
+            pdfio.Block(text="y", page=0, x0=210, y0=5, x1=290, y1=15, size=9.0, ocr=True),
+        ]
+        style = {"rows_pts": [0.0, 10.0, 20.0], "cols_pts": [100.0, 200.0, 300.0],
+                 "merged": [{"r": 0, "c": 1, "row_span": 1, "col_span": 2}],
+                 "header_rows": [0], "header_cols": [1], "align": [], "non_text": []}
+        sem = pdfio.rebuild_semantics(blocks, style)
+        self.assertEqual(sem["cols"], 3)
+        self.assertEqual(sem["header_cols"], [2])              # 1 + col_shift(1)
+        self.assertEqual(sem["merged"][0]["c"], 2)             # 1 + col_shift(1)
+        self.assertEqual(sem["header_rows"], [0])              # 无行前插
+
+    def test_rebuild_pages_does_not_whiteout_non_ocr_page(self):
+        # 防御回归：rebuild_pages 若含非 OCR 表格页的索引，不得整页涂白（会抹掉
+        # 文本层内容）。白矩形只在「本页确实是 OCR 位图表格」时才画。
+        src = _OUT / "rebuild_guard_src.pdf"
+        build_sample_pdf(src, pages=1)
+        doc = pdfio.extract_document_text(str(src), ocr=False, log=lambda m: None)
+        trans = [b.text for b in doc.pages[0]]
+        out = _OUT / "rebuild_guard_out.pdf"
+        style = {"rows_pts": [0.0, 100.0], "cols_pts": [0.0, 300.0],
+                 "merged": [], "header_rows": [], "header_cols": [], "align": [],
+                 "non_text": []}
+        pdfio.save_translated_pdf(str(src), doc.pages, [trans], str(out), "English",
+                                  rebuild_pages={0: style})
+        d = fitz.open(str(out))
+        try:
+            page = d[0]
+            full_white = [
+                dr for dr in page.get_drawings()
+                if dr.get("type") == "f" and dr.get("fill")
+                and all(abs(c - 1.0) < 0.01 for c in dr["fill"])
+                and dr["rect"].width > page.rect.width * 0.9
+                and dr["rect"].height > page.rect.height * 0.9
+            ]
+            self.assertEqual(full_white, [])
+        finally:
+            d.close()
+
 
 class TableCellFitTest(unittest.TestCase):
     """A table cell's translation shrinks onto ONE line (instead of wrapping and
