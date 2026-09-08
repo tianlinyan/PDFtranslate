@@ -681,6 +681,30 @@ class PdfioTest(unittest.TestCase):
         self.assertGreater(collisions, 10 ** 6)
         self.assertEqual(ratio, 0.0)
 
+    def test_rebalance_rebuild_widens_numeric_column(self):
+        # 数字感知列宽自适应：数字列过窄（数字溢出）→ 加宽到容纳最宽数字，总表宽不变。
+        blocks = [
+            pdfio.Block(text="项目", page=0, x0=2, y0=1, x1=300, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="12,345,678,901.12", page=0, x0=310, y0=1, x1=345, y1=9,
+                        size=6.0, ocr=True),
+        ]
+        style = {"rows_pts": [0, 10], "cols_pts": [0, 305, 350], "merged": [],
+                 "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        rebuilt, tables, mapping = pdfio._rebuild_ocr_table_blocks(blocks, style)
+        font = fitz.Font("cjk")
+        col_boxes, new_col_edges = pdfio._rebalance_rebuild_columns(
+            tables, mapping, rebuilt, ["项目", "12,345,678,901.12"], font)
+        edges = new_col_edges[0]
+        src_edges = tables[0]["col_edges"]   # 校准后的总宽（AI 350 被校准收到 349）
+        self.assertAlmostEqual(edges[0], src_edges[0], delta=0.01)
+        self.assertAlmostEqual(edges[-1], src_edges[-1], delta=0.01)  # 总表宽不变
+        self.assertGreater(edges[2] - edges[1],
+                           src_edges[2] - src_edges[1])   # 数字列被加宽
+        # 数字列宽度 ≥ 最宽数字（单行，不破行）。
+        avail_w = col_boxes[1][1] - col_boxes[1][0]
+        need_w = font.text_length("12,345,678,901.12", fontsize=6.0)
+        self.assertGreaterEqual(avail_w, need_w)
+
 
 class TableCellFitTest(unittest.TestCase):
     """A table cell's translation shrinks onto ONE line (instead of wrapping and

@@ -3597,6 +3597,89 @@ def _rebalance_table_columns(tables, mapping, blocks, trans, font):
     return col_boxes, new_col_edges
 
 
+def _recover_rows(tb: dict) -> list[float]:
+    """Recover the row-boundary list from a rebuilt table's ``rows`` (rects)."""
+    rows_pts = [row[0].y0 for row in tb["rows"]]
+    rows_pts.append(tb["rows"][-1][0].y1)
+    return rows_pts
+
+
+def _rebalance_rebuild_columns(tables, mapping, blocks, trans, font):
+    """Numeric-aware column-width rebalance for a *rebuilt* OCR table.
+
+    A rebuilt table's numeric columns come from the AI grid and are often too
+    narrow for the translated numbers (e.g. a 42pt column holding a 46pt
+    ``7,211,506,934.87``) — a single-line number overflows the cell.  We widen each
+    numeric column **by exactly how much its widest number actually overflows**,
+    and take that from the non-numeric (label) columns so the total table width is
+    unchanged.  A column whose numbers already fit is left untouched (measured with
+    the same 1.02 slack as the overflow check), so a well-fitting grid is never
+    disturbed.  Numbers are never broken/wrapped (the numeric red line), so the
+    label columns absorb the difference.  Returns ``(col_boxes, new_col_edges)``;
+    ``new_col_edges`` is keyed by table index (a whole rebuilt page is one table).
+    """
+    col_boxes: dict[int, tuple[float, float]] = {}
+    new_col_edges: dict[int, list[float]] = {}
+    for ti, tb in enumerate(tables):
+        edges = list(tb["col_edges"])
+        if len(edges) < 2:
+            continue
+        ncols = len(edges) - 1
+        cur = [edges[j + 1] - edges[j] for j in range(ncols)]
+        numeric = [False] * ncols
+        add = [0.0] * ncols          # extra width each numeric column actually needs
+        for bi, key in mapping.items():
+            if key[0] != ti or bi >= len(trans):
+                continue
+            c = key[2]
+            if not (0 <= c < ncols):
+                continue
+            t = str(trans[bi]).strip()
+            if not t:
+                continue
+            if not _is_numeric_cell(str(blocks[bi].text)):
+                continue
+            numeric[c] = True
+            # Drawn at the kept font (never broken); clamp like _fit_block.
+            fs = max(5.0, min(float(getattr(blocks[bi], "size", 0.0) or 0.0),
+                              _MAX_FONT))
+            avail = max(1.0, cur[c] - 2 * _TABLE_CELL_PAD)
+            w = font.text_length(t, fontsize=fs)
+            if w > avail * 1.02:      # matches the overflow check: genuinely too wide
+                add[c] = max(add[c], w - avail)
+        total_add = sum(add)
+        if total_add <= 0.0:
+            continue                  # nothing actually overflows -> leave the grid
+        non_numeric = [c for c in range(ncols) if not numeric[c]]
+        non_total = sum(cur[c] for c in non_numeric)
+        if non_total <= 0.0 or total_add > non_total * 0.5:
+            continue                  # labels can't absorb it -> skip (avoid collapsing)
+        new_w = list(cur)
+        for c in non_numeric:
+            new_w[c] = cur[c] - total_add * cur[c] / non_total
+        for c in range(ncols):
+            if numeric[c]:
+                new_w[c] = cur[c] + add[c]
+        # Absorb float rounding into the first non-numeric column to keep the total.
+        diff = sum(cur) - sum(new_w)
+        if non_numeric:
+            new_w[non_numeric[0]] += diff
+        x = edges[0]
+        new_edges = [x]
+        for c in range(ncols):
+            x += new_w[c]
+            new_edges.append(x)
+        new_col_edges[ti] = new_edges
+        for bi, key in mapping.items():
+            if key[0] == ti and 0 <= key[2] < ncols:
+                c = key[2]
+                col_boxes[bi] = (
+                    new_edges[c] + _TABLE_CELL_PAD,
+                    new_edges[c + 1] - _TABLE_CELL_PAD,
+                )
+    return col_boxes, new_col_edges
+
+
 def _in_non_text(block, non_text) -> bool:
     """True when ``block``'s centre falls inside a non-text region (signature/stamp).
 
@@ -4042,7 +4125,24 @@ def save_translated_pdf(
                             and len(style.get("cols_pts", [])) >= 2):
                         rebuilt, r_tables, r_mapping = _rebuild_ocr_table_blocks(
                             blocks, style)
-                        layout_blocks = rebuilt
+                        # 数字感知列宽自适应：数字列加宽到容纳最宽数字（数字红线），
+                        # 非数字列相应变窄、总表宽不变——修掉「数字列过窄、数字溢出」。
+                        from . import table_vision
+                        col_boxes, new_col_edges = _rebalance_rebuild_columns(
+                            r_tables, r_mapping, rebuilt, trans, font)
+                        if col_boxes:
+                            r_tables = [
+                                table_vision.tables_from_grid(
+                                    _recover_rows(tb), new_col_edges[ti])[0]
+                                for ti, tb in enumerate(r_tables)
+                            ]
+                            layout_blocks = [
+                                replace(b, x0=col_boxes[j][0], x1=col_boxes[j][1])
+                                if j in col_boxes else b
+                                for j, b in enumerate(rebuilt)
+                            ]
+                        else:
+                            layout_blocks = rebuilt
                         tables = r_tables
                         mapping = r_mapping
                         shifts, new_bottoms, grid, bboxes = _compute_table_layout(
