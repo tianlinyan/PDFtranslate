@@ -42,7 +42,11 @@ _PROMPT = (
 
 
 def _parse_json(text: str) -> dict | None:
-    """Extract the first JSON object from the model reply (tolerates ``` fences)."""
+    """Extract the first JSON object from the model reply.
+
+    Tolerates ``` fences (already), surrounding prose, and trailing commas before
+    ``}``/``]`` — the most common VLM JSON slip.  Returns the first dict, or ``None``.
+    """
     t = str(text or "").strip()
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, re.DOTALL)
     if m:
@@ -52,11 +56,15 @@ def _parse_json(text: str) -> dict | None:
         e = t.rfind("}")
         if s >= 0 and e > s:
             t = t[s:e + 1]
-    try:
-        data = json.loads(t)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    candidates = [t, re.sub(r",\s*([}\]])", r"\1", t)]
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    return None
 
 
 def _parse_table_style(data: dict, page_width: float, page_height: float) -> dict | None:
@@ -136,33 +144,40 @@ def make_llm_table_structure(
 
     def _single(png: bytes) -> dict | None:
         b64 = base64.b64encode(png).decode()
-        try:
-            resp = client.chat.completions.create(
-                model=model.model,
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": _PROMPT},
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                ]}],
-                temperature=0.0,
-                max_tokens=4096,
-                extra_body=body or None,
-            )
-            content = resp.choices[0].message.content or ""
-        except Exception as exc:  # noqa: BLE001 — a vision outage falls back
-            if log:
-                log(f"  [table_vision] 识别失败：{type(exc).__name__}: {exc}")
-            return None
-        data = _parse_json(content)
-        if not data:
-            if log:
-                log("  [table_vision] 无法解析模型返回（非 JSON）。")
-            return None
-        style = _parse_table_style(data, page_width, page_height)
-        if style is None:
-            if log:
-                log("  [table_vision] 返回缺少可用行列边界。")
-        return style
+        correction = ("\n（注意：你上一次的输出不是合法 JSON。请只输出一个 JSON 对象，"
+                      "不要任何解释或 Markdown 代码块。）")
+        for attempt in range(2):
+            try:
+                resp = client.chat.completions.create(
+                    model=model.model,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text",
+                         "text": _PROMPT if attempt == 0 else _PROMPT + correction},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    ]}],
+                    temperature=0.0,
+                    max_tokens=4096,
+                    extra_body=body or None,
+                )
+                content = resp.choices[0].message.content or ""
+            except Exception as exc:  # noqa: BLE001 — a vision outage falls back
+                if log:
+                    log(f"  [table_vision] 识别失败：{type(exc).__name__}: {exc}")
+                return None
+            data = _parse_json(content)
+            if data:
+                style = _parse_table_style(data, page_width, page_height)
+                if style is None:
+                    if log:
+                        log("  [table_vision] 返回缺少可用行列边界。")
+                    return None
+                return style
+            if log and attempt == 0:
+                log("  [table_vision] 无法解析模型返回（非 JSON），重试一次。")
+        if log:
+            log("  [table_vision] 无法解析模型返回（非 JSON，重试后仍失败）。")
+        return None
 
     def _detect(png: bytes) -> list[dict]:
         out: list[dict] = []

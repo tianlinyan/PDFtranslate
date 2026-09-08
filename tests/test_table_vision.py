@@ -24,6 +24,13 @@ class ParseJsonTest(unittest.TestCase):
         self.assertIsNone(table_vision._parse_json("I cannot see any table"))
         self.assertIsNone(table_vision._parse_json(""))
 
+    def test_parses_json_with_trailing_commas(self):
+        # 常见 VLM 错误：数组/对象尾逗号 → 容错解析。
+        self.assertEqual(
+            table_vision._parse_json('{"rows": [0.1, 0.2,], "cols": [0.3, 0.4,],}'),
+            {"rows": [0.1, 0.2], "cols": [0.3, 0.4]},
+        )
+
 
 class TablesFromGridTest(unittest.TestCase):
     def test_builds_rows_and_col_edges(self):
@@ -91,6 +98,27 @@ class MakeLlmTableStructureTest(unittest.TestCase):
         styles = make(b"png")
         self.assertEqual(len(styles), 2)
         self.assertEqual([len(s["cols_pts"]) for s in styles], [3, 4])
+
+    def test_single_retries_once_on_non_json(self):
+        # 非 JSON 时用「纠正提示」重试一次，而不是直接丢弃该样本。
+        model = mock.Mock()
+        model.vision = True
+        model.model = "m"
+        model.client_kwargs.return_value = {"base_url": "http://x/v1", "api_key": "k"}
+        model.request_params.return_value = {}
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.side_effect = [
+            mock.Mock(choices=[mock.Mock(message=mock.Mock(content="not json"))]),
+            mock.Mock(choices=[mock.Mock(message=mock.Mock(
+                content='{"rows": [0, 1], "cols": [0, 1], "align": []}'))]),
+        ]
+        make = table_vision.make_llm_table_structure(
+            model, page_width=100, page_height=100, client=fake_client,
+            log=lambda m: None, n_samples=1)
+        styles = make(b"png")
+        self.assertEqual(len(styles), 1)
+        self.assertEqual(styles[0]["rows_pts"], [0.0, 100.0])
+        self.assertEqual(fake_client.chat.completions.create.call_count, 2)
 
     def test_detector_falls_back_on_parse_failure(self):
         model = mock.Mock()
