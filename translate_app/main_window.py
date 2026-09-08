@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -282,8 +283,7 @@ class MainWindow(QWidget):
         # --- 翻译管线：IR 文档级管线（可选，默认关） ---
         # OCR / 智能编排已交由 AI 自动处理、不再暴露开关；但 IR 是一条独立的
         # 确定性翻译管线（无交互、公式/数字保真、术语跨页一致），可作为用户选项。
-        self._ir_check = QCheckBox(
-            "IR 文档级管线（无交互批处理、段落成组、公式/数字保真、术语跨页一致）")
+        self._ir_check = QCheckBox("IR 文档级管线")
         self._ir_check.setToolTip(
             "勾选后翻译走 IR 文档级管线（build_ir → translate_ir → 自适应导出），"
             "跳过 AI 单页视觉编排；公式/图/数字原样保留、术语跨页一致，"
@@ -294,10 +294,9 @@ class MainWindow(QWidget):
         )
         self._ir_check.setChecked(bool(prefs.get("ir_mode", False)))
         self._ir_check.toggled.connect(self._persist_ir_mode)
-        form.addRow("翻译管线", self._ir_check)
 
         # --- 文档级术语（agent 路径，默认开启） ---
-        self._agent_terms_check = QCheckBox("文档级术语（跨页术语一致）")
+        self._agent_terms_check = QCheckBox("文档级术语")
         self._agent_terms_check.setToolTip(
             "勾选后，AI 编排翻译前先抽取全文高频/专有术语并统一翻译一次，"
             "再注入每页翻译，保证人名/表头/财务术语跨页一致。\n"
@@ -306,10 +305,9 @@ class MainWindow(QWidget):
         )
         self._agent_terms_check.setChecked(bool(prefs.get("agent_terms", True)))
         self._agent_terms_check.toggled.connect(self._persist_agent_terms)
-        form.addRow("术语注入", self._agent_terms_check)
 
         # --- 表格列宽重排（reflow 保守层，默认关闭） ---
-        self._reflow_check = QCheckBox("表格列宽重排（文本层，默认关）")
+        self._reflow_check = QCheckBox("表格列宽重排")
         self._reflow_check.setToolTip(
             "勾选后，文本层表格的列宽按译文需求重分配：长译文列借用相邻列的空白，"
             "数字列保持不缩，表格总宽不变。\n"
@@ -318,10 +316,9 @@ class MainWindow(QWidget):
         )
         self._reflow_check.setChecked(bool(prefs.get("reflow", False)))
         self._reflow_check.toggled.connect(self._persist_reflow)
-        form.addRow("重排版", self._reflow_check)
 
         # --- 扫描表格重建为矢量表格（默认关闭） ---
-        self._rebuild_table_check = QCheckBox("扫描表格重建为矢量表格（默认关）")
+        self._rebuild_table_check = QCheckBox("扫描表格重建为矢量表格")
         self._rebuild_table_check.setToolTip(
             "勾选后，AI 视觉识别扫描（OCR）表格的真实行/列边界，把 OCR 块重排到"
             "对应单元格（矢量表格），从而走文本层表格管线的行高扩展 + 矢线重绘，"
@@ -330,7 +327,31 @@ class MainWindow(QWidget):
         )
         self._rebuild_table_check.setChecked(bool(prefs.get("rebuild_table", False)))
         self._rebuild_table_check.toggled.connect(self._persist_rebuild_table)
-        form.addRow("扫描重建", self._rebuild_table_check)
+
+        # 四个选项排成两行、每行两个，用 QGridLayout 对齐两列：左列标签右对齐、
+        # 勾选框左对齐，两行的标签/勾选框在同一竖直线上（HBox 拼装会因标签字数
+        # 不同而左右错位）。
+        opt_grid = QGridLayout()
+        opt_grid.setContentsMargins(0, 0, 0, 0)
+        opt_grid.setHorizontalSpacing(16)
+        opt_grid.setVerticalSpacing(4)
+        for row, (lab1, cb1, lab2, cb2) in enumerate((
+            ("翻译管线", self._ir_check, "术语注入", self._agent_terms_check),
+            ("重排版", self._reflow_check, "扫描重建", self._rebuild_table_check),
+        )):
+            left = QLabel(lab1)
+            left.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            right = QLabel(lab2)
+            right.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            opt_grid.addWidget(left, row, 0)
+            opt_grid.addWidget(cb1, row, 1)
+            opt_grid.addWidget(right, row, 2)
+            opt_grid.addWidget(cb2, row, 3)
+        # 第 1、3 列（勾选框列）不参与拉伸，保证两列选项各自成一条竖线。
+        opt_grid.setColumnStretch(1, 0)
+        opt_grid.setColumnStretch(3, 0)
+        opt_grid.setColumnStretch(4, 1)
+        form.addRow(opt_grid)
 
         # --- 智能编排 + 扫描页识别：已交由 AI 自动处理，不再提供开关 ---
         # v0.3 起默认由 agent 视觉闭环驱动全流程翻译；扫描页自动触发 OCR（按页无文本层才识别），
