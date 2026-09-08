@@ -35,7 +35,7 @@ from . import pdfio
 from . import preview
 from . import sidebar
 from .about_dialog import AboutDialog
-from .chat import ChatWorker
+from .chat import ChatWorker, connect_sidebar_cancel
 from .doc_context import DocContext
 from . import prompts
 from .settings import ModelConfig, load_models, load_prefs, save_prefs
@@ -317,13 +317,15 @@ class MainWindow(QWidget):
         self._reflow_check.setChecked(bool(prefs.get("reflow", False)))
         self._reflow_check.toggled.connect(self._persist_reflow)
 
-        # --- 扫描表格重建为矢量表格（默认关闭） ---
+        # --- 扫描表格重绘为矢量表格（默认关闭） ---
         self._rebuild_table_check = QCheckBox("OCR表格重建为矢量表格")
         self._rebuild_table_check.setToolTip(
-            "勾选后，AI 视觉识别扫描（OCR）表格的真实行/列边界，把 OCR 块重排到"
-            "对应单元格（矢量表格），从而走文本层表格管线的行高扩展 + 矢线重绘，"
-            "译文正常填充、不再是 3-4pt 缩字。\n"
-            "需要支持视觉的模型在线。环境变量 PDFTRANSLATE_REBUILD_TABLE=1 可强制开启。"
+            "勾选后，扫描（OCR）表格页会被**重绘为一张干净的矢量表格**：新建空白页，"
+            "按 OCR 块聚类出的行列画网格线，行高按译文扩展，再填入译文——扫描底图、"
+            "印章、手写签字不再保留（签字本就不翻译）。\n"
+            "若模型支持视觉，先由模型把整张表重建为「译文 2D 网格」（并可标注合并单元格），"
+            "失败或不可用时回退到上面的几何重绘。\n"
+            "环境变量 PDFTRANSLATE_REBUILD_TABLE=1 可强制开启。"
         )
         self._rebuild_table_check.setChecked(bool(prefs.get("rebuild_table", False)))
         self._rebuild_table_check.toggled.connect(self._persist_rebuild_table)
@@ -456,7 +458,9 @@ class MainWindow(QWidget):
         self._chat_worker.error.connect(self._on_chat_error)
         self._chat_worker.cancelled.connect(self._on_chat_cancelled)
         # Sidebar "取消" (or Enter while the AI is replying) aborts the in-flight reply.
-        self.agent_sidebar.cancelRequested.connect(self._chat_worker.cancel_current)
+        # MUST be a DirectConnection: the worker thread is blocked inside ``ask`` for
+        # the whole reply, so a queued slot would only run after it finished.
+        connect_sidebar_cancel(self.agent_sidebar.cancelRequested, self._chat_worker)
         self._chat_thread.start()
 
         left = QWidget()
@@ -576,14 +580,21 @@ class MainWindow(QWidget):
         # user's text when the model is vision-capable; otherwise the image is dropped
         # (a non-vision model cannot see it) and only the text is sent.
         model = self._selected_model()
-        if model is not None:
-            img = self._pending_image
-            self._pending_image = None
-            if img is not None and getattr(model, "vision", False):
-                self.agent_sidebar.add_notice("（已附上截图与文本发送）")
-                self._chat_worker.ask_requested.emit(text, model, img)
-            else:
-                self._chat_worker.ask_requested.emit(text, model, None)
+        if model is None:
+            # No usable model (models.json missing / unparsable): say so instead of
+            # dropping the message silently.  ``send_message`` already set the sidebar
+            # busy and rendered the "我" bubble, and nothing would ever reset either.
+            self.agent_sidebar.set_busy(False)
+            self.agent_sidebar.add_message(
+                "ai", "没有可用的 AI 模型，请检查 models.json 配置。")
+            return
+        img = self._pending_image
+        self._pending_image = None
+        if img is not None and getattr(model, "vision", False):
+            self.agent_sidebar.add_notice("（已附上截图与文本发送）")
+            self._chat_worker.ask_requested.emit(text, model, img)
+        else:
+            self._chat_worker.ask_requested.emit(text, model, None)
 
     def _on_chat_reply_chunk(self, chunk: str) -> None:
         """A streamed chunk of the in-progress reply: open a live bubble, then append."""

@@ -135,12 +135,18 @@ def build_ir(doc: DocumentText, *, lang: str = "", parser: str | None = None) ->
         prev_style: dict | None = None
         prev_group = 0
         last_group_was_table = False
+        prev_verbatim = False
         for i, b in enumerate(blocks):
             src_id = offset + i
             role, level = _role_of(src_id, structure)
             table_ref = _table_index_of(src_id, structure, p)
             style = _style_of(b)
             in_table = table_ref > 0 or bool(getattr(b, "in_table", False))
+            # A verbatim block (a pure figure / numeric cell) is a hard boundary of a
+            # prose run: ``translate_ir`` keeps it out of the request, so merging the
+            # blocks around it handed the model a sentence with the amount missing
+            # ("...revenue of million yuan..."), inviting it to invent or move one.
+            verbatim = _is_verbatim(b)
 
             if in_table:
                 # Every cell of a table shares that table's group; group ids are
@@ -156,6 +162,7 @@ def build_ir(doc: DocumentText, *, lang: str = "", parser: str | None = None) ->
             else:
                 # Group a run of same-style prose (a paragraph the extractor split).
                 if (prev_style is not None and role == "text" and not last_group_was_table
+                        and not verbatim and not prev_verbatim
                         and _same_style(prev_style, style)):
                     group_id = prev_group
                 else:
@@ -169,6 +176,7 @@ def build_ir(doc: DocumentText, *, lang: str = "", parser: str | None = None) ->
             ipage.reading_order.append(src_id)
             prev_style = style
             prev_group = group_id
+            prev_verbatim = verbatim
 
         ir.pages.append(ipage)
 
@@ -336,6 +344,8 @@ def _cut_cost(t: str, i: int, target: int) -> tuple[int, int]:
         cost -= 3
     if _is_cjk(prev) and _is_cjk(nxt):
         cost -= 1                      # CJK can break anywhere; no penalty needed
+    elif prev.isalpha() and nxt.isalpha():
+        cost += 6                      # never prefer cutting inside a Latin word
     if prev in _BAD_EDGE or nxt in _BAD_EDGE:
         cost += 8                      # never prefer a dangling hyphen / punctuation
     return (cost, abs(i - target))
@@ -363,10 +373,11 @@ def split_translation(sources: Sequence[str], translated: str) -> list[str]:
     length, snapped to the nearest clean boundary (sentence end > space > any
     position) and never inside a number, so every block keeps roughly its own
     share of the text and the existing per-block fit/export rules still apply.
-    Invariants: the pieces are non-empty (unless the source fragment itself was
-    pure whitespace), their concatenation loses no content of ``translated``, and
-    a failed batch that echoed the source hands the fragments back unchanged
-    (re-splitting the source would scramble the original line breaks).
+    Invariants: the pieces are non-empty (a fragment that could not get any text keeps
+    its SOURCE — never a blank, which would export as an empty box), their concatenation
+    loses no content of ``translated``, and a failed batch that echoed the source hands
+    the fragments back unchanged (re-splitting the source would scramble the original
+    line breaks).
     """
     src = [str(s) for s in sources]
     k = len(src)
@@ -381,8 +392,15 @@ def split_translation(sources: Sequence[str], translated: str) -> list[str]:
         return src                      # the batch failed and echoed the source
     n = len(t)
     if n < k:
-        # Too short to give every fragment something: keep it whole in the first.
-        return [t] + [""] * (k - 1)
+        # Too short to give every fragment something: keep the whole translation in the
+        # longest fragment and leave the others with their SOURCE text.  An empty
+        # fragment exports as a blank box (the exporter redacts the original and draws
+        # nothing) — i.e. silently lost content — while the source text stays visible
+        # and is caught by ``check_residual``.
+        longest = max(range(k), key=lambda idx: len(src[idx]))
+        out = list(src)
+        out[longest] = t
+        return out
     weights = [max(1, len(s)) for s in src]
     total = sum(weights)
     cuts: list[int] = [0]
@@ -393,7 +411,9 @@ def split_translation(sources: Sequence[str], translated: str) -> list[str]:
         cuts.append(_best_cut(t, target, lo, hi))
     cuts.append(n)
     raw = [t[cuts[i]:cuts[i + 1]] for i in range(k)]
-    pieces = ["" if not p.strip() else p.strip() for p in raw]
+    # A whitespace-only slice would blank its block: fall back to that block's source
+    # (same reasoning as the n < k branch — never lose content to a blank).
+    pieces = [p.strip() if p.strip() else str(src[i]) for i, p in enumerate(raw)]
     # Re-insert the single space that separated two fragments across the cut —
     # each piece is stripped independently, so a boundary space is lost and the
     # words would run together ("revenue"|"1,234.56" → "revenue1,234.56").
@@ -425,6 +445,32 @@ def _is_verbatim(block: Block) -> bool:
 #: texts, honouring a glossary: ``fn(texts, *, lang, extra_glossary) -> list[str]``.
 #: The default bound by :func:`make_ir_translate_fn` calls
 #: ``translation_engine.translate_blocks``; tests inject a mock.
+
+#: Function / generic words that are NEVER terminology.  A title-cased heading makes
+#: them look like proper nouns to the ``[A-Z][a-z]+`` regex, and a glossary entry that
+#: pins "The" (or "While"/"Figure") to one rendering is injected into every batch as a
+#: must-use term — corrupting the prose it appears in.
+_INFER_STOPWORDS = frozenset("""
+a an the and or but if then than that this these those there here when while whilst
+as at by for from in into of on onto to with without within about above after again
+against all also am among any are because been before being below between both can
+cannot could did do does doing done down during each either else few first further
+had has have having he her his how however is it its just last least less like may
+me might more most much must my no nor not now off often once only other our out over
+own please rather same she should since so some such their them they though through
+thus too under until up upon us very was we were what where whether which who whom why
+will would you your figure figures table tables note notes data type types full blue
+red green dashed solid small large late early high low new old next previous left
+right top bottom
+""".split())
+
+#: Generic CJK phrases that are not terminology (a report boilerplate word pinned as a
+#: glossary entry just forces a fixed rendering of something that has no single one).
+_INFER_STOPWORDS_CJK = frozenset({
+    "本报告", "本公司", "本公司及", "年度", "单位", "项目", "其中", "合计", "本期", "上年",
+})
+
+
 def infer_terms(ir: IRDoc, *, max_terms: int | None = None) -> list[str]:
     """Conservative document-level terminology candidates (C-⑥).
 
@@ -432,8 +478,9 @@ def infer_terms(ir: IRDoc, *, max_terms: int | None = None) -> list[str]:
     translate them once and inject the result as ``IRDoc.terms``, giving every
     occurrence the same target across pages.  Candidates are CJK phrases (2–4 chars)
     and TitleCase / ALL-CAPS Latin words that appear >=2 times, capped at
-    ``max_terms``.  Deliberately conservative: a noisy candidate is just translated
-    once extra, never a correctness risk.
+    ``max_terms``.  Stopwords (function words, "Figure", "Type", …) are filtered out:
+    a pinned "The" is injected as a must-use term into every request, so a noisy
+    candidate is not harmless — it actively distorts the translation.
     """
     cjk: Counter[str] = Counter()
     latin: Counter[str] = Counter()
@@ -448,8 +495,10 @@ def infer_terms(ir: IRDoc, *, max_terms: int | None = None) -> list[str]:
                     cjk[run] += 1
             for w in re.findall(r"\b[A-Z][a-z]{2,}\b|\b[A-Z]{3,}\b", t):
                 latin[w] += 1
-    cands = [t for t, n in cjk.items() if n >= _INFER_MIN_FREQ]
-    cands += [w for w, n in latin.items() if n >= _INFER_MIN_FREQ]
+    cands = [t for t, n in cjk.items()
+             if n >= _INFER_MIN_FREQ and t not in _INFER_STOPWORDS_CJK]
+    cands += [w for w, n in latin.items()
+              if n >= _INFER_MIN_FREQ and w.casefold() not in _INFER_STOPWORDS]
     # ``cands`` is already unique (CJK runs and Latin words are disjoint key sets),
     # so de-duplication is redundant; just cap the count.
     return cands[:(max_terms or _INFER_MAX_TERMS)]

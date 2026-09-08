@@ -93,6 +93,54 @@ class MeasureCompleteTest(unittest.TestCase):
         res = measure_complete([_block("1,234.56")], [""])
         self.assertEqual(res["missing_count"], 0)
 
+    def test_source_echo_is_flagged_as_identity(self):
+        text = "Revenue increased by ten percent in 2024."
+        res = measure_complete([_block(text)], [text], lang="English")
+        self.assertEqual(res["identity_count"], 1)
+        self.assertEqual("identity", res["identity"][0]["reason"])
+
+    def test_short_technical_token_is_not_identity(self):
+        # "PDF" / "OK" legitimately translate to themselves — flagging those would
+        # be noise, so identity needs a prose-like source.
+        self.assertEqual(0, measure_complete([_block("PDF")], ["PDF"])["identity_count"])
+
+
+class IdentityScoringTest(unittest.TestCase):
+    """F9: an untranslated echo must never score a perfect 100.
+
+    Regression: ``measure_complete`` only looked for *empty* blocks and for
+    source-language residue, and residue was only checked for CJK targets / CJK
+    content — so a Latin→Latin run (e.g. Spanish→English) that echoed the source
+    verbatim scored 100 and ``eval_harness`` returned exit 0.
+    """
+
+    def test_latin_to_latin_echo_does_not_score_100(self):
+        text = "Los ingresos aumentaron un diez por ciento en 2024."
+        res = eval_pages([[_block(text)]], [[text]], lang="English")
+        self.assertEqual(res["complete"]["identity"], 1)
+        self.assertLess(res["score"], 100.0)
+
+    def test_identity_outweighs_a_single_missing_block(self):
+        # IDENTITY_WEIGHT (3.0) > the missing/residual weight (2.0): with enough
+        # clean blocks that the ratio is not saturated, an echo must score lower
+        # than a single untranslated block.
+        text = "Revenue increased by ten percent in 2024."
+        good = "Revenue grew by ten percent in 2024."
+        blocks = [_block(text) for _ in range(5)]
+        echo = eval_pages([blocks], [[good] * 4 + [text]], lang="English")
+        missing = eval_pages([blocks], [[good] * 4 + [""]], lang="English")
+        self.assertEqual(1, echo["complete"]["identity"])
+        self.assertEqual(1, missing["complete"]["missing"])
+        self.assertLess(echo["score"], missing["score"])
+
+    def test_no_measurable_content_scores_zero_and_flags_no_data(self):
+        # An empty measurement is not a perfect one: with nothing to judge the score
+        # is 0 and ``no_data`` is set (it used to be a misleading 100).
+        res = eval_pages([[_block("1,234.56")]], [["1,234.56"]], lang="English")
+        self.assertEqual(res["score"], 0.0)
+        self.assertTrue(res["no_data"])
+        self.assertTrue(res["layout"]["no_data"])
+
 
 class AggregateCompareTest(unittest.TestCase):
     def test_clean_document_scores_100(self):

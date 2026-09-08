@@ -387,6 +387,33 @@ class ChatWorkerTest(unittest.TestCase):
         self.assertEqual(1, len(errors))
         self.assertIn("没有可用的 AI 模型", errors[0])
 
+    def test_ask_failure_emits_error_instead_of_silence(self):
+        # Regression: a request exception only wrote a main-window log line, so the
+        # sidebar got no signal at all — it stayed on "取消" forever and never showed
+        # why (``_on_chat_error`` was unreachable for a real failure).
+        class _BoomClient:
+            @property
+            def chat(self):
+                return self
+
+            @property
+            def completions(self):
+                return self
+
+            def create(self, **_kwargs):
+                raise RuntimeError("boom")
+
+        worker = chat.ChatWorker()
+        errors: list[str] = []
+        replies: list[str] = []
+        worker.error.connect(errors.append)
+        worker.reply_ready.connect(replies.append)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: _BoomClient()):
+            worker.ask("你好", _model())
+        self.assertEqual([], replies)
+        self.assertEqual(1, len(errors))
+        self.assertIn("boom", errors[0])
+
     def test_cancel_aborts_in_flight_reply(self):
         # The sidebar "取消" aborts an in-flight reply (closing the client raises on
         # the blocked create) and surfaces ``cancelled`` instead of an error.

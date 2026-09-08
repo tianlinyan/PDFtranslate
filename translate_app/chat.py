@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 from openai import OpenAI
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from . import prompts
 from . import translator as _tr
@@ -487,6 +487,10 @@ class ChatWorker(QObject):
                 self.cancelled.emit("已取消")
             else:
                 self._log(f"  对话请求失败：{type(exc).__name__}: {exc}")
+                # The GUI resets its busy state / live bubble from ``error``; without
+                # this the sidebar stayed on "取消" forever and showed nothing at all
+                # (the only trace was a main-window log line).
+                self.error.emit(f"{type(exc).__name__}: {exc}")
 
     def cancel_current(self) -> None:
         """Abort the in-flight reply (triggered by the sidebar's "取消" / Enter)."""
@@ -501,3 +505,17 @@ class ChatWorker(QObject):
             self._session.record_exchange(question, answer, target)
         except Exception as exc:  # noqa: BLE001 — never crash the worker on a log-only path
             self.error.emit(f"{type(exc).__name__}: {exc}")
+
+
+def connect_sidebar_cancel(signal, worker: ChatWorker) -> None:
+    """Wire the sidebar's "取消" to :meth:`ChatWorker.cancel_current` **directly**.
+
+    ``ChatWorker`` lives on its own ``QThread``, so the default (Auto) connection
+    queues the call into that thread's event loop — which is blocked inside
+    :meth:`ChatWorker.ask` for the whole reply, so the queued slot only runs after
+    the reply has already finished and "取消" does nothing.  The slot only sets a
+    ``threading.Event`` (thread-safe, touches no Qt state), so invoking it straight
+    from the GUI thread is correct and is the only wiring that actually aborts an
+    in-flight reply.
+    """
+    signal.connect(worker.cancel_current, Qt.ConnectionType.DirectConnection)

@@ -151,8 +151,10 @@ class TranslateWorker(QObject):
         #: C-⑥ reflow（保守层）：文本层表格列宽按译文重分配（数字列不缩）。
         #: 默认关闭；GUI 复选框开启，或 PDFTRANSLATE_REFLOW=1 强制开启。
         self._reflow = bool(reflow) or (os.environ.get("PDFTRANSLATE_REFLOW") == "1")
-        #: C-⑥ 重建扫描表格为矢量表格（默认关闭）：AI 识别扫描表格的真实行/列
-        #: 边界，重建为非 OCR（矢量）表格并正常填充译文，替代「位图线重绘」。
+        #: C-⑥ 重建扫描表格为矢量表格（默认关闭，0.2.7 版做法）：OCR 表格页被重绘
+        #: 为一张干净空白页（只画矢量网格线 + 译文，行高按译文扩展），扫描底图/
+        #: 印章/签字不再保留；模型支持视觉时先由模型重建「译文 2D 网格」（+合并
+        #: 单元格），失败回退几何重绘。
         self._rebuild_table = bool(rebuild_table) or (
             os.environ.get("PDFTRANSLATE_REBUILD_TABLE") == "1")
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
@@ -599,82 +601,6 @@ class TranslateWorker(QObject):
             self.log.emit("  AI 编排未产生翻译（模型可能无法视觉编排），输出将保留原文。")
         return TranslationResult(blocks=doc.blocks, translated=translated)
 
-    def _build_rebuild_pages(
-        self, doc: pdfio.DocumentText, per_page: list[list[str]] | None = None
-    ) -> dict | None:
-        """AI 视觉识别扫描表格页的真实行列结构（rebuild_table + vision model 时）。
-
-        返回 ``{page_index: TableStyle}``（PDF 点），供 ``save_translated_pdf``
-        把 OCR 表格重建为矢量表格并正常填充译文——替代 OCR 块几何（后者对超密集
-        扫描报表给出一堆噪点列边缘）。
-
-        Layer-② 修正：对每页跑 N 次识别得到多个候选（模型行/列数不稳定），用
-        确定性打分 ``pdfio.best_rebuild``（collisions → overflow → 数字落格率）
-        选优，再用 ``pdfio.valid_rebuild`` 作为 fail-closed 地板；最优候选仍不
-        达标就回退普通 OCR。无 vision model / 识别失败 / 无扫描表格页返回 ``None``
-        （回退 OCR 几何，绝不崩）。
-        """
-        if not self._rebuild_table or not getattr(self._model, "vision", False):
-            return None
-        try:
-            import fitz
-            from openai import OpenAI
-
-            from . import table_vision
-
-            structure: dict[int, dict] = {}
-            src = fitz.open(str(self._source))
-            # 一个客户端跨所有扫描表格页复用（不再每页 new 一个连接池、也从不关闭）。
-            client = OpenAI(**self._model.client_kwargs())
-            try:
-                for i, blocks in enumerate(doc.pages):
-                    if not pdfio._reconstruct_ocr_tables(blocks):
-                        continue
-                    page = src[i] if i < src.page_count else None
-                    if page is None:
-                        continue
-                    png = pdfio._render_page_png(page, dpi=150)
-                    detect = table_vision.make_llm_table_structure(
-                        self._model, page_width=page.rect.width,
-                        page_height=page.rect.height, client=client,
-                        log=lambda m: self.log.emit(m))
-                    if detect is None:
-                        return None
-                    candidates = detect(png)
-                    trans_i = (
-                        per_page[i] if per_page and i < len(per_page) else None
-                    )
-                    # Layer-② 修正：多个候选确定性打分选优（不是众数平均、也不是
-                    # 让模型自评放行——实测模型会放行明显错位的网格）。
-                    best, score = pdfio.best_rebuild(blocks, candidates, trans_i)
-                    # Layer-④ 地板：最优候选仍不能让足够多的数字落格 → fail-closed
-                    # 回退普通 OCR，绝不硬输出错表。
-                    if best is not None and pdfio.valid_rebuild(blocks, best):
-                        structure[i] = best
-                        self.log.emit(
-                            f"  [table_vision] 第 {i + 1} 页：{len(candidates)} 个候选，"
-                            f"选优后 collisions={score[0]} overflow={score[1]} "
-                            f"数字落格率={score[2]:.2f}。")
-                    elif candidates:
-                        self.log.emit(
-                            f"  [table_vision] 第 {i + 1} 页：{len(candidates)} 个候选均"
-                            "未通过数字落格地板，回退普通 OCR。")
-            finally:
-                src.close()
-                try:
-                    client.close()
-                except Exception:  # noqa: BLE001 — 关闭失败无害
-                    pass
-            if structure:
-                self.log.emit(
-                    f"  [table_vision] 已识别 {len(structure)} 个扫描表格页的真实行列结构，"
-                    "重建为矢量表格。")
-            return structure or None
-        except Exception as exc:  # noqa: BLE001 — 回退 OCR 几何，绝不崩
-            self.log.emit(
-                f"  [table_vision] 表格结构识别失败，回退 OCR 几何：{type(exc).__name__}: {exc}")
-            return None
-
     def _export(
         self, doc: pdfio.DocumentText, per_page: list[list[str]],
         *, overwrite: bool = False,
@@ -688,11 +614,35 @@ class TranslateWorker(QObject):
                 self._source, per_page, out, self._lang, doc.pages
             )
         elif kind == "translated_pdf":
-            pdfio.save_translated_pdf(
-                self._source, doc.pages, per_page, out, self._lang,
-                log=self.log.emit, reflow=self._reflow,
-                rebuild_pages=self._build_rebuild_pages(doc, per_page),
-            )
+            # 0.2.7 的扫描表格重建：``redraw_ocr`` 把 OCR 表格页重绘为干净矢量表格
+            #（空白页 + 网格线 + 译文，行高按译文扩展）；视觉模型在线时先尝试 AI
+            # 整表重建（译文 2D 网格 + 可选合并单元格），失败/不可用回退几何重绘。
+            rebuild_fn = merge_fn = client = None
+            if self._rebuild_table and getattr(self._model, "vision", False):
+                from openai import OpenAI
+
+                from .translator import make_merge_tool_fn, make_table_rebuild_fn
+
+                # ONE shared client for both callbacks, closed after the export (each
+                # helper would otherwise open its own pool that is never closed).
+                client = OpenAI(**self._model.client_kwargs())
+                rebuild_fn = make_table_rebuild_fn(self._model, self._lang, self.log.emit,
+                                                   client=client)
+                merge_fn = make_merge_tool_fn(self._model, self.log.emit, client=client)
+            try:
+                pdfio.save_translated_pdf(
+                    self._source, doc.pages, per_page, out, self._lang,
+                    log=self.log.emit, reflow=self._reflow,
+                    redraw_ocr=self._rebuild_table,
+                    table_rebuild_fn=rebuild_fn,
+                    merge_tool_fn=merge_fn,
+                )
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:  # noqa: BLE001 — 关闭失败无害
+                        pass
         elif kind == "markdown":
             pdfio.save_markdown(
                 per_page, doc.blocks, doc.block_pages, out, self._lang, doc.title

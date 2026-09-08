@@ -25,6 +25,13 @@ class CompileFromUserTest(unittest.TestCase):
         spec = agent.compile_from_user("检查第5页")
         self.assertEqual([4], spec.scope)
 
+    def test_scope_range_with_a_page_after_the_first_number(self):
+        # Regression: "第2页到第5页" failed the range regex and fell through to the
+        # single-page one, silently auditing only page 2.
+        self.assertEqual([1, 2, 3, 4], uf._parse_scope("重译第2页到第5页"))
+        self.assertEqual([1, 2, 3, 4], uf._parse_scope("第2-5页"))
+        self.assertEqual([1, 2, 3, 4], uf._parse_scope("自检第2到第5页"))
+
     def test_auto_fix_default_when_not_specified(self):
         self.assertIsNone(agent.compile_from_user("自检").auto_fix)
 
@@ -79,6 +86,16 @@ class CompileFromUserTest(unittest.TestCase):
         self.assertEqual("self_check_page", spec.base)
         self.assertIn(spec.base, agent.STANDARD_FLOWS)
 
+    def test_ai_checks_are_canonicalized_and_unknown_names_survive(self):
+        # A Chinese alias the model echoes back must become the registry name so the
+        # check actually runs; an unrecognised name is kept verbatim so
+        # ``audit_page`` reports it (clean=false) instead of auditing nothing.
+        spec = uf._spec_from_ai({"checks": ["数字", "表格", "数"]}, "self_check_page")
+        self.assertEqual(["numbers", "table", "数"], spec.checks)
+        # A bare string is one name, not a character sequence.
+        self.assertEqual(["numbers"],
+                         uf._spec_from_ai({"checks": "numbers"}, "self_check_page").checks)
+
 
 class BuildFlowTest(unittest.TestCase):
     def test_single_page_self_check_overrides_knobs(self):
@@ -94,6 +111,14 @@ class BuildFlowTest(unittest.TestCase):
         flow = agent.build_flow(spec)
         self.assertEqual(["foreach_page"], [s.kind for s in flow.steps])
         self.assertEqual([2, 3, 4], flow.params["pages"])
+
+    def test_single_page_scope_drives_the_page_param(self):
+        # Regression: a one-page scope wrote only ``flow.scope`` (which the executor
+        # never reads), so "检查第4页" silently audited page 1.
+        spec = agent.FlowSpec(base="self_check_page", scope=[3])
+        flow = agent.build_flow(spec)
+        self.assertEqual(3, flow.params["page"])
+        self.assertEqual([3], flow.scope["pages"])   # metadata kept for callers
 
     def test_unknown_base_raises(self):
         with self.assertRaises(ValueError):
@@ -150,6 +175,19 @@ class PersistenceTest(unittest.TestCase):
     def test_load_ignores_corrupt_file(self):
         (Path(self._tmp.name) / "broken.json").write_text("{not json", encoding="utf-8")
         self.assertEqual({}, agent.load_user_flow_specs())   # no crash, skipped
+
+    def test_roundtrip_keeps_the_original_name(self):
+        # The file name is sanitized ("我的 流程" → "我的_流程.json"), so the spec JSON
+        # must carry the original name — otherwise a reload renames the flow and
+        # ``get_user_flow("我的 流程")`` raises KeyError.
+        spec = agent.FlowSpec(base="self_check_page", checks=["table"])
+        agent.save_flow_spec("我的 流程", spec)
+        loaded = agent.load_user_flow_specs()
+        self.assertIn("我的 流程", loaded)
+        self.assertNotIn("我的_流程", loaded)
+        self.assertIsNotNone(agent.get_user_flow("我的 流程"))
+        # ``name`` is not a flow knob: it must not leak into the compiled params.
+        self.assertNotIn("name", agent.get_user_flow("我的 流程").params)
 
 
 class MemoryOnlyPersistenceTest(unittest.TestCase):

@@ -42,6 +42,8 @@ from .state import (
     WorkflowState,
 )
 from .tools import agent_openai_tools
+from .tool_catalog import AUDIT_CHECK_NAMES
+from ..control import ControlSignal
 
 
 @dataclass
@@ -130,8 +132,11 @@ class FlowAgent:
                                error=f"unknown tool: {name}")
         try:
             return AgentResult(ok=True, op_tool=name, op_args=args, result=fn(**args))
-        except _tr.TranslationCancelled:
-            raise                     # a user cancel must propagate, not become ok=False
+        except ControlSignal:
+            # ANY control signal (a user cancel, a flow cancel) must propagate — it is
+            # not a tool failure.  Catching only ``TranslationCancelled`` let a
+            # ``FlowCancelled`` degrade into "ok=False" and the loop kept going.
+            raise
         except Exception as exc:  # noqa: BLE001 — fail-closed, never crash the loop
             return AgentResult(ok=False, op_tool=name, op_args=args,
                                error=f"{type(exc).__name__}: {exc}")
@@ -517,11 +522,23 @@ def make_llm_decide(model, *, task: str, image_provider=None,
         finally:
             if watchdog is not None:
                 watchdog_stop.set()
+        # ``choices`` can be empty on a real endpoint (timeout / content filter / a
+        # provider error body).  Reading ``choices[0]`` outside the try made that an
+        # IndexError that aborted the whole page; a missing answer is a "done".
+        if not getattr(resp, "choices", None):
+            if log:
+                log("  decide 返回空 choices（按本轮结束处理）。")
+            return Decision(action="done", summary="empty response")
         msg = resp.choices[0].message
         tcs = getattr(msg, "tool_calls", None)
         if not tcs:
             return Decision(action="done", summary=str(getattr(msg, "content", "") or ""))
         tc = tcs[0]
+        if len(tcs) > 1 and log:
+            # Only one tool call is executed per step; say which ones were dropped
+            # instead of silently discarding the model's parallel calls.
+            log("  decide 返回多个 tool_calls，本轮只执行第一个："
+                + ", ".join(str(getattr(t.function, "name", "?")) for t in tcs))
         try:
             args = json.loads(tc.function.arguments) if tc.function.arguments else {}
             if not isinstance(args, dict):
@@ -808,8 +825,10 @@ def _is_latin_prose(text: Any) -> bool:
 # all four checks (the source of false green).
 # --------------------------------------------------------------------------
 
-#: The review-check names, in the order the audit runs them.
-_AUDIT_DEFAULT_CHECKS = ("layout", "residual", "missing", "numbers", "table")
+#: The review-check names, in the order the audit runs them.  Sourced from the tool
+#: catalog (``AUDIT_CHECK_NAMES``) so the registry, the tool descriptions and the
+#: model-supplied-name validation can never drift apart.
+_AUDIT_DEFAULT_CHECKS = AUDIT_CHECK_NAMES
 
 #: How many audit→fix→re-audit rounds a single page may take before the review
 #: loop gives up (fail-closed to the best translation so far) and moves on.
@@ -836,10 +855,17 @@ def _audit_read(state, idx):
 
 
 def _audit_protected(state, block):
-    """True when a block must stay byte-identical (engine-skipped or numeric cell)."""
+    """True when a block must stay byte-identical (never a "missing"/"residual").
+
+    Engine-skipped blocks (numbers/symbols/formulas), numeric cells, and blocks the
+    pipeline deliberately keeps verbatim (``keep_original``: a handwritten signature /
+    seal region the rebuild pass marks) are all "protected": reporting them as
+    untranslated made the review loop try to "fix" content that must not change.
+    """
     from .. import pdfio as _pdfio
     return (not _tr._needs_translation(str(block.text))
-            or _pdfio._is_numeric_cell(str(block.text)))
+            or _pdfio._is_numeric_cell(str(block.text))
+            or bool(getattr(block, "keep_original", False)))
 
 
 def _check_residual(state, page=None):
@@ -866,7 +892,7 @@ def _check_missing(state, page=None):
     blocks, offset = _audit_blocks(state, page)
     out = []
     for i, b in enumerate(blocks):
-        if _audit_protected(state, b):
+        if _audit_protected(state, b) or getattr(b, "is_chart", False):
             continue
         idx = offset + i
         if str(b.text).strip() and not _audit_read(state, idx).strip():
@@ -879,6 +905,8 @@ def _check_numbers(state, page=None):
     blocks, offset = _audit_blocks(state, page)
     out = []
     for i, b in enumerate(blocks):
+        if _audit_protected(state, b):
+            continue   # a verbatim numeric cell is not expected to change at all
         idx = offset + i
         t = _audit_read(state, idx)
         if not t.strip():
@@ -921,43 +949,60 @@ def _check_table(state, page=None):
 
 
 def _check_layout(state, page=None):
-    """Structure / layout integrity for ``page`` using the exporter's own fit rules."""
+    """Structure / layout integrity for ``page`` using the exporter's own fit rules.
+
+    Crowding is compared **within one page only**: y restarts on every page, so a
+    whole-document run (``page=None``) used to report a block as "pressing into the
+    next block" when the "next" block was simply the first block of the next page.
+    """
     from .. import pdfio as _pdfio
-    blocks, offset = _audit_blocks(state, page)
+    src = state.src_doc
+    if src is None or not getattr(src, "pages", None):
+        return {"page": page, "count": 0, "issues": [], "truncated": False}
+    if page is None:
+        page_indices = list(range(len(src.pages)))
+    elif 0 <= page < len(src.pages):
+        page_indices = [page]
+    else:
+        page_indices = []
     font = _pdfio._CJK_FONT
     issues: list[dict[str, Any]] = []
-    for i, b in enumerate(blocks):
-        if _audit_protected(state, b) or _pdfio._is_vertical_label(b):
-            continue
-        idx = offset + i
-        t = _audit_read(state, idx)
-        if not t.strip():
-            continue
-        try:
-            lines, fs = _pdfio._fit_block(b, font, t)
-        except Exception:  # noqa: BLE001 — a block we cannot measure is skipped
-            continue
-        in_table = bool(getattr(b, "in_table", False))
-        leading = _pdfio._line_leading(font, in_table=in_table, n_lines=len(lines))
-        height = _pdfio._wrapped_height(font, lines, fs, leading)
-        box_h = max(0.5, b.y1 - b.y0)
-        start_fs = max(5.0, min(b.size, _pdfio._MAX_FONT))
-        floor = (_pdfio._MIN_TABLE_FLOOR if in_table
-                 else min(start_fs, _pdfio._MIN_READABLE))
-        if fs + 1e-9 < floor:
-            issues.append({"index": idx, "kind": "too_small",
-                           "detail": f"译文字号 {fs:.2f}pt 低于可读下限 {floor:.2f}pt"})
-        if height > box_h + 2.0:
-            issues.append({"index": idx, "kind": "overflow",
-                           "detail": f"译文高度 {height:.1f}pt 超过自身框 {box_h:.1f}pt"})
-        below = [nb for nb in blocks
-                 if nb is not b and nb.y0 >= b.y1 - 0.5
-                 and nb.x0 < b.x1 and nb.x1 > b.x0]
-        if below:
-            gap = min(nb.y0 for nb in below) - b.y1
-            if height > box_h + gap + 2.0:
-                issues.append({"index": idx, "kind": "crowding",
-                               "detail": f"译文高 {height:.1f}pt 会压入下一块（剩余 {gap:.1f}pt）"})
+    offset = 0
+    for p in page_indices:
+        blocks = src.pages[p]
+        for i, b in enumerate(blocks):
+            if _audit_protected(state, b) or _pdfio._is_vertical_label(b):
+                continue
+            idx = offset + i
+            t = _audit_read(state, idx)
+            if not t.strip():
+                continue
+            try:
+                lines, fs = _pdfio._fit_block(b, font, t)
+            except Exception:  # noqa: BLE001 — a block we cannot measure is skipped
+                continue
+            in_table = bool(getattr(b, "in_table", False))
+            leading = _pdfio._line_leading(font, in_table=in_table, n_lines=len(lines))
+            height = _pdfio._wrapped_height(font, lines, fs, leading)
+            box_h = max(0.5, b.y1 - b.y0)
+            start_fs = max(5.0, min(b.size, _pdfio._MAX_FONT))
+            floor = (_pdfio._MIN_TABLE_FLOOR if in_table
+                     else min(start_fs, _pdfio._MIN_READABLE))
+            if fs + 1e-9 < floor:
+                issues.append({"index": idx, "kind": "too_small",
+                               "detail": f"译文字号 {fs:.2f}pt 低于可读下限 {floor:.2f}pt"})
+            if height > box_h + 2.0:
+                issues.append({"index": idx, "kind": "overflow",
+                               "detail": f"译文高度 {height:.1f}pt 超过自身框 {box_h:.1f}pt"})
+            below = [nb for nb in blocks
+                     if nb is not b and nb.y0 >= b.y1 - 0.5
+                     and nb.x0 < b.x1 and nb.x1 > b.x0]
+            if below:
+                gap = min(nb.y0 for nb in below) - b.y1
+                if height > box_h + gap + 2.0:
+                    issues.append({"index": idx, "kind": "crowding",
+                                   "detail": f"译文高 {height:.1f}pt 会压入下一块（剩余 {gap:.1f}pt）"})
+        offset += len(blocks)
     return {"page": page, "count": len(issues), "issues": issues[:60],
             "truncated": len(issues) > 60}
 
@@ -991,20 +1036,46 @@ def _audit_normalize(name: str, res: dict) -> tuple[list[dict], bool]:
 def audit_page(state, page=None, checks=None) -> dict[str, Any]:
     """Run a deterministic multi-check audit over ``state``.
 
-    ``checks`` is a subset of ``_AUDIT_DEFAULT_CHECKS`` (default all).  Returns
-    ``{"page", "checks_requested", "checks", "issues", "clean"}`` where ``issues``
-    is a flat, ``check``-tagged list suitable both for machine gating (``clean``)
-    and for injecting into ``prompts.review_page_task`` as concrete findings.
+    ``checks`` is a subset of :data:`~.tool_catalog.AUDIT_CHECK_NAMES` (``None`` /
+    empty = all five).  Returns ``{"page", "checks_requested", "unknown_checks",
+    "checks", "issues", "clean"}`` where ``issues`` is a flat, ``check``-tagged
+    list suitable both for machine gating (``clean``) and for injecting into
+    ``prompts.review_page_task`` as concrete findings.
+
+    A name outside the registry is **never silently dropped**: it is reported as
+    an ``unknown_checks`` issue and forces ``clean=False``.  Without that, a model
+    that misspelled a check (or passed a Chinese name, or a bare string) would get
+    a "clean" report with nothing having run — exactly the false-green this audit
+    gate exists to prevent.  A bare string is read as ONE name (``"numbers"``),
+    not as a character sequence.
     """
-    names = [n for n in (checks or _AUDIT_DEFAULT_CHECKS) if n in _AUDIT_CHECKS]
+    if not checks:                                   # None / [] / "" → all five
+        requested = list(_AUDIT_DEFAULT_CHECKS)
+    elif isinstance(checks, str):                    # a single name, not chars
+        requested = [checks]
+    else:
+        try:
+            requested = [str(n) for n in checks]
+        except TypeError:                            # not iterable → report it
+            requested = [str(checks)]
+    canonical = [str(n).strip().lower() for n in requested]
+    unknown = sorted({raw for raw, name in zip(requested, canonical)
+                      if name not in _AUDIT_CHECKS})
+    names = list(dict.fromkeys(n for n in canonical if n in _AUDIT_CHECKS))
     all_issues: list[dict] = []
     per_check: dict[str, Any] = {}
+    if unknown:
+        all_issues.append({
+            "check": "unknown_checks", "unknown": unknown,
+            "detail": ("未知的检查名（未执行）：" + ", ".join(unknown)
+                       + "；可用：" + ", ".join(_AUDIT_DEFAULT_CHECKS)),
+        })
     for name in names:
         issues, _clean = _audit_normalize(name, _AUDIT_CHECKS[name](state, page))
         per_check[name] = {"clean": not issues, "count": len(issues)}
         all_issues.extend(issues)
-    return {"page": page, "checks_requested": names, "checks": per_check,
-            "issues": all_issues, "clean": not all_issues}
+    return {"page": page, "checks_requested": names, "unknown_checks": unknown,
+            "checks": per_check, "issues": all_issues, "clean": not all_issues}
 
 
 def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] | None = None,
@@ -1012,7 +1083,8 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
                         answer_handler: Callable[..., Any] | None = None,
                         cancel: Callable[[], bool] | None = None,
                         render_handler: Callable[[int, str], bytes | None] | None = None,
-                        client: Any = None) -> dict[str, Callable]:
+                        client: Any = None,
+                        show_preview: Callable[[int, str], None] | None = None) -> dict[str, Callable]:
     """Bound deterministic content / verify / draw tools that operate on ``out_doc``.
 
     These are the agent's *hands* for a single page (the source is read-only via
@@ -1023,8 +1095,10 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
       (financial figures are never rewritten by AI).
     * everything that changes a block writes only to ``out_doc``, never to the
       immutable source.
-    * ``preview_handler`` (optional) lets ``preview_page`` show a page to the user
-      and return the framed region the user drew (see ``preview.PreviewBridge``).
+    * ``show_preview`` (optional, non-blocking) is what ``preview_page`` prefers: it
+      opens the page for the user without waiting.  ``preview_handler`` is the
+      *blocking* region channel (``preview.PreviewBridge.get_region``, up to 120 s)
+      and is only used as a fallback when no non-blocking channel is wired.
     * ``cancel`` (optional) is polled by per-block translation so a user
       cancellation aborts an in-flight request instead of running to its timeout.
     """
@@ -1067,11 +1141,15 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
     def _read(index: int) -> str:
         return str((_out().get(index) or {}).get("text", ""))
 
-    def _translate(source: str, lang: str, attempts: int = 2) -> str:
-        # The engine itself retries transient failures internally; an outer loop
-        # widens the window so a briefly-hiccuping local llama-server is more
-        # likely to land on a good run (the single-page loop fails closed to the
-        # source otherwise).
+    def _translate(source: str, lang: str, attempts: int = 2) -> tuple[str, bool]:
+        """Translate one text; returns ``(text, ok)``.
+
+        ``ok=False`` means every attempt failed and ``text`` is the SOURCE (the engine
+        keeps the source and reports the failure in ``result.errors``).  The caller
+        must not write a failed result as a "translation": doing so made
+        ``translate_block`` report ``ok=True`` with the source text, so the model never
+        learned the block was not translated and the page counted as done.
+        """
         import time
 
         last: str = source
@@ -1090,14 +1168,14 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
                     continue
                 if log:
                     log(f"  翻译重试失败：{type(exc).__name__}: {exc}")
-                return source
+                return source, False
             # A batch that hit a transient failure reports its errors and keeps the
             # source; only a clean result is trusted.
             if not getattr(result, "errors", None) and result.translated:
-                return str(result.translated[0])
+                return str(result.translated[0]), True
             if i < attempts - 1:
                 time.sleep(0.5 * (i + 1))
-        return last
+        return last, False
 
     def translate_block(index: int, text: str | None = None, target_lang: str | None = None):
         b = _block(index)
@@ -1106,7 +1184,12 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         if pdfio._is_numeric_cell(str(b.text)):
             return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
         src = str(text) if text is not None else str(b.text)
-        translated = _translate(src, target_lang or state.lang)
+        translated, ok = _translate(src, target_lang or state.lang)
+        if not ok:
+            # Do NOT write the source back as a "translation" — fail loudly instead so
+            # the model can retry with retranslate_block/set_text or tell the user.
+            return {"ok": False, "index": index,
+                    "error": "翻译失败（模型多次未返回可用译文），本块保持原文未写入。"}
         _write(index, translated)
         return {"ok": True, "index": index, "translated": translated}
 
@@ -1130,7 +1213,15 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
             base = sum(len(p) for p in src_doc.pages[: int(page)])
             candidates = [base + i for i in range(len(src_doc.pages[int(page)]))]
         else:
-            candidates = [int(i) for i in indices]
+            # Explicit indices are flat, but the model named a page: drop indices that
+            # belong to ANOTHER page (a stale/page-local index must not rewrite a block
+            # elsewhere) and say so, instead of silently writing across pages.
+            rng = _page_range(page)
+            raw = [int(i) for i in indices]
+            candidates = [i for i in raw if rng[0] <= i < rng[1]]
+            outside = [i for i in raw if not (rng[0] <= i < rng[1])]
+            if outside and log:
+                log(f"  忽略不属于第 {int(page) + 1} 页的块索引：{outside}")
         picked: list[int] = []
         seen: set[int] = set()
         for idx in candidates:
@@ -1168,7 +1259,33 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
                 "translated": {str(i): _read(i) for i in picked if _read(i)},
                 "failed": sorted(picked[i] for i in failed) if failed else []}
 
+    def _page_range(page: int) -> tuple[int, int] | None:
+        """Flat ``[start, end)`` index range of ``page`` (``None`` if out of range)."""
+        src_doc = state.src_doc
+        if src_doc is None or not (0 <= int(page) < len(src_doc.pages)):
+            return None
+        base = sum(len(p) for p in src_doc.pages[: int(page)])
+        return base, base + len(src_doc.pages[int(page)])
+
+    def _check_index_on_page(page: int, index: int) -> str | None:
+        """Error string when ``index`` is not a flat index of ``page`` (else ``None``).
+
+        ``index`` is a whole-document flat index; validating it against the page the
+        model named stops a page-local index (or an index read from another page) from
+        silently rewriting a block on a different page.
+        """
+        rng = _page_range(page)
+        if rng is None:
+            return f"bad page {page}"
+        if not (rng[0] <= int(index) < rng[1]):
+            return (f"块索引 {index} 不属于第 {int(page) + 1} 页"
+                    f"（该页扁平索引 {rng[0]}..{rng[1] - 1}）")
+        return None
+
     def set_text(page: int, index: int, text: str):
+        err = _check_index_on_page(page, index)
+        if err:
+            return {"ok": False, "error": err}
         b = _block(index)
         if b is None:
             return {"ok": False, "error": f"bad index {index}"}
@@ -1178,6 +1295,9 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         return {"ok": True, "index": index}
 
     def delete_block(page: int, index: int):
+        err = _check_index_on_page(page, index)
+        if err:
+            return {"ok": False, "error": err}
         if index in _out():
             _out()[index].pop("text", None)
             if not _out()[index]:
@@ -1215,6 +1335,11 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
             return {"ok": True, "page": page, "index": flat, "action": action}
         if text is None:
             return {"ok": False, "error": "action=set 需要 text"}
+        if pdfio._is_numeric_cell(str(block.text)):
+            # Same fidelity guard as ``set_text``: a figure must never be rewritten by
+            # an annotation (the audit's number check would then flag a block that the
+            # AI is forbidden to fix).
+            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
         _write(flat, str(text))
         state.record_op(tool="apply_annotation",
                         args={"page": page, "bbox": list(bbox), "action": action,
@@ -1327,12 +1452,27 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         return audit_page(state, page, checks)
 
     def preview_page(page: int, what: str = "translation", region=None, **_kw):
+        # Showing a page must NOT block the page loop: prefer the non-blocking
+        # ``show_preview``.  The blocking region channel (``preview_handler``) waits
+        # up to 120 s for the user to press "发送", which stalled a whole page when
+        # the model merely wanted to show it something.
+        if show_preview is not None:
+            try:
+                show_preview(int(page), str(what or "translation"))
+            except Exception as exc:  # noqa: BLE001 — fail-closed
+                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            return {"ok": True, "page": int(page), "image": b"", "rect": None,
+                    "note": "已在预览窗口显示（非阻塞）。要「看」这一页请调 render_page。"}
         if preview_handler is None:
             return {"ok": False, "error": "预览通道未接线"}
         try:
             res = preview_handler(page, what, region)
         except Exception as exc:  # noqa: BLE001 — fail-closed
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        if res is None:
+            # The user never sent a region (timeout): reporting ok=True with an empty
+            # image made a failure look like success.
+            return {"ok": False, "error": "预览未返回（用户未在预览窗口发送）"}
         # The handler returns either the cropped PNG bytes or ``{"png": .., "rect": ..}``.
         image = rect = None
         if isinstance(res, dict):
@@ -1417,7 +1557,8 @@ def run_page_visual(state: WorkflowState, page_index: int, model,
                     src_path=None, preview_handler: Callable[..., bytes] | None = None,
                     answer_handler: Callable[[str, list[str], str], Any] | None = None,
                     cancel: Callable[[], bool] | None = None,
-                    render_handler: Callable[[int, str], bytes | None] | None = None) -> WorkflowState:
+                    render_handler: Callable[[int, str], bytes | None] | None = None,
+                    show_preview: Callable[[int, str], None] | None = None) -> WorkflowState:
     """Run the AI-orchestrated loop on a single page (the visual closed loop).
 
     Renders the source page once, hands it to a real-LLM ``decide`` (image +
@@ -1465,7 +1606,8 @@ def run_page_visual(state: WorkflowState, page_index: int, model,
                                          answer_handler=answer_handler,
                                          cancel=cancel,
                                          render_handler=render_handler,
-                                         client=shared_client))
+                                         client=shared_client,
+                                         show_preview=show_preview))
     if tools:
         all_tools.update(tools)
     decide = make_llm_decide(model, task=task,
@@ -1648,6 +1790,7 @@ class DocumentSession:
                     max_rounds=steps, log=self.log,
                     preview_handler=self.preview_handler, answer_handler=self.answer_handler,
                     cancel=self.cancel, render_handler=self.render_handler,
+                    show_preview=self.show_preview,
                 )
             except _tr.TranslationCancelled:
                 raise FlowCancelled()
@@ -1723,15 +1866,25 @@ class DocumentSession:
             def _work(i: int) -> None:
                 self._translate_one_normal(i)
 
-            with ThreadPoolExecutor(max_workers=min(concurrency, total)) as pool:
+            # Explicit pool (not ``with``): on a cancel we must NOT wait for the
+            # queued pages — ``with`` calls ``shutdown(wait=True)``, so every
+            # not-yet-started page still ran (each one opening a client and its own
+            # executor) before the cancellation could propagate.
+            pool = ThreadPoolExecutor(max_workers=min(concurrency, total))
+            try:
                 futures = [pool.submit(_work, i) for i in normal]
                 for fut in as_completed(futures):
                     if self.cancel():
+                        for f in futures:
+                            f.cancel()
+                        pool.shutdown(wait=False, cancel_futures=True)
                         raise _tr.TranslationCancelled()
                     fut.result()   # re-raises TranslationCancelled from a page
                     with lock:
                         done += 1
                     self.progress(done, total, "翻译正常页")
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
             return
         for done, i in enumerate(normal, start=1):
             if self.cancel():
@@ -1932,7 +2085,10 @@ class DocumentSession:
         else:
             kept = {i for i, t in self.state.triage.items()
                     if t.decided and t.decision in ("keep", "skip")}
-        pages = [i for i in self.state.triage if i not in kept]
+        # Honour the run's page scope: a "只查第3到第8页" review must not audit (and
+        # rewrite) pages outside it — the translate phases already filter on ``scope``.
+        pages = [i for i in self.state.triage if i not in kept
+                 and (self.scope is None or i in self.scope)]
         total = len(pages)
         if not total:
             self.log("  [复核] 无待复核页（全部为保留/跳过页）。")

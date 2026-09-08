@@ -602,6 +602,58 @@ class DocumentSessionTest(unittest.TestCase):
                         include_kept=True)._ai_self_check()
         self.assertEqual([0, 1, 2], audited)
 
+    def test_ai_self_check_honours_the_run_scope(self):
+        # Regression: the review phase ignored ``scope``, so a "只查第2-3页" run audited
+        # (and could rewrite) every page in the document.
+        doc = _mixed_doc()
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        state.triage = {i: agent.PageTriage(page=i, kind="normal", decided=True,
+                                           decision="translate")
+                        for i in range(len(doc.pages))}
+        audited: list = []
+
+        def fake_audit(page=None, checks=None):
+            audited.append(page)
+            return {"page": page, "issues": [], "clean": True}
+
+        DocumentSession(state, doc, model=object(), log=lambda m: None,
+                        translate_page=lambda st, page, _m, *, task, **kw: st,
+                        audit=fake_audit, scope=[1, 2])._ai_self_check()
+        self.assertEqual([1, 2], audited)
+
+    def test_parallel_cancel_does_not_run_queued_pages(self):
+        # Regression: ``with ThreadPoolExecutor(...)`` calls ``shutdown(wait=True)``, so
+        # a cancel still STARTED every queued page loop.  Count the page loops entered.
+        import threading as _th
+        from types import SimpleNamespace
+
+        pages = [[_blk(f"第{i}页正文", page=i, x0=0, y0=0, x1=60, y1=10)] for i in range(6)]
+        doc = pdfio.DocumentText(pages=pages, blocks=[p[0].text for p in pages],
+                                 block_pages=list(range(6)), title="s")
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        cancel = _th.Event()
+        cancel.set()                     # the user cancelled before the pool reports
+        entered: list = []
+        real_run_flow = agent.flow.run_flow
+
+        def counting_run_flow(*a, **kw):
+            entered.append(kw.get("params", {}).get("page"))
+            return real_run_flow(*a, **kw)
+
+        session = DocumentSession(state, doc, model=SimpleNamespace(page_concurrency=2),
+                                  log=lambda m: None,
+                                  translate_page=lambda st, page, _m, *, task, **kw: st,
+                                  cancel=cancel.is_set)
+        session._preprocess()
+        with mock.patch.object(agent.flow, "run_flow", counting_run_flow):
+            with self.assertRaises(Exception):     # TranslationCancelled (control signal)
+                session._translate_normal()
+        # Only the already-running pages may have started; the queued ones are cancelled
+        # (the old code ran all six before the cancel could propagate).
+        self.assertLess(len(entered), 6, entered)
+
 
 class NearestBlockTest(unittest.TestCase):
     """M6: a user-drawn region maps back to the nearest source block."""

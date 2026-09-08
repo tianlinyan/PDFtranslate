@@ -282,14 +282,20 @@ class SidebarChat(QWidget):
         (True for the input box).  The startup greeting passes ``show=False`` so the
         conversation opens and the AI replies, but the hidden "你好" is not echoed in
         the sidebar.
+
+        The busy state is set **before** emitting: ``userMessage`` is a direct
+        connection, and its handler may route the text somewhere else entirely
+        (answering a pending flow question, a preview-navigation command) and call
+        ``set_busy(False)``.  Setting busy afterwards overwrote that reset and left
+        the button stuck on "取消" after every routed answer.
         """
         text = (text or "").strip()
         if not text:
             return
         if show:
             self.add_message("我", text)
-        self.userMessage.emit(text)
         self.set_busy(True)
+        self.userMessage.emit(text)
 
     def set_busy(self, busy: bool) -> None:
         """Toggle the send button: "发送" when idle, "取消" while the AI is replying."""

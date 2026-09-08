@@ -2,6 +2,7 @@
 import unittest
 
 import pymupdf as fitz
+from PyQt6.QtCore import QPointF
 
 from translate_app import preview
 from translate_app import sidebar
@@ -39,6 +40,41 @@ class CropRegionTest(unittest.TestCase):
         doc = fitz.open(stream=out, filetype="png")
         self.assertLessEqual(doc[0].rect.width, 10.0)
         doc.close()
+
+    def test_crop_region_keeps_the_source_pixel_density(self):
+        # Regression: the rect is in image PIXELS, but a PNG's page rect is in POINTS
+        # (from its DPI tag), so a 200-dpi render (1700x2200 px) was clipped as if it
+        # were 612x792 pt and resampled back at 72 dpi — the "发送" screenshot reached
+        # the AI 2.8x smaller than the page the user was looking at.
+        doc = fitz.open()
+        page = doc.new_page(width=612, height=792)
+        page.insert_text((72, 100), "Hello PDF", fontsize=12)
+        pix = page.get_pixmap(dpi=200)
+        png = pix.tobytes("png")
+        doc.close()
+        out = preview.crop_region(png, (0, 0, float(pix.width), float(pix.height)))
+        self.assertTrue(out)
+        cropped = fitz.Pixmap(out)
+        self.assertEqual((pix.width, pix.height), (cropped.width, cropped.height))
+
+
+class InkBboxTest(unittest.TestCase):
+    """F17: the marker strokes' bounding box is what the AI gets as a region."""
+
+    def test_bbox_covers_the_strokes_with_padding(self):
+        strokes = [[QPointF(100, 200), QPointF(140, 220)]]
+        self.assertEqual([94.0, 194.0, 146.0, 226.0],
+                         preview.PreviewWindow._ink_bbox(strokes, 1000.0, 1000.0))
+
+    def test_bbox_is_clamped_to_the_image(self):
+        strokes = [[QPointF(2, 2), QPointF(999, 999)]]
+        self.assertEqual([0.0, 0.0, 1000.0, 1000.0],
+                         preview.PreviewWindow._ink_bbox(strokes, 1000.0, 1000.0))
+
+    def test_no_strokes_means_no_region(self):
+        # No marker → no region: sending a fake full-page box made
+        # ``apply_annotation`` pick whatever block sat closest to the page centre.
+        self.assertIsNone(preview.PreviewWindow._ink_bbox([], 1000.0, 1000.0))
 
 
 class ScaleRectTest(unittest.TestCase):

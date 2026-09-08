@@ -175,17 +175,48 @@ def measure_numbers(blocks: Sequence, translated_texts: Sequence[str], *,
     return {"page": page, "numbers": out, "count": len(out)}
 
 
+#: Weight of an **identity** defect (a measured block whose translation is its own
+#: source).  Heavier than missing/residual (2.0): a block that was never translated
+#: is the most severe fidelity failure there is, and without this metric a Latin→Latin
+#: run that echoed the source verbatim scored a perfect 100.
+IDENTITY_WEIGHT = 3.0
+
+#: An identity hit needs a prose-like source: a short technical token ("PDF", "OK",
+#: a product code) legitimately translates to itself, so flagging those would be noise.
+_IDENTITY_MIN_LETTERS = 12
+_IDENTITY_MIN_WORDS = 3
+
+
+def _is_identity(source: str, translated: str) -> bool:
+    """True when ``translated`` is (essentially) its own source text.
+
+    Whitespace- and case-insensitive, and only for prose-like sources — see the
+    constants above.  A block that is already in the target language also lands
+    here, which is intentional: the report lists it as ``identity`` so a human (or
+    ``--judge``) can tell "not translated" from "already correct language".
+    """
+    s = " ".join(str(source or "").split()).casefold()
+    t = " ".join(str(translated or "").split()).casefold()
+    if not s or s != t:
+        return False
+    letters = sum(1 for ch in s if ch.isalpha())
+    return letters >= _IDENTITY_MIN_LETTERS or len(s.split()) >= _IDENTITY_MIN_WORDS
+
+
 def measure_complete(blocks: Sequence, translated_texts: Sequence[str], *,
                      lang: str = "English", page: int = 0) -> dict:
     """Completeness: blocks that need translation but got none (missing) plus
-    residual source-language content left in a translated block.
+    residual source-language content left in a translated block, plus blocks whose
+    translation is byte-identical to their source (``identity``).
 
     Mirrors ``agent.flow._check_missing`` / ``_check_residual``: a translated
     block still holding CJK (Western target) or untranslated Latin prose (CJK
-    target) is a residual.
+    target) is a residual.  ``identity`` is checked first and is language-pair
+    independent — that is the only thing that catches a Latin→Latin (e.g.
+    Spanish→English) run that translated nothing.
     """
     cjk_target = _is_cjk_language(lang)
-    missing, residual = [], []
+    missing, residual, identity = [], [], []
     for i, b in enumerate(blocks):
         if not _is_measurable(b):
             continue
@@ -193,13 +224,16 @@ def measure_complete(blocks: Sequence, translated_texts: Sequence[str], *,
         t = str(t or "").strip()
         if not t:
             missing.append({"index": i, "text": str(b.text)})
+        elif _is_identity(str(b.text), t):
+            identity.append({"index": i, "text": str(b.text), "reason": "identity"})
         elif cjk_target:
             if _is_latin_prose(t):
                 residual.append({"index": i, "text": str(b.text), "reason": "residual_latin"})
         elif _has_cjk(t):
             residual.append({"index": i, "text": str(b.text), "reason": "residual_cjk"})
-    return {"page": page, "missing": missing, "residual": residual,
-            "missing_count": len(missing), "residual_count": len(residual)}
+    return {"page": page, "missing": missing, "residual": residual, "identity": identity,
+            "missing_count": len(missing), "residual_count": len(residual),
+            "identity_count": len(identity)}
 
 
 def aggregate(reports: Sequence[EvalReport], *, weights: dict[str, float] | None = None) -> dict:
@@ -207,7 +241,9 @@ def aggregate(reports: Sequence[EvalReport], *, weights: dict[str, float] | None
 
     ``score = 100 × (1 − min(1, weighted_issues / total_blocks))``.
     ``total`` is only the blocks that were actually measured (had a translation),
-    so a page with no translatable content does not drag the score down.
+    so a page with no translatable content does not drag the score down.  When
+    NOTHING was measured at all the score is 0 with ``no_data: True`` — an empty
+    result must never look like a perfect one (it used to score 100).
     """
     w = dict(LAYOUT_WEIGHTS)
     if weights:
@@ -229,7 +265,8 @@ def aggregate(reports: Sequence[EvalReport], *, weights: dict[str, float] | None
         "buckets": buckets,
         "weighted_issues": round(weighted, 2),
         "issue_ratio": round(issue_ratio, 4),
-        "score": round(100 * (1 - issue_ratio), 2),
+        "score": round(100 * (1 - issue_ratio), 2) if total else 0.0,
+        "no_data": not total,
     }
 
 
@@ -249,18 +286,22 @@ def eval_pages(pages_blocks: Sequence[Sequence], pages_translated: Sequence[Sequ
     layout = aggregate(reports, weights=weights)
     n_missing = sum(c["missing_count"] for c in complete)
     n_residual = sum(c["residual_count"] for c in complete)
+    n_identity = sum(c["identity_count"] for c in complete)
     n_numeric = sum(n["count"] for n in numbers)
     # Fold completeness/number defects into the final score with clear weights.
-    defect_blocks = layout["total"] + n_missing + n_residual
+    # ``identity`` (translation == source) counts heaviest — see IDENTITY_WEIGHT.
+    defect_blocks = layout["total"] + n_missing + n_residual + n_identity
     defect_w = (layout["weighted_issues"] + n_missing * 2.0 + n_residual * 2.0
-                + n_numeric * 2.0)
+                + n_numeric * 2.0 + n_identity * IDENTITY_WEIGHT)
     ratio = min(1.0, defect_w / defect_blocks) if defect_blocks else 0.0
     return {
         "lang": lang,
-        "score": round(100 * (1 - ratio), 2),
+        "score": round(100 * (1 - ratio), 2) if defect_blocks else 0.0,
+        "no_data": not defect_blocks,
         "layout": layout,
         "numbers": {"total": n_numeric},
-        "complete": {"missing": n_missing, "residual": n_residual},
+        "complete": {"missing": n_missing, "residual": n_residual,
+                     "identity": n_identity},
         "per_page": [{"layout": asdict(r), "numbers": n, "complete": c}
                      for r, n, c in zip(reports, numbers, complete)],
     }

@@ -96,33 +96,41 @@ def _cn_to_int(text: str) -> int | None:
 #: Chinese ordinal markers that the model renders as Arabic digits for a
 #: Latin-script target: ``一、二、…十、`` and ``（一）（二）…（十）`` plus ``第X节/章/条/篇``.
 #: The digit comparator normalizes these in BOTH texts so converting them
-#: (``一、``→``1.``, ``（四）``→``(4)``, ``第X节``→``Section X``) is not mistaken for a
+#: (``一、``→``1、``, ``（四）``→``(4)``, ``第二节``→``2节``) is not mistaken for a
 #: figure the source lacks — those are section numbers, not amounts.
+#:
+#: The marker's own delimiter is **preserved**: dropping it glued the ordinal digit
+#: onto a following amount (``一、1,234.56`` → ``11,234.56``, ``1,234（一）`` →
+#: ``1,2341``), which made a perfectly correct translation report a fatal
+#: "数字不一致" and exit 1.
 _CN_ORD_PATTERN = re.compile(
-    r"第\s*([一二三四五六七八九十]{1,3})\s*[章节条篇]"
-    r"|([一二三四五六七八九十]{1,3})\s*[、．]"
-    r"|[（(]\s*([一二三四五六七八九十]{1,3})\s*[)）]"
+    r"第\s*(?P<num_ch>[一二三四五六七八九十]{1,3})\s*(?P<suffix>[章节条篇])"
+    r"|(?P<num_sep>[一二三四五六七八九十]{1,3})\s*(?P<sep>[、．])"
+    r"|(?P<open>[（(])\s*(?P<num_paren>[一二三四五六七八九十]{1,3})\s*(?P<close>[)）])"
 )
 
 
 def _normalize_cjk_ordinals(text: str) -> str:
-    """Turn Chinese ordinal markers into their Arabic digit value.
+    """Turn Chinese ordinal markers into their Arabic digit value, keeping the marker.
 
     Only applies to enumeration markers (a numeral followed by ``、``/``．``,
     inside ``()``/``（）``, or after ``第``).  An unrecognisable numeral (containing
     ``百``/``千``) or one outside the ordinal range is left untouched, so prose
-    amounts in words are never rewritten.
+    amounts in words are never rewritten.  The surrounding punctuation is kept
+    (``一、``→``1、``, ``（四）``→``(4)``, ``第二节``→``2节``) so the substituted digits
+    can never merge with an adjacent figure.
     """
 
     def repl(m: re.Match[str]) -> str:
-        for i in (1, 2, 3):
-            num = m.group(i)
-            if num:
-                val = _cn_to_int(num)
-                if val is not None and 1 <= val <= 99:
-                    return str(val)
-                return m.group(0)
-        return m.group(0)
+        num = m.group("num_ch") or m.group("num_sep") or m.group("num_paren")
+        val = _cn_to_int(num) if num else None
+        if val is None or not 1 <= val <= 99:
+            return m.group(0)
+        if m.group("suffix"):
+            return f"{val}{m.group('suffix')}"
+        if m.group("sep"):
+            return f"{val}{m.group('sep')}"
+        return f"({val})"
 
     return _CN_ORD_PATTERN.sub(repl, text)
 

@@ -70,9 +70,12 @@ class FlowSpec:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "FlowSpec":
         data = dict(d or {})
+        # ``name`` is the registry key written alongside the spec by ``save_flow_spec``;
+        # it is not a flow knob and must not leak into ``extra`` (which ``build_flow``
+        # copies straight into the flow's params).
         extra = {k: v for k, v in data.items()
-                 if k not in {"base", "checks", "scope", "include_kept", "auto_fix",
-                              "page", "lang", "kind", "output_type"}}
+                 if k not in {"name", "base", "checks", "scope", "include_kept",
+                              "auto_fix", "page", "lang", "kind", "output_type"}}
         return cls(
             base=str(data.get("base", "self_check_page")),
             checks=list(data["checks"]) if data.get("checks") is not None else None,
@@ -133,7 +136,7 @@ _AUDIT_ALIASES: dict[str, str] = {
     "漏译": "missing", "残留": "residual",
 }
 
-_SCOPE_RANGE_RE = re.compile(r"第?\s*(\d+)\s*(?:-|到|~|至)\s*第?\s*(\d+)\s*页")
+_SCOPE_RANGE_RE = re.compile(r"第?\s*(\d+)\s*页?\s*(?:-|到|~|至)\s*第?\s*(\d+)\s*页")
 _SCOPE_SINGLE_RE = re.compile(r"第\s*(\d+)\s*页")
 
 
@@ -169,6 +172,19 @@ def _base_from(req: str, default: str) -> str:
     return default
 
 
+def _canonical_check(raw: Any) -> str:
+    """Map a model-supplied check name to its registry name (aliases included).
+
+    A Chinese alias (数字/表格/版面/漏译/残留) is the model restating the user's own
+    wording, so it must become the registry name (``numbers``/…) for the check to
+    actually run.  A name that is NOT recognised is passed through **unchanged** so
+    ``agent.flow.audit_page`` reports it as an ``unknown_checks`` issue
+    (``clean=false``) — dropping it here would silently audit nothing.
+    """
+    name = str(raw).strip()
+    return _AUDIT_ALIASES.get(name, name.lower())
+
+
 def _spec_from_ai(data: dict | None, default_base: str) -> FlowSpec:
     """Build a validated :class:`FlowSpec` from an AI slot-filler's dict.
 
@@ -181,7 +197,9 @@ def _spec_from_ai(data: dict | None, default_base: str) -> FlowSpec:
     if base not in STANDARD_FLOWS:
         base = default_base   # fail-closed: unknown base -> the safe default
     checks = data.get("checks")
-    checks = [str(c) for c in checks] if isinstance(checks, list) else None
+    if isinstance(checks, str):
+        checks = [checks]
+    checks = ([_canonical_check(c) for c in checks] if isinstance(checks, list) else None)
     scope = data.get("scope")
     if isinstance(scope, (int, float)):
         scope = [int(scope)]
@@ -351,6 +369,11 @@ def build_flow(spec: FlowSpec) -> Flow:
             flow.scope["pages"] = pages
             if spec.base in ("ai_self_check", "translate_normal", "special_pages"):
                 flow.params["pages"] = pages
+            elif len(pages) == 1 and spec.base in _PER_PAGE_BASES:
+                # A single-page scope ("检查第4页") must drive the per-page base's
+                # ``{{page}}``.  Writing only ``flow.scope`` (which the executor never
+                # reads) silently audited page 1 instead of the requested page.
+                flow.params["page"] = pages[0]
     return flow
 
 
@@ -401,7 +424,10 @@ def _executor_spec_path(name: str) -> Path:
 
 def _atomic_write(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    # PID-unique temp name: a fixed ``.tmp`` suffix made two flows whose sanitized
+    # names differ only by extension ("检查.v2" vs "检查") share one temp file, so
+    # concurrent writes could swap their contents.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 
@@ -411,11 +437,13 @@ def save_flow_spec(name: str, spec: FlowSpec, *, persist: bool = True) -> None:
 
     ``persist=False`` is an explicit in-memory-only promotion; the default ``True``
     is still env-gated (``_flows_persist_enabled``) so a run without
-    ``PDFTRANSLATE_FLOWS_DIR`` never writes user-flow files implicitly.
+    ``PDFTRANSLATE_FLOWS_DIR`` never writes user-flow files implicitly.  The written
+    JSON carries the original ``name`` so a reload keeps the registry key the user
+    chose (the file name is sanitized, e.g. ``我的 流程`` → ``我的_流程.json``).
     """
     USER_FLOW_SPECS[name] = spec
     if persist and _flows_persist_enabled():
-        _atomic_write(_executor_spec_path(name), spec.to_dict())
+        _atomic_write(_executor_spec_path(name), {**spec.to_dict(), "name": name})
 
 
 def load_user_flow_specs() -> dict[str, FlowSpec]:

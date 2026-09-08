@@ -64,19 +64,34 @@ def _cond_accepts_params(cond: Callable) -> bool:
         return False
 
 
+class FlowParamError(Exception):
+    """A ``{{name}}`` placeholder no supplied param can satisfy.
+
+    Raised instead of leaving the literal ``"{{name}}"`` in place: the literal used to
+    travel into a tool call (``set_text(index="{{index}}")``) and blow up far away with
+    a confusing ``TypeError``, or silently produce a wrong-page audit.
+    """
+
+
 def _resolve(value: Any, params: dict[str, Any]) -> Any:
     """Recursively substitute ``{{name}}`` placeholders from ``params``.
 
     When a string is exactly one placeholder, the raw (type-preserving) param value is
     returned — so ``{"page": "{{page}}"}`` with ``params["page"]=3`` yields ``3``, not
-    ``"3"``.  A placeholder embedded in prose becomes ``str(value)``.
+    ``"3"``.  A placeholder embedded in prose becomes ``str(value)``.  A name that is
+    not in ``params`` raises :class:`FlowParamError` (fail-closed) rather than leaving
+    the literal text for a tool to choke on.
     """
+    def _lookup(name: str) -> Any:
+        if name not in params:
+            raise FlowParamError(f"流程参数缺失：{name}")
+        return params[name]
+
     if isinstance(value, str):
         m = _PLACEHOLDER_RE.fullmatch(value.strip())
         if m:
-            return params.get(m.group(1), value)
-        return _PLACEHOLDER_RE.sub(lambda m: str(params.get(m.group(1), m.group(0))),
-                                   value)
+            return _lookup(m.group(1))
+        return _PLACEHOLDER_RE.sub(lambda mm: str(_lookup(mm.group(1))), value)
     if isinstance(value, dict):
         return {k: _resolve(v, params) for k, v in value.items()}
     if isinstance(value, list):
@@ -244,6 +259,11 @@ class _Executor:
     def run(self, steps: list[FlowStep], rs: FlowRunState,
             params: dict[str, Any]) -> FlowRunState:
         for step in steps:
+            if rs.error:
+                # Fail-closed: once a step has failed, the remaining steps must NOT run
+                # against a broken state (a failing audit tool used to be retried for
+                # every remaining iteration of the loop).
+                break
             if self.cancel is not None and self.cancel():
                 raise FlowCancelled()
             if self.max_steps is not None and rs.steps >= self.max_steps:
@@ -404,6 +424,12 @@ def run_flow(flow: Flow, *, tools: dict[str, Callable] | None = None,
         raise                      # control signal — the caller decides
     except FlowBudgetExceeded:
         rs.error = "流程执行超出预算上限"
+    except Exception as exc:       # noqa: BLE001 — fail-closed, never crash the caller
+        # ``_tool``/``_agent``/``_user`` already wrap their own failures, but step
+        # plumbing outside them (``_resolve`` params, ``LoopStep.max_iter`` /
+        # ``ForEachPage.pages`` coercion, a user-supplied ``cond``/``task`` callable)
+        # could still raise.  The documented contract is "a bad step sets rs.error".
+        rs.error = f"{type(exc).__name__}: {exc}"
     return rs
 
 

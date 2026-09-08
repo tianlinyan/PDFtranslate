@@ -25,22 +25,38 @@ _PREVIEW_DEFAULT_W = 680
 _PREVIEW_DEFAULT_H = 900
 
 
-def crop_region(png: bytes, rect, dpi: int = 72) -> bytes:
+def crop_region(png: bytes, rect, dpi: float | None = None) -> bytes:
     """Crop ``rect`` (image-pixel coords ``(x0, y0, x1, y1)``) out of ``png``.
 
     Returns the cropped PNG.  An empty/out-of-bounds selection is clamped to the
     image; a degenerate (zero-area) region returns ``b""``.
+
+    The rect is in **image pixels** while a PNG opened through PyMuPDF reports its
+    page size in *points* (derived from the PNG's DPI metadata), so the rect is
+    scaled by the PNG's own pixel→point ratio.  Without that, a 200-dpi render
+    (1700×2200 px) was clipped as if it were 612×792 pt and resampled back at 72 dpi
+    — the "发送" screenshot silently arrived 2.8× smaller than the page render.
+    ``dpi=None`` keeps the source's pixel density (output pixel size == input).
     """
     import pymupdf as fitz
 
     doc = fitz.open(stream=png, filetype="png")
     try:
         page = doc[0]
-        r = fitz.Rect(float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+        src = fitz.Pixmap(png)          # real pixel dimensions of the PNG
+        if src.width <= 0 or src.height <= 0 or page.rect.width <= 0 or page.rect.height <= 0:
+            return b""
+        sx = page.rect.width / src.width
+        sy = page.rect.height / src.height
+        r = fitz.Rect(float(rect[0]) * sx, float(rect[1]) * sy,
+                      float(rect[2]) * sx, float(rect[3]) * sy)
         r = r & page.rect
         if r.is_empty or r.width <= 0 or r.height <= 0:
             return b""
-        pix = page.get_pixmap(clip=r, dpi=dpi)
+        # Keep the source's own pixel density so the output PNG's pixel size equals
+        # the requested crop (the DPI tag is what makes PyMuPDF report points).
+        src_dpi = 72.0 / sx if sx else 72.0
+        pix = page.get_pixmap(clip=r, dpi=int(dpi) if dpi else int(round(src_dpi)))
         return pix.tobytes("png")
     finally:
         doc.close()
@@ -443,10 +459,30 @@ class PreviewWindow(QWidget):
         if not cropped:
             return
         # Convert the region from image pixels to PDF points (the block coordinate
-        # space) so ``apply_annotation`` can match it to a block.
+        # space) so ``apply_annotation`` can match it to a block.  With marker
+        # strokes the region is the STROKES' bounding box — a whole-page rect made
+        # ``nearest_block`` pick whatever block sits closest to the page centre,
+        # i.e. the annotation landed on an unrelated block.  With no strokes there
+        # is no region at all, so send ``None`` rather than a fake full-page box.
         s = 72.0 / self._dpi
-        pdf_rect = [float(v) * s for v in rect]
+        ink = self._ink_bbox(strokes, float(img.width()), float(img.height()))
+        pdf_rect = [float(v) * s for v in ink] if ink else None
         self.sendRequested.emit(cropped, pdf_rect)
+
+    @staticmethod
+    def _ink_bbox(strokes: list[list[QPointF]], w: float, h: float,
+                  pad: float = 6.0) -> list[float] | None:
+        """Bounding box of the marker strokes in image pixels (``None`` if empty).
+
+        A small pad keeps the box around the marked content rather than cutting
+        through it; the box is clamped to the image.
+        """
+        xs = [p.x() for st in strokes for p in st]
+        ys = [p.y() for st in strokes for p in st]
+        if not xs or not ys:
+            return None
+        return [max(0.0, min(xs) - pad), max(0.0, min(ys) - pad),
+                min(w, max(xs) + pad), min(h, max(ys) + pad)]
 
     def _ink_strokes(self) -> list[list[QPointF]]:
         """All freehand strokes (finished + any in-progress) in image-pixel coords."""

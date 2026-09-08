@@ -139,10 +139,15 @@ class DocLayoutFactoryBranchTest(unittest.TestCase):
     def test_doclayout_importable_returns_doclayout_structure_fn(self):
         # Fake the ``doclayout_yolo`` package so ``make_doclayout_structure_fn`` takes the
         # DocLayout branch (instead of degrading to geometric), then verify the produced
-        # ``structure_fn`` returns the fused regions.
+        # ``structure_fn`` returns the fused regions.  ``_resolve_doclayout_model`` is
+        # stubbed too: without it the factory would try to download the model (and, with
+        # no ``huggingface_hub`` installed, silently degrade to geometric — making this
+        # test depend on the machine's optional deps / HF cache instead of the branch).
         with patch.dict(sys.modules, {
                 "doclayout_yolo": SimpleNamespace(YOLOv10=lambda *_a, **_k: object()),
             }), \
+            patch.object(pdfio, "_resolve_doclayout_model",
+                         return_value="fake-doclayout.onnx"), \
             patch.object(pdfio, "_render_page_png", return_value=b"png"), \
             patch.object(pdfio, "_doclayout_regions",
                          return_value=[{"kind": "table", "bbox": [0, 0, 10, 10]}]) as dr:

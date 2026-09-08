@@ -101,10 +101,14 @@ def _outdoc(src: str, outdoc: str, lang: str, json_out: str | None,
     _say(f"score={summary['score']} layout.total={summary['layout']['total']} "
          f"numbers={summary['numbers']['total']} "
          f"missing={summary['complete']['missing']} "
-         f"residual={summary['complete']['residual']} → {json_out or '(stdout)'}")
+         f"residual={summary['complete']['residual']} "
+         f"identity={summary['complete'].get('identity', 0)}"
+         f"{' [no_data]' if summary.get('no_data') else ''} → {json_out or '(stdout)'}")
 
     defects = (summary["numbers"]["total"] or summary["complete"]["missing"]
-               or summary["complete"]["residual"])
+               or summary["complete"]["residual"]
+               or summary["complete"].get("identity")
+               or summary.get("no_data"))
     if defects and FAIL_ON_DEFECTS:
         return 1
     if compare and summary.get("delta", {}).get("score_delta", 0) < -1e-9:

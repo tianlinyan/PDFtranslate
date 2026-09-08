@@ -567,95 +567,49 @@ class IrModeWorkerTest(_WorkerTestBase):
 
 
 class RebuildPagesWorkerTest(_WorkerTestBase):
-    """C-⑥ 扫描表格页结构识别：客户端复用 + 每页识别 + 验证门放行。"""
+    """C-⑥ 扫描表格重建（0.2.7 版）：worker 把 ``redraw_ocr`` 与 AI 回调交给导出器。"""
 
     def setUp(self):
         super().setUp()
         self._src = build_sample_pdf(self.tmp / "src.pdf", pages=2)
 
-    def _worker(self) -> TranslateWorker:
+    def _worker(self, *, vision: bool = True, rebuild_table: bool = True) -> TranslateWorker:
         model = ModelConfig(
             id="vision", name="vision", type="openai",
-            endpoint="http://127.0.0.1:9/v1", model="m", vision=True)
+            endpoint="http://127.0.0.1:9/v1", model="m", vision=vision)
         return TranslateWorker(
             str(self._src), model, "English", "translated_pdf",
-            str(self.tmp / "o.pdf"), agent_mode=False, rebuild_table=True)
+            str(self.tmp / "o.pdf"), agent_mode=False, rebuild_table=rebuild_table)
 
-    def test_build_rebuild_pages_reuses_one_client_across_pages(self):
-        # 回归：跨扫描表格页复用同一个 OpenAI 客户端——曾每页新建一个连接池。
+    def _export_kwargs(self, worker: TranslateWorker) -> dict:
         doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
-        created: list = []
+        captured: dict = {}
 
-        class FakeClient:
-            def __init__(self, **kw):
-                created.append(self)
+        def fake_save(*_a, **kw):
+            captured.update(kw)
 
-            def close(self):
-                pass
+        with mock.patch.object(pdfio, "save_translated_pdf", fake_save):
+            worker._export(doc, [[t] for t in doc.blocks])
+        return captured
 
-        style = {"rows_pts": [0.0, 100.0], "cols_pts": [0.0, 300.0],
-                 "merged": [], "header_rows": [], "header_cols": [], "align": [],
-                 "non_text": []}
-        with mock.patch("openai.OpenAI", FakeClient), \
-                mock.patch.object(pdfio, "_reconstruct_ocr_tables",
-                                  return_value=[{"bbox": None}]), \
-                mock.patch.object(pdfio, "_render_page_png", return_value=b"png"), \
-                mock.patch.object(pdfio, "valid_rebuild", return_value=True), \
-                mock.patch("translate_app.table_vision.make_llm_table_structure",
-                           return_value=(lambda png: [style])) as mk:
-            out = self._worker()._build_rebuild_pages(doc)
-        self.assertEqual(len(created), 1)       # 一个客户端，不是每页一个
-        self.assertEqual(mk.call_count, 2)      # 两页各识别一次
-        self.assertEqual(set(out), {0, 1})      # 两页都通过验证门
+    def test_vision_model_gets_redraw_and_ai_callbacks(self):
+        kw = self._export_kwargs(self._worker())
+        self.assertTrue(kw["redraw_ocr"])
+        self.assertIsNotNone(kw["table_rebuild_fn"])   # AI 整表重建
+        self.assertIsNotNone(kw["merge_tool_fn"])      # 合并单元格检测
 
-    def test_build_rebuild_pages_picks_best_candidate(self):
-        # Layer-② 修正：多个候选交给确定性打分选优（best_rebuild），不是众数平均。
-        doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
-        good = {"rows_pts": [0.0, 100.0], "cols_pts": [0.0, 300.0], "merged": [],
-                "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        bad = dict(good, cols_pts=[0.0, 100.0, 200.0, 300.0])
-        with mock.patch("openai.OpenAI", lambda **kw: mock.Mock()), \
-                mock.patch.object(pdfio, "_reconstruct_ocr_tables",
-                                  return_value=[{"bbox": None}]), \
-                mock.patch.object(pdfio, "_render_page_png", return_value=b"png"), \
-                mock.patch.object(pdfio, "valid_rebuild", return_value=True), \
-                mock.patch.object(pdfio, "best_rebuild",
-                                  return_value=(good, (0, 0, 1.0))) as pick, \
-                mock.patch("translate_app.table_vision.make_llm_table_structure",
-                           return_value=(lambda png: [bad, good])):
-            out = self._worker()._build_rebuild_pages(doc)
-        self.assertEqual(pick.call_count, 2)                 # 每页选优一次
-        self.assertEqual(pick.call_args[0][1], [bad, good])  # 候选整体传入
-        self.assertIs(out[0], good)                          # 用选优结果
-        self.assertIs(out[1], good)
+    def test_non_vision_model_gets_geometric_redraw_only(self):
+        # 无视觉模型 → 仍重绘为矢量表格，但不接 AI 回调（回退几何重绘）。
+        kw = self._export_kwargs(self._worker(vision=False))
+        self.assertTrue(kw["redraw_ocr"])
+        self.assertIsNone(kw["table_rebuild_fn"])
+        self.assertIsNone(kw["merge_tool_fn"])
 
-    def test_build_rebuild_pages_fails_closed_when_best_fails_floor(self):
-        # Layer-④ 地板：最优候选仍不达标 → 整页回退普通 OCR（不放进 structure）。
-        doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
-        style = {"rows_pts": [0.0, 100.0], "cols_pts": [0.0, 300.0], "merged": [],
-                 "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        with mock.patch("openai.OpenAI", lambda **kw: mock.Mock()), \
-                mock.patch.object(pdfio, "_reconstruct_ocr_tables",
-                                  return_value=[{"bbox": None}]), \
-                mock.patch.object(pdfio, "_render_page_png", return_value=b"png"), \
-                mock.patch.object(pdfio, "best_rebuild",
-                                  return_value=(style, (99, 99, 0.1))), \
-                mock.patch.object(pdfio, "valid_rebuild", return_value=False), \
-                mock.patch("translate_app.table_vision.make_llm_table_structure",
-                           return_value=(lambda png: [style])):
-            out = self._worker()._build_rebuild_pages(doc)
-        self.assertIsNone(out)
-
-    def test_build_rebuild_pages_off_returns_none(self):
-        # 未开启 rebuild_table 时直接返回 None（不触碰模型）。
-        model = ModelConfig(
-            id="vision", name="vision", type="openai",
-            endpoint="http://127.0.0.1:9/v1", model="m", vision=True)
-        w = TranslateWorker(
-            str(self._src), model, "English", "translated_pdf",
-            str(self.tmp / "o.pdf"), agent_mode=False, rebuild_table=False)
-        doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
-        self.assertIsNone(w._build_rebuild_pages(doc))
+    def test_rebuild_off_passes_no_redraw(self):
+        kw = self._export_kwargs(self._worker(rebuild_table=False))
+        self.assertFalse(kw["redraw_ocr"])
+        self.assertIsNone(kw["table_rebuild_fn"])
+        self.assertIsNone(kw["merge_tool_fn"])
 
 
 class ExportUniquePathTest(_WorkerTestBase):

@@ -106,6 +106,15 @@ def catalog_for(audience: str) -> list[ToolDef]:
     return [t for t in TOOL_CATALOG if audience in t.audience]
 
 
+#: The deterministic audit check names ``audit_page`` accepts — the **single
+#: source** for both the check registry (``agent.flow._AUDIT_CHECKS``) and the
+#: validation of model-supplied names (``agent.flow.audit_page`` /
+#: ``agent.user_flows``).  A name outside this tuple must never be silently
+#: dropped: ``audit_page`` reports it as an ``unknown_checks`` issue and forces
+#: ``clean=False``, otherwise a misspelled / Chinese check name would return a
+#: "clean" page with nothing having run.
+AUDIT_CHECK_NAMES: tuple[str, ...] = ("layout", "residual", "missing", "numbers", "table")
+
 #: Tool tiers (the app single-request taxonomy).  Catalog entries are always atomic;
 #: ``Flow`` adds the two higher tiers.
 TIER_ATOMIC = "atomic"
@@ -256,9 +265,11 @@ TOOL_CATALOG: list[ToolDef] = [
           "供你逐条修正）；checks 可传子集（如 ['numbers','table']），默认全五类。只读复核（不修任何东西）时把 clean 当作本轮是否达标",
           {"page": {"type": "integer"},
            "checks": {"type": "array", "items": {"type": "string"},
-                      "description": "要跑的检查子集：layout/residual/missing/numbers/table（默认全部）"}},
+                      "description": "要跑的检查子集：layout/residual/missing/numbers/table（默认全部）；"
+                                     "只能传这五个英文名——传了别的名字会作为 unknown_checks 问题返回且 clean=false"}},
           ["page"], CAT_VERIFY,
-          returns="{checks_requested, checks, issues, clean}——issues 为带 check 标签的列单项，clean 为本轮是否无问题"),
+          returns="{checks_requested, checks, issues, clean}——issues 为带 check 标签的列单项，clean 为本轮是否无问题；"
+                  "未知检查名会以 unknown_checks 出现在 issues 里（clean=false，不会静默通过）"),
     _tool("preview_page",
           "在预览窗口显示指定页面（供用户查看），可聚焦某区域/块",
           {"page": {"type": "integer", "description": "页号（0 起）"},
@@ -319,7 +330,9 @@ TOOL_CATALOG: list[ToolDef] = [
     _tool("self_check",
           "对当前已翻译的 PDF 跑**确定性质检**（只读、不重译、不改动）：残留/漏译/数字保真/表格完整性/版面五类。"
           "用户说“检查第N页的数字/有没有漏译/数字对不对/翻译得怎么样”时调用；page 不传则查全文，checks 可传子集（如只查数字 ['numbers']）。"
-          "返回 {checks_requested, checks, issues, clean}，issues 是带 check 标签的问题清单，clean 为是否无问题。",
+          "返回 {checks_requested, checks, issues, clean}，issues 是带 check 标签的问题清单，clean 为是否无问题。"
+          "checks 只能传 layout/residual/missing/numbers/table 这五个英文名；传别的名字会作为 unknown_checks 问题返回（clean=false），"
+          "不要凭猜测编检查名。",
           {"page": {"type": "integer", "description": "页号（0 起）；不传则审计全文"},
            "checks": {"type": "array", "items": {"type": "string"},
                       "description": "检查子集：layout/residual/missing/numbers/table（默认全部）"}},

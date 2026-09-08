@@ -44,6 +44,28 @@ class BuildIrTest(unittest.TestCase):
         groups = [b.group_id for b in doc_ir.pages[0].blocks]
         self.assertEqual(groups, sorted(groups))
 
+    def test_build_ir_verbatim_block_breaks_the_prose_run(self):
+        # Regression: a numeric block was grouped with the prose around it, so
+        # ``prose_units`` merged "...revenue of" + "million yuan..." into ONE request
+        # (the number is excluded from the request) — the model saw a sentence with the
+        # amount missing.  A verbatim block must be a hard group boundary.
+        texts = ["The Group recorded total operating revenue of", "1,234,567.89",
+                 "million yuan for the year ended 31 December 2024."]
+        blocks = [Block(t, 0, 72, 100 + i * 14, 520, 112 + i * 14, size=10.0)
+                  for i, t in enumerate(texts)]
+        dt = pdfio.DocumentText(pages=[blocks], blocks=texts, block_pages=[0, 0, 0])
+        doc_ir = ir.build_ir(dt, lang="English")
+        groups = [b.group_id for b in doc_ir.pages[0].blocks]
+        self.assertEqual(len(set(groups)), 3, groups)   # no run spans the number
+        translatable = [b for b in doc_ir.pages[0].blocks if not ir._is_verbatim(b.anchor)]
+        units = ir.prose_units(translatable)
+        self.assertEqual([[b.src_id for b in u] for u in units], [[0], [2]])
+        # No request carries the amount, and neither is a truncated sentence: the two
+        # prose fragments are translated independently instead of one hole-riddled
+        # sentence ("...revenue of million yuan...").
+        for u in units:
+            self.assertNotIn("1,234,567.89", ir.join_texts([b.text for b in u]))
+
     def test_table_binds_ref_and_groups(self):
         dt = self._doc()
         # A mock structure with a table grid over page 0's blocks.
@@ -169,6 +191,21 @@ class InferTermsTest(unittest.TestCase):
         terms = ir.infer_terms(self._ir())
         self.assertIn("Revenue", terms)   # appears twice (TitleCase)
         self.assertNotIn("hello", terms)  # appears once
+
+    def test_infer_terms_drops_function_words(self):
+        # Regression: a title-cased heading made "The"/"While"/"Figure" look like
+        # terminology; pinned as a must-use glossary entry they distort every sentence.
+        blocks = [
+            IRBlock(anchor=Block("The Group While Figure", 0, 0, 0, 100, 20),
+                    text="The Group While Figure", role="text", src_id=0),
+            IRBlock(anchor=Block("The Group While Figure", 0, 0, 20, 100, 40),
+                    text="The Group While Figure", role="text", src_id=1),
+        ]
+        terms = ir.infer_terms(IRDoc(title="t", pages=[IRPage(page=0, blocks=blocks)],
+                                     block_count=2))
+        self.assertIn("Group", terms)             # a real term survives
+        for stop in ("The", "While", "Figure"):
+            self.assertNotIn(stop, terms)
 
     def test_translate_ir_infer_injects_computed_glossary(self):
         ir0 = self._ir()
@@ -364,13 +401,25 @@ class ProseGroupingTest(unittest.TestCase):
         self.assertEqual("".join(pieces), "The revenue 1,234.56 is high")
         self.assertIn("1,234.56", "".join(pieces))  # intact, unbroken across a boundary
 
+    def test_split_prefers_a_space_over_cutting_inside_a_word(self):
+        # Regression: a cut inside a Latin word cost nothing, so a boundary could land
+        # mid-word.  Here the exact proportional target (5) is inside "abcdefgh" while
+        # the word ends at 8 — the cut must move to the word boundary.
+        pieces = ir.split_translation(["a" * 5, "b" * 9], "abcdefgh WXYZQ")
+        self.assertEqual("abcdefgh", pieces[0].strip())
+        self.assertEqual("WXYZQ", pieces[1].strip())
+
     def test_split_proportional_first_piece_longer(self):
         pieces = ir.split_translation(["aaaaaa", "bb"], "11111111")
         self.assertGreaterEqual(len(pieces[0]), len(pieces[1]))
 
-    def test_split_too_short_keeps_whole_in_first(self):
+    def test_split_too_short_keeps_source_not_blank(self):
+        # Regression: the too-short branch used to blank the other fragments
+        # (["xy", "", ""]), and a blank fragment exports as an empty box — content
+        # silently lost.  They keep their SOURCE text instead (visible, and caught by
+        # the residual check).
         pieces = ir.split_translation(["a", "b", "c"], "xy")
-        self.assertEqual(pieces, ["xy", "", ""])
+        self.assertEqual(pieces, ["xy", "b", "c"])
 
     # -- translate_ir integration ------------------------------------------- #
     def test_translate_ir_merges_paragraph_and_maps_back(self):

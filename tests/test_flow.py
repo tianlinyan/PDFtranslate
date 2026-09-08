@@ -152,6 +152,37 @@ class RunFlowTest(unittest.TestCase):
         self.assertFalse(rs.ok)
         self.assertIn("unknown tool", rs.error)
 
+    def test_missing_placeholder_fails_closed(self):
+        # Regression: a missing param left the literal "{{missing}}" for the tool to
+        # choke on (or silently produced a wrong-page call).  It must be a clear,
+        # fail-closed error instead.
+        rs = agent.run_flow(self._flow(fs.ToolStep("a", {"v": "{{missing}}"})),
+                            tools={"a": lambda v: v})
+        self.assertFalse(rs.ok)
+        self.assertIn("流程参数缺失", rs.error)
+
+    def test_steps_after_a_failure_do_not_run(self):
+        # Fail-closed: once a step failed, the rest of the flow must not run against
+        # a broken state (a failing audit tool used to be retried every iteration).
+        calls: list = []
+        flow = self._flow(fs.ToolStep("boom"), fs.ToolStep("after"))
+
+        def boom():
+            raise RuntimeError("x")
+
+        rs = agent.run_flow(flow, tools={"boom": boom,
+                                         "after": lambda: calls.append(1)})
+        self.assertFalse(rs.ok)
+        self.assertEqual(["boom"], rs.applied)
+        self.assertEqual([], calls)
+
+    def test_plumbing_errors_are_reported_not_raised(self):
+        # A bad max_iter / pages coercion must land in ``rs.error``, never escape.
+        flow = fs.Flow(name="f", description="", steps=[
+            fs.LoopStep(body=[], max_iter="{{nope}}")])
+        rs = agent.run_flow(flow)
+        self.assertFalse(rs.ok)
+
     def test_tool_step_re_raises_translation_cancelled(self):
         # A deterministic ToolStep that raises the translation engine's cancellation
         # signal must propagate it as a control signal, NOT swallow it as a tool error.

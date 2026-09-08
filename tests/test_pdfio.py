@@ -470,241 +470,6 @@ class PdfioTest(unittest.TestCase):
         self.assertAlmostEqual(col_boxes[1][0], 152.0, delta=0.5)
         self.assertAlmostEqual(col_boxes[1][1], 248.0, delta=0.5)
 
-    def test_rebuild_ocr_table_reanchors_blocks_to_cells(self):
-        # C-⑥ 重建为矢量表格：把 OCR 块 bbox 重排到 AI 识别的单元格边界，
-        # 走文本层表格管线的行高扩展 + 矢线重绘 + 正常填充译文。
-        blocks = [
-            pdfio.Block(text="A", page=0, x0=1, y0=1, x1=10, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="B", page=0, x0=51, y0=1, x1=60, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="C", page=0, x0=1, y0=11, x1=10, y1=19, size=9.0, ocr=True),
-            pdfio.Block(text="D", page=0, x0=51, y0=11, x1=60, y1=19, size=9.0, ocr=True),
-        ]
-        style = {"rows_pts": [0, 10, 20], "cols_pts": [0, 50, 100],
-                 "merged": [], "header_rows": [], "header_cols": [], "align": []}
-        rebuilt, tables, mapping = pdfio._rebuild_ocr_table_blocks(blocks, style)
-        # 每个块的 bbox 重排到对应 AI 单元格（含 _TABLE_CELL_PAD）。
-        self.assertAlmostEqual(rebuilt[0].x0, 2.0)     # 0 + 2
-        self.assertAlmostEqual(rebuilt[0].y0, 0.0)
-        self.assertAlmostEqual(rebuilt[0].x1, 48.0)    # 50 - 2
-        self.assertAlmostEqual(rebuilt[1].x0, 52.0)    # 50 + 2
-        self.assertEqual(len(tables), 1)
-        self.assertEqual(len(tables[0]["rows"]), 2)    # 2 row gaps
-        self.assertEqual(len(mapping), 4)
-        # 每个块都映射到 AI 网格的单元格。
-        self.assertEqual(mapping[0], (0, 0, 0))
-        self.assertEqual(mapping[1], (0, 0, 1))
-        self.assertEqual(mapping[2], (0, 1, 0))
-        self.assertEqual(mapping[3], (0, 1, 1))
-
-    def test_rebuild_semantics_composes_grid(self):
-        # Layer-③: 重建后构建语义 StructTable（cells/merged/header），供审计。
-        blocks = [
-            pdfio.Block(text="A", page=0, x0=1, y0=1, x1=10, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="B", page=0, x0=51, y0=1, x1=60, y1=9, size=9.0, ocr=True),
-        ]
-        style = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100],
-                 "merged": [{"r": 0, "c": 0, "row_span": 1, "col_span": 2}],
-                 "header_rows": [0], "header_cols": [], "align": [], "non_text": []}
-        sem = pdfio.rebuild_semantics(blocks, style)
-        self.assertEqual(sem["rows"], 1)
-        self.assertEqual(sem["cols"], 2)
-        self.assertEqual(sem["header_rows"], [0])
-        self.assertEqual(sem["merged"], [{"r": 0, "c": 0, "row_span": 1, "col_span": 2}])
-        # 块 A/B 映射到 (0,0)/(0,1)。
-        self.assertEqual(sem["cells"][0][0], 0)
-        self.assertEqual(sem["cells"][0][1], 1)
-
-    def test_valid_rebuild_accepts_when_numerics_stay_in_cells(self):
-        # Layer-④: 数字块都映射到重建单元格 → valid_rebuild True。
-        blocks = [
-            pdfio.Block(text="1,234.56", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="label", page=0, x0=51, y0=1, x1=90, y1=9, size=9.0, ocr=True),
-        ]
-        style = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100],
-                 "merged": [], "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        self.assertTrue(pdfio.valid_rebuild(blocks, style))
-
-    def test_valid_rebuild_rejects_when_numerics_flee(self):
-        # Layer-④: 数字块无法映射到任何重建单元格 → 回退（fail-closed）。
-        blocks = [
-            pdfio.Block(text="1,234.56", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True),
-        ]
-        style = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100],
-                 "merged": [], "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        with mock.patch.object(pdfio, "_rebuild_ocr_table_blocks",
-                               return_value=([], [], {})):
-            self.assertFalse(pdfio.valid_rebuild(blocks, style))
-
-    def test_in_non_text_detects_signature_region(self):
-        # 非文本区域（签名/印章）内的块应被识别为保持原样（不重建、不翻译）。
-        non_text = [(50, 690, 550, 750, "signature")]
-        sig = pdfio.Block(text="sig", page=0, x0=100, y0=700, x1=500, y1=740, size=9.0, ocr=True)
-        self.assertTrue(pdfio._in_non_text(sig, non_text))
-        data = pdfio.Block(text="data", page=0, x0=100, y0=100, x1=200, y1=120, size=9.0, ocr=True)
-        self.assertFalse(pdfio._in_non_text(data, non_text))
-
-    def test_calibrate_table_grid_reports_prepended_shift(self):
-        # Layer-① 回归：几何校准在最左补了一列时，必须报告平移量（1），调用方据此
-        # 平移 AI 的 align/merged/header 索引；只补右侧列则不平移。
-        blocks = [
-            pdfio.Block(text="a", page=0, x0=50, y0=5, x1=90, y1=15, size=9.0, ocr=True),
-            pdfio.Block(text="b", page=0, x0=210, y0=5, x1=290, y1=15, size=9.0, ocr=True),
-        ]
-        cols, rows, col_shift, row_shift = pdfio._calibrate_table_grid(
-            blocks, [100.0, 200.0, 300.0], [0.0, 10.0, 20.0])
-        self.assertEqual(col_shift, 1)                 # 50 < 100 - 4 → 前插一列
-        self.assertEqual(cols, [50.0, 100.0, 200.0, 294.0])  # 右界收到内容右缘 290+4
-        self.assertEqual(row_shift, 0)                 # y 在 AI 行跨度内
-        self.assertEqual(rows, [0.0, 10.0, 19.0])      # 底行界收到内容底缘 15+4
-
-    def test_calibrate_table_grid_trims_overwide_right_boundary(self):
-        # 回归「表格超宽」：AI 把最右列画到页面右缘（如 592.7），而内容实际到 533，
-        # 几何校准必须把右界收回到内容右缘，而不是一味向外扩。
-        blocks = [
-            pdfio.Block(text="a", page=0, x0=50, y0=1, x1=90, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="456", page=0, x0=400, y0=1, x1=533, y1=9, size=9.0, ocr=True),
-        ]
-        cols, _rows, col_shift, _row_shift = pdfio._calibrate_table_grid(
-            blocks, [50.0, 300.0, 592.7], [0.0, 10.0, 20.0])
-        self.assertEqual(cols[-1], 537.0)      # 533 + gap(4)，不是 592.7
-        self.assertEqual(col_shift, 0)         # 右侧收回不平移列号
-        # 数字块仍映射到最右列，数字不丢。
-        style = {"rows_pts": [0.0, 10.0, 20.0], "cols_pts": cols, "merged": [],
-                 "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        rebuilt, _t, mapping = pdfio._rebuild_ocr_table_blocks(blocks, style)
-        self.assertIn(1, mapping)              # 数字块仍落在网格内
-        self.assertTrue(any(c.isdigit() for c in rebuilt[1].text))
-
-    def test_calibrate_table_grid_handles_empty_blocks(self):
-        # 无 OCR 块时不得因 min() 空序列抛异常：原样返回 AI 网格、平移为 0。
-        cols, rows, col_shift, row_shift = pdfio._calibrate_table_grid(
-            [], [1.0, 2.0], [3.0, 4.0])
-        self.assertEqual(cols, [1.0, 2.0])
-        self.assertEqual(rows, [3.0, 4.0])
-        self.assertEqual((col_shift, row_shift), (0, 0))
-
-    def test_rebuild_align_follows_column_when_calibration_prepends(self):
-        # 回归：几何校准在最左补列后，AI 说的「第 1 列右对齐」必须仍落到真正含该
-        # 数字块的那一列（重建后的第 2 列），而不是错位到相邻列。
-        blocks = [
-            pdfio.Block(text="甲乙", page=0, x0=50, y0=1, x1=90, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="456", page=0, x0=210, y0=1, x1=290, y1=9, size=9.0, ocr=True),
-        ]
-        style = {"rows_pts": [0.0, 10.0, 20.0], "cols_pts": [100.0, 200.0, 300.0],
-                 "align": [{"col": 1, "dir": "right"}], "merged": [],
-                 "header_rows": [0], "header_cols": [], "non_text": []}
-        rebuilt, _tables, mapping = pdfio._rebuild_ocr_table_blocks(blocks, style)
-        self.assertEqual(mapping[1], (0, 0, 2))        # 数字块落到重建的第 2 列
-        self.assertEqual(rebuilt[1].align, "right")    # 仍右对齐（曾错到 col 1）
-        self.assertEqual(rebuilt[0].align, "left")     # 前插列不是 AI 指定的右对齐列
-
-    def test_rebuild_semantics_shifts_header_and_merge_after_prepend(self):
-        # 回归：几何校准前插列后，merged/header_cols 索引必须一起平移，否则审计
-        # 看到的合并范围/表头位置会错位一位。
-        blocks = [
-            pdfio.Block(text="x", page=0, x0=50, y0=5, x1=90, y1=15, size=9.0, ocr=True),
-            pdfio.Block(text="y", page=0, x0=210, y0=5, x1=290, y1=15, size=9.0, ocr=True),
-        ]
-        style = {"rows_pts": [0.0, 10.0, 20.0], "cols_pts": [100.0, 200.0, 300.0],
-                 "merged": [{"r": 0, "c": 1, "row_span": 1, "col_span": 2}],
-                 "header_rows": [0], "header_cols": [1], "align": [], "non_text": []}
-        sem = pdfio.rebuild_semantics(blocks, style)
-        self.assertEqual(sem["cols"], 3)
-        self.assertEqual(sem["header_cols"], [2])              # 1 + col_shift(1)
-        self.assertEqual(sem["merged"][0]["c"], 2)             # 1 + col_shift(1)
-        self.assertEqual(sem["header_rows"], [0])              # 无行前插
-
-    def test_rebuild_pages_does_not_whiteout_non_ocr_page(self):
-        # 防御回归：rebuild_pages 若含非 OCR 表格页的索引，不得整页涂白（会抹掉
-        # 文本层内容）。白矩形只在「本页确实是 OCR 位图表格」时才画。
-        src = _OUT / "rebuild_guard_src.pdf"
-        build_sample_pdf(src, pages=1)
-        doc = pdfio.extract_document_text(str(src), ocr=False, log=lambda m: None)
-        trans = [b.text for b in doc.pages[0]]
-        out = _OUT / "rebuild_guard_out.pdf"
-        style = {"rows_pts": [0.0, 100.0], "cols_pts": [0.0, 300.0],
-                 "merged": [], "header_rows": [], "header_cols": [], "align": [],
-                 "non_text": []}
-        pdfio.save_translated_pdf(str(src), doc.pages, [trans], str(out), "English",
-                                  rebuild_pages={0: style})
-        d = fitz.open(str(out))
-        try:
-            page = d[0]
-            full_white = [
-                dr for dr in page.get_drawings()
-                if dr.get("type") == "f" and dr.get("fill")
-                and all(abs(c - 1.0) < 0.01 for c in dr["fill"])
-                and dr["rect"].width > page.rect.width * 0.9
-                and dr["rect"].height > page.rect.height * 0.9
-            ]
-            self.assertEqual(full_white, [])
-        finally:
-            d.close()
-
-    def test_score_rebuild_counts_cell_collisions(self):
-        # 确定性打分：删掉一条内竖线（两列合并）→ 两个数字挤进同一格 → collisions 上升。
-        blocks = [
-            pdfio.Block(text="1", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="2", page=0, x0=55, y0=1, x1=75, y1=9, size=9.0, ocr=True),
-        ]
-        good = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100], "merged": [],
-                "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        merged = {"rows_pts": [0, 10], "cols_pts": [0, 100], "merged": [],
-                  "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        self.assertEqual(pdfio.score_rebuild(blocks, good)[0], 0)
-        self.assertEqual(pdfio.score_rebuild(blocks, merged)[0], 1)
-        # 数字落格率都是 1.0 —— 说明单靠 valid_rebuild 分不出好坏，必须靠 collisions。
-        self.assertEqual(pdfio.score_rebuild(blocks, good)[2], 1.0)
-        self.assertEqual(pdfio.score_rebuild(blocks, merged)[2], 1.0)
-
-    def test_best_rebuild_prefers_fewer_collisions(self):
-        # 多个候选确定性选优：合并列的候选 collisions 更高，应被淘汰。
-        blocks = [
-            pdfio.Block(text="1", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="2", page=0, x0=55, y0=1, x1=75, y1=9, size=9.0, ocr=True),
-        ]
-        good = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100], "merged": [],
-                "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        merged = {"rows_pts": [0, 10], "cols_pts": [0, 100], "merged": [],
-                  "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        best, score = pdfio.best_rebuild(blocks, [merged, good])
-        self.assertIs(best, good)
-        self.assertEqual(score[0], 0)
-        self.assertEqual(pdfio.best_rebuild(blocks, [])[0], None)
-
-    def test_score_rebuild_ranks_unusable_style_last(self):
-        # 结构不可用时打分应为最差（供选优淘汰），而不是抛异常。
-        blocks = [pdfio.Block(text="1", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True)]
-        with mock.patch.object(pdfio, "_rebuild_ocr_table_blocks",
-                               side_effect=ValueError("boom")):
-            collisions, overflow, ratio = pdfio.score_rebuild(blocks, {})
-        self.assertGreater(collisions, 10 ** 6)
-        self.assertEqual(ratio, 0.0)
-
-    def test_rebalance_rebuild_widens_numeric_column(self):
-        # 数字感知列宽自适应：数字列过窄（数字溢出）→ 加宽到容纳最宽数字，总表宽不变。
-        blocks = [
-            pdfio.Block(text="项目", page=0, x0=2, y0=1, x1=300, y1=9, size=9.0, ocr=True),
-            pdfio.Block(text="12,345,678,901.12", page=0, x0=310, y0=1, x1=345, y1=9,
-                        size=6.0, ocr=True),
-        ]
-        style = {"rows_pts": [0, 10], "cols_pts": [0, 305, 350], "merged": [],
-                 "header_rows": [], "header_cols": [], "align": [], "non_text": []}
-        rebuilt, tables, mapping = pdfio._rebuild_ocr_table_blocks(blocks, style)
-        font = fitz.Font("cjk")
-        col_boxes, new_col_edges = pdfio._rebalance_rebuild_columns(
-            tables, mapping, rebuilt, ["项目", "12,345,678,901.12"], font)
-        edges = new_col_edges[0]
-        src_edges = tables[0]["col_edges"]   # 校准后的总宽（AI 350 被校准收到 349）
-        self.assertAlmostEqual(edges[0], src_edges[0], delta=0.01)
-        self.assertAlmostEqual(edges[-1], src_edges[-1], delta=0.01)  # 总表宽不变
-        self.assertGreater(edges[2] - edges[1],
-                           src_edges[2] - src_edges[1])   # 数字列被加宽
-        # 数字列宽度 ≥ 最宽数字（单行，不破行）。
-        avail_w = col_boxes[1][1] - col_boxes[1][0]
-        need_w = font.text_length("12,345,678,901.12", fontsize=6.0)
-        self.assertGreaterEqual(avail_w, need_w)
-
     def test_unique_path_appends_number_when_exists(self):
         # 导出不覆盖重名文件：test_English.pdf 已存在 → test_English(1).pdf。
         with tempfile.TemporaryDirectory() as tmp:
@@ -843,21 +608,6 @@ class TableCellFitTest(unittest.TestCase):
         lines, fs = pdfio._fit_block(block, font, long_name)
         self.assertGreater(len(lines), 1)
         self.assertEqual(fs, pdfio._MIN_TABLE_READABLE)
-        self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
-
-    def test_fit_block_keep_font_keeps_size_and_wraps(self):
-        # Rebuilt vector-table cell (keep_font): keep the original font size and
-        # grow the row to the wrapped line count instead of shrinking.
-        font = fitz.Font("cjk")
-        block = pdfio.Block(
-            text="", page=0, x0=100, y0=100, x1=250, y1=120,
-            size=9.0, align="left", bold=False, single_line=True, in_table=True,
-        )
-        block = pdfio.replace(block, keep_font=True)
-        long_name = "Wenling Municipal State-owned Assets Management Co., Ltd."
-        lines, fs = pdfio._fit_block(block, font, long_name)
-        self.assertEqual(fs, 9.0)           # original font size kept, not shrunk
-        self.assertGreater(len(lines), 1)   # wrapped instead of collapsed to 3pt
         self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
 
     def test_fit_block_band_wraps_at_readable_floor_when_band_is_plenty(self):
@@ -1500,6 +1250,28 @@ class SkewDetectTest(unittest.TestCase):
             self.assertIsNotNone(got)
             self.assertAlmostEqual(float(want), float(got), delta=1.2)
 
+    def test_deskew_removes_the_tilt_instead_of_doubling_it(self):
+        # Regression: ``_deskew_affine`` rotated by the wrong sign, so a scan tilted
+        # by θ was fed to OCR at 2θ (a 3° page came out at ~6°).  After deskewing with
+        # the measured angle the residual tilt must be ~0.
+        import cv2
+        import numpy as np
+
+        base = np.full((400, 600), 255, np.uint8)
+        for y in range(60, 340, 30):
+            cv2.line(base, (60, y), (540, y), 0, 3)
+        for angle in (3.0, -3.0):
+            m = cv2.getRotationMatrix2D((300.0, 200.0), angle, 1.0)
+            tilted = cv2.warpAffine(base, m, (600, 400), flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_REPLICATE)
+            est = pdfio._estimate_skew_from_gray(tilted)
+            self.assertIsNotNone(est)
+            fixed, _, _ = pdfio._deskew_affine(tilted, float(est))
+            residual = pdfio._estimate_skew_from_gray(fixed)
+            self.assertIsNotNone(residual)
+            self.assertLess(abs(float(residual)), 0.6,
+                            f"tilt {angle}° → est {est}° → residual {residual}°")
+
     def test_detect_page_skew_flat_page_is_not_recommended(self):
         # A page with straight horizontal rules reads as ~0° (no geometry correction
         # is recommended).  --- a smoke test that the CV path runs without error.
@@ -1515,6 +1287,167 @@ class SkewDetectTest(unittest.TestCase):
         res = pdfio.detect_page_skew(str(src), 0)
         self.assertIsInstance(res["skew_degrees"], float)
         self.assertIn(res["reason"], ("版面基本平正", "未检测到文本线"))
+
+
+class ParagraphGroupingTest(unittest.TestCase):
+    """F2: a paragraph's short last line must not become its own block.
+
+    ``_break_between``'s centre-jump rule (meant for left↔right column changes) fired
+    on any left-aligned last line narrower than ~half the text width — roughly half of
+    all paragraphs — because it measured the jump against the *current* (short) line.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    @staticmethod
+    def _line(x0, x1, y0, text="text"):
+        return {"x0": float(x0), "x1": float(x1), "y0": float(y0),
+                "y1": float(y0) + 11.0, "size": 11.0, "bold": False,
+                "color": 0, "text": text}
+
+    def test_short_last_line_stays_in_the_paragraph(self):
+        lines = [self._line(72, 453, 100), self._line(72, 453, 114),
+                 self._line(72, 140, 128, "the end.")]
+        groups = pdfio._group_lines(lines)
+        self.assertEqual(1, len(groups), [len(g) for g in groups])
+        self.assertEqual(3, len(groups[0]))
+
+    def test_staggered_column_transition_still_breaks(self):
+        # The rule's real job: a two-column page whose right column starts BELOW the
+        # left column's last line (so the y-jump rule cannot catch it).
+        lines = [self._line(72, 250, 100), self._line(72, 150, 114),
+                 self._line(320, 500, 128)]
+        groups = pdfio._group_lines(lines)
+        self.assertEqual([2, 1], [len(g) for g in groups])
+
+    def test_wrapped_paragraph_extracts_as_one_block(self):
+        # End-to-end: the same shape on a real PDF must come back as one block, not
+        # three (the fragment then got translated alone, losing its context).
+        import pymupdf as fitz
+
+        path = Path(self.tmp.name) / "para.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        y = 100.0
+        for line in ("The quick brown fox jumps over the lazy dog and keeps running",
+                     "across the open field until it reaches the far side of the",
+                     "meadow."):
+            page.insert_text((72, y), line, fontsize=11)
+            y += 14.0
+        doc.save(str(path))
+        doc.close()
+        dt = pdfio.extract_document_text(str(path), ocr=False)
+        self.assertEqual(1, len(dt.blocks), dt.blocks)
+        self.assertIn("meadow.", dt.blocks[0])
+
+
+class RotatedPageOcrTest(unittest.TestCase):
+    """F4: OCR boxes on a page with /Rotate ≠ 0 must be mapped to the unrotated frame.
+
+    ``get_pixmap`` renders the *rotated* page, while the text/draw APIs (and hence the
+    exporter) work in the unrotated mediabox frame.  Without the derotation the boxes
+    came out transposed (x/y swapped), so covers and translations landed elsewhere.
+    """
+
+    def test_ocr_boxes_are_derotated(self):
+        import numpy as np
+
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        page.set_rotation(90)
+        try:
+            self.assertEqual(400, page.mediabox.width)
+            # A pixmap-space point (100, 50) is the unrotated (50, 100).
+            img = np.zeros((400, 200, 3), np.uint8)   # 200x400 px at zoom 1
+            box = [[100.0, 50.0], [100.0, 50.0], [100.0, 50.0], [100.0, 50.0]]
+
+            def engine(_img):
+                return [(box, "TXT")]
+
+            res = pdfio._ocr_results_from_img(engine, img, 1.0, 0, None,
+                                              derotate=page.derotation_matrix)
+            self.assertEqual(1, len(res))
+            self.assertAlmostEqual(50.0, res[0][0][0][0], places=1)
+            self.assertAlmostEqual(100.0, res[0][0][0][1], places=1)
+        finally:
+            doc.close()
+
+    def test_ocr_page_blocks_uses_the_page_derotation(self):
+        import numpy as np
+
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        page.set_rotation(90)
+        try:
+            px, py = 500.0, 300.0          # a point in the rendered pixmap
+            zoom = pdfio._OCR_DPI / 72.0
+            expected = fitz.Point(px / zoom, py / zoom) * page.derotation_matrix
+
+            def engine(_img):
+                return [([[px, py], [px, py], [px, py], [px, py]], "TXT")]
+
+            with mock.patch.object(pdfio, "_get_ocr_engine", return_value=engine), \
+                 mock.patch.object(pdfio, "_page_to_array",
+                                   return_value=(np.zeros((10, 10, 3), np.uint8), zoom)):
+                blocks = pdfio._ocr_page_blocks(0, page, None, None)
+            self.assertEqual(1, len(blocks))
+            b = blocks[0]
+            self.assertAlmostEqual(float(expected.x), b.x0, delta=1.0)
+            self.assertAlmostEqual(float(expected.y), b.y0, delta=1.0)
+        finally:
+            doc.close()
+
+
+class LineArtPreservationTest(unittest.TestCase):
+    """F3: a page with a table must not lose its OTHER vector graphics.
+
+    ``apply_redactions(graphics=REMOVE_IF_TOUCHED)`` is page-wide: with a table present
+    it deleted every drawing whose bbox intersected any text redaction rect — e.g. the
+    frame drawn around a paragraph (measured on the real exporter before the fix).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _source(self) -> Path:
+        path = Path(self.tmp.name) / "art.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=500, height=700)
+        for x in (60, 200, 340):                       # a 2x2 ruled table
+            page.draw_line(fitz.Point(x, 100), fitz.Point(x, 200),
+                           color=(0, 0, 1), width=0.8)
+        for y in (100, 150, 200):
+            page.draw_line(fitz.Point(60, y), fitz.Point(340, y),
+                           color=(0, 0, 1), width=0.8)
+        page.insert_text((70, 130), "Cell A", fontsize=10)
+        page.insert_text((210, 130), "123", fontsize=10)
+        page.draw_rect(fitz.Rect(55, 300, 345, 340), color=(0, 0.5, 0), width=1.0)
+        page.insert_text((70, 325), "This paragraph is boxed by a frame.", fontsize=11)
+        page.draw_line(fitz.Point(60, 360), fitz.Point(340, 360),
+                       color=(0, 0.5, 0), width=1.0)
+        doc.save(str(path))
+        doc.close()
+        return path
+
+    def test_boxed_paragraph_keeps_its_frame(self):
+        src = self._source()
+        doc = pdfio.extract_document_text(str(src), ocr=False)
+        self.assertTrue(pdfio._extract_tables(fitz.open(str(src))[0]))  # a table exists
+        per_page = [[f"T{j}" for j in range(len(page))] for page in doc.pages]
+        out = Path(self.tmp.name) / "art_out.pdf"
+        pdfio.save_translated_pdf(str(src), doc.pages, per_page, out, "English")
+        doc2 = fitz.open(str(out))
+        try:
+            rects = [tuple(round(v) for v in dr["rect"]) for dr in doc2[0].get_drawings()]
+        finally:
+            doc2.close()
+        self.assertIn((55, 300, 345, 340), rects,
+                      f"the boxed paragraph lost its frame: {rects}")
+        self.assertIn((60, 360, 340, 360), rects,
+                      f"the underline was removed: {rects}")
 
 
 class StructureTest(unittest.TestCase):
@@ -1805,6 +1738,268 @@ class GeometricStructureTest(unittest.TestCase):
         gt = pdfio.get_table(dt, 1, 0)
         self.assertIsNotNone(gt)
         self.assertEqual(gt["cells"][0], [2, 3])   # page-local 0,1 + offset 2
+
+
+class OcrTableRedrawTest(unittest.TestCase):
+    """``redraw_ocr`` regenerates a scanned table page as a clean vector table.
+
+    Ported from 0.2.7: the current rebuild path replaced v0.4's
+    ``table_vision``-based vector rebuild, so these are the regression guards for
+    the replacement.
+    """
+
+    @staticmethod
+    def _ocr_table_blocks(size: float = 6.0):
+        return [
+            pdfio.Block(text="总资产", page=0, x0=60, y0=100, x1=200, y1=112,
+                        size=size, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="1,234,567.89", page=0, x0=210, y0=100, x1=360, y1=112,
+                        size=size, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="总负债", page=0, x0=60, y0=120, x1=200, y1=132,
+                        size=size, single_line=True, ocr=True, in_table=True),
+            pdfio.Block(text="9,876,543.21", page=0, x0=210, y0=120, x1=360, y1=132,
+                        size=size, single_line=True, ocr=True, in_table=True),
+        ]
+
+    def test_redraw_ocr_table_drops_raster_and_draws_cells(self):
+        src = _OUT / "redraw_src.pdf"
+        build_sample_pdf(src, pages=1)  # used only for the page size
+        blocks = self._ocr_table_blocks()
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21"]
+        out = _OUT / "redraw_out.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True)
+        doc = fitz.open(str(out))
+        try:
+            page = doc[0]
+            self.assertEqual(0, len(page.get_images(full=True)))  # no raster background
+            self.assertGreater(len(page.get_drawings()), 0)       # grid rules drawn
+            text = page.get_text("text")
+            self.assertIn("Total assets", text)
+            self.assertIn("9,876,543.21", text)
+        finally:
+            doc.close()
+
+    def test_redraw_ocr_off_keeps_inplace(self):
+        src = _OUT / "redraw_src2.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = self._ocr_table_blocks(size=9.0)
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21"]
+        out = _OUT / "redraw_out2.pdf"
+        # redraw_ocr=False (default) → the source page (with its raster content) is kept.
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=False)
+        doc = fitz.open(str(out))
+        src_doc = fitz.open(str(src))
+        try:
+            self.assertEqual(src_doc[0].rect.height, doc[0].rect.height)
+            # In-place: the source page is kept (its own text layer survives; only
+            # the OCR blocks are covered).
+            self.assertIn("Page 1 heading", doc[0].get_text("text"))
+        finally:
+            doc.close()
+            src_doc.close()
+
+    def test_redraw_skips_chart_page(self):
+        # A diagram (org chart) page has node labels, not data cells: redraw must
+        # NOT blank it into an empty table. The page falls through to in-place.
+        src = _OUT / "redraw_chart.pdf"
+        build_sample_pdf(src, pages=1)
+        chart_blocks = [
+            pdfio.Block(text="董事会", page=0, x0=60, y0=100, x1=88, y1=130,
+                        size=6.0, single_line=True, ocr=True, is_chart=True),
+            pdfio.Block(text="监事会", page=0, x0=60, y0=140, x1=88, y1=170,
+                        size=6.0, single_line=True, ocr=True, is_chart=True),
+            pdfio.Block(text="委员会", page=0, x0=110, y0=100, x1=138, y1=130,
+                        size=6.0, single_line=True, ocr=True, is_chart=True),
+            pdfio.Block(text="3", page=0, x0=300, y0=270, x1=310, y1=282,
+                        size=8.0, single_line=True, ocr=True),
+        ]
+        trans = [b.text for b in chart_blocks]
+        out = _OUT / "redraw_chart_out.pdf"
+        pdfio.save_translated_pdf(src, [chart_blocks], [trans], str(out), "English",
+                                  redraw_ocr=True)
+        doc = fitz.open(str(out))
+        try:
+            # Not redrawn: the original (source) page is kept, so its text survives.
+            self.assertEqual(1, doc.page_count)
+            self.assertIn("Page 1 heading", doc[0].get_text("text"))
+        finally:
+            doc.close()
+
+    def test_ai_table_rebuild_draws_regular_table(self):
+        # With a model-derived grid, the OCR table page is drawn as a clean,
+        # regular N x M table (no raster, regular grid, translated cells).
+        src = _OUT / "ai_table_src.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = self._ocr_table_blocks()
+        trans = [b.text for b in blocks]
+        grid = [["Item", "2025", "2024"],
+                ["Total assets", "1,234,567.89", "999,999.99"],
+                ["Total liabilities", "9,876,543.21", "888,888.88"]]
+        out = _OUT / "ai_table_out.pdf"
+        logs: list[str] = []
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True, table_rebuild_fn=lambda _i, _png: grid,
+                                  log=logs.append)
+        doc = fitz.open(str(out))
+        try:
+            page = doc[0]
+            self.assertEqual(0, len(page.get_images(full=True)))   # clean, no raster
+            self.assertGreater(len(page.get_drawings()), 0)        # regular grid
+            text = page.get_text("text")
+            self.assertIn("Total assets", text)
+            self.assertIn("999,999.99", text)
+            self.assertIn("Item", text)
+        finally:
+            doc.close()
+        self.assertTrue(any("正在 AI 表格重建" in m for m in logs), logs)
+        self.assertTrue(any("AI 表格重建完成" in m for m in logs), logs)
+
+    def test_ai_table_rebuild_invalid_falls_back(self):
+        # An unavailable / implausible rebuilt grid falls back to the geometric redraw.
+        src = _OUT / "ai_table_src2.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = self._ocr_table_blocks()
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21"]
+        out = _OUT / "ai_table_out2.pdf"
+        logs: list[str] = []
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True,
+                                  table_rebuild_fn=lambda _i, _png: None,
+                                  log=logs.append)
+        doc = fitz.open(str(out))
+        try:
+            self.assertIn("Total assets", doc[0].get_text("text"))
+        finally:
+            doc.close()
+        self.assertTrue(any("回退几何重绘" in m for m in logs), logs)
+
+    def test_redraw_grows_the_row_and_draws_inside_the_band(self):
+        # Regression (self-review): 0.2.7 drew each cell into its ORIGINAL OCR
+        # bbox/fit_height, so the row expansion was cosmetic — the label still
+        # rendered at 4.54pt in a band the grid had left at 12pt.  Now the row grows
+        # to the height the translation needs at the readability floor and the cell
+        # is drawn inside that band.
+        src = _OUT / "band_src.pdf"
+        build_sample_pdf(src, pages=1)
+        label = "Operating revenue from continuing operations"
+        blocks = [
+            pdfio.Block(text="营业收入", page=0, x0=60, y0=100, x1=140, y1=112,
+                        size=6.0, ocr=True, in_table=True, fit_width=80.0,
+                        fit_height=10.5),
+            pdfio.Block(text="1,234.56", page=0, x0=220, y0=100, x1=300, y1=112,
+                        size=6.0, ocr=True, in_table=True),
+            pdfio.Block(text="营业成本", page=0, x0=60, y0=120, x1=140, y1=132,
+                        size=6.0, ocr=True, in_table=True, fit_width=80.0,
+                        fit_height=10.5),
+            pdfio.Block(text="9,876.54", page=0, x0=220, y0=120, x1=300, y1=132,
+                        size=6.0, ocr=True, in_table=True),
+        ]
+        trans = [label, "1,234.56", "Cost of sales", "9,876.54"]
+        out = _OUT / "band_out.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True)
+        doc = fitz.open(str(out))
+        try:
+            page = doc[0]
+            spans = [(sp["size"], sp["bbox"], sp["text"])
+                     for b in page.get_text("dict")["blocks"]
+                     for ln in b.get("lines", []) for sp in ln["spans"]
+                     if sp["text"].strip()]
+            label_spans = [(sz, bb) for sz, bb, txt in spans if txt in label]
+            self.assertEqual(2, len(label_spans), label_spans)      # wrapped to 2 lines
+            self.assertGreaterEqual(min(s[0] for s in label_spans), 5.0,
+                                    "the grown row must not leave the label crushed")
+            h_lines = sorted({round(dr["rect"].y0, 1) for dr in page.get_drawings()
+                              if dr["rect"].height < 1.0})
+            self.assertGreaterEqual(len(h_lines), 2, h_lines)
+            for _fs, bbox in label_spans:
+                self.assertLess(bbox[3], h_lines[1] + 0.6,
+                                "a wrapped cell must stay above the row's lower rule")
+        finally:
+            doc.close()
+
+    def test_redraw_rotated_page_uses_the_unrotated_mediabox(self):
+        # Regression (self-review): the blank page was created with the source's
+        # *rotated* rect (e.g. 200x400) while OCR blocks live in the unrotated
+        # mediabox (400x200) — every grid line past x=200 and half the cells fell
+        # off the page.
+        src = _OUT / "rot_src.pdf"
+        doc = fitz.open()
+        pg = doc.new_page(width=400, height=200)
+        pg.set_rotation(90)
+        doc.save(str(src))
+        doc.close()
+        blocks = [
+            pdfio.Block(text="总资产", page=0, x0=60, y0=40, x1=200, y1=52,
+                        size=6.0, ocr=True, in_table=True),
+            pdfio.Block(text="1,234,567.89", page=0, x0=220, y0=40, x1=380, y1=52,
+                        size=6.0, ocr=True, in_table=True),
+            pdfio.Block(text="总负债", page=0, x0=60, y0=60, x1=200, y1=72,
+                        size=6.0, ocr=True, in_table=True),
+            pdfio.Block(text="9,876,543.21", page=0, x0=220, y0=60, x1=380, y1=72,
+                        size=6.0, ocr=True, in_table=True),
+        ]
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21"]
+        out = _OUT / "rot_out.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True)
+        d = fitz.open(str(out))
+        try:
+            page = d[0]
+            self.assertAlmostEqual(400.0, page.mediabox.width, places=1)
+            self.assertAlmostEqual(200.0, page.mediabox.height, places=1)
+            text = page.get_text("text")
+            for want in trans:
+                self.assertIn(want, text)
+            for dr in page.get_drawings():
+                self.assertLessEqual(dr["rect"].x1, 400.5)   # nothing off-page
+        finally:
+            d.close()
+
+    def test_redraw_empty_ai_grid_falls_back_instead_of_blank(self):
+        # A rebuild callback that returns an empty / all-blank grid must NOT produce
+        # a blank page (silent content loss) — it falls back to the geometric redraw.
+        src = _OUT / "blank_src.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = self._ocr_table_blocks()
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21"]
+        out = _OUT / "blank_out.pdf"
+        logs: list[str] = []
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True,
+                                  table_rebuild_fn=lambda _i, _png: [["", ""], ["", ""]],
+                                  log=logs.append)
+        doc = fitz.open(str(out))
+        try:
+            text = doc[0].get_text("text")
+            self.assertIn("Total assets", text)
+            self.assertIn("Total liabilities", text)
+        finally:
+            doc.close()
+        self.assertTrue(any("回退几何重绘" in m for m in logs), logs)
+
+    def test_draw_ai_table_honours_explicit_merges(self):
+        # The tool-provided merges drive a two-level header: the date spans the
+        # Consolidated / Parent Company sub-columns (internal rule omitted).
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        font = fitz.Font("cjk")
+        rows = [["Item", "December 31, 2025", "", "December 31, 2024", ""],
+                ["", "", "Consolidated", "", "Parent Company"],
+                ["Total assets", "1,234", "2,345", "3,456", "4,567"]]
+        rect = fitz.Rect(36, 36, 559, 806)
+        pdfio._draw_ai_table(page, rows, rect, font, merges=[
+            {"r": 0, "c": 1, "rowspan": 1, "colspan": 2},
+            {"r": 0, "c": 3, "rowspan": 1, "colspan": 2},
+        ])
+        text = page.get_text("text").replace("\n", " ")
+        doc.close()
+        self.assertIn("December 31", text)
+        self.assertIn("Consolidated", text)
+        self.assertIn("Parent Company", text)
+        self.assertIn("Total assets", text)
 
 
 if __name__ == "__main__":

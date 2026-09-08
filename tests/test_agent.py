@@ -220,6 +220,20 @@ class FlowAgentTest(unittest.TestCase):
                 "classify_block": classify_block,
                 "translate_block": translate_block}
 
+    def test_tool_control_signals_propagate(self):
+        # ANY ``ControlSignal`` (not just ``TranslationCancelled``) must escape the tool
+        # wrapper: swallowing a ``FlowCancelled`` turned a user cancel into "tool failed"
+        # and the loop kept going.
+        s = self._state()
+
+        def boom(**_kw):
+            raise agent.FlowCancelled()
+
+        fa = agent.FlowAgent(s, {"boom": boom},
+                             decide=lambda *_a, **_k: None, log=lambda _m: None)
+        with self.assertRaises(agent.FlowCancelled):
+            fa._call("boom", {})
+
     def test_scripted_calls_run_in_order_and_mutate_state(self):
         s = self._state()
         calls: list = []
@@ -387,6 +401,37 @@ class LlmDecideAndPageLoopTest(unittest.TestCase):
         roles = [m["role"] for m in seen[1]["messages"]]
         self.assertIn("assistant", roles)   # the tool_call was echoed back
         self.assertIn("tool", roles)        # the result was fed back
+
+    def test_llm_decide_survives_an_empty_choices_reply(self):
+        # Regression: ``resp.choices[0]`` was read OUTSIDE the try, so a provider that
+        # returns no choice (timeout / content filter) raised IndexError and aborted
+        # the whole page instead of simply ending the round.
+        seen: list = []
+        client = _FakeClient([type("_Empty", (), {"choices": []})()], seen)
+        with mock.patch.object(translator, "OpenAI", lambda **_k: client):
+            decide = agent.make_llm_decide(_vision_model(), task="t",
+                                           image_provider=lambda _s: b"")
+        s = agent.WorkflowState("a.pdf", "English")
+        s.page(0)
+        d = decide("obs", s)
+        self.assertEqual("done", d.action)
+
+    def test_llm_decide_logs_dropped_parallel_tool_calls(self):
+        # Only one tool call runs per step; the dropped ones must at least be visible
+        # in the log instead of vanishing silently.
+        logs: list = []
+        queue = [_FakeResp(_FakeMsg(content="", tool_calls=[
+            _FakeToolCall("read_page", '{"page":0}'),
+            _FakeToolCall("classify_page", '{"page":0}')]))]
+        with mock.patch.object(translator, "OpenAI", lambda **_k: _FakeClient(queue, [])):
+            decide = agent.make_llm_decide(_vision_model(), task="t",
+                                           image_provider=lambda _s: b"",
+                                           log=logs.append)
+        s = agent.WorkflowState("a.pdf", "English")
+        s.page(0)
+        d = decide("obs", s)
+        self.assertEqual("read_page", d.tool)
+        self.assertTrue(any("只执行第一个" in m for m in logs), logs)
 
     def test_llm_decide_uses_translation_params(self):
         # ``decide`` is TRANSLATION-side (by definition only the text chat is
@@ -685,6 +730,32 @@ class PageExecutorsTest(unittest.TestCase):
         self.assertIn(0, missing)
         self.assertIn(2, missing)
 
+    def test_preview_page_is_non_blocking_when_show_preview_is_wired(self):
+        # ``preview_page`` exists to SHOW the user a page; the blocking region channel
+        # waits up to 120 s for "发送" and used to stall the whole page loop.
+        s = self._state()
+        seen: list = []
+
+        def blocking(*_a):
+            raise AssertionError("the blocking region channel must not be used")
+
+        tools = agent.make_page_executors(
+            s, _dummy_model(), show_preview=lambda p, w: seen.append((p, w)),
+            preview_handler=blocking)
+        res = tools["preview_page"](3, "translation")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([(3, "translation")], seen)
+
+    def test_preview_page_reports_a_timeout_as_failure(self):
+        # A handler that returns None (user never pressed 发送) must not be reported
+        # as success with an empty image.
+        s = self._state()
+        tools = agent.make_page_executors(s, _dummy_model(),
+                                          preview_handler=lambda *a: None)
+        res = tools["preview_page"](0)
+        self.assertFalse(res["ok"])
+        self.assertIn("预览未返回", res["error"])
+
     def test_review_check_tools_registered(self):
         # The three new audit tools are part of the registry (and thus advertised).
         for n in ("check_numbers", "check_table", "check_layout"):
@@ -723,6 +794,131 @@ class PageExecutorsTest(unittest.TestCase):
         res = tools["audit_page"](0, checks=["numbers", "table"])
         self.assertEqual(["numbers", "table"], res["checks_requested"])
         self.assertTrue(res["clean"])
+
+    def test_audit_page_rejects_unknown_check_names(self):
+        # Regression: an unknown / Chinese / bare-string check name was silently
+        # dropped, so issues stayed empty and clean stayed True — a "clean" report
+        # with nothing having run (the false-green the audit gate exists to prevent).
+        s = self._state()
+        tools = agent.make_page_executors(s, _dummy_model())
+        for bad in (["数字"], ["num"], ["numbers", "数字"]):
+            res = tools["audit_page"](0, checks=bad)
+            self.assertFalse(res["clean"], bad)
+            self.assertTrue(res["unknown_checks"], bad)
+            self.assertEqual("unknown_checks", res["issues"][0]["check"], bad)
+        # The known name in the mixed list still ran (unknown did not abort it).
+        mixed = tools["audit_page"](0, checks=["numbers", "数字"])
+        self.assertEqual(["numbers"], mixed["checks_requested"])
+        ok = tools["audit_page"](0, checks=["numbers"])
+        self.assertEqual(["numbers"], ok["checks_requested"])
+        self.assertEqual([], ok["unknown_checks"])
+
+    def test_audit_registry_matches_the_tool_catalog(self):
+        # One source of truth: the check registry, the tool descriptions and the
+        # model-name validation all come from ``tool_catalog.AUDIT_CHECK_NAMES``.
+        self.assertEqual(set(agent.tool_catalog.AUDIT_CHECK_NAMES),
+                         set(agent.flow._AUDIT_CHECKS))
+
+    def test_catalog_and_bindings_are_exactly_aligned(self):
+        # The CLAUDE.md "AI 工具有效性铁律": every tool the model can SEE must be bound
+        # (and vice versa).  This used to be asserted only against the catalog itself
+        # (a tautology), so an unbound catalog entry — or a bound tool missing from the
+        # catalog, which ``agent_openai_tools`` silently drops — went unnoticed.
+        s = self._state()
+        bound = set(agent.make_source_tools(s, src_path="x.pdf"))
+        bound |= set(agent.make_page_executors(s, _dummy_model()))
+        catalog = {t.name for t in agent.AGENT_TOOLS}
+        self.assertEqual(catalog, bound)
+
+    def test_translate_block_failure_does_not_write_source_as_translation(self):
+        # Regression: a failed engine call fell through to "return source", which
+        # ``translate_block`` then wrote as the translation with ok=True — the model
+        # could not tell the block was never translated.
+        class _FailEngine:
+            def __init__(self, *_a, **_k):
+                pass
+            def translate_blocks(self, *_a, **_k):
+                return SimpleNamespace(errors=["块 1 翻译失败，保留原文"], translated=["总资产"])
+        with mock.patch.object(agent.flow._tr, "TranslationEngine", _FailEngine):
+            s = self._state()
+            tools = agent.make_page_executors(s, _dummy_model())
+            res = tools["translate_block"](0, "总资产")
+        self.assertFalse(res["ok"], res)
+        self.assertIn("翻译失败", res["error"])
+        self.assertNotIn(0, (s.out_doc or {}))
+
+    def test_check_layout_whole_doc_does_not_crowd_across_pages(self):
+        # Regression: y restarts every page, so a whole-document run reported a block as
+        # "pressing into the next block" when the next block was on the NEXT page.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("页一标题", page=0, x0=72, y0=100, x1=300, y1=112, size=11)],
+                   [pdfio.Block("页二标题", page=1, x0=72, y0=117, x1=300, y1=129, size=11)]],
+            blocks=["页一标题", "页二标题"], block_pages=[0, 1])
+        s.out_doc = {0: {"text": "长译文" * 40}, 1: {"text": "短"}}
+        per_page = [i["kind"] for i in agent.flow._check_layout(s, 0)["issues"]]
+        whole = [i["kind"] for i in agent.flow._check_layout(s, None)["issues"]]
+        self.assertNotIn("crowding", per_page)
+        self.assertEqual(per_page, whole)
+
+    def test_kept_verbatim_blocks_are_not_reported_as_missing(self):
+        # A ``keep_original`` block (signature / seal region the rebuild pass marks) is
+        # deliberately untranslated; reporting it as missing made the review loop try to
+        # "fix" content that must not change.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("手写签名", page=0, x0=0, y0=0, x1=50, y1=10,
+                                keep_original=True, ocr=True)]],
+            blocks=["手写签名"], block_pages=[0])
+        s.out_doc = {}
+        tools = agent.make_page_executors(s, _dummy_model())
+        self.assertEqual([], tools["check_missing"]()["missing"])
+        self.assertEqual([], tools["check_residual"]()["residual"])
+
+    def test_check_numbers_skips_verbatim_numeric_cells(self):
+        # A numeric cell must never be reported as a number defect: the AI is forbidden
+        # from rewriting it, so there is nothing it could do about a finding.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("1,234.56", page=0, x0=0, y0=0, x1=50, y1=10)]],
+            blocks=["1,234.56"], block_pages=[0])
+        s.out_doc = {0: {"text": "1,235.56"}}   # (an annotation could write this)
+        tools = agent.make_page_executors(s, _dummy_model())
+        self.assertEqual([], tools["check_numbers"]()["numbers"])
+
+    def test_set_text_and_delete_block_validate_the_page(self):
+        # ``index`` is a whole-document flat index; the named page must contain it,
+        # otherwise a page-local index silently rewrites a block on another page.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("第一页", page=0, x0=0, y0=0, x1=50, y1=10)],
+                   [pdfio.Block("第二页", page=1, x0=0, y0=0, x1=50, y1=10)]],
+            blocks=["第一页", "第二页"], block_pages=[0, 1])
+        tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["set_text"](0, 1, "Second page")     # index 1 belongs to page 1
+        self.assertFalse(res["ok"])
+        self.assertIn("不属于第 1 页", res["error"])
+        self.assertTrue(tools["set_text"](1, 1, "Second page")["ok"])
+        self.assertFalse(tools["delete_block"](0, 1)["ok"])
+
+    def test_apply_annotation_refuses_a_numeric_block(self):
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("1,234.56", page=0, x0=0, y0=0, x1=50, y1=10)]],
+            blocks=["1,234.56"], block_pages=[0])
+        tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["apply_annotation"](0, [0, 0, 50, 10], "9,999.99")
+        self.assertFalse(res["ok"])
+        self.assertIn("不可被 AI 改写", res["error"])
+
+    def test_audit_page_reads_a_bare_check_name_as_one_name(self):
+        # "numbers" (a string, not a list) must mean the numbers check — not the
+        # characters n/u/m/b/e/r/s.
+        s = self._state()
+        s.out_doc = {0: {"text": "Total assets"}, 2: {"text": "Total liabilities"}}
+        res = agent.audit_page(s, 0, checks="numbers")
+        self.assertEqual(["numbers"], res["checks_requested"])
+        self.assertEqual([], res["unknown_checks"])
 
     def test_audit_page_flags_number_discrepancy(self):
         # A translation that drops a digit is flagged by the aggregate audit.
@@ -1009,6 +1205,34 @@ class PageExecutorsTest(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(["总资产", "总负债"], seen[0])   # bogus 99 / numeric 1 dropped
         self.assertEqual(2, res["count"])
+
+    def test_translate_blocks_drops_indices_from_another_page(self):
+        # A flat index that belongs to another page must not be rewritten when the
+        # model named THIS page (it would silently translate the wrong page).
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("第一页", page=0, x0=0, y0=0, x1=50, y1=10)],
+                   [pdfio.Block("第二页", page=1, x0=0, y0=0, x1=50, y1=10)]],
+            blocks=["第一页", "第二页"], block_pages=[0, 1])
+        seen: list = []
+
+        class _Eng:
+            def __init__(self, model):
+                self.model = model
+
+            def translate_blocks(self, blocks, lang, **kw):
+                seen.append(list(blocks))
+                return type("R", (), {
+                    "translated": [f"T-{b}" for b in blocks], "errors": []})()
+
+        logs: list = []
+        with mock.patch.object(translator, "TranslationEngine", _Eng):
+            tools = agent.make_page_executors(s, _dummy_model(), log=logs.append)
+        res = tools["translate_blocks"](0, indices=[0, 1])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([0], res["indices"])
+        self.assertEqual(["第一页"], seen[0])
+        self.assertTrue(any("不属于第 1 页" in m for m in logs), logs)
 
     def test_translate_blocks_nothing_to_translate_errors(self):
         class _Eng:

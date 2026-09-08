@@ -21,6 +21,7 @@ Key behaviours
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -1206,6 +1207,236 @@ def make_retranslate_batch_fn(
             return list(texts)
 
     return _batch
+
+
+# ---------------------------------------------------------------------------
+# OCR 表格重建（0.2.7 版）：整页视觉重建 + 合并单元格检测。
+#
+# 扫描表格页在导出时会被重绘为**干净矢量表格**（``pdfio.save_translated_pdf``
+# 的 ``redraw_ocr`` 路径）：这里提供两个可选的视觉回调——整表重建（把扫描页
+# 还原成「译文 2D 网格」）与合并单元格检测。二者都是 best-effort：失败/返回
+# 不可用时调用方回退到几何重绘（``pdfio._draw_ocr_grid_page``），绝不崩。
+# ---------------------------------------------------------------------------
+
+def _image_data_url(png: bytes) -> str:
+    """Encode a PNG as a ``data:image/png;base64,`` URL for the chat API."""
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _extract_json_object(content: str) -> dict | None:
+    """Pull the outer ``{ ... }`` out of a model reply and decode it.
+
+    The reply often wraps the object in prose or markdown fences, so the whole
+    reply is scanned for the outermost brace pair.  Anything malformed returns
+    ``None`` (the caller treats it as an empty / no-op result).
+    """
+    if not content:
+        return None
+    start = content.find("{")
+    if start < 0:
+        return None
+    end = content.rfind("}")
+    if end <= start:
+        return None
+    try:
+        data = json.loads(content[start:end + 1])
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _vision_call(client, model: str, prompt: str, images: list[bytes],
+                 temperature: float = 0.0, extra_body: dict | None = None) -> str:
+    """Send ``prompt`` plus ``images`` to the model and return the assistant text."""
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    content.extend(
+        {"type": "image_url", "image_url": {"url": _image_data_url(img)}}
+        for img in images
+    )
+    kwargs: dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": temperature,
+    }
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+    resp = client.chat.completions.create(**kwargs)
+    return getattr(resp.choices[0].message, "content", None) or ""
+
+
+_REVIEW_TABLE_PROMPT = (
+    "这是原图中的一张财务报表（扫描件）。请把整张表的内容提取并**翻译成 @@TARGET_LANG@@**"
+    "（目标语言：@@TARGET_LANG@@），输出一个 JSON 二维数组，**保持原表的行数、列数和单元格结构**：\n"
+    "{\"rows\": [[\"第1行第1格\", \"第1行第2格\", ...], [\"第2行第1格\", ...]]}\n"
+    "规则：\n"
+    "- **每个单元格都必须用 @@TARGET_LANG@@ 书写，绝不能把原文（中文）原样照抄进译文**。"
+    "只有本身就是数字/代码的项（报表/科目代码如会企01表-1、行次数字、单位）保持原样；"
+    "其余全部翻译成语目标语言。若某个单元格的原文已经是目标语言则按原文输出。\n"
+    "- 逐格对应原表的行/列。跨列/跨行合并的单元格（如二级表头 2025年度 → 合并/母公司）"
+    "只写一次：内容放在它覆盖区域的**第一个**格子，同一行/列被它覆盖的其余格子留空；"
+    "子表头（合并/母公司）另起一行。不要在每个子列重复表头。\n"
+    "- 数字一律用**阿拉伯数字**：中文序数/编号"
+    "（一、二、三、（三十三））转成 1、2、3、(33)；仅当原文**字面用罗马数字**"
+    "（Ⅰ、Ⅱ、I. II.）时才保留罗马数字。单位、报表/科目代码（会企01表-1、行次数字）保持原样。\n"
+    "- 表头行放数组第一行，数据行依次往下；没有内容的格子用空字符串占位。\n"
+    "- 忽略表格之外的非文本内容（手写签字、印章、水印、照片）。\n"
+    "不要输出除此 JSON 之外的文字。"
+)
+
+#: Sanity cap on a rebuilt table, so a model that "hallucinates" a giant grid is
+#: rejected and the caller falls back to the geometric redraw.
+_TABLE_REBUILD_MAX_ROWS = 200
+_TABLE_REBUILD_MAX_COLS = 40
+
+
+def _parse_table_grid(content: str) -> list[list[str]] | None:
+    """Parse a table-rebuild reply into a padded 2D grid, or ``None`` if invalid.
+
+    Each row is a list of cell strings; rows shorter than the widest are padded
+    with empty strings so the grid is rectangular.  Returns ``None`` for anything
+    malformed or implausible, so the caller falls back rather than drawing junk.
+    """
+    data = _extract_json_object(content)
+    if data is None:
+        return None
+    raw = data.get("rows")
+    if not isinstance(raw, list) or not raw:
+        return None
+    grid: list[list[str]] = []
+    for r in raw:
+        if not isinstance(r, list):
+            continue
+        grid.append([str(c) for c in r])
+    if not grid:
+        return None
+    n_cols = max(len(r) for r in grid)
+    if len(grid) > _TABLE_REBUILD_MAX_ROWS or n_cols > _TABLE_REBUILD_MAX_COLS or n_cols == 0:
+        return None
+    return [r + [""] * (n_cols - len(r)) for r in grid]
+
+
+def make_table_rebuild_fn(
+    model: ModelConfig, target_lang: str, log: Callable[[str], None] | None = None,
+    client: Any = None,
+) -> Callable[[int, bytes], list[list[str]] | None] | None:
+    """Return a whole-table rebuild callback for ``model``, or ``None`` if disabled.
+
+    Signature ``(page_index, original_png) -> list[list[str]] | None``: it sends the
+    original scanned table page to a vision model, which returns the table as a
+    translated 2D grid (row/column structure preserved).  ``target_lang`` is baked
+    into the prompt so the model actually knows what language to translate into
+    (a prompt that says "translate into the target language" without naming it
+    leaves the model guessing and it tends to echo the source Chinese).  Best-effort
+    — any failure or implausible result returns ``None`` so the caller falls back.
+    ``client`` (optional) reuses a shared OpenAI client.
+    """
+    if not model.vision:
+        return None
+    client = client or OpenAI(**model.client_kwargs())
+    prompt = _REVIEW_TABLE_PROMPT.replace("@@TARGET_LANG@@", str(target_lang))
+    body = model.request_params()
+
+    def _rebuild(page_index: int, original_png: bytes) -> list[list[str]] | None:
+        try:
+            content = _vision_call(client, model.model, prompt, [original_png],
+                                   extra_body=body or None)
+            return _parse_table_grid(content)
+        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
+            if log:
+                log(f"  第 {page_index + 1} 页表格重建失败：{type(exc).__name__}: {exc}")
+            return None
+
+    return _rebuild
+
+
+#: OpenAI ``tools`` schema for the table-merge detector.
+_MERGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "detect_table_merge",
+        "description": "标注原表中需要跨列/跨行合并的单元格（如二级表头 2025年度 跨 合并/母公司）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "row": {"type": "integer", "description": "合并单元格左上角行号（0 起）"},
+                "col": {"type": "integer", "description": "合并单元格左上角列号（0 起）"},
+                "rowspan": {"type": "integer", "description": "跨行数（≥1）"},
+                "colspan": {"type": "integer", "description": "跨列数（≥1）"},
+                "reason": {"type": "string"},
+            },
+            "required": ["row", "col", "rowspan", "colspan"],
+        },
+    },
+}
+
+
+def _parse_merge_tool_calls(msg) -> list[dict]:
+    """Extract ``detect_table_merge`` tool_calls into ``[{row,col,rowspan,colspan}]``."""
+    out: list[dict] = []
+    tcs = getattr(msg, "tool_calls", None)
+    if not tcs:
+        return out
+    for tc in tcs:
+        fn = getattr(tc, "function", None)
+        if getattr(fn, "name", None) != "detect_table_merge":
+            continue
+        args = getattr(fn, "arguments", None)
+        try:
+            data = json.loads(args) if args else {}
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def make_merge_tool_fn(
+    model: ModelConfig, log: Callable[[str], None] | None = None,
+    client: Any = None,
+) -> Callable[[int, bytes, Sequence[Sequence[str]]], list[dict]] | None:
+    """Return a tool-use table-merge detector, or ``None`` if disabled.
+
+    Signature ``(page_index, original_png, grid) -> [{row,col,rowspan,colspan}, ...]``:
+    it sends the scanned table page + the rebuilt grid to ``detect_table_merge`` and
+    parses the returned merges.  Best-effort — any failure returns ``[]`` so the
+    caller draws without explicit merges.
+    """
+    if not model.vision:
+        return None
+    client = client or OpenAI(**model.client_kwargs())
+    body = model.request_params()
+
+    def _merges(page_index: int, original_png: bytes, grid: Sequence[Sequence[str]]) -> list[dict]:
+        g = "\n".join(f"[{i}] " + " | ".join(str(c) for c in row) for i, row in enumerate(grid))
+        prompt = (
+            "这是原图中的表格。请标注需要跨列/跨行合并的单元格（如二级表头：2025年度 跨 合并/母公司 "
+            "两列、表头跨两行），逐一调用 detect_table_merge。表格内容如下：\n" + g
+        )
+        try:
+            kwargs: dict = {
+                "model": model.model, "temperature": 0.0, "max_tokens": 4096,
+                "tools": [_MERGE_TOOL], "tool_choice": "auto",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": _image_data_url(original_png)}},
+                ]}],
+            }
+            if body:
+                # Mirror ``_vision_call``: llama.cpp-style endpoints 500 without
+                # ``reasoning_effort``, which silently dropped every merge.
+                kwargs["extra_body"] = body
+            resp = client.chat.completions.create(**kwargs)
+            msg = resp.choices[0].message
+            merges = _parse_merge_tool_calls(msg)
+            if not merges and log:
+                log("  detect_table_merge 未返回 tool_call：" + str(getattr(msg, "content", "")))
+            return merges
+        except Exception as exc:  # noqa: BLE001 — best-effort, fail-closed
+            if log:
+                log(f"  合并检测失败：{type(exc).__name__}: {exc}")
+            return []
+
+    return _merges
 
 
 

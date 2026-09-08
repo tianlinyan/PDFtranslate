@@ -161,5 +161,53 @@ class SettingsTest(unittest.TestCase):
         self.assertNotIn("enable_thinking", m.interaction_request_params())
 
 
+class PrefsTest(unittest.TestCase):
+    """``load_prefs`` / ``save_prefs``: atomic write, failure reason, corrupt tolerance.
+
+    The GUI hard-exits the process on window close, so a plain overwrite could leave a
+    truncated ``prefs.json`` behind — and a silently lost preference is invisible until
+    the next launch.  Both had zero coverage.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from translate_app import settings
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "prefs.json"
+        patcher = mock.patch.object(settings, "APP_PREFS_PATH", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.settings = settings
+
+    def test_roundtrip(self):
+        self.assertIsNone(self.settings.save_prefs({"language": "English"}))
+        self.assertEqual({"language": "English"}, self.settings.load_prefs())
+
+    def test_corrupt_file_reads_as_empty(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertEqual({}, self.settings.load_prefs())
+
+    def test_failure_returns_a_reason_and_leaves_no_temp_file(self):
+        from unittest import mock
+
+        with mock.patch.object(self.settings.os, "replace",
+                               side_effect=OSError("disk full")):
+            reason = self.settings.save_prefs({"language": "German"})
+        self.assertIsNotNone(reason)
+        self.assertIn("disk full", reason)
+        self.assertEqual([], list(self.path.parent.glob("*.tmp")))
+
+    def test_write_is_atomic_and_overwrites(self):
+        self.settings.save_prefs({"a": 1})
+        self.settings.save_prefs({"a": 2})
+        self.assertEqual({"a": 2}, self.settings.load_prefs())
+        self.assertEqual([], list(self.path.parent.glob("*.tmp")))
+
+
 if __name__ == "__main__":
     unittest.main()

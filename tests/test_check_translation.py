@@ -177,11 +177,25 @@ class CheckerTest(unittest.TestCase):
         self.assertEqual([], checker.numbering, checker.numbering)
 
     def test_normalize_cjk_ordinals_handles_common_forms(self):
-        # The marker's punctuation is dropped; the digit is what the number
-        # comparator uses to match the translated "1." / "(4)" / "Section 2".
-        self.assertEqual("1主要", _normalize_cjk_ordinals("一、主要"))
-        self.assertEqual("4市场", _normalize_cjk_ordinals("（四）市场"))
-        self.assertEqual("2 数据", _normalize_cjk_ordinals("第二节 数据"))
+        # The numeral becomes Arabic but the marker's own delimiter is KEPT, so the
+        # substituted digit can never merge with an adjacent figure.
+        self.assertEqual("1、主要", _normalize_cjk_ordinals("一、主要"))
+        self.assertEqual("(4)市场", _normalize_cjk_ordinals("（四）市场"))
+        self.assertEqual("2节 数据", _normalize_cjk_ordinals("第二节 数据"))
+
+    def test_ordinal_next_to_an_amount_does_not_glue_digits(self):
+        # Regression: 一、1,234.56 used to normalize to "11,234.56" (the marker was
+        # dropped and its digit glued to the amount), so a *correct* translation was
+        # reported as a fatal 数字不一致 and the script exited 1.
+        self.assertEqual("1、1,234.56", _normalize_cjk_ordinals("一、1,234.56"))
+        self.assertEqual("1,234(1)", _normalize_cjk_ordinals("1,234（一）"))
+
+    def test_correct_translation_beside_an_ordinal_passes_end_to_end(self):
+        src = _pdf(self.tmp / "src.pdf", [["一、1,234.56 营业收入同比增长。"]])
+        tgt = _pdf(self.tmp / "tgt.pdf", [["1. 1,234.56 Revenue increased."]])
+        checker = run_checks(src, tgt, lang="English")
+        self.assertTrue(checker.numeric_ok(), checker.numeric)
+        self.assertEqual(0, main([str(src), str(tgt)]))
 
     def test_statement_codes_exempt_from_residual_cjk(self):
         # Statement / subject codes (会商银02表, 会企01表-1) are deliberately kept

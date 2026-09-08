@@ -103,11 +103,6 @@ class Block:
     #: translation never crosses the table line below the row.  0 = no band
     #: (last row of a grid, or a text-layer cell), each with its own fallback.
     fit_height: float = 0.0
-    #: When True (set by the scan-table *rebuild* pass), the exporter keeps this
-    #: cell's font size at its original value and grows the row height to the
-    #: wrapped line count instead of shrinking the font to fit — the "prefer row
-    #: height over tiny font" trade-off for rebuilt vector tables.
-    keep_font: bool = False
 
 
 @dataclass
@@ -1439,12 +1434,16 @@ def _estimate_skew_from_gray(gray) -> float | None:
 #: Pad (px) added around the image before deskew-rotating, so the small rotation does
 #: not crop content at the page edges; a minimal 20px margin covers very slight skew.
 def _deskew_affine(img, skew: float) -> tuple[object, object, int]:
-    """Return ``(rotated_img, inv_affine, pad)`` for deskewing ``img`` by ``skew``°.
+    """Return ``(rotated_img, inv_affine, pad)`` that removes a ``skew``° tilt.
 
-    ``cv2.getRotationMatrix2D`` rotates about the image centre; the image is first
-    padded so the small rotation does not clip page-edge content, and the returned
-    inverse affine maps a point in the rotated(+padded) frame back to the ORIGINAL
-    (unpadded) image coordinates — subtract ``pad`` after applying it.
+    ``skew`` is the *measured* tilt from :func:`_estimate_skew_from_gray` (the sign
+    convention that function produces), so the image is rotated **by that angle** to
+    make its text lines axis-aligned — the opposite sign doubled the tilt instead
+    (a 3° scan came out at 6°).  ``cv2.getRotationMatrix2D`` rotates about the image
+    centre; the image is first padded so the small rotation does not clip page-edge
+    content, and the returned inverse affine maps a point in the rotated(+padded)
+    frame back to the ORIGINAL (unpadded) image coordinates — subtract ``pad`` after
+    applying it.
     """
     import numpy as np
     import cv2
@@ -1454,7 +1453,7 @@ def _deskew_affine(img, skew: float) -> tuple[object, object, int]:
     pad = int(max(w, h) * float(np.sin(rad)) + max(w, h) * (1.0 - float(np.cos(rad)))) + 20
     padded = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
     cx, cy = w / 2.0 + pad, h / 2.0 + pad
-    m = cv2.getRotationMatrix2D((cx, cy), -skew, 1.0)
+    m = cv2.getRotationMatrix2D((cx, cy), skew, 1.0)
     rotated = cv2.warpAffine(padded, m, (w + 2 * pad, h + 2 * pad),
                              flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     return rotated, cv2.invertAffineTransform(m), pad
@@ -1990,7 +1989,8 @@ def _needs_ocr(page) -> bool:
         return False
 
 
-def _ocr_results_from_img(engine, img, zoom, page_index, log=None) -> list[tuple[list, str]]:
+def _ocr_results_from_img(engine, img, zoom, page_index, log=None,
+                          derotate=None) -> list[tuple[list, str]]:
     """Run RapidOCR on a rendered page, deskewing first if it is noticeably tilted.
 
     Returns ``[(pdf_box, text), ...]`` with boxes already in PDF points.  When the page's
@@ -2000,6 +2000,12 @@ def _ocr_results_from_img(engine, img, zoom, page_index, log=None) -> list[tuple
     inverse affine, so the grid reconstruction still sees correct, un-rotated geometry.  A
     near-flat page skips the transform entirely — the low-risk "don't over-rotate a good
     scan" guard.
+
+    ``derotate`` (a ``Page.derotation_matrix``) is applied last for a page with
+    ``/Rotate`` ≠ 0: ``get_pixmap`` renders the *rotated* page, so pixel-derived
+    coordinates live in that rotated frame while every text/draw API (and therefore
+    the exporter) works in the unrotated mediabox frame.  Without it a rotated scan's
+    blocks came out transposed — covers and translations drawn at swapped x/y.
     """
     import cv2
     import numpy as np
@@ -2032,7 +2038,11 @@ def _ocr_results_from_img(engine, img, zoom, page_index, log=None) -> list[tuple
                 ox, oy = _map_pt_back(inv_affine, pad, float(px), float(py))
             else:
                 ox, oy = float(px), float(py)
-            pts.append([ox / zoom, oy / zoom])
+            ox, oy = ox / zoom, oy / zoom
+            if derotate is not None:
+                pt = fitz.Point(ox, oy) * derotate
+                ox, oy = float(pt.x), float(pt.y)
+            pts.append([ox, oy])
         results.append((pts, text))
     return results
 
@@ -2077,7 +2087,11 @@ def _ocr_page_blocks(
         return []
     try:
         img, zoom = _page_to_array(page)
-        results = _ocr_results_from_img(engine, img, zoom, page_index, log)
+        # A page with /Rotate ≠ 0 is rendered in its rotated frame; map the detected
+        # boxes back into the unrotated (mediabox) frame the exporter draws in.
+        derotate = page.derotation_matrix if int(getattr(page, "rotation", 0) or 0) else None
+        results = _ocr_results_from_img(engine, img, zoom, page_index, log,
+                                        derotate=derotate)
         return _synthesize_ocr_blocks(
             results, page_index, log, page_height=page.rect.height
         )
@@ -2341,14 +2355,22 @@ def _break_between(base: dict, prev: dict, cur: dict) -> bool:
     ):
         return True
     # A line whose horizontal CENTRE has jumped far from the previous line's
-    # centre (> ~0.55× this line's width, with a small absolute floor) is a
-    # different COLUMN (left↔right on a 2-column page).  Inter-column lines
-    # stream close in y, so the y-gap / style checks above don't fire; without
-    # this they merge into one full-width block whose translation is drawn
-    # across the page and collides with its neighbour column.
+    # centre is a different COLUMN (left↔right on a 2-column page).  Inter-column
+    # lines stream close in y, so the y-gap / style checks above don't fire; without
+    # this they merge into one full-width block whose translation is drawn across
+    # the page and collides with its neighbour column.
+    #
+    # The x-ranges must ALSO be disjoint: a paragraph's short last line is
+    # left-aligned like the lines above it, and its centre jump alone used to split
+    # it into its own block (~half of all paragraphs, since a left-aligned last line
+    # narrower than ~half the text width trips the old rule).  The threshold is
+    # measured against the PREVIOUS line's width — the current line is exactly the
+    # short one that must not trigger it.
     cur_cx = (cur["x0"] + cur["x1"]) / 2.0
     prev_cx = (prev["x0"] + prev["x1"]) / 2.0
-    if abs(cur_cx - prev_cx) > max(24.0, 0.55 * (cur["x1"] - cur["x0"])):
+    prev_w = prev["x1"] - prev["x0"]
+    if (abs(cur_cx - prev_cx) > max(24.0, 0.55 * prev_w)
+            and (cur["x0"] > prev["x1"] - 1.0 or prev["x0"] > cur["x1"] - 1.0)):
         return True
     return False
 
@@ -2803,11 +2825,7 @@ _MIN_TABLE_READABLE = 6.0
 #: is cheaper than splitting a table row — the original scan is also one line
 #: per cell, so a wrapped cell is a visible misalignment, not a readable fix.
 _MIN_TABLE_FLOOR = 3.0
-#: A rebuilt vector-table cell keeps its font size up to this many wrapped lines;
-#: beyond it the font shrinks toward ``_MIN_TABLE_READABLE`` so a pathological long
-#: translation cannot grow the whole table off the page ("prefer row height, but
-#: never let a single cell blow up the layout").
-_TABLE_KEEP_FONT_MAX_LINES = 4
+
 
 def _render_note(page: fitz.Page, font, lang: str) -> None:
     """Write the 'nothing to translate on this page' note."""
@@ -3053,20 +3071,6 @@ def _fit_block(block: Block, font, text: str) -> tuple[list[str], float]:
     fs = max(5.0, min(block.size, _MAX_FONT))
 
     if getattr(block, "in_table", False):
-        # Rebuilt vector-table cell: prefer row height over shrink — keep the
-        # font at its original size and let the row grow to the wrapped line
-        # count (never collapse to the 3pt floor).
-        if getattr(block, "keep_font", False):
-            flat = " ".join(str(text).split())
-            lines = _wrap(font, flat, max_width, fs)
-            # Keep the font (row height absorbs the wrap); only shrink toward the
-            # readability floor when the wrap exceeds the row-height cap, so a
-            # pathological long text cannot grow the whole table off the page.
-            if len(lines) > _TABLE_KEEP_FONT_MAX_LINES:
-                while len(lines) > _TABLE_KEEP_FONT_MAX_LINES and fs > _MIN_TABLE_READABLE:
-                    fs = max(_MIN_TABLE_READABLE, round(fs * 0.9, 2))
-                    lines = _wrap(font, flat, max_width, fs)
-            return lines, fs
         # The line count of the SOURCE cell (grid cells are one OCR line; a
         # text-layer cell may span several source lines joined by \n).
         n_lines = max(1, len(block.text.split("\n")))
@@ -3597,371 +3601,6 @@ def _rebalance_table_columns(tables, mapping, blocks, trans, font):
     return col_boxes, new_col_edges
 
 
-def _recover_rows(tb: dict) -> list[float]:
-    """Recover the row-boundary list from a rebuilt table's ``rows`` (rects)."""
-    rows_pts = [row[0].y0 for row in tb["rows"]]
-    rows_pts.append(tb["rows"][-1][0].y1)
-    return rows_pts
-
-
-def _rebalance_rebuild_columns(tables, mapping, blocks, trans, font):
-    """Numeric-aware column-width rebalance for a *rebuilt* OCR table.
-
-    A rebuilt table's numeric columns come from the AI grid and are often too
-    narrow for the translated numbers (e.g. a 42pt column holding a 46pt
-    ``7,211,506,934.87``) — a single-line number overflows the cell.  We widen each
-    numeric column **by exactly how much its widest number actually overflows**,
-    and take that from the non-numeric (label) columns so the total table width is
-    unchanged.  A column whose numbers already fit is left untouched (measured with
-    the same 1.02 slack as the overflow check), so a well-fitting grid is never
-    disturbed.  Numbers are never broken/wrapped (the numeric red line), so the
-    label columns absorb the difference.  Returns ``(col_boxes, new_col_edges)``;
-    ``new_col_edges`` is keyed by table index (a whole rebuilt page is one table).
-    """
-    col_boxes: dict[int, tuple[float, float]] = {}
-    new_col_edges: dict[int, list[float]] = {}
-    for ti, tb in enumerate(tables):
-        edges = list(tb["col_edges"])
-        if len(edges) < 2:
-            continue
-        ncols = len(edges) - 1
-        cur = [edges[j + 1] - edges[j] for j in range(ncols)]
-        numeric = [False] * ncols
-        add = [0.0] * ncols          # extra width each numeric column actually needs
-        for bi, key in mapping.items():
-            if key[0] != ti or bi >= len(trans):
-                continue
-            c = key[2]
-            if not (0 <= c < ncols):
-                continue
-            t = str(trans[bi]).strip()
-            if not t:
-                continue
-            if not _is_numeric_cell(str(blocks[bi].text)):
-                continue
-            numeric[c] = True
-            # Drawn at the kept font (never broken); clamp like _fit_block.
-            fs = max(5.0, min(float(getattr(blocks[bi], "size", 0.0) or 0.0),
-                              _MAX_FONT))
-            avail = max(1.0, cur[c] - 2 * _TABLE_CELL_PAD)
-            w = font.text_length(t, fontsize=fs)
-            if w > avail * 1.02:      # matches the overflow check: genuinely too wide
-                add[c] = max(add[c], w - avail)
-        total_add = sum(add)
-        if total_add <= 0.0:
-            continue                  # nothing actually overflows -> leave the grid
-        non_numeric = [c for c in range(ncols) if not numeric[c]]
-        non_total = sum(cur[c] for c in non_numeric)
-        if non_total <= 0.0 or total_add > non_total * 0.5:
-            continue                  # labels can't absorb it -> skip (avoid collapsing)
-        new_w = list(cur)
-        for c in non_numeric:
-            new_w[c] = cur[c] - total_add * cur[c] / non_total
-        for c in range(ncols):
-            if numeric[c]:
-                new_w[c] = cur[c] + add[c]
-        # Absorb float rounding into the first non-numeric column to keep the total.
-        diff = sum(cur) - sum(new_w)
-        if non_numeric:
-            new_w[non_numeric[0]] += diff
-        x = edges[0]
-        new_edges = [x]
-        for c in range(ncols):
-            x += new_w[c]
-            new_edges.append(x)
-        new_col_edges[ti] = new_edges
-        for bi, key in mapping.items():
-            if key[0] == ti and 0 <= key[2] < ncols:
-                c = key[2]
-                col_boxes[bi] = (
-                    new_edges[c] + _TABLE_CELL_PAD,
-                    new_edges[c + 1] - _TABLE_CELL_PAD,
-                )
-    return col_boxes, new_col_edges
-
-
-def _in_non_text(block, non_text) -> bool:
-    """True when ``block``'s centre falls inside a non-text region (signature/stamp).
-
-    ``non_text`` is a list of ``(x0, y0, x1, y1, kind)`` PDF-point boxes from the
-    AI table-style recognition; such regions hold identity/imagery (a handwritten
-    signature, a seal), not tabular content, so their blocks are left verbatim.
-    """
-    cx = (block.x0 + block.x1) / 2.0
-    cy = (block.y0 + block.y1) / 2.0
-    for x0, y0, x1, y1, _kind in non_text:
-        if x0 - 2.0 <= cx <= x1 + 2.0 and y0 - 2.0 <= cy <= y1 + 2.0:
-            return True
-    return False
-
-
-def _calibrate_table_grid(blocks, ai_cols_pts, ai_rows_pts, *, gap: float = 4.0):
-    """Layer-①: fold OCR *geometry* into the AI grid — extend OR trim to the true
-    content extent.
-
-    Vision model drops the rightmost column of a dense scan and its row count
-    drifts, *and* (after the prompt over-anchored to the page right edge) it can
-    push the table wider than the content.  This compares the AI boundary span
-    with the OCR geometric column/row clusters (the *real* separations): the
-    outermost geometric boundary is added only when it lies beyond the AI span by
-    more than ``gap`` — so a missed 2024-parent column is filled in — while an AI
-    boundary that sits past the content extent by more than ``gap`` is pulled back
-    to it (fixes the "table too wide", where the rightmost column became ~2× and
-    numbers ran off the page).  Boundaries lying outside the content extent are
-    dropped.
-
-    Returns ``(cols_pts, rows_pts, col_shift, row_shift)``.  The shifts are how
-    many boundaries were prepended on the *left/top* (0 or 1); appends on the
-    right/bottom do not renumber existing AI indices, but a prepend does — callers
-    that hold AI-indexed data (``align`` / ``merged`` / ``header_*``) MUST add the
-    shift or they address the wrong column/row.
-    """
-    items = [(b.y0, b.x0, b.x1, b.y1, str(b.text)) for b in blocks]
-    cols = _cluster_ocr_columns(items) if items else []
-    rows = _cluster_ocr_rows(items) if items else []
-    if not cols or not rows:
-        # Nothing to calibrate against: keep the AI grid exactly as recognised.
-        return list(ai_cols_pts), list(ai_rows_pts), 0, 0
-    col_lo = min(min(it[1] for it in c) for c in cols)
-    col_hi = max(max(it[2] for it in c) for c in cols)
-    row_lo = min(min(it[0] for it in r) for r in rows)
-    row_hi = max(max(it[3] for it in r) for r in rows)
-    cols_pts = list(ai_cols_pts)
-    col_shift = 0
-    if col_hi > cols_pts[-1] + gap:
-        cols_pts.append(col_hi)            # AI 漏了最右列 → 补
-    elif cols_pts[-1] > col_hi + gap:
-        cols_pts[-1] = col_hi + gap        # AI 把表画到页面右缘 → 收回内容实际右缘
-    if col_lo < cols_pts[0] - gap:
-        cols_pts.insert(0, col_lo)
-        col_shift = 1
-    elif cols_pts[0] > col_lo + gap:
-        cols_pts[0] = col_lo - gap
-    rows_pts = list(ai_rows_pts)
-    row_shift = 0
-    if row_hi > rows_pts[-1] + gap:
-        rows_pts.append(row_hi)
-    elif rows_pts[-1] > row_hi + gap:
-        rows_pts[-1] = row_hi + gap
-    if row_lo < rows_pts[0] - gap:
-        rows_pts.insert(0, row_lo)
-        row_shift = 1
-    elif rows_pts[0] > row_lo + gap:
-        rows_pts[0] = row_lo - gap
-    return sorted(cols_pts), sorted(rows_pts), col_shift, row_shift
-
-
-def valid_rebuild(blocks, style, *, min_mapped_ratio: float = 0.8) -> bool:
-    """Layer-④: True when the rebuilt grid keeps enough numeric blocks inside cells.
-
-    AI 识别的列/行可能漏列或错位，导致大量数字块游离在表格外。数字是红线：若
-    重建后映射到重建单元格的数字块占比低于阈值，说明重建结构不可靠——调用方应
-    回退到普通 OCR（fail-closed，绝不硬输出错表）。
-    """
-    try:
-        _rebuilt, _tables, mapping = _rebuild_ocr_table_blocks(blocks, style)
-    except Exception:
-        return False
-    numeric = [j for j, b in enumerate(blocks) if any(ch.isdigit() for ch in str(b.text))]
-    if not numeric:
-        return True
-    mapped = sum(1 for j in numeric if j in mapping)
-    return (mapped / len(numeric)) >= min_mapped_ratio
-
-
-def score_rebuild(blocks, style, trans=None, *, font=None) -> tuple[int, int, float]:
-    """Deterministic structural score of a rebuilt grid (candidate ranking).
-
-    Returns ``(collisions, overflow, map_ratio)`` — smaller collisions/overflow is
-    better, larger map_ratio is better.  The worker runs the vision model several
-    times and ranks the samples with this instead of using an absolute accept
-    threshold: on a dense scan even the *correct* structure has some collisions
-    (OCR splits a label into fragments) and some overflow (physically tight rows),
-    so "zero" is not a usable gate — *ranking the samples* is.
-
-    * ``collisions``: rebuilt cells holding more than one block — two blocks drawn
-      into one cell overlap; a merged or shifted grid line shows up here.
-    * ``overflow``: mapped cells whose fitted translation exceeds the cell (width
-      or height).  Needs ``trans``; counted as 0 when absent.
-    * ``map_ratio``: fraction of numeric blocks that map into the grid.
-    """
-    try:
-        rebuilt, _tables, mapping = _rebuild_ocr_table_blocks(blocks, style)
-    except Exception:  # noqa: BLE001 — an unusable style ranks last
-        return (1 << 30, 1 << 30, 0.0)
-    numeric = [j for j, b in enumerate(blocks) if any(ch.isdigit() for ch in str(b.text))]
-    map_ratio = (
-        sum(1 for j in numeric if j in mapping) / len(numeric) if numeric else 1.0
-    )
-    per_cell: dict[tuple, int] = {}
-    for cell in mapping.values():
-        per_cell[cell] = per_cell.get(cell, 0) + 1
-    collisions = sum(1 for v in per_cell.values() if v > 1)
-    overflow = 0
-    if trans is not None:
-        font = font or _CJK_FONT
-        for j, b in enumerate(rebuilt):
-            if j not in mapping or j >= len(trans):
-                continue
-            lines, fs = _fit_block(b, font, trans[j])
-            w_avail = max(1.0, b.x1 - b.x0)
-            h_avail = max(1.0, b.y1 - b.y0)
-            w_max = max((font.text_length(ln, fontsize=fs) for ln in lines), default=0.0)
-            h_need = _wrapped_height(
-                font, lines, fs,
-                _line_leading(font, in_table=True, n_lines=len(lines)),
-            )
-            if w_max > w_avail * 1.02 or h_need > h_avail * 1.05:
-                overflow += 1
-    return (collisions, overflow, round(map_ratio, 4))
-
-
-def best_rebuild(blocks, styles, trans=None, *, font=None):
-    """Pick the best-scoring candidate style, or ``(None, None)`` if none.
-
-    Ranking key: fewest collisions, then least overflow, then highest numeric
-    mapping.  This is Layer-② revised — the vision samples disagree (row counts
-    especially), so the deterministic scorer decides instead of a mode vote or an
-    unreliable "AI approves" loop.
-    """
-    best_style = None
-    best_score: tuple[int, int, float] | None = None
-    for st in (styles or []):
-        sc = score_rebuild(blocks, st, trans, font=font)
-        if best_score is None or (sc[0], sc[1], -sc[2]) < (
-                best_score[0], best_score[1], -best_score[2]):
-            best_style, best_score = st, sc
-    return best_style, best_score
-
-
-def rebuild_semantics(blocks, style) -> dict:
-    """Layer-③: build a semantic table structure from the rebuilt grid.
-
-    Composes the rebuilt ``cells`` (block -> ``(row, col)`` from the AI grid)
-    with the AI-recognised ``merged`` (spanning headers) and ``header_rows`` /
-    ``header_cols``, so the audit/``check_table`` path sees the table's *semantic*
-    layout (merges, header position) rather than a flat list of cells.  Returns a
-    dict ``{rows, cols, cells, merged, header_rows, header_cols}``.
-    """
-    from . import table_vision
-
-    _rebuilt, tables, mapping = _rebuild_ocr_table_blocks(blocks, style)
-    if not tables:
-        return {"rows": 0, "cols": 0, "cells": [], "merged": [],
-                "header_rows": [], "header_cols": []}
-    # AI 的 ``merged`` / ``header_*`` 索引同样是**校准前**的行列号；几何校准若在
-    # 前部插了一列/行，必须整体平移，否则语义结构（合并范围、表头位置）与重建
-    # 网格错位一位。平移量与 ``_rebuild_ocr_table_blocks`` 用的是同一个校准结果。
-    _cols, _rows, col_shift, row_shift = _calibrate_table_grid(
-        blocks, list(style.get("cols_pts") or []), list(style.get("rows_pts") or []))
-
-    def _shifted(idxs, delta: int) -> list[int]:
-        out: list[int] = []
-        for v in (idxs or []):
-            try:
-                out.append(int(v) + delta)
-            except (TypeError, ValueError):
-                continue
-        return out
-
-    merged: list[dict] = []
-    for m in (style.get("merged") or []):
-        if not isinstance(m, dict):
-            continue
-        try:
-            m2 = dict(m)
-            m2["r"] = int(m.get("r", 0)) + row_shift
-            m2["c"] = int(m.get("c", 0)) + col_shift
-        except (TypeError, ValueError):
-            continue
-        merged.append(m2)
-    tb = tables[0]
-    nrows = len(tb["rows"])
-    ncols = len(tb["col_edges"]) - 1
-    cells: list[list[int]] = [[-1] * ncols for _ in range(nrows)]
-    for bi, (ti, r, c) in mapping.items():
-        if ti == 0 and 0 <= r < nrows and 0 <= c < ncols:
-            cells[r][c] = bi
-    return {
-        "rows": nrows,
-        "cols": ncols,
-        "cells": cells,
-        "merged": merged,
-        "header_rows": _shifted(style.get("header_rows"), row_shift),
-        "header_cols": _shifted(style.get("header_cols"), col_shift),
-    }
-
-
-def _rebuild_ocr_table_blocks(blocks, style):
-    """Rebuild an OCR table into a *vector* table: re-anchor blocks to AI cells.
-
-    ``style`` is the AI-recognised TableStyle dict (``rows_pts`` / ``cols_pts`` in
-    PDF points plus ``align`` / ``merged`` / ``header_*``).  This rebuilds the
-    table as a movable vector grid (``tables``) and re-anchors each OCR block's
-    bbox to its own AI cell, so the exporter treats it like a text-layer table —
-    row-height expansion, vector-grid redraw and a normal, readable translation
-    fill — instead of being pinned by the bitmap lines (which forced 3–4pt shrink).
-
-    Returns ``(rebuilt_blocks, tables, mapping)``:
-    * ``rebuilt_blocks``: blocks with ``x0/x1/y0/y1`` snapped to their AI cell
-      (cell-padded), ``fit_width``/``fit_height`` cleared, and alignment applied
-      (a right-aligned number column keeps the figure flush right).
-    * ``tables``: the AI vector-grid structure (consumed by ``_compute_table_layout``).
-    * ``mapping``: block index -> ``(table, row, col)`` over the AI grid.
-    """
-    from . import table_vision
-
-    rows_pts = style["rows_pts"]
-    cols_pts = list(style["cols_pts"])
-    # 第 1 层：用 OCR 几何（列/行簇）校准 AI 识别的行列边界——补漏列行、吸附到真实
-    # 分隔、合并 <3pt 的噪点边界。AI 漏的最右列（2024 母公司）由此被补回。
-    cols_pts, rows_pts, col_shift, _row_shift = _calibrate_table_grid(
-        blocks, cols_pts, rows_pts)
-    # AI 的 ``align`` 列号是**校准前**的索引：几何校准若在最左插了一列，其后所有
-    # 列号整体右移一位，必须加 ``col_shift``——否则右对齐会套到相邻列（数字被左
-    # 对齐）。模型返回非数字列号时忽略该条，而不是让 int() 抛异常中断导出。
-    align_by_col: dict[int, str] = {}
-    for a in style.get("align", []):
-        if not (isinstance(a, dict) and "col" in a):
-            continue
-        try:
-            c_ai = int(a.get("col"))
-        except (TypeError, ValueError):
-            continue
-        align_by_col[c_ai + col_shift] = (a.get("dir") or "right")
-    # 非文本区域（手写体签名/印章）：这些是身份/图案，不是表格内容——落在其中的
-    # OCR 块不映射到单元格、不翻译、不覆盖，保持原位原样。
-    non_text = list(style.get("non_text", []) or [])
-    tables = table_vision.tables_from_grid(rows_pts, cols_pts)
-    mapping = _map_blocks_to_table_cells(blocks, tables)
-    rebuilt: list[Block] = []
-    for j, b in enumerate(blocks):
-        nb = b
-        if _in_non_text(b, non_text) and _is_pure_symbol(str(b.text)):
-            # 非文本区域且**无可识别文本**（纯符号/印章图案）→ 过滤，保留原样。
-            # 能识别为文本的块（印刷标签、有内容的块）不过滤——照常映射、翻译。
-            nb = replace(b, keep_original=True)
-            rebuilt.append(nb)
-            continue
-        if j in mapping:
-            ti, r, c = mapping[j]
-            cell = tables[ti]["rows"][r][c]
-            nb = replace(
-                b,
-                x0=cell.x0 + _TABLE_CELL_PAD,
-                x1=cell.x1 - _TABLE_CELL_PAD,
-                y0=cell.y0,
-                y1=cell.y1,
-                fit_width=0.0,
-                fit_height=0.0,
-                keep_font=True,
-            )
-            if c in align_by_col and align_by_col[c] == "right":
-                nb = replace(nb, align="right")
-        rebuilt.append(nb)
-    return rebuilt, tables, mapping
-
-
 def _compute_table_layout(tables, mapping, blocks, trans, font):
     """Work out how far every table row must be pushed down so translations fit.
 
@@ -4063,6 +3702,242 @@ def unique_path(path: str | Path) -> Path:
         n += 1
 
 
+#: DPI the scanned table page is rendered at for the AI rebuild call (0.2.7's
+#: ``_REVIEW_DPI``): high enough for the vision model to read the grid, low enough
+#: to keep the request small.
+_AI_TABLE_RENDER_DPI = 150
+
+#: Base font size for a rebuilt (AI) table cell, before the wrap shrinks it.
+_AI_TABLE_FONT = 7.0
+#: Left/right inset (pt) inside each rebuilt table cell, so the text sits clear
+#: of the grid rules instead of touching the column borders.
+_AI_TABLE_PAD = 4.0
+#: Minimum row height (pt) for a rebuilt table's empty / numeric rows.
+_AI_TABLE_MIN_ROW = 11.0
+#: Page margin (pt) used when drawing a rebuilt table.
+_AI_TABLE_MARGIN = 36.0
+
+
+def _draw_ocr_grid_page(
+    page: "fitz.Page",
+    blocks: Sequence[Block],
+    trans: Sequence[str],
+    font,
+) -> None:
+    """Regenerate a scanned table page as a clean table.
+
+    ``page`` is already a *blank* page of the source's size.  The OCR blocks are
+    clustered into rows / columns; each row is then expanded to fit its longest
+    translated cell (the OCR row height fits the short Chinese source, but the
+    English translation is usually longer), the grid rules are drawn at the
+    expanded boundaries, and each cell's translation is drawn **into its grown row
+    band**.  Nothing from the original raster — the scan background, stamps,
+    photos or handwriting — is copied.
+
+    Deviation from the 0.2.7 original (which this is ported from): there the cells
+    were drawn with their *original* OCR bbox and ``fit_height``, so the row
+    expansion was cosmetic — the grid moved down but the translation was still
+    squeezed into the 12pt glyph box (measured: a two-line label rendered at
+    4.54pt in a 10.5pt band that the grid had left at 12pt).  Here the row is
+    grown to the height the translation needs **at the readability floor**, and
+    the cell is drawn into that band, so the growth is actually used.
+    """
+    ocr = [(b, t) for b, t in zip(blocks, trans)
+           if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)]
+    if len(ocr) < 4:
+        return
+    # items carry a trailing index so a row/column cluster can be mapped back to
+    # its block (the clustering helpers only read the first five fields).
+    items = [(b.y0, b.x0, b.x1, b.y1, b.text, i) for i, (b, _t) in enumerate(ocr)]
+    rows = _cluster_ocr_rows(items)
+    cols = _cluster_ocr_columns(items)
+    if len(rows) < 2 or len(cols) < 2:
+        return
+    rows_sorted = sorted(rows, key=lambda r: min(it[0] for it in r))
+    cols_sorted = sorted(cols, key=lambda c: min(it[1] for it in c))
+
+    def _needed_height(b: Block, text: str) -> float:
+        """Height the translation needs at the table readability floor."""
+        width = max(1.0, (b.fit_width or 0.0) or (b.x1 - b.x0))
+        lines = _wrap(font, " ".join(str(text).split()), width, _MIN_TABLE_READABLE)
+        return _wrapped_height(font, lines, _MIN_TABLE_READABLE, _TABLE_CELL_LEADING)
+
+    # Expand each row to fit its longest translated cell, then lay the rows out
+    # top-to-bottom (a taller row pushes the ones below it down).  The first row
+    # keeps its original top, so the table stays where the scan put it.
+    row_tops: list[float] = []
+    row_bots: list[float] = []
+    cur = min(it[0] for it in rows_sorted[0])
+    for r in rows_sorted:
+        orig_h = max(it[3] for it in r) - min(it[0] for it in r)
+        need = orig_h
+        for it in r:
+            b, t = ocr[it[5]]
+            need = max(need, _needed_height(b, t))
+        row_tops.append(cur)
+        cur += max(orig_h, need)
+        row_bots.append(cur)
+
+    # Column boundaries: one line per gap between the (left-to-right) columns,
+    # plus the outer left / right edges.
+    xs = [round(min(it[1] for it in cols_sorted[0]), 0)]
+    for a, b_ in zip(cols_sorted, cols_sorted[1:]):
+        xs.append(round((max(it[2] for it in a) + min(it[1] for it in b_)) / 2, 0))
+    xs.append(round(max(it[2] for it in cols_sorted[-1]), 0))
+    xs = sorted(set(xs))
+    left, right = xs[0], xs[-1]
+    top, bot = row_tops[0], row_bots[-1]
+
+    # Draw the grid rules at the (expanded) row boundaries and the column gaps.
+    for y in set(round(v, 1) for v in row_tops + [bot]):
+        page.draw_line(fitz.Point(left, y), fitz.Point(right, y), color=(0, 0, 0), width=0.5)
+    for x in xs:
+        page.draw_line(fitz.Point(x, top), fitz.Point(x, bot), color=(0, 0, 0), width=0.5)
+
+    # Draw each cell's translation inside its own grown row band, top-anchored
+    # (a wrapped cell then stays above the row's lower rule instead of crossing it).
+    for k, r in enumerate(rows_sorted):
+        band = max(1.0, row_bots[k] - row_tops[k] - 1.0)
+        for it in r:
+            b, t = ocr[it[5]]
+            draw_b = replace(b, y0=row_tops[k], y1=row_bots[k], fit_height=band)
+            _draw_translated_block(page, font, draw_b, t)
+
+
+def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font,
+                   merges: Sequence[dict] | None = None) -> None:
+    """Draw a clean, regular N x M table from a translated 2D grid.
+
+    ``rows`` is the rebuilt grid (one list per table row).  Columns are sized by
+    content (the AI's relative widths, else the widest cell); each row is grown to
+    fit its tallest cell.  ``merges`` (from ``detect_table_merge``) gives explicit
+    spanning headers — the top-left cell is centred across its colspan and the
+    internal rules are omitted for the spanned rows; without it a top-two-row
+    heuristic is used.
+    """
+    n_rows = len(rows)
+    n_cols = max(len(r) for r in rows) if rows else 0
+    if n_rows < 1 or n_cols < 1:
+        return
+
+    # Content-based column widths: a column gets more width when its cells are
+    # wider (long labels), and stays narrow when they are short (figures, line
+    # numbers).
+    base = rect.width / n_cols
+    weights = []
+    for j in range(n_cols):
+        w = 0.0
+        for r in rows:
+            cell = str(r[j]) if j < len(r) else ""
+            if cell.strip():
+                w = max(w, font.text_length(cell, fontsize=_AI_TABLE_FONT))
+        weights.append(max(base * 0.35, min(w, rect.width * 0.33)))
+    tot_w = sum(weights)
+    col_widths = [rect.width * w / tot_w for w in weights] if tot_w > 0 else [base] * n_cols
+
+    xs = [rect.x0 + sum(col_widths[:j]) for j in range(n_cols + 1)]
+
+    # Merged spans: explicit ``merges`` (from detect_table_merge) win; otherwise a
+    # top-two-row heuristic (a non-empty cell followed by consecutive empties).
+    # ``merged[i]`` = {col: colspan} for the top-left of a column span in row i;
+    # ``rowspan_internal`` = row -> set of internal column-boundary indices to omit
+    # (covers colspan of a merge that spans several rows).
+    merged: dict[int, dict[int, int]] = {}
+    rowspan_internal: dict[int, set[int]] = {}
+    if merges:
+        for m in (merges if isinstance(merges, list) else []):
+            if not isinstance(m, dict):
+                continue
+            try:
+                r = int(m.get("r", 0)); c = int(m.get("c", 0))
+                rs = int(m.get("rowspan", 1)); cs = int(m.get("colspan", 1))
+            except (TypeError, ValueError):
+                continue
+            if rs >= 1 and cs >= 1 and 0 <= r < n_rows and 0 <= c < n_cols \
+                    and c + cs <= n_cols:
+                merged.setdefault(r, {})[c] = cs
+                for rr in range(r, min(n_rows, r + rs)):
+                    rowspan_internal.setdefault(rr, set()).update(range(c + 1, c + cs))
+    else:
+        for i, r in enumerate(rows[:2]):
+            spans: dict[int, int] = {}
+            j = 0
+            while j < n_cols:
+                if str(r[j]).strip():
+                    k = j + 1
+                    while k < n_cols and not str(r[k]).strip():
+                        k += 1
+                    if k - j > 1:
+                        spans[j] = k - j
+                    j = k
+                else:
+                    j += 1
+            merged[i] = spans
+            rowspan_internal[i] = {k for j, s in spans.items() for k in range(j + 1, j + s)}
+
+    def cell_block(j: int, top: float, h: float, text: str) -> Block:
+        w = col_widths[j]
+        return Block(
+            text="", page=0, x0=xs[j] + _AI_TABLE_PAD, y0=top,
+            x1=xs[j] + w - _AI_TABLE_PAD, y1=top + h,
+            size=_AI_TABLE_FONT, align="right" if _is_numeric_cell(text) else "left",
+            single_line=False, in_table=False,
+        )
+
+    def cell_height(cell: str, j: int) -> float:
+        if not str(cell).strip():
+            return 0.0
+        width = max(1.0, col_widths[j] - 2 * _AI_TABLE_PAD)
+        lines = _wrap(font, str(cell), width, _AI_TABLE_FONT)
+        return _wrapped_height(font, lines, _AI_TABLE_FONT, _LOOSE_LEADING)
+
+    # Row heights: grow each row to fit its tallest cell (keep a minimum).
+    row_hs = [max(_AI_TABLE_MIN_ROW, max((cell_height(c, j) for j, c in enumerate(r)), default=0.0))
+              for r in rows]
+    # If the table overflows the page, shrink the base font proportionally.
+    total = sum(row_hs)
+    if total > rect.height:
+        factor = rect.height / total
+        for i, h in enumerate(row_hs):
+            row_hs[i] = max(_AI_TABLE_MIN_ROW * 0.6, h * factor)
+
+    y = rect.y0
+    for i, r in enumerate(rows):
+        h = row_hs[i]
+        spans = merged.get(i, {})
+        for j, cell in enumerate(r):
+            text = str(cell)
+            if j in spans:
+                s = spans[j]
+                cb = Block(
+                    text="", page=0, x0=xs[j] + _AI_TABLE_PAD, y0=y,
+                    x1=xs[j + s] - _AI_TABLE_PAD, y1=y + h,
+                    size=_AI_TABLE_FONT, align="center", single_line=False, in_table=False,
+                )
+            else:
+                cb = cell_block(j, y, h, text)
+            _draw_translated_block(page, font, cb, text)
+        y += h
+    # Horizontal rules.
+    yy = rect.y0
+    for h in row_hs:
+        page.draw_line(fitz.Point(rect.x0, yy), fitz.Point(rect.x1, yy), color=(0, 0, 0), width=0.5)
+        yy += h
+    page.draw_line(fitz.Point(rect.x0, yy), fitz.Point(rect.x1, yy), color=(0, 0, 0), width=0.5)
+    # Vertical rules, drawn per row so a merged header's internal boundary is
+    # omitted for that row while the data rows below keep it.
+    yy = rect.y0
+    for i, h in enumerate(row_hs):
+        internal: set[int] = set(rowspan_internal.get(i, set()))
+        for j, s in merged.get(i, {}).items():
+            internal.update(range(j + 1, j + s))
+        for k in range(n_cols + 1):
+            if k in internal:
+                continue
+            page.draw_line(fitz.Point(xs[k], yy), fitz.Point(xs[k], yy + h), color=(0, 0, 0), width=0.5)
+        yy += h
+
+
 def save_translated_pdf(
     src_path: str | Path,
     pages: Sequence[Sequence[Block]],
@@ -4071,7 +3946,9 @@ def save_translated_pdf(
     lang: str,
     log: Callable[[str], None] | None = None,
     reflow: bool = False,
-    rebuild_pages: dict[int, tuple[list[float], list[float]]] | None = None,
+    redraw_ocr: bool = False,
+    table_rebuild_fn: Callable[[int, bytes], Sequence[Sequence[str]] | None] | None = None,
+    merge_tool_fn: Callable[[int, bytes, Sequence[Sequence[str]]], list[dict]] | None = None,
 ) -> None:
     """Create a layout-preserving translation PDF.
 
@@ -4079,6 +3956,20 @@ def save_translated_pdf(
     vector graphics in their exact places), while the original text is redacted
     and replaced by the translated text at the same positions.  This is the
     ``仅译文 / translation in place`` output.
+
+    With ``redraw_ocr``, a scanned (OCR-reconstructed) table page is instead
+    regenerated as a *clean* page: a blank page carrying only the table's grid
+    rules and the translated cells, with the raster background, stamps and
+    handwriting explicitly ignored (signatures are dropped at extraction).  Row
+    heights are expanded to fit the translations, so a rebuilt table needs no
+    shrinking to the readability floor.  Non-OCR / non-table pages keep the
+    in-place behaviour.
+
+    ``table_rebuild_fn`` is the AI-table rebuild callback (see
+    ``translator.make_table_rebuild_fn``): when ``redraw_ocr`` is on and it is
+    provided, an OCR table page is drawn from a model-derived translated 2D grid
+    (clean, regular N x M table) instead of the geometric OCR-frame redraw; any
+    failure / implausible grid falls back to the geometric redraw.
     """
     src = fitz.open(str(src_path))
     out_doc = fitz.open()
@@ -4092,6 +3983,66 @@ def save_translated_pdf(
             if m == 0:
                 out_doc.insert_pdf(src, from_page=i, to_page=i)
                 continue
+
+            # Clean redraw of an OCR table page: start from a blank page, draw
+            # only the reconstructed grid rules + translated cells, and ignore
+            # the scan's raster background / stamps / handwriting.  Handle only
+            # genuine *tables* — a diagram page (org chart) has node labels, not
+            # data cells, so it is left on the in-place path.
+            if redraw_ocr:
+                table_blocks = [
+                    b for b in blocks
+                    if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)
+                ]
+                if len(table_blocks) >= 4 and _reconstruct_ocr_tables(table_blocks):
+                    # The blank page must use the source's UNROTATED mediabox: OCR
+                    # blocks live in that frame (see ``_ocr_results_from_img``), so a
+                    # /Rotate page's visual rect (transposed) put every grid line and
+                    # cell off-page.  The rotation is re-applied to the new page so it
+                    # still displays in the same orientation as the source.
+                    src_page = src[i]
+                    mb = src_page.mediabox
+                    page = out_doc.new_page(width=mb.width, height=mb.height)
+                    if int(getattr(src_page, "rotation", 0) or 0):
+                        page.set_rotation(int(src_page.rotation))
+                    rebuilt = None
+                    page_png = None
+                    if table_rebuild_fn is not None:
+                        if log:
+                            log(f"  正在 AI 表格重建：第 {i + 1} 页…")
+                        try:
+                            page_png = _render_page_png(src_page, dpi=_AI_TABLE_RENDER_DPI)
+                            rebuilt = table_rebuild_fn(i, page_png)
+                        except Exception:  # noqa: BLE001 — fail-closed
+                            rebuilt = None
+                    # A grid with no text at all is unusable: drawing it would leave a
+                    # BLANK page (silent content loss), so fall back instead.
+                    if rebuilt and any(str(c).strip() for row in rebuilt for c in row):
+                        if log:
+                            log(f"  AI 表格重建完成（第 {i + 1} 页，{len(rebuilt)} 行）。")
+                        rect = fitz.Rect(
+                            _AI_TABLE_MARGIN, _AI_TABLE_MARGIN,
+                            mb.width - _AI_TABLE_MARGIN, mb.height - _AI_TABLE_MARGIN,
+                        )
+                        merges = None
+                        if merge_tool_fn is not None and rect.width > 0 and rect.height > 0:
+                            try:
+                                page_png = page_png or _render_page_png(
+                                    src_page, dpi=_AI_TABLE_RENDER_DPI)
+                                merges = merge_tool_fn(i, page_png, rebuilt)
+                            except Exception:  # noqa: BLE001 — fail-closed
+                                merges = None
+                        if rect.width > 0 and rect.height > 0:
+                            _draw_ai_table(page, rebuilt, rect, font, merges=merges)
+                        else:
+                            if log:
+                                log(f"  第 {i + 1} 页过小，无法重画 AI 表格，回退几何重绘。")
+                            _draw_ocr_grid_page(page, blocks[:m], trans[:m], font)
+                    else:
+                        if log:
+                            log(f"  第 {i + 1} 页 AI 表格重建不可用，回退几何重绘。")
+                        _draw_ocr_grid_page(page, blocks[:m], trans[:m], font)
+                    continue
 
             out_doc.insert_pdf(src, from_page=i, to_page=i)
             page = out_doc[-1]
@@ -4132,39 +4083,10 @@ def save_translated_pdf(
                     for j, b in enumerate(blocks)
                 ]
 
-            # C-⑥ 重建为矢量表格（默认关）：对 AI 识别行列的扫描表格页，把 OCR
-            # 块重排到真实单元格边界（矢量），走文本层表格管线的行高扩展 + 矢线
-            # 重绘 + 正常填充译文，而不是被位图线钉死缩字。
             if ocr_table:
+                # 扫描表格保持 OCR 几何：不推挤行高（位图表格线与签字墨迹钉死在像素上），
+                # 靠单元格行带换行 + 缩字兜底。
                 shifts, new_bottoms, grid, bboxes = {}, {}, [], []
-                if rebuild_pages and i in rebuild_pages:
-                    style = rebuild_pages[i]
-                    if (len(style.get("rows_pts", [])) >= 2
-                            and len(style.get("cols_pts", [])) >= 2):
-                        rebuilt, r_tables, r_mapping = _rebuild_ocr_table_blocks(
-                            blocks, style)
-                        # 数字感知列宽自适应：数字列加宽到容纳最宽数字（数字红线），
-                        # 非数字列相应变窄、总表宽不变——修掉「数字列过窄、数字溢出」。
-                        from . import table_vision
-                        col_boxes, new_col_edges = _rebalance_rebuild_columns(
-                            r_tables, r_mapping, rebuilt, trans, font)
-                        if col_boxes:
-                            r_tables = [
-                                table_vision.tables_from_grid(
-                                    _recover_rows(tb), new_col_edges[ti])[0]
-                                for ti, tb in enumerate(r_tables)
-                            ]
-                            layout_blocks = [
-                                replace(b, x0=col_boxes[j][0], x1=col_boxes[j][1])
-                                if j in col_boxes else b
-                                for j, b in enumerate(rebuilt)
-                            ]
-                        else:
-                            layout_blocks = rebuilt
-                        tables = r_tables
-                        mapping = r_mapping
-                        shifts, new_bottoms, grid, bboxes = _compute_table_layout(
-                            tables, mapping, layout_blocks, trans, font)
             else:
                 shifts, new_bottoms, grid, bboxes = _compute_table_layout(
                     tables, mapping, layout_blocks, trans, font
@@ -4185,33 +4107,25 @@ def save_translated_pdf(
             if tables:
                 for bb in bboxes:
                     page.add_redact_annot(bb)
+            # Pass 1 keeps ALL line art: ``REMOVE_IF_TOUCHED`` is page-wide, so using
+            # it here also deleted every drawing whose bbox intersects any *text*
+            # redaction rect — a frame drawn around a paragraph, an underline, a
+            # chart connector — i.e. real content loss (measured: a boxed paragraph
+            # lost its frame).
             page.apply_redactions(
                 images=fitz.PDF_REDACT_IMAGE_NONE,
-                graphics=(
-                    fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED
-                    if tables else fitz.PDF_REDACT_LINE_ART_NONE
-                ),
+                graphics=fitz.PDF_REDACT_LINE_ART_NONE,
             )
-
-            # 重建为矢量表格：覆盖整个表格区域，抹掉**位图**表格线与原扫描文字
-            #（红action 对位图无效，必须用白矩形盖）；再覆盖签名/印章区域——它们
-            # 是非文本，**过滤不显示**（用户明确要求，不再"保护保留"），让重绘的
-            # 矢量线 + 译文文本成为唯一内容，即转成真正的非 OCR 表格。
-            # 必须同时要求 ``ocr_table``：整页涂白只对「本页就是扫描位图表格」成立；
-            # 若调用方给 ``rebuild_pages`` 传了非 OCR 表格页的索引，涂白会连文本层
-            # 内容一起抹掉（防御性——生产路径只把 OCR 表格页放进去）。
-            if ocr_table and rebuild_pages and i in rebuild_pages:
-                # 转成非 OCR 表格页：覆盖整页（在页面内容流里画一个覆盖全页的白矩形，
-                # 盖掉所有原扫描位图——表格线、原文字、印章、签名），让下面重绘的矢量
-                # 线 + 译文文本成为唯一内容。删除位图资源（尽力而为），页面剩余全靠矢量。
-                page.draw_rect(
-                    fitz.Rect(page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y1),
-                    color=None, fill=(1, 1, 1))
-                for img in page.get_images(full=True):
-                    try:
-                        page.delete_image(img[0])
-                    except Exception:  # noqa: BLE001 — 删除失败则靠白矩形盖住
-                        pass
+            if tables:
+                # Pass 2 removes the line art of the TABLE ONLY, scoped to the table
+                # bboxes (the exporter redraws that grid itself, at the possibly
+                # shifted row positions).  Everything outside the table is untouched.
+                for bb in bboxes:
+                    page.add_redact_annot(bb)
+                page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED,
+                )
 
             # Draw the translation at the original positions / alignment /
             # font size (see ``_draw_translated_block`` for the fitting rules).
@@ -4224,11 +4138,7 @@ def save_translated_pdf(
                     continue
                 if getattr(b, "keep_original", False) and getattr(b, "ocr", False):
                     # Non-text region (handwritten signature / seal): do not draw a
-                    # translation over it.  On the plain OCR path nothing was
-                    # covered here, so the original scan pixels stay verbatim; on a
-                    # *rebuild* page the whole page was whitened above, so the
-                    # signature/seal is intentionally gone — the user asked for
-                    # these to be filtered out, not preserved.
+                    # translation over it — the original scan pixels stay verbatim.
                     continue
                 draw_b = b
                 if j in shifts and shifts[j]:

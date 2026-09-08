@@ -199,6 +199,28 @@ class TranslatorTest(unittest.TestCase):
     def test_cache_dir_env_override_is_used(self):
         self.assertEqual(self.cache_dir, _cache_dir())
 
+    def test_retry_backoff_is_interruptible(self):
+        # Every other test injects ``retry_delays=(0, 0)``, so ``_sleep_interruptible``
+        # returned before its loop and the "cancel during backoff" path was never
+        # exercised — the documented reason a cancel stays responsive.
+        import time as _time
+
+        with MockServer() as server:
+            engine = self._engine(server)
+            engine._request_locked = lambda *_a, **_k: (_ for _ in ()).throw(
+                RuntimeError("boom"))
+            calls = {"n": 0}
+
+            def cancel():
+                calls["n"] += 1
+                return calls["n"] >= 3      # 1st = pre-request, 2nd = post-request
+
+            started = _time.monotonic()
+            with self.assertRaises(TranslationCancelled):
+                engine.translate_blocks(["Hello."], "Chinese", doc_path=Path("_fake.pdf"),
+                                        cancel=cancel, retry_delays=(5.0,))
+            self.assertLess(_time.monotonic() - started, 2.0)
+
     def test_cache_write_is_atomic(self):
         # The GUI hard-exits the process on close, so a plain overwrite could
         # leave truncated JSON behind — which reads back as "no cache" and
@@ -1119,6 +1141,64 @@ class NeedsTranslationFormulaTest(unittest.TestCase):
     def test_needs_translation_keeps_prose_and_units(self):
         self.assertTrue(translator._needs_translation("营业收入 合计"))
         self.assertTrue(translator._needs_translation("GB/T 33436-2016"))
+
+
+class TableRebuildFnTest(unittest.TestCase):
+    """OCR 表格重建（0.2.7 版）：整表重建回调 + 网格解析（离线，假客户端）。"""
+
+    @staticmethod
+    def _model(vision: bool = False) -> ModelConfig:
+        return ModelConfig.from_dict(dict(
+            id="v", name="v", type="openai",
+            endpoint="http://127.0.0.1:9/v1/chat/completions", model="m",
+            vision=vision))
+
+    def test_parse_table_grid_pads_short_rows(self):
+        self.assertEqual(
+            translator._parse_table_grid('{"rows": [["a", "b"], ["c"]]}'),
+            [["a", "b"], ["c", ""]],
+        )
+        self.assertIsNone(translator._parse_table_grid('{"rows": []}'))
+        self.assertIsNone(translator._parse_table_grid("not json"))
+        self.assertIsNone(translator._parse_table_grid('{"rows": "not-a-list"}'))
+
+    def test_parse_table_grid_rejects_implausible_size(self):
+        big = {"rows": [[str(i)] for i in range(translator._TABLE_REBUILD_MAX_ROWS + 1)]}
+        self.assertIsNone(translator._parse_table_grid(json.dumps(big)))
+
+    def test_rebuild_fn_gated_by_vision(self):
+        self.assertIsNone(translator.make_table_rebuild_fn(self._model(), "English"))
+        self.assertIsNone(translator.make_merge_tool_fn(self._model()))
+        self.assertIsNotNone(
+            translator.make_table_rebuild_fn(self._model(vision=True), "English"))
+
+    def test_rebuild_fn_calls_model_and_parses(self):
+        seen: list = []
+
+        class _Completions:
+            def create(self, **kwargs):
+                seen.append(kwargs)
+                msg = type("_M", (), {"content":
+                           '{"rows": [["Item", "2025"], ["Total assets", "32,613,779.11"]]}'})()
+                return type("_R", (), {"choices": [type("_C", (), {"message": msg})()]})()
+
+        client = type("_Cl", (), {"chat": type("_Ch", (), {
+            "completions": _Completions()})()})()
+        fn = translator.make_table_rebuild_fn(self._model(vision=True), "English",
+                                              client=client)
+        grid = fn(0, b"ORIG")
+        self.assertEqual(grid[1][1], "32,613,779.11")
+        # The prompt names the target language and carries the image.
+        content = seen[0]["messages"][0]["content"]
+        self.assertIn("English", content[0]["text"])
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_rebuild_prompt_defaults_to_arabic_numerals(self):
+        prompt = translator._REVIEW_TABLE_PROMPT
+        self.assertIn("阿拉伯数字", prompt)
+        self.assertIn("罗马数字", prompt)
+        self.assertIn("(33)", prompt)
+        self.assertIn("@@TARGET_LANG@@", prompt)   # substituted per run
 
 
 if __name__ == "__main__":
