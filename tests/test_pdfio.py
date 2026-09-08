@@ -705,6 +705,17 @@ class PdfioTest(unittest.TestCase):
         need_w = font.text_length("12,345,678,901.12", fontsize=6.0)
         self.assertGreaterEqual(avail_w, need_w)
 
+    def test_unique_path_appends_number_when_exists(self):
+        # 导出不覆盖重名文件：test_English.pdf 已存在 → test_English(1).pdf。
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            base = d / "test_English.pdf"
+            self.assertEqual(pdfio.unique_path(base), base)
+            base.write_bytes(b"x")
+            self.assertEqual(pdfio.unique_path(base), d / "test_English(1).pdf")
+            (d / "test_English(1).pdf").write_bytes(b"x")
+            self.assertEqual(pdfio.unique_path(base), d / "test_English(2).pdf")
+
 
 class TableCellFitTest(unittest.TestCase):
     """A table cell's translation shrinks onto ONE line (instead of wrapping and

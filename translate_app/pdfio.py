@@ -4045,6 +4045,24 @@ def _compute_table_layout(tables, mapping, blocks, trans, font):
     return shifts, new_bottoms, grid, bboxes
 
 
+def unique_path(path: str | Path) -> Path:
+    """Return ``path``, or ``stem(1).ext`` / ``stem(2).ext`` … when it already exists.
+
+    Exporting must never silently overwrite an existing file: a second run of the
+    same document produces ``test_English(1).pdf`` instead of clobbering
+    ``test_English.pdf``.
+    """
+    p = Path(path)
+    if not p.exists():
+        return p
+    n = 1
+    while True:
+        cand = p.with_name(f"{p.stem}({n}){p.suffix}")
+        if not cand.exists():
+            return cand
+        n += 1
+
+
 def save_translated_pdf(
     src_path: str | Path,
     pages: Sequence[Sequence[Block]],

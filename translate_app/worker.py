@@ -676,7 +676,8 @@ class TranslateWorker(QObject):
             return None
 
     def _export(self, doc: pdfio.DocumentText, per_page: list[list[str]]) -> str:
-        out = Path(self._output_path)
+        # Never overwrite an existing output: a same-named file becomes "name(1).ext".
+        out = pdfio.unique_path(self._output_path)
         kind = self._output_type
         if kind == "bilingual_pdf":
             pdfio.save_interleaved_pdf(

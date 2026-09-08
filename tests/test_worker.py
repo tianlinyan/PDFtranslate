@@ -658,6 +658,24 @@ class RebuildPagesWorkerTest(_WorkerTestBase):
         self.assertIsNone(w._build_rebuild_pages(doc))
 
 
+class ExportUniquePathTest(_WorkerTestBase):
+    """导出不覆盖重名文件：第二次导出得到 name(1).ext。"""
+
+    def test_export_does_not_overwrite_existing_output(self):
+        out = self.tmp / "o.txt"
+        w = TranslateWorker(
+            "x.pdf", self._model("http://127.0.0.1:9/v1"), "English",
+            "plain_text", str(out), agent_mode=False)
+        doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("a", 0, 0, 0, 10, 10)]], blocks=["a"], block_pages=[0])
+        p1 = Path(w._export(doc, [["A"]]))
+        p2 = Path(w._export(doc, [["A"]]))
+        self.assertEqual(p1, out)
+        self.assertEqual(p2, self.tmp / "o(1).txt")
+        self.assertTrue(out.exists())
+        self.assertTrue((self.tmp / "o(1).txt").exists())
+
+
 class StructureModeWorkerTest(_WorkerTestBase):
     """B-④: worker structure_mode extracts via the geometric structure backend."""
 
