@@ -675,6 +675,21 @@ class ExportUniquePathTest(_WorkerTestBase):
         self.assertTrue(out.exists())
         self.assertTrue((self.tmp / "o(1).txt").exists())
 
+    def test_reexport_overwrites_existing_output(self):
+        # 「重新导出」覆盖同一文件（overwrite=True），不再堆积 (1)(2)。
+        out = self.tmp / "r.txt"
+        w = TranslateWorker(
+            "x.pdf", self._model("http://127.0.0.1:9/v1"), "English",
+            "plain_text", str(out), agent_mode=False)
+        doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("a", 0, 0, 0, 10, 10)]], blocks=["a"], block_pages=[0])
+        p1 = Path(w._export(doc, [["A"]], overwrite=True))
+        p2 = Path(w._export(doc, [["B"]], overwrite=True))
+        self.assertEqual(p1, out)
+        self.assertEqual(p2, out)                    # 同一路径：覆盖，不新建
+        self.assertFalse((self.tmp / "r(1).txt").exists())
+        self.assertIn("B", out.read_text(encoding="utf-8"))
+
 
 class StructureModeWorkerTest(_WorkerTestBase):
     """B-④: worker structure_mode extracts via the geometric structure backend."""
