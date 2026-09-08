@@ -599,13 +599,20 @@ class TranslateWorker(QObject):
             self.log.emit("  AI 编排未产生翻译（模型可能无法视觉编排），输出将保留原文。")
         return TranslationResult(blocks=doc.blocks, translated=translated)
 
-    def _build_rebuild_pages(self, doc: pdfio.DocumentText) -> dict | None:
+    def _build_rebuild_pages(
+        self, doc: pdfio.DocumentText, per_page: list[list[str]] | None = None
+    ) -> dict | None:
         """AI 视觉识别扫描表格页的真实行列结构（rebuild_table + vision model 时）。
 
-        返回 ``{page_index: (rows_pts, cols_pts)}``（PDF 点），供
-        ``save_translated_pdf`` 把 OCR 表格重建为矢量表格并正常填充译文——替代
-        OCR 块几何（后者对超密集扫描报表给出一堆噪点列边缘）。无 vision model /
-        识别失败 / 无扫描表格页时返回 ``None``（回退 OCR 几何，绝不崩）。
+        返回 ``{page_index: TableStyle}``（PDF 点），供 ``save_translated_pdf``
+        把 OCR 表格重建为矢量表格并正常填充译文——替代 OCR 块几何（后者对超密集
+        扫描报表给出一堆噪点列边缘）。
+
+        Layer-② 修正：对每页跑 N 次识别得到多个候选（模型行/列数不稳定），用
+        确定性打分 ``pdfio.best_rebuild``（collisions → overflow → 数字落格率）
+        选优，再用 ``pdfio.valid_rebuild`` 作为 fail-closed 地板；最优候选仍不
+        达标就回退普通 OCR。无 vision model / 识别失败 / 无扫描表格页返回 ``None``
+        （回退 OCR 几何，绝不崩）。
         """
         if not self._rebuild_table or not getattr(self._model, "vision", False):
             return None
@@ -633,11 +640,25 @@ class TranslateWorker(QObject):
                         log=lambda m: self.log.emit(m))
                     if detect is None:
                         return None
-                    res = detect(png)
-                    # Layer-④ 验证门：重建结构若不能容纳足够多的数字块（漏列/错位
-                    # → 数字游离），fail-closed 回退普通 OCR，绝不硬输出错表。
-                    if res and pdfio.valid_rebuild(blocks, res):
-                        structure[i] = res
+                    candidates = detect(png)
+                    trans_i = (
+                        per_page[i] if per_page and i < len(per_page) else None
+                    )
+                    # Layer-② 修正：多个候选确定性打分选优（不是众数平均、也不是
+                    # 让模型自评放行——实测模型会放行明显错位的网格）。
+                    best, score = pdfio.best_rebuild(blocks, candidates, trans_i)
+                    # Layer-④ 地板：最优候选仍不能让足够多的数字落格 → fail-closed
+                    # 回退普通 OCR，绝不硬输出错表。
+                    if best is not None and pdfio.valid_rebuild(blocks, best):
+                        structure[i] = best
+                        self.log.emit(
+                            f"  [table_vision] 第 {i + 1} 页：{len(candidates)} 个候选，"
+                            f"选优后 collisions={score[0]} overflow={score[1]} "
+                            f"数字落格率={score[2]:.2f}。")
+                    elif candidates:
+                        self.log.emit(
+                            f"  [table_vision] 第 {i + 1} 页：{len(candidates)} 个候选均"
+                            "未通过数字落格地板，回退普通 OCR。")
             finally:
                 src.close()
                 try:
@@ -665,7 +686,7 @@ class TranslateWorker(QObject):
             pdfio.save_translated_pdf(
                 self._source, doc.pages, per_page, out, self._lang,
                 log=self.log.emit, reflow=self._reflow,
-                rebuild_pages=self._build_rebuild_pages(doc),
+                rebuild_pages=self._build_rebuild_pages(doc, per_page),
             )
         elif kind == "markdown":
             pdfio.save_markdown(

@@ -62,12 +62,35 @@ class MakeLlmTableStructureTest(unittest.TestCase):
                     '"align": [{"col": 1, "dir": "right"}]}'))]
         fake_client.chat.completions.create.return_value = fake_resp
         make = table_vision.make_llm_table_structure(
-            model, page_width=200, page_height=400, client=fake_client)
-        style = make(b"png")
+            model, page_width=200, page_height=400, client=fake_client, n_samples=1)
+        styles = make(b"png")
+        self.assertEqual(len(styles), 1)
+        style = styles[0]
         self.assertEqual(style["rows_pts"], [0.0, 200.0, 400.0])
         self.assertEqual(style["cols_pts"], [0.0, 200.0])
         self.assertEqual(style["align"], [{"col": 1, "dir": "right"}])
         self.assertEqual(style["header_rows"], [0])
+
+    def test_detector_returns_every_sample(self):
+        # Layer-② 修正：返回**全部**候选（不再众数平均），由确定性打分选优。
+        model = mock.Mock()
+        model.vision = True
+        model.model = "m"
+        model.client_kwargs.return_value = {"base_url": "http://x/v1", "api_key": "k"}
+        model.request_params.return_value = {}
+        fake_client = mock.Mock()
+        contents = [
+            '{"rows": [0, 1], "cols": [0, 0.5, 1], "align": []}',
+            '{"rows": [0, 1], "cols": [0, 0.3, 0.6, 1], "align": []}',
+        ]
+        fake_client.chat.completions.create.side_effect = [
+            mock.Mock(choices=[mock.Mock(message=mock.Mock(content=c))]) for c in contents
+        ]
+        make = table_vision.make_llm_table_structure(
+            model, page_width=100, page_height=100, client=fake_client, n_samples=2)
+        styles = make(b"png")
+        self.assertEqual(len(styles), 2)
+        self.assertEqual([len(s["cols_pts"]) for s in styles], [3, 4])
 
     def test_detector_falls_back_on_parse_failure(self):
         model = mock.Mock()
@@ -81,7 +104,7 @@ class MakeLlmTableStructureTest(unittest.TestCase):
         fake_client.chat.completions.create.return_value = fake_resp
         make = table_vision.make_llm_table_structure(
             model, page_width=200, page_height=400, client=fake_client, log=lambda m: None)
-        self.assertIsNone(make(b"png"))
+        self.assertEqual(make(b"png"), [])
 
 
 if __name__ == "__main__":

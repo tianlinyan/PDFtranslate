@@ -623,6 +623,46 @@ class PdfioTest(unittest.TestCase):
         finally:
             d.close()
 
+    def test_score_rebuild_counts_cell_collisions(self):
+        # 确定性打分：删掉一条内竖线（两列合并）→ 两个数字挤进同一格 → collisions 上升。
+        blocks = [
+            pdfio.Block(text="1", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="2", page=0, x0=55, y0=1, x1=75, y1=9, size=9.0, ocr=True),
+        ]
+        good = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100], "merged": [],
+                "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        merged = {"rows_pts": [0, 10], "cols_pts": [0, 100], "merged": [],
+                  "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        self.assertEqual(pdfio.score_rebuild(blocks, good)[0], 0)
+        self.assertEqual(pdfio.score_rebuild(blocks, merged)[0], 1)
+        # 数字落格率都是 1.0 —— 说明单靠 valid_rebuild 分不出好坏，必须靠 collisions。
+        self.assertEqual(pdfio.score_rebuild(blocks, good)[2], 1.0)
+        self.assertEqual(pdfio.score_rebuild(blocks, merged)[2], 1.0)
+
+    def test_best_rebuild_prefers_fewer_collisions(self):
+        # 多个候选确定性选优：合并列的候选 collisions 更高，应被淘汰。
+        blocks = [
+            pdfio.Block(text="1", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True),
+            pdfio.Block(text="2", page=0, x0=55, y0=1, x1=75, y1=9, size=9.0, ocr=True),
+        ]
+        good = {"rows_pts": [0, 10], "cols_pts": [0, 50, 100], "merged": [],
+                "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        merged = {"rows_pts": [0, 10], "cols_pts": [0, 100], "merged": [],
+                  "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        best, score = pdfio.best_rebuild(blocks, [merged, good])
+        self.assertIs(best, good)
+        self.assertEqual(score[0], 0)
+        self.assertEqual(pdfio.best_rebuild(blocks, [])[0], None)
+
+    def test_score_rebuild_ranks_unusable_style_last(self):
+        # 结构不可用时打分应为最差（供选优淘汰），而不是抛异常。
+        blocks = [pdfio.Block(text="1", page=0, x0=1, y0=1, x1=20, y1=9, size=9.0, ocr=True)]
+        with mock.patch.object(pdfio, "_rebuild_ocr_table_blocks",
+                               side_effect=ValueError("boom")):
+            collisions, overflow, ratio = pdfio.score_rebuild(blocks, {})
+        self.assertGreater(collisions, 10 ** 6)
+        self.assertEqual(ratio, 0.0)
+
 
 class TableCellFitTest(unittest.TestCase):
     """A table cell's translation shrinks onto ONE line (instead of wrapping and

@@ -116,14 +116,16 @@ def make_llm_table_structure(
     page_height: float,
     client=None,
     log: Callable[[str], None] | None = None,
-    n_tries: int = 2,
-) -> Callable[[bytes], dict | None] | None:
-    """Return a ``png -> TableStyle dict`` detector, or ``None`` if non-vision.
+    n_samples: int = 3,
+) -> Callable[[bytes], list[dict]] | None:
+    """Return a ``png -> [TableStyle, ...]`` detector, or ``None`` if non-vision.
 
-    Layer-② robustness: the detector runs the vision model ``n_tries`` times and
-    keeps the runs whose column count is the mode, averaging the column/row
-    boundaries (the AI grid drifts slightly run to run; the geometric calibration
-    in :func:`pdfio._calibrate_table_grid` then fills any missed column).
+    Layer-② robustness (revised): the detector runs the vision model ``n_samples``
+    times and returns *every* parsed sample.  It deliberately does NOT mode-average
+    here — the samples genuinely disagree (notably on row count, 60 vs 52 on the
+    same page) and averaging hides that; the caller scores them with
+    :func:`pdfio.score_rebuild` and picks the best, falling back to plain OCR when
+    even the best fails :func:`pdfio.valid_rebuild`.
     """
     if not getattr(model, "vision", False):
         return None
@@ -162,32 +164,13 @@ def make_llm_table_structure(
                 log("  [table_vision] 返回缺少可用行列边界。")
         return style
 
-    def _detect(png: bytes) -> dict | None:
-        results = []
-        for _ in range(max(1, int(n_tries))):
+    def _detect(png: bytes) -> list[dict]:
+        out: list[dict] = []
+        for _ in range(max(1, int(n_samples))):
             r = _single(png)
             if r:
-                results.append(r)
-        if not results:
-            return None
-        if len(results) == 1:
-            return results[0]
-        # Keep runs whose column count is the mode; average their boundaries.
-        from collections import Counter
-        ncols = Counter(len(r["cols_pts"]) for r in results)
-        best_k = ncols.most_common(1)[0][0]
-        group = [r for r in results if len(r["cols_pts"]) == best_k]
-        base = dict(group[0])
-        base["cols_pts"] = [
-            round(sum(r["cols_pts"][i] for r in group) / len(group), 2)
-            for i in range(best_k)
-        ]
-        if len({len(r["rows_pts"]) for r in group}) == 1:
-            base["rows_pts"] = [
-                round(sum(r["rows_pts"][i] for r in group) / len(group), 2)
-                for i in range(len(base["rows_pts"]))
-            ]
-        return base
+                out.append(r)
+        return out
 
     return _detect
 

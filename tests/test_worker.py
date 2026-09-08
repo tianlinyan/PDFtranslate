@@ -602,11 +602,49 @@ class RebuildPagesWorkerTest(_WorkerTestBase):
                 mock.patch.object(pdfio, "_render_page_png", return_value=b"png"), \
                 mock.patch.object(pdfio, "valid_rebuild", return_value=True), \
                 mock.patch("translate_app.table_vision.make_llm_table_structure",
-                           return_value=(lambda png: style)) as mk:
+                           return_value=(lambda png: [style])) as mk:
             out = self._worker()._build_rebuild_pages(doc)
         self.assertEqual(len(created), 1)       # 一个客户端，不是每页一个
         self.assertEqual(mk.call_count, 2)      # 两页各识别一次
         self.assertEqual(set(out), {0, 1})      # 两页都通过验证门
+
+    def test_build_rebuild_pages_picks_best_candidate(self):
+        # Layer-② 修正：多个候选交给确定性打分选优（best_rebuild），不是众数平均。
+        doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
+        good = {"rows_pts": [0.0, 100.0], "cols_pts": [0.0, 300.0], "merged": [],
+                "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        bad = dict(good, cols_pts=[0.0, 100.0, 200.0, 300.0])
+        with mock.patch("openai.OpenAI", lambda **kw: mock.Mock()), \
+                mock.patch.object(pdfio, "_reconstruct_ocr_tables",
+                                  return_value=[{"bbox": None}]), \
+                mock.patch.object(pdfio, "_render_page_png", return_value=b"png"), \
+                mock.patch.object(pdfio, "valid_rebuild", return_value=True), \
+                mock.patch.object(pdfio, "best_rebuild",
+                                  return_value=(good, (0, 0, 1.0))) as pick, \
+                mock.patch("translate_app.table_vision.make_llm_table_structure",
+                           return_value=(lambda png: [bad, good])):
+            out = self._worker()._build_rebuild_pages(doc)
+        self.assertEqual(pick.call_count, 2)                 # 每页选优一次
+        self.assertEqual(pick.call_args[0][1], [bad, good])  # 候选整体传入
+        self.assertIs(out[0], good)                          # 用选优结果
+        self.assertIs(out[1], good)
+
+    def test_build_rebuild_pages_fails_closed_when_best_fails_floor(self):
+        # Layer-④ 地板：最优候选仍不达标 → 整页回退普通 OCR（不放进 structure）。
+        doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
+        style = {"rows_pts": [0.0, 100.0], "cols_pts": [0.0, 300.0], "merged": [],
+                 "header_rows": [], "header_cols": [], "align": [], "non_text": []}
+        with mock.patch("openai.OpenAI", lambda **kw: mock.Mock()), \
+                mock.patch.object(pdfio, "_reconstruct_ocr_tables",
+                                  return_value=[{"bbox": None}]), \
+                mock.patch.object(pdfio, "_render_page_png", return_value=b"png"), \
+                mock.patch.object(pdfio, "best_rebuild",
+                                  return_value=(style, (99, 99, 0.1))), \
+                mock.patch.object(pdfio, "valid_rebuild", return_value=False), \
+                mock.patch("translate_app.table_vision.make_llm_table_structure",
+                           return_value=(lambda png: [style])):
+            out = self._worker()._build_rebuild_pages(doc)
+        self.assertIsNone(out)
 
     def test_build_rebuild_pages_off_returns_none(self):
         # 未开启 rebuild_table 时直接返回 None（不触碰模型）。

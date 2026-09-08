@@ -3674,6 +3674,71 @@ def valid_rebuild(blocks, style, *, min_mapped_ratio: float = 0.8) -> bool:
     return (mapped / len(numeric)) >= min_mapped_ratio
 
 
+def score_rebuild(blocks, style, trans=None, *, font=None) -> tuple[int, int, float]:
+    """Deterministic structural score of a rebuilt grid (candidate ranking).
+
+    Returns ``(collisions, overflow, map_ratio)`` — smaller collisions/overflow is
+    better, larger map_ratio is better.  The worker runs the vision model several
+    times and ranks the samples with this instead of using an absolute accept
+    threshold: on a dense scan even the *correct* structure has some collisions
+    (OCR splits a label into fragments) and some overflow (physically tight rows),
+    so "zero" is not a usable gate — *ranking the samples* is.
+
+    * ``collisions``: rebuilt cells holding more than one block — two blocks drawn
+      into one cell overlap; a merged or shifted grid line shows up here.
+    * ``overflow``: mapped cells whose fitted translation exceeds the cell (width
+      or height).  Needs ``trans``; counted as 0 when absent.
+    * ``map_ratio``: fraction of numeric blocks that map into the grid.
+    """
+    try:
+        rebuilt, _tables, mapping = _rebuild_ocr_table_blocks(blocks, style)
+    except Exception:  # noqa: BLE001 — an unusable style ranks last
+        return (1 << 30, 1 << 30, 0.0)
+    numeric = [j for j, b in enumerate(blocks) if any(ch.isdigit() for ch in str(b.text))]
+    map_ratio = (
+        sum(1 for j in numeric if j in mapping) / len(numeric) if numeric else 1.0
+    )
+    per_cell: dict[tuple, int] = {}
+    for cell in mapping.values():
+        per_cell[cell] = per_cell.get(cell, 0) + 1
+    collisions = sum(1 for v in per_cell.values() if v > 1)
+    overflow = 0
+    if trans is not None:
+        font = font or _CJK_FONT
+        for j, b in enumerate(rebuilt):
+            if j not in mapping or j >= len(trans):
+                continue
+            lines, fs = _fit_block(b, font, trans[j])
+            w_avail = max(1.0, b.x1 - b.x0)
+            h_avail = max(1.0, b.y1 - b.y0)
+            w_max = max((font.text_length(ln, fontsize=fs) for ln in lines), default=0.0)
+            h_need = _wrapped_height(
+                font, lines, fs,
+                _line_leading(font, in_table=True, n_lines=len(lines)),
+            )
+            if w_max > w_avail * 1.02 or h_need > h_avail * 1.05:
+                overflow += 1
+    return (collisions, overflow, round(map_ratio, 4))
+
+
+def best_rebuild(blocks, styles, trans=None, *, font=None):
+    """Pick the best-scoring candidate style, or ``(None, None)`` if none.
+
+    Ranking key: fewest collisions, then least overflow, then highest numeric
+    mapping.  This is Layer-② revised — the vision samples disagree (row counts
+    especially), so the deterministic scorer decides instead of a mode vote or an
+    unreliable "AI approves" loop.
+    """
+    best_style = None
+    best_score: tuple[int, int, float] | None = None
+    for st in (styles or []):
+        sc = score_rebuild(blocks, st, trans, font=font)
+        if best_score is None or (sc[0], sc[1], -sc[2]) < (
+                best_score[0], best_score[1], -best_score[2]):
+            best_style, best_score = st, sc
+    return best_style, best_score
+
+
 def rebuild_semantics(blocks, style) -> dict:
     """Layer-③: build a semantic table structure from the rebuilt grid.
 
