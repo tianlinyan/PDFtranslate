@@ -467,6 +467,44 @@ class PdfioTest(unittest.TestCase):
         finally:
             d.close()
 
+    def test_rule_bound_does_not_move_a_single_line_translation(self):
+        # v0.5.36: the next printed rule is a *height budget*, not a box stretch.
+        # Stretching the box down to the rule made every single-line translation
+        # centre lower than its source line (measured: up to +10 pt on a dense
+        # statement); the text must stay where the source was.
+        src = _OUT / "rule_budget_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((50, 56), "Amount unit: RMB", fontsize=10)
+        page.draw_line(fitz.Point(50, 100), fitz.Point(350, 100),
+                       color=(0, 0, 0), width=0.8)     # a rule 44 pt below
+        doc.save(str(src))
+        doc.close()
+
+        blocks = pdfio.extract_document_text(src).pages[0]
+        label = next(b for b in blocks if "Amount unit" in b.text)
+        trans = [b.text for b in blocks]
+        out = _OUT / "rule_budget.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], out, "English")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            spans = [
+                s for blk in page.get_text("dict")["blocks"] if "lines" in blk
+                for line in blk["lines"] for s in line["spans"]
+                if "Amount unit" in s["text"]
+            ]
+            self.assertTrue(spans)
+            origin = spans[0]["origin"][1]
+            self.assertLessEqual(
+                abs(origin - label.y1), 4.0,
+                f"translation moved away from its source line: {origin} vs "
+                f"{label.y1}",
+            )
+        finally:
+            d.close()
+
     def test_ocr_cover_band_bounds_the_translation(self):
         # The translation is fitted into the measured band too, so it cannot be
         # drawn past the row rule (the second half of "避免压线").
@@ -1455,6 +1493,11 @@ class OcrGridTest(unittest.TestCase):
         # glyph box (``band > y1 - y0``), so dense statement rows fell back to
         # ``fit_height == 0`` = "no band / wrap unbounded" and their 2-3 line wrap
         # crossed the grid line below (542 of 824 cells on the real p24-27 scan).
+        #
+        # v0.5.36: the band is also floored at the cell's own glyph height — the
+        # source text demonstrably fit there, and a "next row" that starts inside
+        # this box (a tall label beside short numeric cells) used to squeeze the
+        # translation to 3 pt when 4.5 pt was available.
         items = [
             (100.0, 78, 300, 109.6, "现金及存放中央银行款项"),
             (100.0, 320, 420, 109.6, "17,485,938,749.91"),
@@ -1466,8 +1509,9 @@ class OcrGridTest(unittest.TestCase):
         blocks, _ = pdfio._reconstruct_ocr_grid(items)
         by_text = {b.text: b for b in blocks}
         cell = by_text["现金及存放中央银行款项"]
-        self.assertLess(cell.fit_height, cell.y1 - cell.y0)   # a narrow band
-        self.assertGreater(cell.fit_height, 0.0)              # but still a band
+        self.assertGreaterEqual(
+            cell.fit_height, cell.y1 - cell.y0 - 0.01)   # at least its own height
+        self.assertLess(cell.fit_height, 165.0)          # never into the next row
         self.assertEqual(0.0, by_text["发放贷款和垫款"].fit_height)   # last row
         # The wrap (or the single line chosen instead) must stay inside the band.
         font = fitz.Font("cjk")

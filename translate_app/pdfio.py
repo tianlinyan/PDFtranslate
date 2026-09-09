@@ -1354,7 +1354,11 @@ def _ocr_cache_dir() -> Path:
 #: means "no band, wrap unbounded" — the wrap then crossed the grid line below).
 #: v6 caches must be re-synthesized or the fix never applies to an already-cached
 #: document.
-_OCR_CACHE_VERSION = 7
+#:
+#: v8: ``fit_height`` is floored at the cell's own glyph height (a "next row" that
+#: starts inside a tall label's box used to squeeze the translation to 3 pt where
+#: 4.5 pt was available).  A v7 cache holds the squeezed values.
+_OCR_CACHE_VERSION = 8
 
 
 def _ocr_cache_path(doc_path: str | Path) -> Path:
@@ -1994,9 +1998,16 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
             # statement (p24-27): 542 of 824 cells had a band narrower than their
             # glyph box, and 537 of them could not hold a 2-line wrap at all.
             # Only the last row (nothing below it) keeps 0.0.
+            #
+            # The band is never smaller than the cell's own glyph height: the source
+            # text demonstrably fit in its own box, so a "next row" that starts
+            # inside this box (a taller label beside short numeric cells) must not
+            # squeeze the translation below what the source used — that produced
+            # 3 pt cells where 4.5 pt was available (measured: band 3.5 vs box 8.1).
             fit_height = 0.0
             if next_top is not None:
                 fit_height = max(0.0, next_top - y0 - 1.5)
+                fit_height = max(fit_height, y1 - y0)
             size = min(_MAX_FONT, max(5.0, (y1 - y0) / 1.2))
             blocks.append(
                 Block(
@@ -4235,7 +4246,12 @@ def _fit_block(block: Block, font, text: str,
     # so the loop never goes below the floor (a bare ``round(fs * 0.9, 2)``
     # could undershoot it, e.g. 7.2 -> 6.48).
     floor = min(fs, _MIN_READABLE)
-    while fs > floor and height() > r.height + 1.0:
+    box_h = r.height
+    if avoid_below is not None and avoid_below > r.y0:
+        # ``avoid_below`` (the next printed rule) is a *height budget*: the text
+        # may not reach it, even when the source box does.
+        box_h = min(box_h, avoid_below - 0.5 - r.y0)
+    while fs > floor and height() > box_h + 1.0:
         fs = max(floor, round(fs * 0.9, 2))
         lines = _wrap(font, text, max_width, fs)
     if (
@@ -5748,13 +5764,18 @@ def save_translated_pdf(
                         # through the dotted line of a scanned statement.  A rotated
                         # page's vertical bound would be horizontal in the block
                         # frame, so it is handled by the cover rects alone there.
+                        # Only the *wrap budget* shrinks to the rule — the box
+                        # itself stays put, or a single-line translation would be
+                        # centred lower than its source line (measured: up to +10 pt
+                        # on a dense statement).
                         if avoid is not None and not rotated:
-                            if avoid - draw_b.y0 >= 3.0:
-                                avail = avoid - 0.5 - draw_b.y0
-                                fit_h = float(getattr(draw_b, "fit_height", 0.0) or 0.0)
+                            avail = avoid - 0.5 - draw_b.y0
+                            if avail >= 3.0:
+                                fit_h = float(
+                                    getattr(draw_b, "fit_height", 0.0) or 0.0
+                                )
                                 draw_b = replace(
                                     draw_b,
-                                    y1=avoid - 0.5,
                                     fit_height=(
                                         min(fit_h, avail) if fit_h > 0 else avail
                                     ),
