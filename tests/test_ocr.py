@@ -219,9 +219,9 @@ class OcrPlumbingTest(unittest.TestCase):
         self.assertIn("资产", texts)
         self.assertNotIn("小波", texts)
         self.assertEqual(
-            1, len([m for m in logs if "手写体签字" in m]), logs
+            1, len([m for m in logs if "疑似手写签字" in m]), logs
         )
-        self.assertIn("第 1 页", [m for m in logs if "手写体签字" in m][0])
+        self.assertIn("第 1 页", [m for m in logs if "疑似手写签字" in m][0])
 
     def test_tall_bottom_band_item_with_digits_is_kept(self):
         # A tall bottom-band box that *contains digits* is a figure (seal outline,
@@ -238,7 +238,7 @@ class OcrPlumbingTest(unittest.TestCase):
             0, log=logs.append, page_height=800.0,
         )
         self.assertIn("V001", [b.text for b in blocks])
-        self.assertEqual([], [m for m in logs if "手写体签字" in m], logs)
+        self.assertEqual([], [m for m in logs if "疑似手写签字" in m], logs)
 
     def test_tall_name_item_outside_the_bottom_band_is_kept(self):
         # Only the form's bottom third holds signature rows; a tall name-only box
@@ -311,7 +311,7 @@ class OcrPlumbingTest(unittest.TestCase):
             logs: list[str] = []
             blocks = pdfio._ocr_page_blocks(0, page, ocr_fn, None, logs.append)
             self.assertNotIn("Xiaobo", [b.text for b in blocks])
-            self.assertEqual(1, len([m for m in logs if "手写体签字" in m]), logs)
+            self.assertEqual(1, len([m for m in logs if "疑似手写签字" in m]), logs)
         finally:
             doc.close()
 
@@ -329,14 +329,14 @@ class OcrPlumbingTest(unittest.TestCase):
                     ([[2.0, 10.0], [80.0, 10.0], [80.0, 19.0], [2.0, 19.0]], "项目"),
                     ([[2.0, 30.0], [80.0, 30.0], [80.0, 39.0], [2.0, 39.0]], "资产"),
                     ([[2.0, 50.0], [80.0, 50.0], [80.0, 59.0], [2.0, 59.0]], "利润"),
-                    ([[200.0, 90.0], [320.0, 90.0], [320.0, 115.0], [200.0, 115.0]],
+                    ([[200.0, 75.0], [320.0, 75.0], [320.0, 115.0], [200.0, 115.0]],
                      "Xiaobo"),
                 ]
 
             logs: list[str] = []
             blocks = pdfio._ocr_page_blocks(0, page, ocr_fn, None, logs.append)
             self.assertNotIn("Xiaobo", [b.text for b in blocks])
-            self.assertEqual(1, len([m for m in logs if "手写体签字" in m]), logs)
+            self.assertEqual(1, len([m for m in logs if "疑似手写签字" in m]), logs)
         finally:
             doc.close()
 
@@ -399,6 +399,60 @@ class OcrExtractionTest(_TempOcrCacheMixin, unittest.TestCase):
         self.assertIn("EST. 1998", texts)
         self.assertEqual(0, result.ocr_count)          # the page HAD a text layer
         self.assertTrue(any("已并入 OCR 结果" in m for m in logs), logs)
+
+    def test_repeated_value_survives_the_sparse_merge(self):
+        # P1-4: a duplicate must match on text AND position.  A scanned statement
+        # repeats values (two rows of 100.00) and the text layer's page number may
+        # equal a table cell's value; the old page-wide text set dropped the second
+        # occurrence — and an OCR box enclosed by a text block was dropped even
+        # when it held different content (logo art read from an image).
+        def blk(text, x0, y0, x1, y1, ocr=True):
+            return pdfio.Block(text=text, page=0, x0=x0, y0=y0, x1=x1, y1=y1,
+                               size=8.0, single_line=True, ocr=ocr)
+
+        text_layer = [blk("22", 290, 800, 305, 812, ocr=False)]
+        ocr_blocks = [
+            blk("22", 290, 800, 305, 812),        # same text, same place -> duplicate
+            blk("100.00", 200, 300, 260, 312),
+            blk("100.00", 200, 340, 260, 352),    # same text, another row -> kept
+        ]
+        texts = [b.text for b in pdfio._merge_ocr_blocks(text_layer, ocr_blocks)]
+        self.assertEqual(2, texts.count("100.00"), texts)
+        self.assertEqual(1, texts.count("22"), texts)
+
+    def test_ocr_block_inside_a_text_block_is_kept(self):
+        # An OCR box enclosed by a text-layer block is *extra* content read from an
+        # image, not a duplicate: the old "centre inside / >=20% overlap" test threw
+        # the whole line away.
+        def blk(text, x0, y0, x1, y1, ocr=True):
+            return pdfio.Block(text=text, page=0, x0=x0, y0=y0, x1=x1, y1=y1,
+                               size=8.0, single_line=True, ocr=ocr)
+
+        title = [blk("LOGO AND TITLE ART", 60, 60, 300, 200, ocr=False)]
+        ocr = [blk("some raster text", 80, 90, 200, 110)]
+        merged = [b.text for b in pdfio._merge_ocr_blocks(title, ocr)]
+        self.assertEqual(["LOGO AND TITLE ART", "some raster text"], merged)
+
+    def test_bottom_caption_in_a_tall_box_is_not_a_signature(self):
+        # P1-7: the old rule (tall + bottom band + has a letter) dropped a footer
+        # caption and a bottom heading from the translation and the text exports.
+        # A signature is *short* (a name / scrawl), so a long caption is kept.
+        items = []
+        for i in range(20):
+            y = 100.0 + i * 9.0
+            items.append(([[60.0, y], [300.0, y], [300.0, y + 9.0], [60.0, y + 9.0]],
+                          "row"))
+        items.append(([[120.0, 700.0], [400.0, 700.0], [400.0, 730.0], [120.0, 730.0]],
+                      "Independent Auditor's Report"))
+        items.append(([[120.0, 740.0], [260.0, 740.0], [260.0, 770.0], [120.0, 770.0]],
+                      "合并资产负债表"))
+        logs: list[str] = []
+        blocks = pdfio._synthesize_ocr_blocks(items, 0, log=logs.append,
+                                              page_height=800.0)
+        texts = [b.text for b in blocks]
+        self.assertIn("Independent Auditor's Report", texts)
+        self.assertIn("合并资产负债表", texts)
+        self.assertEqual([], [m for m in logs if "疑似手写签字" in m], logs)
 
     def test_extract_honours_cancel(self):
         path = self._build_vector_page()

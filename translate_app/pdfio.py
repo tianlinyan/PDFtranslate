@@ -1907,7 +1907,11 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
         row_sorted = [c[0] for c in cells]
         for i, (it, ci, numeric) in enumerate(cells):
             y0, x0, x1, y1, text = it
-            if _is_pure_symbol(text):
+            # A pure symbol IS content inside a table cell: ``—`` is the standard
+            # "no value" marker of a statement.  It is kept (and never translated,
+            # ``_needs_translation`` is False) so the rebuilt grid still shows it;
+            # dropping it made the cell disappear from a redrawn page.
+            if not text.strip():
                 continue
             fit_width = 0.0
             if ci >= 0 and not numeric and not numeric_cols[ci]:
@@ -2013,6 +2017,15 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
     return blocks, tables
 
 
+#: A signature box is much taller than the printed rows around it (measured on the
+#: real statements: 5.1x and 6.4x the median line height) and its OCR text is a
+#: short name / scrawl, never a caption: ``Independent Auditor's Report`` (27 chars)
+#: and a 7-char bottom heading were both *legitimate* content the old 2.5x + "has a
+#: letter" test silently dropped from the translation and the text exports.
+_SIGNATURE_MIN_HEIGHT_FACTOR = 3.0
+_SIGNATURE_MAX_CHARS = 6
+
+
 def _drop_signature_items(
     items: list[tuple], page_height: float | None,
     log: Callable[[str], None] | None, page_index: int,
@@ -2022,11 +2035,18 @@ def _drop_signature_items(
     A handwritten 签字 on a scanned statement (the ``法定代表人：`` /
     ``会计机构负责人：`` rows at the form's bottom) comes through RapidOCR as an
     item whose box spans the whole brush stroke — several times taller than the
-    ~9pt print rows — and whose text is a name (letters, no digits).  Keeping it
-    means the translation passes a pinyin romanization drawn over the area, and
-    the exporter's white cover rect hides the actual handwriting on top of it.
-    A signature is identity, not content: drop the item, nothing is translated
-    and the scan's signature stays visible.
+    ~9pt print rows — and whose text is a short name (letters, no digits).
+    Keeping it means the translation passes a pinyin romanization drawn over the
+    area, and the exporter's white cover rect hides the actual handwriting on top
+    of it.  A signature is identity, not content: drop the item, nothing is
+    translated and the scan's signature stays visible.
+
+    Every condition is needed — a signature box is (a) at least
+    :data:`_SIGNATURE_MIN_HEIGHT_FACTOR` times the median line height, (b) in the
+    bottom 30% of the page, (c) letter-bearing and digit-free, and (d) *short*
+    (≤ :data:`_SIGNATURE_MAX_CHARS` non-space characters).  Without (d) a footer
+    caption or a bottom heading in a large font was dropped and mislabelled as a
+    signature in the log.
     """
     if not items or page_height is None:
         return items
@@ -2036,32 +2056,38 @@ def _drop_signature_items(
     for it in items:
         y0, _x0, _x1, y1, text = it
         h = y1 - y0
-        if h >= max(15.0, 2.5 * med) and (y0 + y1) / 2.0 >= 0.7 * page_height:
-            if any(ch.isalpha() for ch in text) and not re.search(r"\d", text):
-                dropped += 1
-                continue
+        if h >= max(15.0, _SIGNATURE_MIN_HEIGHT_FACTOR * med) \
+                and (y0 + y1) / 2.0 >= 0.7 * page_height \
+                and len(text.replace(" ", "")) <= _SIGNATURE_MAX_CHARS \
+                and any(ch.isalpha() for ch in text) \
+                and not re.search(r"\d", text):
+            dropped += 1
+            continue
         kept.append(it)
     if dropped and log:
         log(
-            f"  第 {page_index + 1} 页：检测到 {dropped} 处手写体签字，"
-            "已保留扫描原样（不翻译、不覆盖）。"
+            f"  第 {page_index + 1} 页：疑似手写签字 {dropped} 处，已跳过"
+            "（保留扫描原样、不翻译、不覆盖；若非签字请人工确认）。"
         )
     return kept
 
 
-def _boxes_overlap(a: Block, b: Block, *, min_ratio: float = 0.2) -> bool:
-    """True when ``a``'s box overlaps ``b``'s enough to be the same content."""
-    ix = max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
-    iy = max(0.0, min(a.y1, b.y1) - max(a.y0, b.y0))
-    inter = ix * iy
-    if inter <= 0.0:
-        return False
-    cx, cy = (a.x0 + a.x1) / 2.0, (a.y0 + a.y1) / 2.0
-    if b.x0 <= cx <= b.x1 and b.y0 <= cy <= b.y1:
-        return True
-    area_a = max(1e-6, (a.x1 - a.x0) * (a.y1 - a.y0))
-    area_b = max(1e-6, (b.x1 - b.x0) * (b.y1 - b.y0))
-    return inter / min(area_a, area_b) >= min_ratio
+def _covered_ratio(block: Block, cover: Block) -> float:
+    """Share of ``block``'s own area that ``cover`` overlaps.
+
+    Unlike :func:`_boxes_overlap` this is *asymmetric*: a small OCR box inside a
+    big text block is fully covered (ratio 1.0) while the big block is barely
+    touched by the small one.  ``_merge_ocr_blocks`` needs exactly that direction.
+    """
+    ix = max(0.0, min(block.x1, cover.x1) - max(block.x0, cover.x0))
+    iy = max(0.0, min(block.y1, cover.y1) - max(block.y0, cover.y0))
+    area = max(1e-6, (block.x1 - block.x0) * (block.y1 - block.y0))
+    return ix * iy / area
+
+
+#: An OCR block whose own box is covered at least this much by a text-layer block
+#: holding the SAME text is the text layer re-read: a duplicate, dropped.
+_MERGE_DUP_COVER = 0.5
 
 
 def _merge_ocr_blocks(text_blocks: Sequence[Block], ocr_blocks: Sequence[Block]) -> list[Block]:
@@ -2071,23 +2097,33 @@ def _merge_ocr_blocks(text_blocks: Sequence[Block], ocr_blocks: Sequence[Block])
     carries a logo or a figure) used to be *replaced* by the OCR result, so the
     extractable title silently vanished from the Markdown / plain-text exports and
     the translation only covered the logo text.  Keep the text layer and add only
-    OCR blocks that are genuinely new — same text, centre inside a text block, or
-    a ≥20% box overlap all count as duplicates — then sort the page by reading
-    order (y, then x).
+    OCR blocks that are genuinely new, then sort the page by reading order (y, then
+    x).
+
+    A duplicate must match on **both text and position** (same normalized text,
+    OCR box at least :data:`_MERGE_DUP_COVER` covered by that text block):
+
+    * text alone is not enough — a scanned statement repeats values (two rows of
+      ``100.00``, a page number that equals a table cell) and the old page-wide
+      text set silently dropped the second occurrence;
+    * overlap alone is not enough — OCR often reads extra text baked into an image
+      (a logo whose line sits inside a text-layer block), which the old
+      "centre inside / ≥20% of the smaller area" test threw away.
     """
     def _norm(t: str) -> str:
         return " ".join(str(t).split()).casefold()
 
-    seen = {_norm(b.text) for b in text_blocks if str(b.text).strip()}
     kept: list[Block] = []
     for b in ocr_blocks:
         text = _norm(b.text)
-        if not text or text in seen:
+        if not text:
             continue
-        if any(_boxes_overlap(b, t) for t in text_blocks):
+        if any(
+            _norm(t.text) == text and _covered_ratio(b, t) >= _MERGE_DUP_COVER
+            for t in text_blocks
+        ):
             continue
         kept.append(b)
-        seen.add(text)
     if not kept:
         return list(text_blocks)
     merged = list(text_blocks) + kept
@@ -3124,7 +3160,7 @@ def _build_table_blocks(
 
     cell_rects = list(cell_rects)
     for ln in sorted(table_lines, key=_table_cell_key):
-        if not ln["text"].strip() or _is_pure_symbol(ln["text"]):
+        if not ln["text"].strip():
             continue
         y0, y1 = ln["y0"], ln["y1"]
         groups = _line_cell_groups(ln, cell_rects)
@@ -3134,6 +3170,12 @@ def _build_table_blocks(
             meta = _block_meta(fitz.Rect(ln["x0"], y0, ln["x1"], y1), spans,
                                page_x0, page_x1, n_lines=1)
             cell = _cell_for_line(ln, cell_rects)
+            if cell is None and _is_pure_symbol(ln["text"]):
+                # A stray page glyph (``。``, ``①``, a decorative bullet) is not
+                # content; inside a table cell the same symbol IS content (``—``
+                # is the "no value" marker) and must survive the redaction of the
+                # table bbox, so only the non-cell case is dropped.
+                continue
             if cell is not None:
                 # Re-derive alignment for the widened cell: numeric columns
                 # right-align (figures share a flush right edge), others centre.
@@ -3164,6 +3206,9 @@ def _build_table_blocks(
                 )
             else:
                 # A span that sits outside any content cell: paragraph-style block.
+                # A stray page glyph there is not content and is dropped.
+                if _is_pure_symbol(text):
+                    continue
                 meta = _block_meta(extent, spans, page_x0, page_x1, n_lines=1)
                 _accumulate(
                     ("line", len(acc)), text, ln, meta,

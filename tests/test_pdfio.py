@@ -2272,6 +2272,56 @@ class OcrTableRedrawTest(unittest.TestCase):
         self.assertGreaterEqual(gap, fs0 * 0.9)
 
 
+class SymbolCellTest(unittest.TestCase):
+    """P1-6: a pure-symbol *table cell* is content (``—`` = "no value"), not a
+    stray page glyph — dropping it while the whole table bbox is redacted erased it
+    for good."""
+
+    def test_symbol_cell_survives_inplace_export(self):
+        src = _OUT / "symbol_cell.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.draw_rect(fitz.Rect(60, 80, 340, 120), color=(0, 0, 0))
+        page.draw_line(fitz.Point(200, 80), fitz.Point(200, 120), color=(0, 0, 0))
+        page.insert_text((70, 105), "项目", fontsize=9, fontname="china-s")
+        page.insert_text((210, 105), "—", fontsize=9, fontname="china-s")
+        doc.save(str(src))
+        doc.close()
+
+        dt = pdfio.extract_document_text(src, log=lambda _m: None)
+        texts = [b.text for b in dt.pages[0]]
+        self.assertIn("—", texts, texts)
+        out = _OUT / "symbol_cell_out.pdf"
+        trans = [["Items" if b.text == "项目" else b.text for b in dt.pages[0]]]
+        pdfio.save_translated_pdf(src, dt.pages, trans, str(out), "English")
+        doc = fitz.open(str(out))
+        try:
+            # The table bbox redaction would have erased the dash if no block drew it.
+            self.assertIn("—", doc[0].get_text())
+        finally:
+            doc.close()
+
+    def test_symbol_cell_survives_the_ocr_grid(self):
+        items = [
+            (100.0, 60.0, 160.0, 109.0, "营业收入"),
+            (100.0, 200.0, 260.0, 109.0, "1,234.56"),
+            (120.0, 60.0, 160.0, 129.0, "营业成本"),
+            (120.0, 200.0, 260.0, 129.0, "—"),
+        ]
+        blocks, tables = pdfio._reconstruct_ocr_grid(items)
+        self.assertTrue(tables)
+        self.assertIn("—", [b.text for b in blocks])
+
+    def test_stray_symbol_outside_a_cell_is_still_dropped(self):
+        # The original intent is preserved for prose: a lone ``。`` / bullet on the
+        # page is noise, not content.
+        cell_rects = [fitz.Rect(100, 100, 300, 120)]
+        line = {"x0": 60, "y0": 105, "x1": 66, "y1": 115, "size": 9.0,
+                "bold": False, "color": 0, "text": "。"}
+        blocks = pdfio._build_table_blocks([line], [], 0, 600, 0, cell_rects)
+        self.assertEqual([], blocks)
+
+
 class ChartNotATableTest(unittest.TestCase):
     """P0-1: ``find_tables`` only looks for ruling lines, so a chart whose plot
     area has a full grid *and* text inside the cells was reported as a table — and
