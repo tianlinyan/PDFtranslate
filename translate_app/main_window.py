@@ -199,6 +199,11 @@ class MainWindow(QWidget):
         self._pending_image: bytes | None = None
         #: Whether the sidebar is currently streaming an AI reply (a live bubble is open).
         self._chat_streaming = False
+        #: Set when the 「开始翻译」 button asks the chat AI to start a run.  If that
+        #: chat turn ends without the AI actually starting one (it asked a question or
+        #: only narrated), the button starts the pipeline itself — the button is an
+        #: explicit user command, so "nothing happened" is never acceptable.
+        self._pending_start = False
         #: True once the window's controls are fully built; guards ``_refresh_chat_settings``
         #: from running during ``__init__`` (before the model/type combos exist).
         self._settings_ready = False
@@ -405,7 +410,8 @@ class MainWindow(QWidget):
         # --- Buttons ---
         self._start_btn = QPushButton("开始翻译")
         self._start_btn.setToolTip(
-            "等价于在侧栏输入「开始翻译」并发送：AI 读取当前设置后启动翻译。"
+            "直接开始全新翻译：重新提取 + 重新翻译 + 导出（按当前界面设置，"
+            "包括「OCR表格重建」等导出选项）。等价于在侧栏输入「开始翻译」并发送。"
         )
         # The button drives the AI entry (the chat AI reads settings and calls
         # ``run_translate``), so the action shows as a user message in the sidebar.
@@ -594,6 +600,10 @@ class MainWindow(QWidget):
         # already rendered by ``SidebarChat.send_message(show=True)`` (the only emitter
         # of ``userMessage``), so do NOT add it again here — that made the same user
         # message appear twice.
+        # Any message other than the 「开始翻译」 button's own cancels a pending
+        # fallback start, so a later unrelated reply never kicks off a translation.
+        if self._pending_start and text.strip() != "开始翻译":
+            self._pending_start = False
         if self.answer_bridge.is_pending() and text.strip():
             self.answer_bridge.answer(str(text).strip(), self.answer_bridge.pending_target)
             self.agent_sidebar.set_busy(False)   # routed as an answer, no chat turn
@@ -645,6 +655,7 @@ class MainWindow(QWidget):
         else:
             self.agent_sidebar.add_message("ai", reply)
         self.agent_sidebar.set_busy(False)
+        self._maybe_fallback_start()
 
     def _on_chat_error(self, err: str) -> None:
         if self._chat_streaming:
@@ -652,6 +663,9 @@ class MainWindow(QWidget):
             self._chat_streaming = False
         self.agent_sidebar.add_message("ai", f"（对话失败：{err}）")
         self.agent_sidebar.set_busy(False)
+        # Do NOT fall back to starting a run here: the model itself is unreachable, so
+        # the pipeline would fail too — leave the error as the single, accurate message.
+        self._pending_start = False
 
     def _on_chat_cancelled(self, msg: str) -> None:
         """The user aborted the in-flight reply; show it and clear the busy state."""
@@ -660,6 +674,8 @@ class MainWindow(QWidget):
             self._chat_streaming = False
         self.agent_sidebar.set_busy(False)
         self.agent_sidebar.add_notice(str(msg or "已取消"))
+        # An aborted reply must not start a translation later on.
+        self._pending_start = False
 
     def _show_preview(self, page: int, what: str = "source") -> None:
         """Open the preview window for ``page``; framed sends go to the bridge."""
@@ -952,10 +968,31 @@ class MainWindow(QWidget):
         """Behave exactly like the user typing & sending "开始翻译" in the sidebar.
 
         The button no longer starts the pipeline directly — it drives the AI entry
-        (``get_settings`` → ``set_setting`` → ``run_translate``), so the whole flow is
-        AI-centric and the action is recorded in the sidebar conversation.
+        (``run_translate``), so the whole flow is AI-centric and the action is recorded
+        in the sidebar conversation.  「开始翻译」 always means a **fresh** translation
+        (re-extract + re-translate + export): the AI must not ask for confirmation
+        first, and if this chat turn ends without it actually starting a run, the
+        pipeline is started directly (see ``_maybe_fallback_start``).
         """
+        self._pending_start = True
         self.agent_sidebar.send_message("开始翻译")
+
+    def _maybe_fallback_start(self) -> None:
+        """Start the run ourselves if the chat turn for 「开始翻译」 didn't.
+
+        The AI is the console, but the button is an explicit user command: a reply that
+        only asks a question ("要重新翻译还是重新导出？" / "确认开始吗？") or narrates
+        ("即将开始…") must not leave the user with nothing running.  Called when a chat
+        reply settles; a run started by ``run_translate`` sets ``self._thread`` first
+        (its queued signal is delivered before the reply), so this is a no-op then.
+        """
+        if not self._pending_start:
+            return
+        self._pending_start = False
+        if self._thread is not None:
+            return
+        self._append_log("AI 未启动翻译，已直接开始全新翻译（重新提取 + 重新翻译 + 导出）。")
+        self._start()
 
     def _start(self, requirement: str = "", page_scope: list[int] | None = None) -> None:
         """Start the translation pipeline (the "开始翻译" entry, button or AI tool).

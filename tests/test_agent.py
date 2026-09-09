@@ -589,6 +589,9 @@ class LlmDecideAndPageLoopTest(unittest.TestCase):
         system = [m["content"] for m in seen[0]["messages"] if m["role"] == "system"][0]
         self.assertIn("ask_user", system)
         self.assertIn("【与用户交互】", system)
+        # v0.5.31: starting / re-starting a translation is NOT a question — the model
+        # must not confirm it ("确认开始吗 / 要重新翻译还是重新导出").
+        self.assertIn("不需要任何确认", system)
         self.assertIn("ask_user", [f["function"]["name"] for f in seen[0]["tools"]])
         # The system prompt carries the tool function + usage reference, so the model
         # reads every tool's contract here (not just one-line descriptions in the

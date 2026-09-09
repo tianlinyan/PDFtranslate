@@ -106,6 +106,20 @@ class ChatToolsTest(_CtxTest):
         )
         self.assertIn("run_translate", desc)
 
+    def test_start_translate_needs_no_confirmation(self):
+        # v0.5.31: 「开始翻译 / 再次开始翻译 / 重新翻译」＝fresh run, immediately —
+        # the model must not detour through get_settings, ask 「要重新翻译还是重新导出？」
+        # or narrate 「即将开始」 without starting.
+        hint = prompts.chat_tool_hint()
+        self.assertIn("立刻调 run_translate", hint)
+        self.assertIn("不要问", hint)
+        self.assertIn("不要问用户", hint)
+        descs = {t["function"]["name"]: t["function"]["description"]
+                 for t in chat_tools.CHAT_TOOL_SPECS}
+        self.assertIn("直接调它", descs["run_translate"])
+        self.assertIn("不要为了「开始翻译」先调它", descs["get_settings"])
+        self.assertIn("不要反问用户", descs["re_export"])
+
     def test_chat_semantic_tools_reported_by_specs(self):
         # The two semantic tools are advertised in the OpenAI schema list too.
         names = {t["function"]["name"] for t in chat_tools.CHAT_TOOL_SPECS}

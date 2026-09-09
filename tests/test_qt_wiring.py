@@ -225,5 +225,106 @@ class ReExportForwardsExportFlagsTest(unittest.TestCase):
                 win._chat_thread.wait(2000)
 
 
+class StartButtonAlwaysStartsTest(unittest.TestCase):
+    """v0.5.31: 「开始翻译」＝全新翻译，且 AI 没启动时按钮自己启动。
+
+    The button drives the AI entry, but the AI sometimes only asked a question
+    (「要重新翻译还是重新导出？」「确认开始吗？」) or narrated 「即将开始…」 and nothing
+    ran.  A button the user pressed must never end with nothing happening — and a
+    later, unrelated chat reply must not start a translation either.
+    """
+
+    class _StubChatWorker(QObject):
+        """Swallows ``ask_requested`` so no real chat turn (or network) happens."""
+
+        class _Sig:
+            @staticmethod
+            def emit(*_a) -> None:
+                pass
+
+        ask_requested = _Sig()
+        record_exchange_requested = _Sig()
+
+    def _window(self, tmp: str):
+        import pymupdf as fitz
+
+        from translate_app.settings import ModelConfig
+
+        win = MainWindow()
+        src = os.path.join(tmp, "src.pdf")
+        doc = fitz.open()
+        doc.new_page(width=595, height=842)
+        doc.save(src)
+        doc.close()
+        win.models = [ModelConfig(
+            id="t", name="t", type="chat",
+            endpoint="http://127.0.0.1:1/v1/chat/completions", model="m")]
+        win._source = src
+        win._path_edit.setText(os.path.join(tmp, "out.pdf"))
+        win._save_prefs = lambda *_a, **_k: None   # never touch the real prefs.json
+        win._chat_worker = self._StubChatWorker()
+        return win
+
+    def test_button_starts_the_run_itself_when_the_ai_did_not(self):
+        import tempfile
+
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            win = self._window(tmp)
+            try:
+                started: list = []
+                win._launch_worker = started.append
+                win._start_via_chat()
+                self.assertTrue(win._pending_start)   # waiting for the chat turn
+                self.assertEqual([], started)
+                win._maybe_fallback_start()           # the AI's reply arrived, no run
+                self.assertEqual(1, len(started), "按钮没有启动翻译")
+                self.assertFalse(win._pending_start)
+                worker = started[0]
+                # It is a genuine fresh run: no re-export, no reused translation.
+                self.assertFalse(getattr(worker, "_re_export", False))
+                self.assertIsNone(win._last_translated)
+            finally:
+                win._chat_thread.quit()
+                win._chat_thread.wait(2000)
+
+    def test_no_second_start_when_the_ai_already_started_one(self):
+        import tempfile
+
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            win = self._window(tmp)
+            try:
+                started: list = []
+                win._launch_worker = started.append
+                win._start_via_chat()
+                win._thread = object()                # run_translate already launched
+                win._maybe_fallback_start()
+                self.assertEqual([], started, "AI 已启动却重复启动")
+                self.assertFalse(win._pending_start)
+            finally:
+                win._thread = None
+                win._chat_thread.quit()
+                win._chat_thread.wait(2000)
+
+    def test_another_message_cancels_the_pending_start(self):
+        import tempfile
+
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            win = self._window(tmp)
+            try:
+                started: list = []
+                win._launch_worker = started.append
+                win._start_via_chat()
+                win.agent_sidebar.send_message("第3页翻成什么了？")   # unrelated turn
+                self.assertFalse(win._pending_start)
+                win._maybe_fallback_start()
+                self.assertEqual([], started, "无关消息之后仍然启动了翻译")
+            finally:
+                win._chat_thread.quit()
+                win._chat_thread.wait(2000)
+
+
 if __name__ == "__main__":
     unittest.main()
