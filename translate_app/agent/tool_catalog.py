@@ -355,7 +355,9 @@ TOOL_CATALOG: list[ToolDef] = [
            "name": {"type": "string", "description": "可选：把该流程登记为命名流程（本次会话内可复用）"}},
           ["requirement"], CAT_CONTENT, audience=("chat",)),
     _tool("re_export",
-          "用当前已加载 PDF 上一次的成功译文，重新导出（应用本次对话/标注里已有的修改；不重新翻译、秒级）。",
+          "用当前已加载 PDF 上一次的成功译文，重新导出（应用本次对话/标注里已有的修改；不重新翻译、秒级）。"
+          "**用户说「重新翻译/再翻一遍/从头翻译」时请改用 run_translate**——re_export 不会重译，也不会重新读取"
+          "「OCR表格重建」等导出选项以外的设置变更。",
           {}, [], CAT_CONTENT, audience=("chat",)),
     _tool("run_plan",
           "把用户的一句话要求**分解成按顺序执行的若干任务**并依次实施（AI 自由组合，需模型在线）：可混合调用单个工具"

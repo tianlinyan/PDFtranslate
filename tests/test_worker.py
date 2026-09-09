@@ -611,6 +611,16 @@ class RebuildPagesWorkerTest(_WorkerTestBase):
         self.assertIsNone(kw["table_rebuild_fn"])
         self.assertIsNone(kw["merge_tool_fn"])
 
+    def test_options_are_logged_with_their_effective_values(self):
+        # The user must be able to verify from the log that the checkbox reached
+        # the worker: 「OCR表格重建」 is read when the run starts.
+        on = self._worker()
+        self.assertIn("OCR表格重建=开", on._options_line())
+        off = self._worker(rebuild_table=False)
+        line = off._options_line()
+        self.assertIn("OCR表格重建=关", line)
+        self.assertIn("表格列宽重排=关", line)
+
 
 class ExportOverwriteTest(_WorkerTestBase):
     """导出**直接覆盖**目标文件（v0.5.24：不再生成 ``name(1).ext``）。"""

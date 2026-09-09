@@ -9,7 +9,7 @@ from unittest import mock
 
 import pymupdf as fitz
 
-from translate_app import chat_tools
+from translate_app import chat_tools, prompts
 from translate_app.doc_context import DocContext
 
 from tests._helpers import build_sample_pdf
@@ -93,6 +93,18 @@ class ChatToolsTest(_CtxTest):
             "apply_annotation", "re_export", "run_translate", "set_setting",
             "self_check", "run_flow", "retranslate", "run_plan",
         }, self._tool_names())
+
+    def test_hint_separates_retranslate_from_reexport(self):
+        # 「重新翻译」 must route to run_translate (fresh extract+translate+export);
+        # re_export only regenerates the file from the previous translation.
+        hint = prompts.chat_tool_hint()
+        self.assertIn("重新翻译", hint)
+        self.assertIn("run_translate", hint)
+        desc = next(
+            t["function"]["description"] for t in chat_tools.CHAT_TOOL_SPECS
+            if t["function"]["name"] == "re_export"
+        )
+        self.assertIn("run_translate", desc)
 
     def test_chat_semantic_tools_reported_by_specs(self):
         # The two semantic tools are advertised in the OpenAI schema list too.

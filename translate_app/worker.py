@@ -178,6 +178,20 @@ class TranslateWorker(QObject):
         self._agent_state: Any = None
 
     @pyqtSlot()
+    def _options_line(self) -> str:
+        """One log line naming the *effective* export options of this run.
+
+        The 「OCR表格重建为矢量表格」 checkbox is read when the run starts; without
+        this line a user who toggled it could not tell whether the worker actually
+        received the new value (the earlier "option has no effect" reports were both
+        about the option not reaching / not being honoured somewhere).
+        """
+        return (
+            f"导出选项：OCR表格重建={'开' if self._rebuild_table else '关'}，"
+            f"表格列宽重排={'开' if self._reflow else '关'}"
+            f"{'（AI 重建表：模型支持视觉）' if self._rebuild_table and getattr(self._model, 'vision', False) else ''}。"
+        )
+
     def run(self) -> None:
         started = time.monotonic()
         try:
@@ -191,6 +205,7 @@ class TranslateWorker(QObject):
                 return
 
             self.log.emit(f"开始时间：{time.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.log.emit(self._options_line())
             self.log.emit(f"正在提取文本：{self._source}")
             if self._ocr:
                 self.log.emit("已启用 OCR（自动识别原文语言），将识别无文本层的扫描页。")
@@ -437,6 +452,7 @@ class TranslateWorker(QObject):
         if not self._last_translated:
             self.error.emit("没有上一次的译文可重新导出。")
             return
+        self.log.emit(self._options_line())
         self.log.emit(f"正在导出：已应用当前对话/标注编辑，重新生成 {self._source} 的译文…")
         doc = pdfio.extract_document_text(
             self._source,
