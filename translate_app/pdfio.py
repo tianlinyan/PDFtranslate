@@ -3519,6 +3519,21 @@ def _reconstruct_ocr_tables(blocks: Sequence[Block]) -> list[dict]:
     return [{"bbox": bbox, "rows": row_rects, "col_edges": col_edges}]
 
 
+def _is_pure_ocr_table_page(blocks: Sequence[Block]) -> bool:
+    """True iff *every* block on the page is a redraw-eligible OCR table cell.
+
+    ``save_translated_pdf``'s ``redraw_ocr`` regenerates a scanned table page as a
+    blank page holding only the OCR table cells — a chart node label
+    (``is_chart``) or a non-OCR (text-layer) footnote / page number has nowhere
+    to go, so it would be silently dropped.  Gate the redraw to genuinely pure
+    OCR-table pages: any block that is not a redraw-eligible cell means the page
+    must take the in-place path (which preserves every block) instead.
+    """
+    return bool(blocks) and all(
+        getattr(b, "ocr", False) and not getattr(b, "is_chart", False) for b in blocks
+    )
+
+
 def _extract_tables(page) -> list[dict]:
     """Return every ruled table on ``page`` as ``{"bbox", "rows", "col_edges"}``.
 
@@ -4048,7 +4063,17 @@ def save_translated_pdf(
                     b for b in blocks
                     if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)
                 ]
-                if len(table_blocks) >= 4 and _reconstruct_ocr_tables(table_blocks):
+                # A *mixed* page (an OCR table plus a chart node label or a
+                # non-OCR footnote / page number) must NOT be blank-redrawn — the
+                # redraw keeps only the OCR table cells, so every other block would
+                # be silently dropped.  Gate the redraw to a genuinely pure OCR-table
+                # page and hand the rest to the in-place path, which preserves all
+                # blocks.
+                if (
+                    _is_pure_ocr_table_page(blocks)
+                    and len(table_blocks) >= 4
+                    and _reconstruct_ocr_tables(table_blocks)
+                ):
                     # The blank page must use the source's UNROTATED mediabox: OCR
                     # blocks live in that frame (see ``_ocr_results_from_img``), so a
                     # /Rotate page's visual rect (transposed) put every grid line and

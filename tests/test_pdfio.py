@@ -1827,6 +1827,37 @@ class OcrTableRedrawTest(unittest.TestCase):
         finally:
             doc.close()
 
+    def test_redraw_skips_mixed_page(self):
+        # A page carrying an OCR table AND a non-redraw-eligible block (here an
+        # ``is_chart`` node label; a non-OCR footnote would do the same) must NOT be
+        # blank-redrawn — the redraw keeps only the OCR table cells, silently
+        # dropping the rest.  It falls through to the in-place path, which preserves
+        # the whole original page.  Regression: the gate must not throw (a
+        # "翻译失败" window) and must not blank the page.
+        src = _OUT / "redraw_mixed_src.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = self._ocr_table_blocks() + [
+            pdfio.Block(
+                text="董事会", page=0, x0=300, y0=40, x1=340, y1=70,
+                size=6.0, single_line=True, ocr=True, is_chart=True),
+        ]
+        trans = ["Total assets", "1,234,567.89", "Total liabilities", "9,876,543.21",
+                 "董事会"]
+        out = _OUT / "redraw_mixed_out.pdf"
+        # Must not raise.
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True)
+        doc = fitz.open(str(out))
+        try:
+            text = doc[0].get_text("text")
+            # In-place (not blank-redrawn): the source page's own text survives.
+            self.assertIn("Page 1 heading", text)
+            # The OCR table cells are still translated in place.
+            self.assertIn("Total assets", text)
+            self.assertIn("9,876,543.21", text)
+        finally:
+            doc.close()
+
     def test_ai_table_rebuild_draws_regular_table(self):
         # With a model-derived grid, the OCR table page is drawn as a clean,
         # regular N x M table (no raster, regular grid, translated cells).
@@ -2000,6 +2031,36 @@ class OcrTableRedrawTest(unittest.TestCase):
         self.assertIn("Consolidated", text)
         self.assertIn("Parent Company", text)
         self.assertIn("Total assets", text)
+
+
+class PureOcrTablePageTest(unittest.TestCase):
+    """``_is_pure_ocr_table_page`` decides whether a page may be blank-redrawn.
+
+    The gate must reject any page that carries a block the redraw would drop —
+    a chart node label (``is_chart``) or a non-OCR (text-layer) block.
+    """
+
+    def _cell(self, text="x", ocr=True, is_chart=False):
+        return pdfio.Block(
+            text=text, page=0, x0=60, y0=100, x1=200, y1=112,
+            size=6.0, single_line=True, ocr=ocr, is_chart=is_chart)
+
+    def test_all_ocr_cells_is_pure(self):
+        self.assertTrue(pdfio._is_pure_ocr_table_page(
+            [self._cell(), self._cell(), self._cell(), self._cell()]))
+
+    def test_mixed_with_non_ocr_is_impure(self):
+        self.assertFalse(pdfio._is_pure_ocr_table_page(
+            [self._cell(), self._cell(), self._cell(),
+             self._cell(ocr=False)]))
+
+    def test_mixed_with_chart_is_impure(self):
+        self.assertFalse(pdfio._is_pure_ocr_table_page(
+            [self._cell(), self._cell(), self._cell(),
+             self._cell(is_chart=True)]))
+
+    def test_empty_is_impure(self):
+        self.assertFalse(pdfio._is_pure_ocr_table_page([]))
 
 
 if __name__ == "__main__":
