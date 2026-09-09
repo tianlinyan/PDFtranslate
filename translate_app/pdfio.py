@@ -1750,6 +1750,62 @@ def _can_merge_label(prev: tuple, prev_numeric: bool, nxt: tuple, nxt_numeric: b
     return not _NOTE_MARK_RE.match(ntext)
 
 
+#: A single OCR item spanning at least this fraction of the page's text width and
+#: holding no figure is a *prose* line, not a table cell.  On the real scanned
+#: statements every single-item table row spans at most 0.24 of the text width,
+#: while a paragraph line spans ~1.0.
+_OCR_PROSE_WIDTH_FRACTION = 0.6
+
+
+def _split_grid_items(
+    items: Sequence[tuple], rows: Sequence[Sequence[tuple]]
+) -> tuple[list[tuple], list[tuple], list[tuple]]:
+    """Split OCR ``items`` into (table region, prose above, prose below).
+
+    A scanned page often mixes a statement with prose (the notes below it).  The
+    grid used to swallow the prose: every line of a paragraph became an
+    ``in_table`` cell — re-flowed with table rules, given a row band, and with
+    「OCR表格重建」 even drawn with table rules.  The table region is the maximal
+    contiguous run of rows around the numeric rows, stopping at a prose row (a
+    single wide non-numeric item); everything else stays prose.
+    """
+    width = max(it[2] for it in items) - min(it[1] for it in items)
+    if width <= 0:
+        return list(items), [], []
+    prose_row: list[bool] = []
+    numeric_row: list[bool] = []
+    for row in rows:
+        wide = max(it[2] for it in row) - min(it[1] for it in row)
+        has_num = any(_is_numeric_cell(it[4]) for it in row)
+        prose_row.append(
+            len(row) == 1 and not has_num
+            and wide >= _OCR_PROSE_WIDTH_FRACTION * width
+        )
+        numeric_row.append(has_num)
+    if not any(numeric_row):
+        return list(items), [], []
+    first = numeric_row.index(True)
+    last = len(numeric_row) - 1 - numeric_row[::-1].index(True)
+    start, end = first, last
+    while start > 0 and not prose_row[start - 1]:
+        start -= 1
+    while end + 1 < len(rows) and not prose_row[end + 1]:
+        end += 1
+    if start == 0 and end == len(rows) - 1:
+        return list(items), [], []
+    table_items = [it for row in rows[start:end + 1] for it in row]
+    if not table_items:
+        return list(items), [], []
+    others = (
+        [it for row in rows[:start] for it in row]
+        + [it for row in rows[end + 1:] for it in row]
+    )
+    top = min(it[0] for it in table_items)
+    above = [it for it in others if it[3] <= top + 0.5]
+    below = [it for it in others if it[3] > top + 0.5]
+    return table_items, above, below
+
+
 def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dict]]:
     """Turn OCR ``items`` into a row-major grid of cells, when they form a table.
 
@@ -1789,6 +1845,19 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
     # require that — a page of prose never has a numeric column.
     if not any(_is_numeric_column(c) for c in cols):
         return [], []
+
+    # P1-2: a mixed scan (statement + prose notes) must not be grid-ified whole.
+    # Keep only the maximal run of table rows around the numeric rows; the rest is
+    # emitted as ordinary OCR blocks (no table flags) so it keeps prose fitting and
+    # is not drawn as table rows by 「OCR表格重建」.
+    table_items, prose_above, prose_below = _split_grid_items(items, rows)
+    if len(table_items) != len(items):
+        items = table_items
+        rows = _cluster_ocr_rows(items)
+        cols = _cluster_ocr_columns(items)
+        if (len(rows) < 2 or len(cols) < 2
+                or not any(_is_numeric_column(c) for c in cols)):
+            return [], []
 
     def col_for(x_centre: float) -> int:
         for ci, col in enumerate(cols):
@@ -1926,6 +1995,14 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
         max(it[2] for it in items), max(it[3] for it in items),
     )
     tables = [{"bbox": bbox, "rows": row_rects, "col_edges": col_edges}]
+    if prose_above or prose_below:
+        # Prose stays prose: ordinary OCR blocks, no table flags, placed around the
+        # grid in reading order (the grid's own row-major order is preserved).
+        blocks = (
+            _ocr_plain_blocks(prose_above)
+            + blocks
+            + _ocr_plain_blocks(prose_below)
+        )
     return blocks, tables
 
 
@@ -2058,6 +2135,17 @@ def _synthesize_ocr_blocks(
             b.page = page_index
         _log_number_fixes(log, page_index, fixed_count, fixed_examples)
         return grid_blocks
+    blocks = _ocr_plain_blocks(items, page_index)
+    _log_number_fixes(log, page_index, fixed_count, fixed_examples)
+    return blocks
+
+
+def _ocr_plain_blocks(items: Sequence[tuple], page_index: int = 0) -> list[Block]:
+    """Build ordinary OCR blocks (no table flags) from ``items``.
+
+    Used for a whole page that does not form a grid, and for the prose part of a
+    mixed scan (a statement with notes below it, see ``_reconstruct_ocr_grid``).
+    """
     blocks: list[Block] = []
     for y0, x0, x1, y1, text in _order_blocks(items):
         if _is_pure_symbol(text):
@@ -2070,7 +2158,6 @@ def _synthesize_ocr_blocks(
                 ocr=True,
             )
         )
-    _log_number_fixes(log, page_index, fixed_count, fixed_examples)
     return blocks
 
 
@@ -2722,6 +2809,100 @@ def _table_has_chart_art(page, bbox) -> bool:
     return False
 
 
+#: Median text-width / cell-width share above which a ``text``-strategy "table" is
+#: really prose.  Measured: a two-column prose page gives word-tight cells (shares
+#: 0.65-0.86, median 0.72) while a borderless table's cells are column bands whose
+#: label column is mostly empty (medians 0.26 and 0.48).  A paragraph's lines fill
+#: whatever band they are put in, a table cell does not.
+_BORDERLESS_MAX_FILL = 0.6
+
+
+#: Share of content rows that must fill every column for a ``text``-strategy hit to
+#: be a table.  A heading list is split by the strategy into word cells (measured on
+#: a real report page: 3 of 7 content rows filled both "columns"), a table fills
+#: them in (almost) every row.
+_BORDERLESS_MIN_FULL_ROWS = 0.6
+
+
+def _borderless_tables(page) -> list:
+    """``find_tables(strategy="text")`` hits that really look like a borderless table.
+
+    The default ``lines`` strategy only sees ruling lines, so a report's borderless
+    ``项目 / 本期 / 上期`` table has no cell geometry at all and its rows collapse
+    into one run-on block per column (row alignment lost, the figures swept into a
+    translated paragraph).  The ``text`` strategy finds those tables, but it also
+    "finds" a two-column *prose* page (measured: 23x2 with word-tight cells), so
+    every hit is filtered:
+
+    * at least 2 rows and 2 columns, with >= 2 rows holding >= 2 non-empty cells;
+    * the median share of a cell's width taken by its text is below
+      :data:`_BORDERLESS_MAX_FILL` — prose lines fill their band, table cells
+      (especially a mostly-empty label column) do not.
+
+    The caller must not redraw a grid for these tables (there are no rules to
+    replace); they only get the row-alignment / row-expansion treatment.
+    """
+    try:
+        tabs = page.find_tables(strategy="text")
+    except Exception:  # noqa: BLE001 — detection is best-effort
+        return []
+    out: list = []
+    for t in getattr(tabs, "tables", None) or []:
+        try:
+            grid = t.extract()
+            rows = list(getattr(t, "rows", None) or [])
+        except Exception:  # noqa: BLE001
+            continue
+        if len(grid) < 2 or max((len(r) for r in grid), default=0) < 2:
+            continue
+        ncols = max(len(r) for r in grid)
+        counts = [sum(1 for c in r if str(c).strip()) for r in grid]
+        content = [c for c in counts if c >= 1]
+        if len(content) < 2:
+            continue
+        if sum(1 for c in content if c >= ncols) / len(content) < _BORDERLESS_MIN_FULL_ROWS:
+            continue
+        content_rows = sum(1 for c in counts if c >= 2)
+        if content_rows < 2:
+            continue
+        fills: list[float] = []
+        for row_obj, row_text in zip(rows, grid):
+            for rect, text in zip(getattr(row_obj, "cells", None) or [], row_text):
+                if not rect or not str(text).strip():
+                    continue
+                r = fitz.Rect(rect)
+                if r.width <= 0:
+                    continue
+                fills.append(
+                    _CJK_FONT.text_length(str(text), fontsize=9.0) / r.width
+                )
+        if not fills:
+            continue
+        if statistics.median(fills) >= _BORDERLESS_MAX_FILL:
+            continue
+        out.append(t)
+    return out
+
+
+def _page_tables(page, log: Callable[[str], None] | None = None) -> tuple[list, bool]:
+    """Ruling-line tables on ``page``, else borderless ones.
+
+    Returns ``(tables, borderless)``.  The fallback only runs when the default
+    strategy finds nothing, so a normal ruled table keeps its exact behaviour.
+    """
+    try:
+        tabs = page.find_tables()
+    except Exception:  # noqa: BLE001
+        tabs = None
+    tables = list(getattr(tabs, "tables", None) or [])
+    if tables:
+        return tables, False
+    tables = _borderless_tables(page)
+    if tables and log:
+        log("未检测到框线表格，已改用文本策略识别无框线表格（按单元格对齐，不画表格线）。")
+    return tables, bool(tables)
+
+
 def _detect_table_cell_rects(
     page, log: Callable[[str], None] | None = None
 ) -> list[fitz.Rect]:
@@ -2738,12 +2919,11 @@ def _detect_table_cell_rects(
     labels stay ordinary prose blocks and the export never runs the destructive
     table redraw over the plot.
     """
-    try:
-        tabs = page.find_tables()
-    except Exception:
+    tabs, _borderless = _page_tables(page, log)
+    if not tabs:
         return []
     rects: list[fitz.Rect] = []
-    for t in getattr(tabs, "tables", None) or []:
+    for t in tabs:
         try:
             tb = fitz.Rect(t.bbox)
         except Exception:  # noqa: BLE001
@@ -3756,7 +3936,10 @@ def _reconstruct_ocr_tables(blocks: Sequence[Block]) -> list[dict]:
     those blocks so the row-height expansion and grid redraw that the vector-table
     path gets also run for scans.  Non-OCR (or non-grid) pages return ``[]``.
     """
-    ocr_blocks = [b for b in blocks if getattr(b, "ocr", False)]
+    ocr_blocks = [
+        b for b in blocks
+        if getattr(b, "ocr", False) and getattr(b, "in_table", False)
+    ]
     if len(ocr_blocks) < 4:
         return []
     items = [(b.y0, b.x0, b.x1, b.y1, b.text) for b in ocr_blocks]
@@ -3824,19 +4007,21 @@ def _is_page_furniture(block: Block) -> bool:
 
 
 def _is_pure_ocr_table_page(blocks: Sequence[Block]) -> bool:
-    """True iff the page may be blank-redrawn from its OCR table cells.
+    """True iff the page may be blank-redrawn from its OCR *grid* cells.
 
     ``save_translated_pdf``'s ``redraw_ocr`` regenerates a scanned table page as a
     blank page holding only the OCR table cells — a chart node label
-    (``is_chart``) or a non-OCR (text-layer) footnote has nowhere to go, so it
-    would be silently dropped.  Gate the redraw to pages whose blocks are all
-    redraw-eligible cells *or* page furniture (a page number / rule outside the
-    table, which ``_draw_page_furniture`` puts back).  Anything else means the
+    (``is_chart``), a text-layer footnote or the prose part of a mixed scan
+    (``ocr`` but ``in_table=False``, see ``_split_grid_items``) has nowhere to go,
+    so it would be silently dropped.  Gate the redraw to pages whose blocks are all
+    redraw-eligible grid cells *or* page furniture (a page number / rule outside
+    the table, which ``_draw_page_furniture`` puts back).  Anything else means the
     page takes the in-place path, which preserves every block.
     """
     cells = [
         b for b in blocks
-        if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)
+        if getattr(b, "ocr", False) and getattr(b, "in_table", False)
+        and not getattr(b, "is_chart", False)
     ]
     if not cells:
         return False
@@ -3845,7 +4030,8 @@ def _is_pure_ocr_table_page(blocks: Sequence[Block]) -> bool:
     tx1 = max(b.x1 for b in cells)
     ty1 = max(b.y1 for b in cells)
     for b in blocks:
-        if getattr(b, "ocr", False) and not getattr(b, "is_chart", False):
+        if (getattr(b, "ocr", False) and getattr(b, "in_table", False)
+                and not getattr(b, "is_chart", False)):
             continue
         if not _is_page_furniture(b):
             return False
@@ -3866,13 +4052,14 @@ def _extract_tables(page, log: Callable[[str], None] | None = None) -> list[dict
     with no detectable table returns ``[]``.  A hit that is really a chart is
     dropped (``_table_has_chart_art``): the row expansion would be meaningless and
     the scoped redaction pass would delete the plot's own line art.
+
+    A *borderless* table (found by the ``text`` fallback, ``_page_tables``) is
+    marked ``borderless: True``: it gets the row alignment / expansion but must
+    not have a grid redrawn — the source has no rules to replace.
     """
-    try:
-        tabs = page.find_tables()
-    except Exception:
-        return []
+    tabs, borderless = _page_tables(page, log)
     out: list[dict] = []
-    for t in getattr(tabs, "tables", None) or []:
+    for t in tabs:
         rows: list[list[fitz.Rect]] = []
         for row in getattr(t, "rows", None) or []:
             cells = [fitz.Rect(c) for c in (getattr(row, "cells", None) or []) if c]
@@ -3892,7 +4079,8 @@ def _extract_tables(page, log: Callable[[str], None] | None = None) -> list[dict
         col_edges = sorted(
             {round(c.x0, 1) for c in all_cells} | {round(c.x1, 1) for c in all_cells}
         )
-        out.append({"bbox": bbox, "rows": rows, "col_edges": col_edges})
+        out.append({"bbox": bbox, "rows": rows, "col_edges": col_edges,
+                    "borderless": borderless})
     return out
 
 
@@ -4052,6 +4240,7 @@ def _compute_table_layout(
             {
                 "orig_top": orig_top, "orig_h": orig_h, "needed_h": needed_h,
                 "bbox": tb["bbox"], "col_edges": tb["col_edges"],
+                "borderless": bool(tb.get("borderless")),
             }
         )
     # P0-3: a rigid-body push-down may not leave the page.  Total growth above the
@@ -4119,6 +4308,11 @@ def _compute_table_layout(
     grid: list = []
     bboxes: list[fitz.Rect] = []
     for ti, t in enumerate(tinfo):
+        if t["borderless"]:
+            # A borderless table has no rules to replace: redrawing the detected
+            # cell edges would *add* a grid the source never had, and there is
+            # nothing for pass 2 to redact inside its bbox.
+            continue
         base_shift = base[("table", ti)]
         left, right = t["bbox"].x0, t["bbox"].x1
         for r in range(len(t["orig_top"])):
@@ -4192,7 +4386,8 @@ def _draw_ocr_grid_page(
     the cell is drawn into that band, so the growth is actually used.
     """
     ocr = [(b, t) for b, t in zip(blocks, trans)
-           if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)]
+           if getattr(b, "ocr", False) and getattr(b, "in_table", False)
+           and not getattr(b, "is_chart", False)]
     if len(ocr) < 4:
         return
     # items carry a trailing index so a row/column cluster can be mapped back to
@@ -4470,7 +4665,8 @@ def save_translated_pdf(
             if redraw_ocr:
                 table_blocks = [
                     b for b in blocks
-                    if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)
+                    if getattr(b, "ocr", False) and getattr(b, "in_table", False)
+                    and not getattr(b, "is_chart", False)
                 ]
                 # A *mixed* page (an OCR table plus a chart node label or a
                 # non-OCR footnote / page number) must NOT be blank-redrawn — the

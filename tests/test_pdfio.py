@@ -910,20 +910,21 @@ class OcrGridTest(unittest.TestCase):
         coords = [(100.0, 60.0), (100.0, 300.0), (120.0, 60.0),
                   (120.0, 300.0), (140.0, 60.0), (140.0, 300.0)]
         blocks = [
-            pdfio.Block(text=t, page=0, x0=x, y0=y, x1=x + 120, y1=y + 10, ocr=True)
+            pdfio.Block(text=t, page=0, x0=x, y0=y, x1=x + 120, y1=y + 10, ocr=True,
+                        in_table=True)
             for t, (y, x) in zip(texts, coords)
         ]
         self.assertEqual([], pdfio._reconstruct_ocr_tables(blocks))
         # The same shape with a figures column is still a table.
         numeric = [
             pdfio.Block(text="现金及存放中央银行款项", page=0, x0=60, y0=100, x1=180,
-                        y1=110, ocr=True),
+                        y1=110, ocr=True, in_table=True),
             pdfio.Block(text="17,485,938,749.91", page=0, x0=300, y0=100, x1=420,
-                        y1=110, ocr=True),
+                        y1=110, ocr=True, in_table=True),
             pdfio.Block(text="存放同业款项", page=0, x0=60, y0=120, x1=180,
-                        y1=130, ocr=True),
+                        y1=130, ocr=True, in_table=True),
             pdfio.Block(text="3,702,726,474.45", page=0, x0=300, y0=120, x1=420,
-                        y1=130, ocr=True),
+                        y1=130, ocr=True, in_table=True),
         ]
         self.assertEqual(1, len(pdfio._reconstruct_ocr_tables(numeric)))
 
@@ -2367,6 +2368,130 @@ class TablePageBottomClampTest(unittest.TestCase):
         self.assertEqual(free[1], clamped[1])
 
 
+class BorderlessTableTest(unittest.TestCase):
+    """P1-1: a table without ruling lines must still get cell geometry — the
+    ``text`` fallback is used, with guards so prose pages are not "found"."""
+
+    @staticmethod
+    def _borderless_table(path):
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        rows = [("营业收入", "1,234,567.89"), ("营业成本", "9,876,543.21"),
+                ("营业利润", "5,555,555.55")]
+        for i, (label, value) in enumerate(rows):
+            page.insert_text((60, 100 + i * 16), label, fontsize=11, fontname="china-s")
+            page.insert_text((300, 100 + i * 16), value, fontsize=11)
+        doc.save(str(path))
+        doc.close()
+
+    @staticmethod
+    def _two_column_prose(path):
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        para = ("本行报告期内的营业收入主要来源于公司银行业务、零售银行业务及资金业务"
+                "的利息净收入与非利息收入，具体构成及变动原因详见本报告附注七之说明。")
+        for x in (60, 320):
+            for i in range(12):
+                page.insert_text((x, 100 + i * 14), para[:24], fontsize=9,
+                                 fontname="china-s")
+        doc.save(str(path))
+        doc.close()
+
+    def test_borderless_table_gets_cell_geometry(self):
+        src = _OUT / "borderless.pdf"
+        self._borderless_table(src)
+        doc = fitz.open(str(src))
+        try:
+            self.assertTrue(pdfio._detect_table_cell_rects(doc[0]))
+            tables = pdfio._extract_tables(doc[0])
+            self.assertEqual(1, len(tables))
+            self.assertTrue(tables[0]["borderless"])
+        finally:
+            doc.close()
+        dt = pdfio.extract_document_text(src, log=lambda _m: None)
+        label = next(b for b in dt.pages[0] if "营业收入" in b.text)
+        value = next(b for b in dt.pages[0] if "1,234,567.89" in b.text)
+        self.assertTrue(label.in_table and value.in_table)
+        self.assertLess(label.y1, value.y1)  # row order preserved
+
+    def test_borderless_table_is_not_drawn_with_a_grid(self):
+        src = _OUT / "borderless2.pdf"
+        self._borderless_table(src)
+        dt = pdfio.extract_document_text(src, log=lambda _m: None)
+        trans = [["T " + b.text for b in dt.pages[0]]]
+        out = _OUT / "borderless_out.pdf"
+        pdfio.save_translated_pdf(src, dt.pages, trans, str(out), "English")
+        doc = fitz.open(str(out))
+        try:
+            # The source had no rules, so the export must not add any.
+            self.assertEqual(0, len(doc[0].get_drawings()))
+            self.assertIn("T ", doc[0].get_text())
+        finally:
+            doc.close()
+
+    def test_two_column_prose_is_not_a_table(self):
+        src = _OUT / "two_col_prose.pdf"
+        self._two_column_prose(src)
+        doc = fitz.open(str(src))
+        try:
+            self.assertEqual([], pdfio._detect_table_cell_rects(doc[0]))
+            self.assertEqual([], pdfio._extract_tables(doc[0]))
+        finally:
+            doc.close()
+
+
+class OcrMixedPageGridTest(unittest.TestCase):
+    """P1-2: a scanned page that mixes a table with prose must not be grid-ified
+    whole — the prose keeps prose fitting and blocks the blank redraw."""
+
+    @staticmethod
+    def _items():
+        items = []
+        y = 100.0
+        for label, amount in (("营业收入", "1,234,567.89"),
+                              ("营业成本", "9,876,543.21"),
+                              ("营业利润", "5,555,555.55")):
+            items.append((y, 60.0, 160.0, y + 9.0, label))
+            items.append((y, 200.0, 300.0, y + 9.0, amount))
+            y += 12.0
+        y += 6.0
+        for i, line in enumerate((
+                "本行报告期内的营业收入主要来源于公司银行业务、",
+                "零售银行业务及资金业务的利息净收入与非利息收入，",
+                "具体构成及变动原因详见本报告附注七之说明。")):
+            items.append((y + i * 11.0, 60.0, 520.0, y + 9.0 + i * 11.0, line))
+        return items
+
+    def test_prose_rows_stay_out_of_the_grid(self):
+        blocks, tables = pdfio._reconstruct_ocr_grid(self._items())
+        self.assertTrue(blocks)
+        self.assertEqual(1, len(tables))
+        prose = [b for b in blocks if not b.in_table]
+        grid = [b for b in blocks if b.in_table]
+        self.assertEqual(3, len(prose))          # the three paragraph lines
+        self.assertEqual(6, len(grid))           # 3 rows x 2 cells
+        for b in prose:
+            self.assertTrue(b.ocr)
+            self.assertEqual(0.0, b.fit_width)
+            self.assertEqual(0.0, b.fit_height)
+        # Reading order: the prose sits below the grid.
+        self.assertLess(max(b.y1 for b in grid), min(b.y0 for b in prose))
+
+    def test_prose_is_not_part_of_the_exported_table(self):
+        blocks, _tables = pdfio._reconstruct_ocr_grid(self._items())
+        tables = pdfio._reconstruct_ocr_tables(blocks)
+        self.assertEqual(1, len(tables))
+        mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
+        prose_idx = [i for i, b in enumerate(blocks) if not b.in_table]
+        self.assertTrue(prose_idx)
+        for i in prose_idx:
+            self.assertNotIn(i, mapping)
+
+    def test_mixed_page_is_not_blank_redrawn(self):
+        blocks, _tables = pdfio._reconstruct_ocr_grid(self._items())
+        self.assertFalse(pdfio._is_pure_ocr_table_page(blocks))
+
+
 class PureOcrTablePageTest(unittest.TestCase):
     """``_is_pure_ocr_table_page`` decides whether a page may be blank-redrawn.
 
@@ -2376,14 +2501,22 @@ class PureOcrTablePageTest(unittest.TestCase):
     which ``_draw_page_furniture`` puts back on the rebuilt page.
     """
 
-    def _cell(self, text="x", ocr=True, is_chart=False):
+    def _cell(self, text="x", ocr=True, is_chart=False, in_table=True):
         return pdfio.Block(
             text=text, page=0, x0=60, y0=100, x1=200, y1=112,
-            size=6.0, single_line=True, ocr=ocr, is_chart=is_chart)
+            size=6.0, single_line=True, ocr=ocr, is_chart=is_chart,
+            in_table=in_table)
 
     def test_all_ocr_cells_is_pure(self):
         self.assertTrue(pdfio._is_pure_ocr_table_page(
             [self._cell(), self._cell(), self._cell(), self._cell()]))
+
+    def test_ocr_prose_block_is_impure(self):
+        # P1-2: the prose part of a mixed scan is ``ocr`` but NOT a grid cell; the
+        # redraw would drop it (and draw the prose as table rows).
+        self.assertFalse(pdfio._is_pure_ocr_table_page(
+            [self._cell(), self._cell(), self._cell(),
+             self._cell(in_table=False)]))
 
     def test_mixed_with_non_ocr_is_impure(self):
         self.assertFalse(pdfio._is_pure_ocr_table_page(
