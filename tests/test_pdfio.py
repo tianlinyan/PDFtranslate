@@ -120,9 +120,11 @@ class PdfioTest(unittest.TestCase):
         src = _OUT / "scan_src.pdf"
         doc = fitz.open()
         page = doc.new_page(width=400, height=300)
-        # A dark pixmap standing in for a scanned region containing text.
+        # White paper with a dark line of "printed text": a scan of printed text is
+        # mostly white, which is what keeps the cover (see the photo test below).
         pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 300, 70), 0)
-        pix.set_rect(fitz.IRect(0, 0, 300, 70), (30,))  # dark gray "scan"
+        pix.set_rect(fitz.IRect(0, 0, 300, 70), (255,))
+        pix.set_rect(fitz.IRect(0, 25, 300, 45), (30,))  # the printed line
         page.insert_image(fitz.Rect(50, 50, 350, 120), pixmap=pix)
         doc.save(str(src))
         doc.close()
@@ -156,6 +158,45 @@ class PdfioTest(unittest.TestCase):
                 found_white = True
         d.close()
         self.assertTrue(found_white, "expected a white cover rectangle over the OCR block")
+
+    def test_translated_pdf_does_not_cover_an_ocr_block_on_a_photo(self):
+        # P1-3: text detected on a photo / coloured logo must NOT get the opaque
+        # white cover — that punches a white hole in the picture.  The translation
+        # is still drawn; only the cover is skipped.
+        src = _OUT / "photo_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 300, 70))
+        pix.set_rect(fitz.IRect(0, 0, 300, 70), (20, 90, 170))   # a blue "photo"
+        page.insert_image(fitz.Rect(50, 50, 350, 120), pixmap=pix)
+        doc.save(str(src))
+        doc.close()
+
+        ocr_block = pdfio.Block(
+            text="text baked into the photo", page=0, x0=50, y0=50, x1=350, y1=120,
+            size=12.0, align="left", bold=False, single_line=False, ocr=True,
+        )
+        logs: list[str] = []
+        out = _OUT / "translated_photo.pdf"
+        pdfio.save_translated_pdf(src, [[ocr_block]], [["translated text"]], out,
+                                  "Chinese", log=logs.append)
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            self.assertIn("translated text", page.get_text())
+            for dr in page.get_drawings():
+                fill = dr.get("fill")
+                if fill is None or not all(abs(c - 1.0) < 0.01 for c in fill):
+                    continue
+                r = dr["rect"]
+                self.assertFalse(
+                    r.x0 < 100 and r.x1 > 300 and r.y0 < 70 and r.y1 > 100,
+                    f"white cover over the photo: {r}",
+                )
+            self.assertTrue(any("图片区域" in m for m in logs), logs)
+        finally:
+            d.close()
 
     def test_translated_pdf_keeps_readable_font(self):
         # A translation far longer than its box used to be font-trimmed down to
@@ -526,6 +567,110 @@ class PdfioTest(unittest.TestCase):
         # 数字列不缩：bbox 保持原列边界（150+2, 250-2）。
         self.assertAlmostEqual(col_boxes[1][0], 152.0, delta=0.5)
         self.assertAlmostEqual(col_boxes[1][1], 248.0, delta=0.5)
+
+    def test_rebalance_keeps_a_merged_cell_and_an_empty_column(self):
+        # P1-8: mapping's third element is the cell index *within its row*, not the
+        # column index.  A merged header (one cell spanning all three columns) used
+        # to get column 0's box — its wrap width collapsed — and a column with no
+        # mapped block got demand 0 and therefore zero width (its two rules
+        # coincided).  The column is now resolved from the cell's x-range, and a
+        # column without demand keeps its width.
+        font = fitz.Font("cjk")
+        merged = [fitz.Rect(60, 180, 350, 200)]
+        rows = [
+            merged,
+            [fitz.Rect(60, 200, 150, 220), fitz.Rect(150, 200, 250, 220),
+             fitz.Rect(250, 200, 350, 220)],
+            [fitz.Rect(60, 220, 150, 240), fitz.Rect(150, 220, 250, 240),
+             fitz.Rect(250, 220, 350, 240)],
+        ]
+        tables = [{"bbox": fitz.Rect(60, 180, 350, 240), "rows": rows,
+                   "col_edges": [60, 150, 250, 350]}]
+        blocks = [
+            # the merged header: its box spans the whole table
+            pdfio.Block(text="合并表头", page=0, x0=60, y0=180, x1=350, y1=200, size=9.0),
+            # column 0 gets a long translation, column 2 a short one; column 1 has
+            # no block at all
+            pdfio.Block(text="项目", page=0, x0=60, y0=200, x1=150, y1=220, size=9.0),
+            pdfio.Block(text="备注", page=0, x0=250, y0=200, x1=350, y1=220, size=9.0),
+        ]
+        trans = ["A merged header that spans every column of this table",
+                 "A very long translated label that exceeds the first column width",
+                 "ok"]
+        mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
+        self.assertIn(0, mapping)
+        col_boxes, new_edges = pdfio._rebalance_table_columns(
+            tables, mapping, blocks, trans, font)
+        # The merged cell keeps its own box (not column 0's).
+        self.assertNotIn(0, col_boxes)
+        # The empty middle column keeps its width (edges 150 / 250 stay put).
+        self.assertAlmostEqual(new_edges[0][1], 150.0, delta=1.0)
+        self.assertAlmostEqual(new_edges[0][2], 250.0, delta=1.0)
+        # Total width is preserved.
+        self.assertAlmostEqual(new_edges[0][-1] - new_edges[0][0], 290.0, delta=0.5)
+
+    def test_block_straddling_cells_is_mapped_to_its_row(self):
+        # P1-9: a block whose centre lands in no cell (it spans two cells) used to be
+        # treated as prose: its height was not measured into the row (a multi-line
+        # translation overlapped the row below) and it was shifted by the whole
+        # table's growth.  It must map to the row that contains it.
+        font = fitz.Font("cjk")
+        rows = [
+            [fitz.Rect(60, 200, 150, 220), fitz.Rect(150, 200, 250, 220)],
+            [fitz.Rect(60, 220, 150, 240), fitz.Rect(150, 220, 250, 240)],
+        ]
+        tables = [{"bbox": fitz.Rect(60, 200, 250, 240), "rows": rows,
+                   "col_edges": [60, 150, 250]}]
+        # A value span that overflows its cell: its centre (x=205) is inside cell 1
+        # of row 0, so use a block straddling the boundary at x=150.
+        straddler = pdfio.Block(text="straddling value", page=0, x0=120, y0=200,
+                                x1=190, y1=220, size=9.0)
+        blocks = [straddler]
+        mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
+        # The centre x = 155 falls inside cell 1 (150..250) — map by cell there; to
+        # exercise the row-band fallback use a box centred on the shared rule.
+        on_rule = pdfio.Block(text="on the rule", page=0, x0=60, y0=198, x1=250,
+                              y1=222, size=9.0)
+        mapping = pdfio._map_blocks_to_table_cells([on_rule], tables)
+        self.assertIn(0, mapping)
+        self.assertEqual(0, mapping[0][1])            # row 0
+        # Its height is measured into the row: with the block mapped, row 0 grows
+        # (without the mapping it is treated as prose and the row keeps its height).
+        trans = ["A considerably longer translated string that wraps across many "
+                 "lines and therefore needs extra row height. " * 3]
+        mapped = pdfio._compute_table_layout(tables, mapping, [on_rule], trans, font)
+        unmapped = pdfio._compute_table_layout(tables, {}, [on_rule], trans, font)
+        self.assertGreater(mapped[1][0], 220.0)
+        self.assertEqual({}, unmapped[1])
+
+    def test_bilingual_translation_page_keeps_a_figure(self):
+        # P1-10: the mirror page was a blank sheet, so a figure page's translation
+        # page showed text floating in white space.  A page with a picture (or vector
+        # art) now gets a copy of the source with its text redacted.
+        src = _OUT / "bi_figure_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 60, 60))
+        pix.set_rect(pix.irect, (200, 30, 30))
+        page.insert_image(fitz.Rect(40, 40, 140, 140), pixmap=pix)
+        page.insert_text((40, 180), "FIGURE CAPTION", fontsize=11)
+        doc.save(str(src))
+        doc.close()
+
+        block = pdfio.Block(text="FIGURE CAPTION", page=0, x0=40, y0=168, x1=200,
+                            y1=182, size=11.0, single_line=True)
+        out = _OUT / "bi_figure.pdf"
+        pdfio.save_interleaved_pdf(src, [["TRANSLATED CAPTION"]], out, "Chinese",
+                                   [[block]])
+        d = fitz.open(str(out))
+        try:
+            self.assertEqual(2, d.page_count)
+            mirror = d[1]
+            self.assertEqual(1, len(mirror.get_images(full=True)))
+            self.assertIn("TRANSLATED CAPTION", mirror.get_text())
+            self.assertNotIn("FIGURE CAPTION", mirror.get_text())
+        finally:
+            d.close()
 
     def test_unique_path_appends_number_when_exists(self):
         # 导出不覆盖重名文件：test_English.pdf 已存在 → test_English(1).pdf。

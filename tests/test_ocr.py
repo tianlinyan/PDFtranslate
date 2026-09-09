@@ -110,6 +110,12 @@ class NumberNormalizationTest(unittest.TestCase):
         ("1,304,083,150.0 / 8", "1,304,083,150.08"),
         ("192, / 003,164.72", "192,003,164.72"),
         ("292,712,933,925.1 / 7", "292,712,933,925.17"),
+        # Accounting negatives (P1-5): the brackets used to defeat the shape test,
+        # so a mangled negative reached the reader verbatim.
+        ("(3,702.726,474.45)", "(3,702,726,474.45)"),
+        ("(65, 334, 085.99)", "(65,334,085.99)"),
+        ("（1,234.56）", "(1,234.56)"),
+        ("(11,530,351,55)", "(11,530,351.55)"),
     ]
 
     #: Strings that are *not* regrouped: dates, plain values, prose.
@@ -148,6 +154,18 @@ class NumberNormalizationTest(unittest.TestCase):
                 self.assertEqual(
                     re.sub(r"\D", "", corrupted), re.sub(r"\D", "", expected)
                 )
+
+    def test_mangled_negative_is_still_a_figure_cell(self):
+        # P1-5: ``_is_numeric_cell`` tests the repaired form too, so a mangled
+        # accounting negative keeps its right alignment and its "never send to the
+        # model" protection instead of being treated as prose.
+        for text in ("(3,702.726,474.45)", "(65, 334, 085.99)", "（1,234.56）",
+                     "(1,234.56)", "-60,327,958.12"):
+            with self.subTest(text=text):
+                self.assertTrue(pdfio._is_numeric_cell(text))
+        for text in ("—", "营业收入", "1960.08", "1,234.56万元", "(1,234.56万元)"):
+            with self.subTest(text=text):
+                self.assertFalse(pdfio._is_numeric_cell(text))
 
     def test_synthesize_reports_fixes_through_log(self):
         logs: list[str] = []

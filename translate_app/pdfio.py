@@ -1177,12 +1177,24 @@ def _normalize_number(text: str) -> str:
     s = str(text)
     s = (
         s.replace("，", ",").replace("．", ".")
+        .replace("（", "(").replace("）", ")")
         .replace("　", " ").replace("\xa0", " ")
         .replace("％", "%").replace("−", "-").replace("－", "-")
     )
     s = s.strip()
     if not s:
         return str(text)
+    # Accounting negative (``(1,234.56)``): the standard way a Chinese statement
+    # prints a negative figure.  Peel the brackets off first — the shape test below
+    # rejects a leading bracket outright, so a mangled negative
+    # (``(3,702.726,474.45)``) was returned verbatim *and* was not recognised as a
+    # figure cell either (the reader saw the corruption and the cell was left-aligned
+    # and sent to the model).
+    open_bracket = close_bracket = ""
+    if s.startswith("("):
+        open_bracket, s = "(", s[1:].strip()
+    if s.endswith(")"):
+        close_bracket, s = ")", s[:-1].strip()
     tail = ""
     if s.endswith("%"):
         tail = "%"
@@ -1192,6 +1204,10 @@ def _normalize_number(text: str) -> str:
         sign, s = s[0], s[1:].strip()
     if not s or not _NUM_SHAPE_RE.match(s):
         return str(text)
+
+    def _wrap(core: str) -> str:
+        return f"{open_bracket}{sign}{core}{tail}{close_bracket}"
+
     if "," not in s:
         # No thousands separators at all: a date (1960.08), a plain value
         # (0.98) or ungrouped digits.  Not enough signal to regroup; drop stray
@@ -1202,13 +1218,13 @@ def _normalize_number(text: str) -> str:
         core = re.sub(r"\s+", "", s)
         if "." in core and "/" in core:
             core = core.replace("/", "")
-        return sign + core + tail if core else str(text)
+        return _wrap(core) if core else str(text)
     s2 = s.replace(" ", "")
     if _WELL_FORMED_NUM_RE.match(s2):
-        return sign + s2 + tail
+        return _wrap(s2)
     repaired = _repair_number_separators(s2)
     if _WELL_FORMED_NUM_RE.match(repaired):
-        return sign + repaired + tail
+        return _wrap(repaired)
     # Digit count cannot form valid 3-digit groups: leave it for human review
     # (silently "fixing" it could emit a wrong amount).
     return str(text)
@@ -1567,7 +1583,13 @@ def _is_numeric_cell(text: str) -> bool:
     t = str(text).strip()
     if not t:
         return False
-    return bool(_NUMERIC_CELL_RE.match(t))
+    if _NUMERIC_CELL_RE.match(t):
+        return True
+    # A *mangled* figure is still a figure: test the repaired form too, so the cell
+    # keeps its right alignment and its "never send to the model" protection
+    # (``(3,702.726,474.45)``, ``65, 334, 085.99``).
+    repaired = _normalize_number(t)
+    return repaired != t and bool(_NUMERIC_CELL_RE.match(repaired))
 
 
 #: Characters typical of a math / formula expression (operators, relations,
@@ -2072,6 +2094,112 @@ def _drop_signature_items(
     return kept
 
 
+def _rect_covered_ratio(rect, cover) -> float:
+    """Share of ``rect``'s area that ``cover`` overlaps (asymmetric)."""
+    ix = max(0.0, min(rect.x1, cover.x1) - max(rect.x0, cover.x0))
+    iy = max(0.0, min(rect.y1, cover.y1) - max(rect.y0, cover.y0))
+    area = max(1e-6, (rect.x1 - rect.x0) * (rect.y1 - rect.y0))
+    return ix * iy / area
+
+
+def _partial_image_rects(page) -> list[fitz.Rect]:
+    """Image rects that are *partial page* images (photos, logos), not a full scan.
+
+    A scanned page is one page-sized image; a partial image is a photo / logo whose
+    own pixels may carry text.  Images covering more than half the page are treated
+    as scans (their OCR blocks get the white cover).
+    """
+    try:
+        infos = page.get_image_info()
+    except Exception:  # noqa: BLE001 — best-effort
+        return []
+    page_area = max(1.0, abs(page.rect.width * page.rect.height))
+    out: list[fitz.Rect] = []
+    for info in infos or []:
+        try:
+            r = fitz.Rect(info["bbox"])
+        except Exception:  # noqa: BLE001
+            continue
+        if r.width <= 1.0 or r.height <= 1.0:
+            continue
+        if r.get_area() <= 0.5 * page_area:
+            out.append(r)
+    return out
+
+
+#: Mean luminance (0-255) of a "paper" pixel: white paper, however faintly printed.
+_PAPER_LUMA = 200
+#: Share of paper pixels for a region to count as paper (a printed line of text on
+#: white paper still leaves most pixels white; a photo does not).
+_PAPER_SHARE = 0.6
+#: DPI the page is rendered at to sample the background under an OCR block.
+_PHOTO_SAMPLE_DPI = 72
+
+
+def _region_is_paper(pix, rect, page) -> bool:
+    """True when the rendered region under ``rect`` is mostly white paper.
+
+    Decides whether an OCR block sits on a *scan of printed text* (the white cover
+    is what hides the printed glyphs) or on a photo / coloured logo (the pixels are
+    the content — a cover would punch a white hole in it).  A rotated page cannot be
+    sampled with the unrotated block coordinates, and any sampling failure keeps the
+    safe behaviour (cover).
+    """
+    if pix is None or pix.width <= 0 or pix.height <= 0:
+        return True
+    if int(getattr(page, "rotation", 0) or 0):
+        return True
+    sx = pix.width / max(1e-6, float(page.rect.width))
+    sy = pix.height / max(1e-6, float(page.rect.height))
+    x0 = max(0, int(rect.x0 * sx))
+    x1 = min(pix.width, int(rect.x1 * sx) + 1)
+    y0 = max(0, int(rect.y0 * sy))
+    y1 = min(pix.height, int(rect.y1 * sy) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return True
+    try:
+        import numpy as np
+
+        arr = np.frombuffer(pix.samples, dtype=np.uint8)
+        arr = arr.reshape(pix.height, pix.stride)[:, : pix.width * pix.n]
+        arr = arr.reshape(pix.height, pix.width, pix.n)
+        region = arr[y0:y1, x0:x1, : min(3, pix.n)]
+        if region.size == 0:
+            return True
+        luma = region.mean(axis=2)
+        return float((luma >= _PAPER_LUMA).mean()) >= _PAPER_SHARE
+    except Exception:  # noqa: BLE001 — no numpy / odd pixmap: keep the cover
+        return True
+
+
+def _photo_ocr_blocks(page, blocks: Sequence[Block],
+                      log: Callable[[str], None] | None = None) -> set[int]:
+    """Indices of OCR blocks that sit on a photo / coloured logo (P1-3).
+
+    Such a block must not get the opaque white cover — it would punch a white hole
+    in the picture — so the cover is skipped (the translation is still drawn).  A
+    scan of printed text is mostly white paper and keeps its cover.
+    """
+    partial = _partial_image_rects(page)
+    if not partial:
+        return set()
+    candidates = [
+        j for j, b in enumerate(blocks)
+        if getattr(b, "ocr", False)
+        and any(_rect_covered_ratio(b, r) >= 0.6 for r in partial)
+    ]
+    if not candidates:
+        return set()
+    try:
+        pix = page.get_pixmap(dpi=_PHOTO_SAMPLE_DPI)
+    except Exception:  # noqa: BLE001 — sampling is best-effort
+        pix = None
+    out = {j for j in candidates if not _region_is_paper(pix, blocks[j], page)}
+    if out and log:
+        log(f"{len(out)} 个 OCR 文本块位于图片区域，已保留原图像素（不画白底）。")
+    return out
+
+
 def _covered_ratio(block: Block, cover: Block) -> float:
     """Share of ``block``'s own area that ``cover`` overlaps.
 
@@ -2079,10 +2207,7 @@ def _covered_ratio(block: Block, cover: Block) -> float:
     big text block is fully covered (ratio 1.0) while the big block is barely
     touched by the small one.  ``_merge_ocr_blocks`` needs exactly that direction.
     """
-    ix = max(0.0, min(block.x1, cover.x1) - max(block.x0, cover.x0))
-    iy = max(0.0, min(block.y1, cover.y1) - max(block.y0, cover.y0))
-    area = max(1e-6, (block.x1 - block.x0) * (block.y1 - block.y0))
-    return ix * iy / area
+    return _rect_covered_ratio(block, cover)
 
 
 #: An OCR block whose own box is covered at least this much by a text-layer block
@@ -3954,30 +4079,68 @@ def save_interleaved_pdf(
     lang: str,
     pages: Sequence[Sequence[Block]] | None = None,
 ) -> None:
-    """Create a bilingual PDF: each original page followed by a translation
-    page that mirrors the original layout (every translated block sits at its
-    source block's position)."""
+    """Create a bilingual PDF: each original page followed by a translation page.
+
+    The translation page mirrors the original layout (every translated block sits at
+    its source block's position) **and keeps the page's pictures and vector art**:
+    when the page carries a photo / figure (a partial-page image) or drawings, the
+    page is a copy of the source with its text redacted — what the in-place export
+    does — instead of a blank sheet.  P1-10: a photo-heavy page's translation page
+    used to be text floating in white space.  A page with nothing but text keeps the
+    clean blank sheet (and the unrotated mediabox + ``/Rotate`` below).
+    """
     src = fitz.open(str(src_path))
     new_doc = fitz.open()
     try:
         font = _CJK_FONT
         for i in range(src.page_count):
             new_doc.insert_pdf(src, from_page=i, to_page=i)
+            src_page = src[i]
+            blocks = pages[i] if pages is not None and i < len(pages) else []
+            trans = per_page[i] if i < len(per_page) else []
+            m = min(len(blocks), len(trans))
+            keep_art = bool(_partial_image_rects(src_page)) or bool(src_page.get_drawings())
+            if keep_art:
+                # A copy of the source page with its text redacted: pictures, photos
+                # and vector art survive on the translation page too.
+                new_doc.insert_pdf(src, from_page=i, to_page=i)
+                tpage = new_doc[-1]
+                if m == 0:
+                    _render_note(tpage, font, lang)
+                    continue
+                for j in range(m):
+                    b = blocks[j]
+                    if not b.ocr and not b.is_chart:
+                        tpage.add_redact_annot(fitz.Rect(b.x0, b.y0, b.x1, b.y1))
+                tpage.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                )
+                on_photo = _photo_ocr_blocks(tpage, blocks[:m])
+                for j in range(m):
+                    b = blocks[j]
+                    if b.is_chart:
+                        # A diagram node label keeps its source (as in-place).
+                        continue
+                    if b.ocr and j not in on_photo:
+                        tpage.draw_rect(
+                            fitz.Rect(b.x0 - 0.5, b.y0 - 0.5,
+                                      b.x1 + 0.5, b.y1 + 0.5),
+                            color=None, fill=(1, 1, 1),
+                        )
+                    _draw_translated_block(tpage, font, b, trans[j])
+                continue
             # The mirror page must be built in the SAME coordinate frame the blocks
             # live in: block bboxes come from ``get_text("dict")``, i.e. the
             # *unrotated* mediabox frame.  ``src[i].rect`` is the rotated view, so
             # on a /Rotate 90/270 page it swaps width/height and every block below
             # y = width is drawn off-page (its translation silently vanished).
             # Mirror the OCR-redraw branch: unrotated mediabox + carry /Rotate.
-            src_page = src[i]
             mb = src_page.mediabox
             tpage = new_doc.new_page(width=mb.width, height=mb.height)
             rotation = int(getattr(src_page, "rotation", 0) or 0)
             if rotation:
                 tpage.set_rotation(rotation)
-            blocks = pages[i] if pages is not None and i < len(pages) else []
-            trans = per_page[i] if i < len(per_page) else []
-            m = min(len(blocks), len(trans))
             if m == 0:
                 _render_note(tpage, font, lang)
                 continue
@@ -4146,24 +4309,51 @@ def _extract_tables(page, log: Callable[[str], None] | None = None) -> list[dict
     return out
 
 
+def _locate_block(block: Block, cx: float, cy: float, tables) -> tuple[int, int, int] | None:
+    """Locate ``block`` in a table: exact cell first, then its row band (P1-9)."""
+    for ti, tb in enumerate(tables):
+        for ri, row in enumerate(tb["rows"]):
+            for ci, cell in enumerate(row):
+                if cell.x0 <= cx <= cell.x1 and cell.y0 <= cy <= cell.y1:
+                    return (ti, ri, ci)
+    # A block whose centre is not inside any cell (it straddles cells, or sits in a
+    # gutter / an unmapped span) but lies inside the table's extent still belongs to
+    # a *row*: without this it was treated as prose — its height was not measured
+    # into the row (so a multi-line translation overlapped the row below) and it was
+    # shifted by the whole table's growth instead of its own row's.
+    for ti, tb in enumerate(tables):
+        box = tb["bbox"]
+        if not (block.x0 < box.x1 and block.x1 > box.x0
+                and block.y0 < box.y1 and block.y1 > box.y0):
+            continue
+        for ri, row in enumerate(tb["rows"]):
+            top = min(c.y0 for c in row)
+            bot = max(c.y1 for c in row)
+            if top <= cy <= bot:
+                ci = next(
+                    (i for i, c in enumerate(row) if c.x0 <= cx <= c.x1), 0
+                )
+                return (ti, ri, ci)
+    return None
+
+
 def _map_blocks_to_table_cells(blocks, tables) -> dict[int, tuple[int, int, int]]:
     """Map block index -> ``(table_index, row_index, column_index)`` for every table cell block.
 
     A block belongs to a table when its bbox centre falls inside one of that
-    table's cell rects.  The column index (position within the row, left-to-right)
-    lets the reflow pass widen/narrow individual columns.  Non-table blocks
-    (headings, prose, footers) are absent.
+    table's cell rects; a block inside the table's extent whose centre lands in no
+    cell (a spanning / gutter block) is mapped to the row that contains it, so its
+    height counts and it is pushed with its row.  The column index (position within
+    the row, left-to-right) lets the reflow pass widen/narrow individual columns.
+    Non-table blocks (headings, prose, footers) are absent.
     """
     mapping: dict[int, tuple[int, int, int]] = {}
     for bi, b in enumerate(blocks):
         cx = (b.x0 + b.x1) / 2.0
         cy = (b.y0 + b.y1) / 2.0
-        for ti, tb in enumerate(tables):
-            for ri, row in enumerate(tb["rows"]):
-                for ci, cell in enumerate(row):
-                    if cell.x0 <= cx <= cell.x1 and cell.y0 <= cy <= cell.y1:
-                        mapping[bi] = (ti, ri, ci)
-                        break
+        hit = _locate_block(b, cx, cy, tables)
+        if hit is not None:
+            mapping[bi] = hit
     return mapping
 
 
@@ -4202,14 +4392,35 @@ def _rebalance_table_columns(tables, mapping, blocks, trans, font):
             continue
         ncols = len(edges) - 1
         cur = [edges[j + 1] - edges[j] for j in range(ncols)]
+
+        def _column_of(ri: int, ci: int) -> int | None:
+            """Real column index of a cell, or ``None`` for a merged / spanning cell.
+
+            ``mapping``'s third element is the cell's index *within its row*, which
+            is not the column index once a row has a merged cell (``find_tables``
+            reports the span as one cell).  Using it as a column index gave the
+            merged header column 0's box — its wrap width collapsed from 296pt to
+            96pt (measured) — so the column is resolved from the cell's x-range.
+            """
+            row = tb["rows"][ri] if 0 <= ri < len(tb["rows"]) else []
+            if not (0 <= ci < len(row)):
+                return None
+            cell = row[ci]
+            for c in range(ncols):
+                if (edges[c] - 2.0 <= cell.x0 and cell.x1 <= edges[c + 1] + 2.0):
+                    return c
+            return None
+
         demand = [0.0] * ncols
         numeric = [False] * ncols
+        col_of_block: dict[int, int] = {}
         for bi, key in mapping.items():
             if key[0] != ti or bi >= len(trans):
                 continue
-            c = key[2]
-            if not (0 <= c < ncols):
+            c = _column_of(key[1], key[2])
+            if c is None:
                 continue
+            col_of_block[bi] = c
             t = str(trans[bi]).strip()
             if not t:
                 continue
@@ -4226,30 +4437,29 @@ def _rebalance_table_columns(tables, mapping, blocks, trans, font):
         if total_demand <= total_cur or total_demand <= 0.0:
             new_w = list(cur)   # no reflow needed / nothing to gain
         else:
-            num_sum = sum(cur[c] for c in range(ncols) if numeric[c])
-            budget = max(0.0, total_cur - num_sum)
-            non_demand = sum(demand[c] for c in range(ncols) if not numeric[c])
-            new_w = [0.0] * ncols
-            for c in range(ncols):
-                if numeric[c]:
-                    new_w[c] = cur[c]
-                elif non_demand > 0:
-                    new_w[c] = budget * demand[c] / non_demand
-                else:
-                    new_w[c] = cur[c]
+            # Columns that must keep their width: numeric ones (a figure stays on
+            # one line) and columns with no mapped block at all — the old rule gave
+            # the latter ``demand == 0`` and therefore a *zero* width, which made
+            # their two rules coincide and the column disappear (measured).
+            keep = [c for c in range(ncols) if numeric[c] or demand[c] <= 0.0]
+            budget = max(0.0, total_cur - sum(cur[c] for c in keep))
+            flex = [c for c in range(ncols) if c not in keep]
+            flex_demand = sum(demand[c] for c in flex)
+            new_w = list(cur)
+            if flex and flex_demand > 0:
+                for c in flex:
+                    new_w[c] = budget * demand[c] / flex_demand
         x = edges[0]
         new_edges = [x]
         for c in range(ncols):
             x += new_w[c]
             new_edges.append(x)
         new_col_edges[ti] = new_edges
-        for bi, key in mapping.items():
-            if key[0] == ti and 0 <= key[2] < ncols:
-                c = key[2]
-                col_boxes[bi] = (
-                    new_edges[c] + _TABLE_CELL_PAD,
-                    new_edges[c + 1] - _TABLE_CELL_PAD,
-                )
+        for bi, c in col_of_block.items():
+            col_boxes[bi] = (
+                new_edges[c] + _TABLE_CELL_PAD,
+                new_edges[c + 1] - _TABLE_CELL_PAD,
+            )
     return col_boxes, new_col_edges
 
 
@@ -4867,6 +5077,16 @@ def save_translated_pdf(
                     log=(lambda m: log(f"  第 {i + 1} 页：{m}")) if log else None,
                 )
 
+            # P1-3: an OCR block that sits on a *photo / coloured logo* must not get
+            # the opaque white cover — it would punch a white hole in the picture.
+            # The block is still drawn; only the cover is skipped.  The decision is
+            # pixel-based (``_region_is_paper``): a scan of printed text is mostly
+            # white paper and keeps its cover, a photo does not.
+            on_photo = _photo_ocr_blocks(
+                page, blocks[:m],
+                log=(lambda msg: log(f"  第 {i + 1} 页：{msg}")) if log else None,
+            )
+
             # Remove the original text (keep images and other line art/graphics).
             # OCR blocks sit on a raster image rather than a text layer, so
             # nothing is redacted for them — they are covered below instead.
@@ -4944,11 +5164,12 @@ def save_translated_pdf(
                             y0=min(c.y0 for c in row) + dy,
                             y1=max(c.y1 for c in row) + dy,
                         )
-                if b.ocr:
+                if b.ocr and j not in on_photo:
                     # Cover the underlying scan pixels so the translation does
                     # not overprint the original (raster) text.  Use the (possibly
                     # expanded / shifted) draw box, not the original bbox, or the
                     # translation drawn lower would sit on uncovered scan text.
+                    # Skipped on a photo (P1-3): the pixels there are the content.
                     page.draw_rect(
                         fitz.Rect(
                             draw_b.x0 - 0.5, draw_b.y0 - 0.5,
