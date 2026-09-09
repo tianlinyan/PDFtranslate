@@ -162,6 +162,16 @@ class TranslateWorker(QObject):
         # thread: the Event gives explicit, memory-model-safe signalling
         # instead of relying on the CPython GIL to make a bool atomic.
         self._cancelled = threading.Event()
+        #: The console-facing completion summary (the agent's ``state.summary``).
+        #: Initialised here, not only in ``_run_agent``: the IR pipeline, the
+        #: deterministic fallback and "重新导出" never set it, and ``MainWindow``
+        #: reads it after the run.  A field that only *sometimes* exists in the
+        #: wrapper's ``__dict__`` makes the read fall through to sip once the C++
+        #: object has been deleted (``stopped -> deleteLater``), which raises
+        #: ``RuntimeError: wrapped C/C++ object ... has been deleted`` — and PyQt
+        #: aborts the process for an unhandled exception in a slot (v0.5.21/0.5.22
+        #: 的「异常退出」).
+        self._report = ""
         #: The agent's ``WorkflowState`` while an AI-orchestrated run is active.
         #: Set by ``_run_agent`` and read (while the worker is blocked in a
         #: preview) to render an in-progress "translation" preview page.

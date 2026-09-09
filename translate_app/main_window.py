@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from PyQt6 import sip
 from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QTextCursor
 from PyQt6.QtWidgets import (
@@ -79,6 +80,36 @@ def resolve_language(text: str) -> str:
     # An unknown value is passed through: the model can translate into far more
     # languages than the six listed here.
     return typed or LANGUAGES[0][1]
+
+
+def worker_is_alive(worker: object) -> bool:
+    """True while ``worker``'s C++ object still exists.
+
+    ``TranslateWorker.stopped`` is connected to ``deleteLater`` *inside the
+    worker thread*, so the C++ object can already be freed when the GUI thread
+    processes the queued ``finished``/``error`` signal.  Any Qt-level call on the
+    dead wrapper raises ``RuntimeError: wrapped C/C++ object ... has been
+    deleted``, and PyQt aborts the whole process for an unhandled exception in a
+    slot — v0.5.21/0.5.22 crashed exactly that way ("异常退出").
+    """
+    return worker is not None and not sip.isdeleted(worker)
+
+
+def worker_field(worker: object, name: str, default=None):
+    """Read a worker field, tolerating a worker whose C++ object was deleted.
+
+    Python attributes live in the wrapper's ``__dict__`` and survive the C++
+    deletion, so the values ``_on_finished`` needs are still readable; only a
+    *missing* attribute falls through to sip and raises.  Reading defensively
+    keeps the completion summary/``_last_translated``/``_last_pdf`` working even
+    when the deletion won the race, instead of dropping them.
+    """
+    if worker is None:
+        return default
+    try:
+        return getattr(worker, name, default)
+    except RuntimeError:
+        return default
 
 
 #: Chinese digit chars for parsing page numbers like 第三页.
@@ -609,8 +640,9 @@ class MainWindow(QWidget):
             return
         # Best-effort: inject the free-text requirement into the running agent so
         # its next decision sees it (a no-op if no agent run is active).
-        if self._worker is not None and text.strip():
-            self._worker.add_user_requirement(text)
+        worker = self._live_worker()
+        if worker is not None and text.strip():
+            worker.add_user_requirement(text)
         # Persistent chat: ask the interaction model on the background thread.  A
         # buffered preview image (from the preview's "发送") is sent together with the
         # user's text when the model is vision-capable; otherwise the image is dropped
@@ -730,8 +762,9 @@ class MainWindow(QWidget):
 
     def _on_preview_page_changed(self, page: int) -> None:
         """A navigation request from the preview window (prev/next/jump)."""
-        if self._worker is not None:
-            self._worker.set_current_page(page)
+        worker = self._live_worker()
+        if worker is not None:
+            worker.set_current_page(page)
         self._show_preview(page, self._preview_current_what)
 
     def _on_preview_send(self, png: bytes, pdf_rect: list[float]) -> None:
@@ -763,8 +796,9 @@ class MainWindow(QWidget):
             page = min(total - 1, self._preview_current_page + 1)
         else:  # goto
             page = max(0, min(total - 1, page))
-        if self._worker is not None:
-            self._worker.set_current_page(page)
+        worker = self._live_worker()
+        if worker is not None:
+            worker.set_current_page(page)
         self._show_preview(page, target_what)
         return True
 
@@ -797,7 +831,7 @@ class MainWindow(QWidget):
         if pdf_path and Path(pdf_path).exists():
             out_page = self._translation_output_page(page, self._last_output_type)
             return self._render_pdf_page_png(pdf_path, out_page)
-        worker = self._worker
+        worker = self._live_worker()
         if worker is not None:
             return worker.render_translation(page)
         return self._render_cached_translation_preview(page)
@@ -1027,6 +1061,19 @@ class MainWindow(QWidget):
             page_scope=page_scope,
         ))
 
+    def _live_worker(self) -> TranslateWorker | None:
+        """``self._worker`` while its C++ object is alive, else ``None``.
+
+        GUI callbacks (sidebar requirement, preview navigation, cancel) must go
+        through here: the worker's C++ object is deleted from the worker thread,
+        so between a run finishing and ``_cleanup`` it can be gone while
+        ``self._worker`` still points at the wrapper — and a Qt-level call on it
+        (e.g. ``add_user_requirement``'s ``log.emit``) raises ``RuntimeError``,
+        which PyQt turns into a process abort.
+        """
+        worker = self._worker
+        return worker if worker_is_alive(worker) else None
+
     def _launch_worker(self, worker: TranslateWorker) -> None:
         """Move ``worker`` onto a fresh thread and wire its signals.
 
@@ -1132,8 +1179,9 @@ class MainWindow(QWidget):
             pass
 
     def _cancel(self) -> None:
-        if self._worker is not None:
-            self._worker.cancel()
+        worker = self._live_worker()
+        if worker is not None:
+            worker.cancel()
             self._cancelled_by_user = True
             self._append_log("正在取消…")
         self._cancel_btn.setEnabled(False)
@@ -1239,24 +1287,32 @@ class MainWindow(QWidget):
         self._append_log(f"翻译完成，已保存：{out_path}")
         # Feed the chat's document context the final translation so the AI reads the
         # real current output (not just the protected chat edits).
+        #
+        # ``worker_field`` tolerates a worker whose C++ object was already freed
+        # (``stopped -> deleteLater`` runs in the worker thread, so the deletion can
+        # win the race against this queued slot): the fields live in the Python
+        # wrapper and are still valid, so a lost race must neither drop the run's
+        # results nor raise — PyQt aborts the process for an unhandled slot error.
         worker = self._worker
-        if worker is not None and getattr(worker, "_last_translated", None):
-            self.doc_ctx.set_last_translated(worker._last_translated)
-            self._last_translated = list(worker._last_translated)
+        last_translated = worker_field(worker, "_last_translated")
+        if last_translated:
+            self.doc_ctx.set_last_translated(last_translated)
+            self._last_translated = list(last_translated)
             self._last_translated_source = self._source
             self._re_export_btn.setEnabled(True)
         # Remember the exported PDF + its type so the preview's "译文" side can
         # render the REAL translated output after the run.  ``_cleanup`` drops the
         # worker reference, so this must live here.
         if worker is not None:
-            self._last_pdf = getattr(worker, "_last_pdf", None)
-            self._last_output_type = getattr(worker, "_output_type", "")
+            self._last_pdf = worker_field(worker, "_last_pdf")
+            self._last_output_type = worker_field(worker, "_output_type", "")
         else:
             self._last_pdf = None
         # Gap1: feed the run's result back to the console surface so the user sees a
         # clear completion summary in the sidebar (the console can then follow up).
-        if worker is not None and getattr(worker, "_report", ""):
-            self.agent_sidebar.add_notice(worker._report)
+        report = worker_field(worker, "_report", "")
+        if report:
+            self.agent_sidebar.add_notice(report)
 
     def _on_error(self, msg: str) -> None:
         # Settle the progress bar (it may be stuck in the busy state) and mark
@@ -1332,8 +1388,9 @@ class MainWindow(QWidget):
         # 六亲不认的强行退出：关闭窗口即刻强制结束工作线程，并直接硬退出整个
         # 进程——不弹任何确认框、不等待当前请求完成、不理会任何后台线程。
         if self._thread is not None and self._thread.isRunning():
-            if self._worker is not None:
-                self._worker.cancel()
+            worker = self._live_worker()
+            if worker is not None:
+                worker.cancel()
             # Force-kill the background worker thread, then reap it from the OS.
             self._thread.terminate()
             self._thread.wait(5000)

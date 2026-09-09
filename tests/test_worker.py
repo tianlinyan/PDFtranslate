@@ -680,5 +680,44 @@ class StructureModeWorkerTest(_WorkerTestBase):
                 str(self.tmp / "o.txt"))._structure_mode)
 
 
+class WorkerFieldLifetimeTest(_WorkerTestBase):
+    """回归 v0.5.21/0.5.22 的「异常退出」。
+
+    ``stopped -> deleteLater`` 在 worker 线程里删掉 C++ 对象，而 ``finished`` 是排队
+    投给 GUI 线程的，删除可以先到；此时读取一个**只在某些运行路径里才存在**的属性
+    （``_report``：IR 模式 / 非视觉回退 / 重新导出 都不设置）会落到 sip 上抛
+    ``RuntimeError: wrapped C/C++ object ... has been deleted``，PyQt 随后 abort 整个
+    进程。因此：字段必须在 ``__init__`` 里就存在，且 GUI 的读取必须容忍删除。
+    """
+
+    def _worker(self) -> TranslateWorker:
+        return TranslateWorker(
+            str(self.tmp / "a.pdf"), self._model("http://127.0.0.1:9/v1"),
+            "English", "translated_pdf", str(self.tmp / "out.pdf"),
+        )
+
+    def test_fields_main_window_reads_exist_before_any_run(self):
+        worker = self._worker()
+        for name in ("_report", "_last_translated", "_last_pdf", "_output_type"):
+            self.assertTrue(hasattr(worker, name), name)
+        self.assertEqual("", worker._report)
+
+    def test_field_reads_survive_the_cpp_object_deletion(self):
+        from PyQt6 import sip
+
+        from translate_app.main_window import worker_field, worker_is_alive
+
+        worker = self._worker()
+        worker._last_translated = ["译文"]
+        sip.delete(worker)                      # deleteLater 的等价效果
+        self.assertTrue(sip.isdeleted(worker))
+        self.assertFalse(worker_is_alive(worker))
+        # 与 main_window._on_finished 同款读取：删除后也不得抛 RuntimeError。
+        self.assertEqual(["译文"], worker_field(worker, "_last_translated"))
+        self.assertEqual("", worker_field(worker, "_report", ""))
+        self.assertIsNone(worker_field(worker, "_last_pdf"))
+        self.assertEqual("translated_pdf", worker_field(worker, "_output_type", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

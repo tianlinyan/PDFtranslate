@@ -1,12 +1,20 @@
 # PDFtranslate
 
-> 当前版本：**v0.5.22**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
+> 当前版本：**v0.5.23**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
 > 各阶段性设计见 `docs/`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
 即可把文档翻译成指定语言并保存为双语 PDF、原位翻译 PDF、Markdown 或纯文本。
 
-> **v0.5.22（本轮）**：修复「OCR 表格重建」在**混合页**上丢失内容——`redraw_ocr` 会把扫描
+> **v0.5.23（本轮）**：修复**翻译成功后异常退出**（`RuntimeError: wrapped C/C++ object of
+> type TranslateWorker has been deleted`，进程直接 abort）。`stopped -> worker.deleteLater`
+> 在 worker 线程内释放 C++ 对象，而 `finished` 是排队投给 GUI 线程的，删除可能先到；此时
+> `_on_finished` 读 `_report` 就会落到 sip 上抛异常。`_report` 此前只在 agent 路径赋值，
+> 因此 **IR 模式 / 非视觉模型回退 / 「重新导出」** 三种运行必然命中（v0.5.21 用户实测即 IR 模式）。
+> 现改为：`TranslateWorker.__init__` 初始化 `_report = ""`；GUI 侧读字段统一走 `worker_field()`
+> （对象已删也能读到真值），对 worker 的 Qt 级调用统一先经 `MainWindow._live_worker()` 过滤。
+
+> **v0.5.22**：修复「OCR 表格重建」在**混合页**上丢失内容——`redraw_ocr` 会把扫描
 > 表格页重绘为干净矢量表（空白页 + 网格线 + 译文），但重绘只保留 OCR 表格单元；若该页还混有
 > `is_chart`（图表节点）或非 OCR（文本层脚注/页码）块，这些块会被**整页静默丢弃**。现新增纯页
 > 判定 `_is_pure_ocr_table_page`：仅当整页每个块都是可重绘的 OCR 表格单元时才整页重绘，否则落到
