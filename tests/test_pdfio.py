@@ -208,6 +208,98 @@ class PdfioTest(unittest.TestCase):
         finally:
             d.close()
 
+    def test_single_line_label_above_a_table_stays_one_line(self):
+        # v0.5.34: a one-line source label whose translation is longer must not wrap
+        # across the rule directly under it.  Measured on a real report: 「单位：人民币
+        # 万元」 → "Unit: RMB in ten thousand yuan" wrapped and its second line ran
+        # through the table's top border.  It keeps ONE line at the readability
+        # floor and overflows sideways instead.
+        src = _OUT / "label_table_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((50, 56), "Amount unit: RMB", fontsize=10)
+        # A ruled 2x2 table directly below the label (its top border at y=60).
+        page.draw_rect(fitz.Rect(50, 60, 350, 120), color=(0, 0, 0), width=0.8)
+        page.draw_line(fitz.Point(50, 90), fitz.Point(350, 90), color=(0, 0, 0), width=0.8)
+        page.draw_line(fitz.Point(200, 60), fitz.Point(200, 120), color=(0, 0, 0), width=0.8)
+        page.insert_text((60, 82), "Item", fontsize=10)
+        page.insert_text((60, 112), "Total assets", fontsize=10)
+        doc.save(str(src))
+        doc.close()
+
+        blocks = pdfio.extract_document_text(src).pages[0]
+        label_idx = next(
+            i for i, b in enumerate(blocks) if "Amount unit" in b.text
+        )
+        trans = [b.text for b in blocks]
+        trans[label_idx] = "Amount unit: RMB in ten thousand yuan"
+        out = _OUT / "label_table.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], out, "English")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            spans = [
+                s for blk in page.get_text("dict")["blocks"] if "lines" in blk
+                for line in blk["lines"] for s in line["spans"]
+                if "Amount unit:" in s["text"]
+            ]
+            self.assertEqual(1, len(spans), [s["text"] for s in spans])
+            self.assertLessEqual(
+                spans[0]["bbox"][3], 60.0,
+                f"label wrapped through the table's top border: {spans[0]['bbox']}",
+            )
+            # ... and the table's top rule is still there.
+            top_rules = [
+                dr for dr in page.get_drawings()
+                if dr.get("rect") and abs(dr["rect"].y0 - 60.0) < 1.5
+                and dr["rect"].width > 100
+            ]
+            self.assertTrue(top_rules, "the table's top border disappeared")
+        finally:
+            d.close()
+
+    def test_faint_scan_text_is_covered_too(self):
+        # v0.5.34: the cover band is measured with a *core* threshold (dark strokes)
+        # and then grown into the printed (lighter) rows around it.  Without that
+        # growth the faint parts of a scanned glyph stayed visible under the
+        # translation (visible ghosting on a real scan).
+        src = _OUT / "scan_faint_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 300, 70), 0)
+        pix.set_rect(fitz.IRect(0, 0, 300, 70), (255,))
+        for x in range(4, 296, 14):
+            pix.set_rect(fitz.IRect(x, 30, x + 8, 42), (30,))     # dark core
+            pix.set_rect(fitz.IRect(x, 26, x + 8, 30), (185,))    # faint top edge
+            pix.set_rect(fitz.IRect(x, 42, x + 8, 46), (185,))    # faint bottom edge
+        page.insert_image(fitz.Rect(50, 50, 350, 120), pixmap=pix)
+        doc.save(str(src))
+        doc.close()
+
+        ocr_block = pdfio.Block(
+            text="scanned text", page=0, x0=50, y0=50, x1=350, y1=120,
+            size=12.0, align="left", bold=False, single_line=False, ocr=True,
+        )
+        out = _OUT / "scan_faint.pdf"
+        pdfio.save_translated_pdf(src, [[ocr_block]], [["translated text"]], out, "Chinese")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            covers = [
+                dr["rect"] for dr in page.get_drawings()
+                if dr.get("fill") and all(abs(c - 1.0) < 0.01 for c in dr["fill"])
+            ]
+            self.assertTrue(covers)
+            top = min(r.y0 for r in covers)
+            bottom = max(r.y1 for r in covers)
+            # The faint rows (page y 76..80 and 92..96) are covered too.
+            self.assertLessEqual(top, 76.5)
+            self.assertGreaterEqual(bottom, 95.5)
+        finally:
+            d.close()
+
     def test_ocr_cover_band_bounds_the_translation(self):
         # The translation is fitted into the measured band too, so it cannot be
         # drawn past the row rule (the second half of "避免压线").
