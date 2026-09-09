@@ -2127,60 +2127,142 @@ def _partial_image_rects(page) -> list[fitz.Rect]:
     return out
 
 
-#: Mean luminance (0-255) of a "paper" pixel: white paper, however faintly printed.
-_PAPER_LUMA = 200
 #: Share of paper pixels for a region to count as paper (a printed line of text on
 #: white paper still leaves most pixels white; a photo does not).
 _PAPER_SHARE = 0.6
 #: DPI the page is rendered at to sample the background under an OCR block.
 _PHOTO_SAMPLE_DPI = 72
+#: Smallest page contrast (luma span) for a page to be measurable.  A blank or
+#: near-uniform page has no glyphs to find, and percentile noise would invent them.
+_MIN_LUMA_SPAN = 20.0
+#: Below this paper level the page is *mostly dark* (a photo / inverted scan): the
+#: adaptive thresholds are unreliable, so callers fall back to the safe cover.
+_MIN_PAPER_LEVEL = 100.0
+#: Side of the local-background sampling cell, in points (≈ 16 pt ⇒ a few text
+#: lines): a rule or a grey scan patch is compared with *its own* surroundings
+#: rather than with the whole page.
+_BG_CELL_PT = 16.0
 
 
-def _region_is_paper(pix, rect, page) -> bool:
-    """True when the rendered region under ``rect`` is mostly white paper.
+def _local_paper(luma, cell: int):
+    """Per-pixel local paper level (90th percentile of a ``cell``-sized window).
+
+    A page-level paper estimate cannot serve both a white margin and a grey scan
+    patch: on a white page a faint scan's paper is 20-60 luma *below* the page's
+    white, so a global threshold reads the scan's paper as ink and the rule mask
+    collapses.  A coarse grid of local 90th percentiles (upsampled) gives each
+    area its own paper level.  Pure numpy (block reshape + percentile).
+    """
+    import numpy as np
+
+    h, w = luma.shape
+    cell = max(4, int(cell))
+    ph = ((h + cell - 1) // cell) * cell
+    pw = ((w + cell - 1) // cell) * cell
+    padded = np.pad(luma, ((0, ph - h), (0, pw - w)), mode="edge")
+    blocks = (
+        padded.reshape(ph // cell, cell, pw // cell, cell)
+        .transpose(0, 2, 1, 3)
+        .reshape(-1, cell * cell)
+    )
+    p90 = np.percentile(blocks, 90.0, axis=1)
+    grid = p90.reshape(ph // cell, pw // cell)
+    # A cell straddling a bright margin (white page next to a grey scan) would take
+    # the margin as its paper level and read the scan as ink.  The paper level of a
+    # neighbourhood is the *darkest* of its cells: a bright neighbour must not raise
+    # it, while a dark neighbour only lowers it (glyphs stay below either way).
+    padded_grid = np.pad(grid, 1, mode="edge")
+    grid = np.minimum.reduce([
+        padded_grid[i:i + grid.shape[0], j:j + grid.shape[1]]
+        for i in range(3) for j in range(3)
+    ])
+    bg = np.repeat(np.repeat(grid, cell, axis=0), cell, axis=1)[:h, :w]
+    return bg
+
+
+def _page_levels(luma, scale: float):
+    """``(bg, span, offsets)`` for a page, or ``None`` when it cannot be measured.
+
+    ``bg`` is the per-pixel local paper level (``_local_paper``); ``span`` is a
+    robust page contrast (p90 - p1); the returned offsets are the luma distances
+    below ``bg`` that mark a pixel as printed / glyph core / antialiased edge.
+    Everything is derived from the page itself, so a clean 300 dpi scan (paper 250,
+    ink 30), a grey photocopy (200/90) and a faint fax (235/165) are all handled
+    without retuning — a fixed pair either leaves faint strokes uncovered (ghosting
+    under the translation) or treats paper as ink (whole-box covers that clip rules).
+    """
+    if luma is None or luma.size == 0:
+        return None
+    try:
+        import numpy as np
+    except Exception:                  # noqa: BLE001 — no numpy: caller falls back
+        return None
+    try:
+        p90 = float(np.percentile(luma, 90.0))
+        p01 = float(np.percentile(luma, 1.0))
+    except Exception:                  # noqa: BLE001
+        return None
+    if p90 < _MIN_PAPER_LEVEL:
+        return None
+    span = max(_MIN_LUMA_SPAN, p90 - p01)
+    cell = max(4, int(round(_BG_CELL_PT * max(0.1, scale))))
+    try:
+        bg = _local_paper(luma, cell)
+    except Exception:                  # noqa: BLE001
+        return None
+    printed = max(8.0, 0.22 * span)
+    core = max(20.0, 0.50 * span)
+    edge = max(6.0, 0.15 * span)
+    return bg, span, (printed, core, edge)
+
+
+def _region_is_paper(luma, rect, levels, page) -> bool:
+    """True when the rendered region under ``rect`` is mostly *paper*.
 
     Decides whether an OCR block sits on a *scan of printed text* (the white cover
     is what hides the printed glyphs) or on a photo / coloured logo (the pixels are
-    the content — a cover would punch a white hole in it).  A rotated page cannot be
-    sampled with the unrotated block coordinates, and any sampling failure keeps the
+    the content — a cover would punch a white hole in it).  Two conditions: the
+    region's own local paper level must dominate it (so a scan on grey paper
+    passes) and must be within reach of the page's paper level (so a uniformly dark
+    photo does not pass just because it is uniform).  Sampling failure keeps the
     safe behaviour (cover).
     """
-    if pix is None or pix.width <= 0 or pix.height <= 0:
+    if luma is None or levels is None:
         return True
-    if int(getattr(page, "rotation", 0) or 0):
-        return True
-    sx = pix.width / max(1e-6, float(page.rect.width))
-    sy = pix.height / max(1e-6, float(page.rect.height))
-    x0 = max(0, int(rect.x0 * sx))
-    x1 = min(pix.width, int(rect.x1 * sx) + 1)
-    y0 = max(0, int(rect.y0 * sy))
-    y1 = min(pix.height, int(rect.y1 * sy) + 1)
+    import numpy as np
+
+    bg, span, _offsets = levels
+    h, w = luma.shape
+    sx = w / max(1e-6, float(page.rect.width))
+    sy = h / max(1e-6, float(page.rect.height))
+    x0 = max(0, int((rect.x0 - page.rect.x0) * sx))
+    x1 = min(w, int((rect.x1 - page.rect.x0) * sx) + 1)
+    y0 = max(0, int((rect.y0 - page.rect.y0) * sy))
+    y1 = min(h, int((rect.y1 - page.rect.y0) * sy) + 1)
     if x1 <= x0 or y1 <= y0:
         return True
-    try:
-        import numpy as np
-
-        arr = np.frombuffer(pix.samples, dtype=np.uint8)
-        arr = arr.reshape(pix.height, pix.stride)[:, : pix.width * pix.n]
-        arr = arr.reshape(pix.height, pix.width, pix.n)
-        region = arr[y0:y1, x0:x1, : min(3, pix.n)]
-        if region.size == 0:
-            return True
-        luma = region.mean(axis=2)
-        return float((luma >= _PAPER_LUMA).mean()) >= _PAPER_SHARE
-    except Exception:  # noqa: BLE001 — no numpy / odd pixmap: keep the cover
+    region = luma[y0:y1, x0:x1]
+    if region.size == 0:
         return True
+    try:
+        local_bg = float(np.median(bg[y0:y1, x0:x1]))
+        page_paper = float(np.median(bg))
+    except Exception:                  # noqa: BLE001
+        return True
+    if local_bg < 0.75 * page_paper:
+        return False                   # a dark region is a photo, not paper
+    return float((region >= local_bg - 0.10 * span).mean()) >= _PAPER_SHARE
 
 
 def _photo_ocr_blocks(page, blocks: Sequence[Block],
                       log: Callable[[str], None] | None = None,
-                      pix=None) -> set[int]:
+                      pix=None, luma=None, levels=None) -> set[int]:
     """Indices of OCR blocks that sit on a photo / coloured logo (P1-3).
 
     Such a block must not get the opaque white cover — it would punch a white hole
     in the picture — so the cover is skipped (the translation is still drawn).  A
-    scan of printed text is mostly white paper and keeps its cover.  ``pix`` lets
-    the caller pass an already rendered page (the ink-band sampler renders one).
+    scan of printed text is mostly paper and keeps its cover.  ``pix``/``luma``/
+    ``levels`` let the caller reuse the page render it already made.
     """
     partial = _partial_image_rects(page)
     if not partial:
@@ -2192,12 +2274,23 @@ def _photo_ocr_blocks(page, blocks: Sequence[Block],
     ]
     if not candidates:
         return set()
-    if pix is None:
-        try:
-            pix = page.get_pixmap(dpi=_PHOTO_SAMPLE_DPI)
-        except Exception:  # noqa: BLE001 — sampling is best-effort
-            pix = None
-    out = {j for j in candidates if not _region_is_paper(pix, blocks[j], page)}
+    if luma is None:
+        if pix is None:
+            try:
+                pix = page.get_pixmap(dpi=_PHOTO_SAMPLE_DPI)
+            except Exception:  # noqa: BLE001 — sampling is best-effort
+                pix = None
+        luma = _pixmap_luma(pix)
+    if levels is None:
+        scale = (
+            luma.shape[1] / max(1e-6, float(page.rect.width))
+            if luma is not None else 1.0
+        )
+        levels = _page_levels(luma, scale)
+    out = {
+        j for j in candidates
+        if not _region_is_paper(luma, blocks[j], levels, page)
+    }
     if out and log:
         log(f"{len(out)} 个 OCR 文本块位于图片区域，已保留原图像素（不画白底）。")
     return out
@@ -2207,37 +2300,27 @@ def _photo_ocr_blocks(page, blocks: Sequence[Block],
 #: 150 dpi resolves a 0.5 pt printed rule (≈1 px); at 72 dpi a hairline rule falls
 #: between pixel rows, reads as blank paper, and the cover would pad over it.
 _INK_SAMPLE_DPI = 150
-#: A pixel counts as a glyph *core* below this luminance (0-255).  Dark enough to
-#: separate printed strokes from the grey speckle of a scanned page.
-_INK_LUMA = 140
-#: A pixel counts as *printed* below this luminance — the antialiased edge of a
-#: glyph is lighter than its core but must still be covered (leaving those rows
-#: out made faint source strokes show through the white cover).
-_INK_EDGE_LUMA = 200
 #: How many rows a measured glyph run may grow into printed (non-rule) rows —
 #: ~4 pt at 150 dpi, enough for antialiased edges and faint stroke ends while
 #: still stopping at the row rule (rules are excluded explicitly).
 _INK_EDGE_PX = 9
-#: A pixel counts as *printed* (not paper) below this luminance.  Used for rule
-#: detection, where the run-length + thickness filters remove noise on their own.
-_PRINTED_LUMA = _PAPER_LUMA
 #: A pixel row needs at least this share of glyph ink to count as a text row
 #: (isolated scan specks are ignored).
 _MIN_INK_SHARE = 0.005
-#: A printed run at least this long (pixels at ``_INK_SAMPLE_DPI``) is a RULE, not a
-#: glyph stroke: a 10 pt character is ~21 px tall at 150 dpi, a table rule runs
-#: across a whole cell.
-_RULE_MIN_RUN_PX = 30
-#: A rule is *thin*: a printed run thicker than this in the perpendicular direction
-#: is text (a dense line of glyphs whose strokes touch), never a rule.
-_RULE_MAX_THICK_PX = 6
-#: Gaps up to this many pixels are closed before measuring runs, so a *dashed*
-#: rule (common on scanned statements) counts as one printed line.  The thinness
-#: filter below keeps merged text lines from being mistaken for rules.
-_RULE_GAP_PX = 4
-#: A rule must carry a solid run of at least this many pixels (its dashes), which
+#: A printed run at least this long is a RULE, not a glyph stroke: a 10 pt glyph
+#: stroke is ~21 px at 150 dpi while a table rule runs across a cell.  Expressed in
+#: *points* so the criterion does not depend on the sampling DPI.
+_RULE_MIN_RUN_PT = 10.0
+#: A rule is *thin*: a printed run thicker than this (points) in the perpendicular
+#: direction is text (a dense line of glyphs whose strokes touch), never a rule.
+_RULE_MAX_THICK_PT = 3.0
+#: Gaps up to this many points are closed before measuring runs, so a *dashed* rule
+#: (common on scanned statements) counts as one printed line.  The thinness filter
+#: keeps merged text lines from being mistaken for rules.
+_RULE_GAP_PT = 2.0
+#: A rule must carry a solid run of at least this many points (its dashes), which
 #: the 1-2 px dots of a scanned page's texture never do.
-_RULE_MIN_SOLID_PX = 6
+_RULE_MIN_SOLID_PT = 3.0
 #: Share of a row/column inside a block's box that must be rule pixels for it to
 #: count as a rule crossing that block.
 _RULE_OVERLAP_SHARE = 0.3
@@ -2293,26 +2376,31 @@ def _close_gaps(mask, axis: int, gap: int):
     return out if axis == 1 else out.T
 
 
-def _page_rule_mask(luma):
+def _page_rule_mask(luma, levels, scale: float):
     """Boolean mask of printed RULES (table lines / underlines), not glyphs.
 
-    A rule is a *long and thin* printed run: long enough to cross a cell (30 px ≈
-    14 pt at 150 dpi) and at most ``_RULE_MAX_THICK_PX`` thick across.  Glyph
-    strokes are thin too but short, and a dense text line is long but thick, so
-    the pair of filters separates rules from text without any text analysis —
-    and it catches a rule at *any* darkness, which a per-block threshold misses.
-    Small gaps are closed first so a dashed rule counts as one line.
+    A rule is a *long and thin* printed run: longer than ``_RULE_MIN_RUN_PT`` and at
+    most ``_RULE_MAX_THICK_PT`` thick across (both in *points*, so the criteria do
+    not depend on the sampling DPI or the document's size).  Glyph strokes are thin
+    too but short, and a dense text line is long but thick, so the pair of filters
+    separates rules from text without any text analysis — and it catches a rule at
+    *any* darkness, which a per-block threshold misses.  Small gaps are closed first
+    so a dashed rule counts as one line.  ``levels``/``scale`` come from the page's
+    own contrast and render resolution.
     """
-    if luma is None:
+    if luma is None or levels is None:
         return None
-    printed = luma < _PRINTED_LUMA
+    bg, _span, offsets = levels
+    edge_off = offsets[2]
+    min_run = max(4, int(round(_RULE_MIN_RUN_PT * scale)))
+    max_thick = max(2, int(round(_RULE_MAX_THICK_PT * scale)))
+    gap = max(1, int(round(_RULE_GAP_PT * scale)))
+    min_solid = max(2, int(round(_RULE_MIN_SOLID_PT * scale)))
+    printed = luma < bg - edge_off
     # Both closings feed one mask: measuring the thickness on the *horizontally*
     # closed mask alone made every gap-filled pixel look "thin" (it has no
     # vertical extent of its own), so whole text lines were classified as rules.
-    both = (
-        _close_gaps(printed, 1, _RULE_GAP_PX)
-        | _close_gaps(printed, 0, _RULE_GAP_PX)
-    )
+    both = _close_gaps(printed, 1, gap) | _close_gaps(printed, 0, gap)
     h_len = _runs_len(both, 1)
     v_len = _runs_len(both, 0)
     # A rule must also contain a *solid* stretch of its own: the fine dot texture
@@ -2321,18 +2409,44 @@ def _page_rule_mask(luma):
     raw_h = _runs_len(printed, 1)
     raw_v = _runs_len(printed, 0)
     h_rule = (
-        both & (h_len >= _RULE_MIN_RUN_PX) & (v_len <= _RULE_MAX_THICK_PX)
-        & (raw_h >= _RULE_MIN_SOLID_PX)
+        both & (h_len >= min_run) & (v_len <= max_thick)
+        & (raw_h >= min_solid)
     )
     v_rule = (
-        both & (v_len >= _RULE_MIN_RUN_PX) & (h_len <= _RULE_MAX_THICK_PX)
-        & (raw_v >= _RULE_MIN_SOLID_PX)
+        both & (v_len >= min_run) & (h_len <= max_thick)
+        & (raw_v >= min_solid)
     )
     return h_rule | v_rule
 
 
-def _ink_bands(luma, rules, rect, page):
-    """Measured glyph bands of an OCR box: ``([x0, x1]…, [(y0, y1)…])``.
+def _rot_map_rect(rect: fitz.Rect, page, inverse: bool = False) -> fitz.Rect:
+    """Map a rect between the page's unrotated frame and its rendered frame.
+
+    ``Block`` coordinates live in the unrotated frame while ``get_pixmap`` renders
+    the *displayed* (rotated) page, so a rotated scan needs the mapping to be
+    sampled at all.  The transform is a pure axis swap/mirror, so rects stay rects.
+    """
+    rot = int(getattr(page, "rotation", 0) or 0) % 360
+    if rot == 0:
+        return fitz.Rect(rect)
+    w = float(page.mediabox.width)
+    h = float(page.mediabox.height)
+    r = rect
+    if inverse:
+        if rot == 90:      # (x, y) = (y', H - x')
+            return fitz.Rect(r.y0, h - r.x1, r.y1, h - r.x0)
+        if rot == 180:     # self-inverse
+            return fitz.Rect(w - r.x1, h - r.y1, w - r.x0, h - r.y0)
+        return fitz.Rect(w - r.y1, r.x0, w - r.y0, r.x1)   # 270: (x, y) = (W - y', x')
+    if rot == 90:          # (x', y') = (H - y, x)
+        return fitz.Rect(h - r.y1, r.x0, h - r.y0, r.x1)
+    if rot == 180:         # (x', y') = (W - x, H - y)
+        return fitz.Rect(w - r.x1, h - r.y1, w - r.x0, h - r.y0)
+    return fitz.Rect(r.y0, w - r.x1, r.y1, w - r.x0)       # 270: (x', y') = (y, W - x)
+
+
+def _ink_bands(luma, rules, rect, page, levels, tight_x: bool = False):
+    """Tight white-cover rects for one OCR box, in the *rendered* frame.
 
     An OCR box carries padding above and below the glyphs, and on a scanned
     financial statement it usually reaches the row rules, so covering the whole
@@ -2342,15 +2456,20 @@ def _ink_bands(luma, rules, rect, page):
     and split the cover, so each text line gets its own tight white rectangle and
     every rule survives.
 
-    Returns ``None`` when nothing can be measured (rotated page / no numpy / no
-    ink) — the caller then keeps the previous whole-box cover.
+    ``tight_x`` also shrinks the horizontal span to the measured ink columns —
+    needed on a rotated page, where the text's vertical extent in the *block* frame
+    is the horizontal extent of the rendered frame.
+
+    Returns a list of ``(x0, y0, x1, y1)`` rects (empty when nothing can be
+    measured: no numpy / no ink / a page without usable contrast) — the caller
+    then keeps the previous whole-box cover.
     """
-    if luma is None:
-        return None
-    if int(getattr(page, "rotation", 0) or 0):
-        return None                    # block coords live in the unrotated frame
+    if luma is None or levels is None:
+        return []
     import numpy as np
 
+    bg, _span, offsets = levels
+    core_off, edge_off = offsets[1], offsets[2]
     h, w = luma.shape
     sx = w / max(1e-6, float(page.rect.width))
     sy = h / max(1e-6, float(page.rect.height))
@@ -2359,25 +2478,34 @@ def _ink_bands(luma, rules, rect, page):
     py0 = max(0, int((rect.y0 - page.rect.y0) * sy))
     py1 = min(h, int((rect.y1 - page.rect.y0) * sy) + 1)
     if px1 <= px0 or py1 <= py0:
-        return None
+        return []
     region = luma[py0:py1, px0:px1]
     if region.size == 0:
-        return None
-    core = region < _INK_LUMA
-    printed = region < _INK_EDGE_LUMA
+        return []
+    core = region < bg[py0:py1, px0:px1] - core_off
+    printed = region < bg[py0:py1, px0:px1] - edge_off
     min_px = max(2, int(_MIN_INK_SHARE * region.shape[1]))
     is_rule_row = np.zeros(region.shape[0], dtype=bool)
     is_rule_col = np.zeros(region.shape[1], dtype=bool)
+    thin_rule_col = np.zeros(region.shape[1], dtype=bool)
     if rules is not None:
         rregion = rules[py0:py1, px0:px1]
         is_rule_row = rregion.mean(axis=1) >= _RULE_OVERLAP_SHARE
+        col_share = rregion.mean(axis=0)
         # A vertical rule must also continue *beyond* the block's box: a glyph's
         # own vertical stroke is a thin tall run too, but it stops inside the box.
         ext = max(3, int(2.0 * sy))
         above = rules[max(0, py0 - ext):py0, px0:px1].any(axis=0)
         below = rules[py1:min(h, py1 + ext), px0:px1].any(axis=0)
-        is_rule_col = (
-            (rregion.mean(axis=0) >= _RULE_OVERLAP_SHARE) & (above | below)
+        is_rule_col = (col_share >= _RULE_OVERLAP_SHARE) & (above | below)
+        # ... and independently of that: a *thin* rule strip (its own width is a
+        # rule thickness) is a rule wherever it sits — on a rotated page the glyph
+        # band and the row rule are both vertical strips in the rendered frame, and
+        # only the rule strip is thin.
+        rule_width = _runs_len(rregion, 1).max(axis=0) if rregion.any() else col_share
+        thin_rule_col = (
+            (col_share >= _RULE_OVERLAP_SHARE)
+            & (rule_width <= max(2, int(round(_RULE_MAX_THICK_PT * sy))))
         )
 
     def _runs_of(mask) -> list[tuple[int, int]]:
@@ -2431,40 +2559,65 @@ def _ink_bands(luma, rules, rect, page):
             merged.append((a, b))
     runs = merged
     if not runs:
-        return None
-    # Horizontal span: split at printed rule columns, so a cover never crosses a
-    # vertical table line even when the OCR box spans one (merged fragments do).
-    xsegs: list[tuple[int, int]] = []
-    start = None
-    for k, rule_col in enumerate(is_rule_col):
-        if not rule_col and start is None:
-            start = k
-        elif rule_col and start is not None:
-            xsegs.append((start, k))
-            start = None
-    if start is not None:
-        xsegs.append((start, len(is_rule_col)))
-    if not xsegs:
-        xsegs = [(0, len(is_rule_col))]
-    return (
-        [
-            (page.rect.x0 + (px0 + a) / sx, page.rect.x0 + (px0 + b) / sx)
-            for a, b in xsegs
-        ],
-        [
-            (page.rect.y0 + (py0 + a) / sy, page.rect.y0 + (py0 + b) / sy)
-            for a, b in runs
-        ],
-    )
+        return []
+    # Horizontal span: normally the block's own x-range minus printed rule columns
+    # (so a cover never crosses a vertical table line even when the OCR box spans
+    # one).  With ``tight_x`` it is additionally shrunk to the ink columns — a
+    # rotated page's text band runs along x in the rendered frame.
+    if tight_x:
+        col_core = core.sum(axis=0) >= max(2, int(_MIN_INK_SHARE * region.shape[0]))
+        col_printed = printed.sum(axis=0)
+        col_runs = _runs_of(col_core & ~thin_rule_col)
+        grown_cols: list[tuple[int, int]] = []
+        for a, b in col_runs:
+            for _ in range(_INK_EDGE_PX):
+                if a > 0 and not thin_rule_col[a - 1] and col_printed[a - 1] >= 2:
+                    a -= 1
+                else:
+                    break
+            for _ in range(_INK_EDGE_PX):
+                if (
+                    b < len(col_core) and not thin_rule_col[b]
+                    and col_printed[b] >= 2
+                ):
+                    b += 1
+                else:
+                    break
+            grown_cols.append((a, b))
+        xsegs = grown_cols or [(0, len(is_rule_col))]
+    else:
+        xsegs = []
+        start = None
+        for k, rule_col in enumerate(is_rule_col):
+            if not rule_col and start is None:
+                start = k
+            elif rule_col and start is not None:
+                xsegs.append((start, k))
+                start = None
+        if start is not None:
+            xsegs.append((start, len(is_rule_col)))
+        if not xsegs:
+            xsegs = [(0, len(is_rule_col))]
+    return [
+        (
+            page.rect.x0 + (px0 + a) / sx,
+            page.rect.y0 + (py0 + c) / sy,
+            page.rect.x0 + (px0 + b) / sx,
+            page.rect.y0 + (py0 + d) / sy,
+        )
+        for a, b in xsegs
+        for c, d in runs
+    ]
 
 
 def _rule_below(rules, page, y_from: float, x0: float, x1: float,
-                search_pt: float = 60.0) -> float | None:
+                search_pt: float = 200.0) -> float | None:
     """PDF y of the first printed rule row at/below ``y_from`` within ``x0..x1``.
 
     Used to bound a translation vertically: the OCR row band is derived from text
     tops, so it *includes* the row rule — a wrapped translation could otherwise
-    run through it.
+    run through it.  The search window is generous (200 pt) so a tall row or a
+    paragraph above a rule is still bounded.
     """
     if rules is None:
         return None
@@ -2489,17 +2642,18 @@ def _rule_below(rules, page, y_from: float, x0: float, x1: float,
 
 
 def _tight_ocr_box(block: Block, draw_box: fitz.Rect,
-                   bands: Sequence[tuple[float, float]]) -> fitz.Rect:
+                   rects: Sequence[tuple[float, float, float, float]]) -> fitz.Rect:
     """Shrink ``draw_box`` onto the measured glyph band, never below one line.
 
     The translation is fitted into the returned box, so it hugs the row exactly
     like the source line did instead of floating in the OCR box's padding — the
-    same padding that made the cover clip the row rules.
+    same padding that made the cover clip the row rules.  ``rects`` are cover
+    rects (unrotated frame); only their vertical extent is used.
     """
-    if not bands:
+    if not rects:
         return draw_box
-    y0 = min(b[0] for b in bands)
-    y1 = max(b[1] for b in bands)
+    y0 = min(r[1] for r in rects)
+    y1 = max(r[3] for r in rects)
     one_line = max(3.0, float(getattr(block, "size", 0.0) or 0.0) * 1.1)
     if y1 - y0 < one_line:
         cy = (y0 + y1) / 2.0
@@ -4219,8 +4373,9 @@ def _draw_translated_block(page: fitz.Page, font, block: Block, text: str,
             # An over-long right-aligned line grows into the blank space on its
             # LEFT: the source box is the glyph box, so clamping to its left edge
             # would push the overflow to the right instead, over the neighbouring
-            # cell (or off the page).  Shorter lines are unchanged.
-            x = r.x1 - lw
+            # cell (or off the page).  Shorter lines are unchanged; an extreme
+            # overflow is still clamped to the page so it stays visible.
+            x = max(page.rect.x0 + 1.0, r.x1 - lw)
         tw.append(fitz.Point(x, y), line, font=font, fontsize=fs)
         y += fs * leading
     tw.write_text(page, color=_color_tuple(block.color) if block.color else None)
@@ -5411,14 +5566,35 @@ def save_translated_pdf(
                     log=(lambda m: log(f"  第 {i + 1} 页：{m}")) if log else None,
                 )
 
+            # Render the page ONCE and derive everything pixel-based from it: the
+            # adaptive luma levels (this page's own contrast), the printed-rule mask
+            # and the per-block glyph bands.  Rendering is cheap (A4 at 150 dpi ≈
+            # 3 ms) and doing it for every page — not just scanned ones — is what
+            # makes the "do not cross a printed rule" rule work on text-layer pages
+            # too (a label above an underline has no table bbox to consult).
+            ink_pix = None
+            try:
+                ink_pix = page.get_pixmap(dpi=_INK_SAMPLE_DPI)
+            except Exception:  # noqa: BLE001 — measurement is best-effort
+                ink_pix = None
+            ink_luma = _pixmap_luma(ink_pix)
+            ink_scale = (
+                ink_luma.shape[1] / max(1e-6, float(page.rect.width))
+                if ink_luma is not None else 1.0
+            )
+            ink_levels = _page_levels(ink_luma, ink_scale)
+            ink_rules = _page_rule_mask(ink_luma, ink_levels, ink_scale)
+            rotated = bool(int(getattr(page, "rotation", 0) or 0) % 360)
+
             # P1-3: an OCR block that sits on a *photo / coloured logo* must not get
             # the opaque white cover — it would punch a white hole in the picture.
             # The block is still drawn; only the cover is skipped.  The decision is
             # pixel-based (``_region_is_paper``): a scan of printed text is mostly
-            # white paper and keeps its cover, a photo does not.
+            # this page's paper colour and keeps its cover, a photo does not.
             on_photo = _photo_ocr_blocks(
                 page, blocks[:m],
                 log=(lambda msg: log(f"  第 {i + 1} 页：{msg}")) if log else None,
+                luma=ink_luma, levels=ink_levels,
             )
 
             # Top edges (rules) of the tables on this page: a translation must not
@@ -5429,26 +5605,27 @@ def save_translated_pdf(
             # white cover, so the cover (and the translation drawn into it) hugs the
             # row instead of the OCR box's padding — the box reaches the row rules
             # on a scanned statement, and covering it clipped those rules.
-            # Value: ``([x0, x1]…, [(y0, y1)…])`` of the measured glyph bands.
-            cover_bands: dict[
-                int, tuple[list[tuple[float, float]], list[tuple[float, float]]]
-            ] = {}
+            # Value: cover rects in the *unrotated* (block) frame.
+            cover_rects: dict[int, list[tuple[float, float, float, float]]] = {}
             cover_idx = [
                 j for j in range(m)
                 if getattr(blocks[j], "ocr", False) and j not in on_photo
             ]
-            if cover_idx:
-                try:
-                    ink_pix = page.get_pixmap(dpi=_INK_SAMPLE_DPI)
-                except Exception:  # noqa: BLE001 — measurement is best-effort
-                    ink_pix = None
-                ink_luma = _pixmap_luma(ink_pix)
-                ink_rules = _page_rule_mask(ink_luma)
-                if ink_luma is not None:
-                    for j in cover_idx:
-                        measured = _ink_bands(ink_luma, ink_rules, blocks[j], page)
-                        if measured is not None:
-                            cover_bands[j] = measured
+            if ink_luma is not None:
+                for j in cover_idx:
+                    box = fitz.Rect(
+                        blocks[j].x0, blocks[j].y0, blocks[j].x1, blocks[j].y1
+                    )
+                    measured = _ink_bands(
+                        ink_luma, ink_rules, _rot_map_rect(box, page), page,
+                        ink_levels, tight_x=rotated,
+                    )
+                    if measured:
+                        cover_rects[j] = [
+                            tuple(_rot_map_rect(fitz.Rect(r), page, inverse=True))
+                            if rotated else r
+                            for r in measured
+                        ]
 
             # Remove the original text (keep images and other line art/graphics).
             # OCR blocks sit on a raster image rather than a text layer, so
@@ -5528,12 +5705,17 @@ def save_translated_pdf(
                             y1=max(c.y1 for c in row) + dy,
                         )
                 # Obstacles the translation must not reach: the top rule of a table
-                # directly below this block (a wrapped single-line label otherwise
-                # runs through it — measured on the real report's unit note).
+                # directly below this block, and — on *any* page — the next printed
+                # rule below it (a wrapped single-line label otherwise runs through
+                # it; measured on a real report's unit note above a table border).
                 avoid: float | None = None
                 for top in table_tops:
                     if top >= draw_b.y0 + 1.0 and (avoid is None or top < avoid):
                         avoid = top
+                if not rotated:
+                    below = _rule_below(ink_rules, page, draw_b.y1, b.x0, b.x1)
+                    if below is not None:
+                        avoid = below if avoid is None else min(avoid, below)
                 if b.ocr and j not in on_photo:
                     # Cover the underlying scan pixels so the translation does
                     # not overprint the original (raster) text.  The cover hugs
@@ -5544,39 +5726,39 @@ def save_translated_pdf(
                     # band cannot be measured — and it is what the translation is
                     # drawn into when it can, so text and cover coincide.
                     # Skipped on a photo (P1-3): the pixels there are the content.
-                    measured = cover_bands.get(j)
+                    measured = cover_rects.get(j)
                     if measured:
-                        xsegs, runs = measured
-                        for cy0, cy1 in runs:
-                            for cx0, cx1 in xsegs:
-                                page.draw_rect(
-                                    fitz.Rect(cx0, cy0, cx1, cy1),
-                                    color=None,
-                                    fill=(1, 1, 1),
-                                )
+                        for cx0, cy0, cx1, cy1 in measured:
+                            page.draw_rect(
+                                fitz.Rect(cx0, cy0, cx1, cy1),
+                                color=None,
+                                fill=(1, 1, 1),
+                            )
                         # The *translation* hugs the band too, but only for prose
                         # blocks: a table cell's box is already bounded by its row
                         # band (``fit_height``), and shrinking it would let a wrapped
                         # translation start lower and reach the row's bottom rule.
-                        if not b.in_table:
-                            tight = _tight_ocr_box(b, draw_b, runs)
+                        if not b.in_table and not rotated:
+                            tight = _tight_ocr_box(b, draw_b, measured)
                             if tight is not draw_b:
                                 draw_b = replace(draw_b, y0=tight.y0, y1=tight.y1)
                         # Never let the translation cross the row's printed rule:
                         # ``fit_height`` is measured from OCR *text* tops and so
                         # includes the rule, which is how a wrapped label ran
-                        # through the dotted line of a scanned statement.
-                        limit = _rule_below(ink_rules, page, runs[-1][1], b.x0, b.x1)
-                        if limit is not None:
-                            avoid = limit if avoid is None else min(avoid, limit)
-                        if limit is not None and limit - draw_b.y0 >= 3.0:
-                            avail = limit - 0.5 - draw_b.y0
-                            fit_h = float(getattr(draw_b, "fit_height", 0.0) or 0.0)
-                            draw_b = replace(
-                                draw_b,
-                                y1=limit - 0.5,
-                                fit_height=min(fit_h, avail) if fit_h > 0 else avail,
-                            )
+                        # through the dotted line of a scanned statement.  A rotated
+                        # page's vertical bound would be horizontal in the block
+                        # frame, so it is handled by the cover rects alone there.
+                        if avoid is not None and not rotated:
+                            if avoid - draw_b.y0 >= 3.0:
+                                avail = avoid - 0.5 - draw_b.y0
+                                fit_h = float(getattr(draw_b, "fit_height", 0.0) or 0.0)
+                                draw_b = replace(
+                                    draw_b,
+                                    y1=avoid - 0.5,
+                                    fit_height=(
+                                        min(fit_h, avail) if fit_h > 0 else avail
+                                    ),
+                                )
                     else:
                         page.draw_rect(
                             fitz.Rect(

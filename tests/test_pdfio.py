@@ -300,6 +300,173 @@ class PdfioTest(unittest.TestCase):
         finally:
             d.close()
 
+    def _scan_page(self, doc, *, paper: int, ink: int, rule: int | None,
+                   width: int = 300, height: int = 70, full_page: bool = False):
+        """A raster 'scan': letter-like ink segments, optional printed rule."""
+        pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, width, height), 0)
+        pix.set_rect(fitz.IRect(0, 0, width, height), (paper,))
+        for x in range(4, width - 4, 14):
+            pix.set_rect(fitz.IRect(x, 25, x + 8, 45), (ink,))
+        if rule is not None:
+            pix.set_rect(fitz.IRect(0, height - 10, width, height - 8), (rule,))
+        page = doc.new_page(width=400, height=300)
+        rect = page.rect if full_page else fitz.Rect(50, 50, 350, 120)
+        page.insert_image(rect, pixmap=pix)
+        return page
+
+    def _white_covers(self, page):
+        return [
+            dr["rect"] for dr in page.get_drawings()
+            if dr.get("fill") and all(abs(c - 1.0) < 0.01 for c in dr["fill"])
+        ]
+
+    def test_faint_scan_still_gets_a_tight_cover(self):
+        # v0.5.35: the ink/paper levels are derived from the page's OWN contrast.
+        # On a faint scan (paper 235, ink 165) fixed thresholds tuned on a dark
+        # scan find no ink at all — the cover would fall back to the whole OCR box
+        # (clipping rules) or vanish (leaving the source text under the translation).
+        src = _OUT / "faint_src.pdf"
+        doc = fitz.open()
+        self._scan_page(doc, paper=235, ink=165, rule=120)
+        doc.save(str(src))
+        doc.close()
+
+        block = pdfio.Block(
+            text="scanned text", page=0, x0=50, y0=50, x1=350, y1=120,
+            size=12.0, align="left", bold=False, single_line=False, ocr=True,
+        )
+        out = _OUT / "faint.pdf"
+        pdfio.save_translated_pdf(src, [[block]], [["translated text"]], out, "Chinese")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            covers = self._white_covers(page)
+            self.assertTrue(covers, "no cover at all on a faint scan")
+            top = min(r.y0 for r in covers)
+            bottom = max(r.y1 for r in covers)
+            self.assertGreaterEqual(top, 70.0)      # not the whole box (50..120)
+            self.assertLessEqual(bottom, 100.0)
+            for r in covers:
+                self.assertFalse(
+                    r.y0 < 110.5 < r.y1 and r.x0 < 300 and r.x1 > 100,
+                    f"white cover clipped the printed rule: {r}",
+                )
+        finally:
+            d.close()
+
+    def test_dark_scan_paper_is_not_read_as_ink(self):
+        # A dark-ish scan (paper 150, ink 40) must not make the *paper* count as
+        # printed: with an absolute threshold the whole page reads as ink, no rule
+        # is ever detected, and the cover clips it.
+        src = _OUT / "dark_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 400, 300), 0)
+        pix.set_rect(fitz.IRect(0, 0, 400, 300), (150,))          # grey paper
+        for x in range(6, 394, 18):                               # the printed line
+            pix.set_rect(fitz.IRect(x, 100, x + 10, 140), (40,))
+        pix.set_rect(fitz.IRect(0, 160, 400, 162), (40,))         # the row rule
+        page.insert_image(page.rect, pixmap=pix)
+        doc.save(str(src))
+        doc.close()
+
+        block = pdfio.Block(
+            text="scanned text", page=0, x0=40, y0=100, x1=360, y1=140,
+            size=12.0, align="left", bold=False, single_line=False, ocr=True,
+        )
+        out = _OUT / "dark.pdf"
+        pdfio.save_translated_pdf(src, [[block]], [["translated text"]], out, "Chinese")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            covers = self._white_covers(page)
+            self.assertTrue(covers)
+            top = min(r.y0 for r in covers)
+            bottom = max(r.y1 for r in covers)
+            self.assertGreaterEqual(top, 95.0)      # tight, not the 100..140 box
+            self.assertLessEqual(bottom, 145.0)
+            for r in covers:
+                self.assertFalse(
+                    r.y0 < 160.5 < r.y1 and r.x0 < 300 and r.x1 > 100,
+                    f"white cover clipped the printed rule: {r}",
+                )
+        finally:
+            d.close()
+
+    def test_rotated_scan_cover_avoids_the_rule(self):
+        # A /Rotate page's blocks live in the unrotated frame while the sampler
+        # renders the displayed (rotated) page — the mapping must be applied, or the
+        # cover is measured at the wrong place (previously the rotated page fell back
+        # to a whole-box cover that clipped rules).
+        src = _OUT / "rot_src.pdf"
+        doc = fitz.open()
+        page = self._scan_page(doc, paper=255, ink=30, rule=30)
+        page.set_rotation(90)
+        doc.save(str(src))
+        doc.close()
+
+        block = pdfio.Block(
+            text="scanned text", page=0, x0=50, y0=50, x1=350, y1=120,
+            size=12.0, align="left", bold=False, single_line=False, ocr=True,
+        )
+        out = _OUT / "rot.pdf"
+        pdfio.save_translated_pdf(src, [[block]], [["translated text"]], out, "Chinese")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            self.assertEqual(90, int(page.rotation))
+            covers = self._white_covers(page)
+            self.assertTrue(covers)
+            top = min(r.y0 for r in covers)
+            bottom = max(r.y1 for r in covers)
+            # Tight (the glyph band, not the 70 pt box) …
+            self.assertGreaterEqual(top, 70.0)
+            self.assertLessEqual(bottom, 100.0)
+            # … and the rule at unrotated y=110..112 is untouched.
+            for r in covers:
+                self.assertFalse(
+                    r.y0 < 111.0 < r.y1 and r.x0 < 300 and r.x1 > 100,
+                    f"white cover clipped the printed rule: {r}",
+                )
+        finally:
+            d.close()
+
+    def test_label_above_an_underline_stays_one_line(self):
+        # v0.5.35: the "do not cross a rule" obstacle is taken from the page's
+        # printed-rule mask, not only from detected tables — a label above a plain
+        # underline (no table at all) must stay one line too.
+        src = _OUT / "underline_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((50, 56), "Amount unit: RMB", fontsize=10)
+        page.draw_line(fitz.Point(50, 60), fitz.Point(130, 60),
+                       color=(0, 0, 0), width=0.8)
+        doc.save(str(src))
+        doc.close()
+
+        blocks = pdfio.extract_document_text(src).pages[0]
+        label_idx = next(i for i, b in enumerate(blocks) if "Amount unit" in b.text)
+        trans = [b.text for b in blocks]
+        trans[label_idx] = "Amount unit: RMB in ten thousand yuan"
+        out = _OUT / "underline.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], out, "English")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            spans = [
+                s for blk in page.get_text("dict")["blocks"] if "lines" in blk
+                for line in blk["lines"] for s in line["spans"]
+                if "Amount unit:" in s["text"]
+            ]
+            self.assertEqual(1, len(spans), [s["text"] for s in spans])
+            self.assertLessEqual(spans[0]["bbox"][3], 60.0)
+        finally:
+            d.close()
+
     def test_ocr_cover_band_bounds_the_translation(self):
         # The translation is fitted into the measured band too, so it cannot be
         # drawn past the row rule (the second half of "避免压线").
