@@ -814,6 +814,12 @@ class TableCellFitTest(unittest.TestCase):
         # Paragraph (non-table) blocks keep the loose leading.
         self.assertEqual(pdfio._line_leading(font, in_table=False, n_lines=3),
                          pdfio._LOOSE_LEADING)
+        # An explicit override wins (a rebuilt vector table's cells are not
+        # ``in_table`` but still need the tight table leading).
+        self.assertEqual(
+            pdfio._line_leading(font, in_table=False, n_lines=3, override=tight), tight)
+        self.assertEqual(
+            pdfio._line_leading(font, in_table=True, n_lines=3, override=0.0), tight)
         # A wrapped cell measured through ``_fit_block`` is also measured tight,
         # so the row-height re-layout agrees with the drawing pass.
         cell = pdfio.Block(
@@ -2233,6 +2239,37 @@ class OcrTableRedrawTest(unittest.TestCase):
         self.assertIn("Consolidated", text)
         self.assertIn("Parent Company", text)
         self.assertIn("Total assets", text)
+
+
+    def test_draw_ai_table_wraps_with_tight_leading(self):
+        # The rebuilt vector table's rows are sized from the same tight leading the
+        # cells are drawn with.  With the loose paragraph leading (1.35) a two-line
+        # label overran its row and the second line crossed the grid rule below.
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        font = fitz.Font("cjk")
+        label = 'Net profit from continuing operations (net losses indicated by "-")'
+        rows = [[label, "29"], ["Net profit from discontinued operations", "30"]]
+        rect = fitz.Rect(36, 36, 300, 400)
+        pdfio._draw_ai_table(page, rows, rect, font)
+        lines = []
+        for blk in page.get_text("dict")["blocks"]:
+            if blk.get("type") != 0:
+                continue
+            for line in blk.get("lines", []):
+                text = "".join(s["text"] for s in line["spans"]).strip()
+                if text:
+                    lines.append((line["bbox"], line["spans"][0]["size"], text))
+        doc.close()
+        # The first column's lines, top to bottom: the label wraps over two lines.
+        col = sorted(
+            [(b, size) for b, size, _t in lines if abs(b[0] - 40.0) <= 1.0],
+            key=lambda pair: pair[0][1])
+        self.assertGreaterEqual(len(col), 2, lines)
+        (b0, fs0), (b1, _fs1) = col[0], col[1]
+        gap = b1[1] - b0[1]                      # baseline-to-baseline spacing
+        self.assertLessEqual(gap, fs0 * 1.1)     # tight (~1.0), not loose 1.35
+        self.assertGreaterEqual(gap, fs0 * 0.9)
 
 
 class ChartNotATableTest(unittest.TestCase):

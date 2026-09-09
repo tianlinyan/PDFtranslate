@@ -1,10 +1,22 @@
 # PDFtranslate
 
-> 当前版本：**v0.5.27**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
+> 当前版本：**v0.5.28**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
 > 各阶段性设计见 `docs/`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
 即可把文档翻译成指定语言并保存为双语 PDF、原位翻译 PDF、Markdown 或纯文本。
+
+> **v0.5.28**：**调小「OCR表格重建」里 AI 重建矢量表格的文本行间距**——多行单元格原本走
+> **段落**拟合（`in_table=False`）：行距用 1.35× 的松散段落值、字号下限是 7pt 的正文下限，
+> 于是一个两行的长标签既压不下去也排不开，第二行会**越过下面的表格线**（用户截图即此现象）。
+> 现改为**按表格单元格拟合**（`in_table=True` + 显式 `Block.line_leading = 1.0`）：
+> 行距 1.0×、字号下限降到表格的 6pt、优先单行，且行高由 `cell_height` **用同一套 `_fit_block`
+> 测量**（测量与绘制必然一致）。实测同一内容（3 行、窄列）：行距 9.45pt → 6.0pt、
+> 行高 18.6pt → 13.9pt，第二行不再压线；几何重绘（`_draw_ocr_grid_page`）本就使用紧凑行距，
+> 不受影响。
+> `Block` 新增 `line_leading` 字段（0 = 自动），`_line_leading`/`_measure_block_height`/
+> `_draw_translated_block` 全部支持显式覆盖；OCR 缓存块不带该字段时取默认值，**无需递增
+> `_OCR_CACHE_VERSION`**。
 
 > **v0.5.27**：按处理路径审查报告 §4 的顺序继续修 P1，本轮是**结构判定**两条：
 > ① **无框线表格识别不到**（`docs/处理路径审查-v0.5.25.md` P1-1）：`find_tables()` 默认只认框线，

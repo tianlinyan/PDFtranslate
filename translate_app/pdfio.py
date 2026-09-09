@@ -103,6 +103,13 @@ class Block:
     #: translation never crosses the table line below the row.  0 = no band
     #: (last row of a grid, or a text-layer cell), each with its own fallback.
     fit_height: float = 0.0
+    #: Explicit baseline-to-baseline multiplier for this block's wrapped lines.
+    #: 0 = automatic (``_line_leading``: tight 1.0 for a multi-line table cell,
+    #: loose 1.35 for prose).  A *rebuilt* vector table (``_draw_ai_table``) sets
+    #: the tight table leading even though its cells are not ``in_table`` — with
+    #: the loose paragraph leading a two-line label overran its row and the
+    #: second line crossed the grid rule below.
+    line_leading: float = 0.0
 
 
 @dataclass
@@ -3439,7 +3446,8 @@ _LOOSE_LEADING = 1.35
 _TABLE_CELL_LEADING = 1.0
 
 
-def _line_leading(font, *, in_table: bool, n_lines: int) -> float:
+def _line_leading(font, *, in_table: bool, n_lines: int,
+                  override: float = 0.0) -> float:
     """Baseline-to-baseline multiplier for a block's wrapped lines.
 
     A *multi-line* table cell uses the tight ``_TABLE_CELL_LEADING`` (1.0× font
@@ -3447,7 +3455,13 @@ def _line_leading(font, *, in_table: bool, n_lines: int) -> float:
     cells keep: a long translation in a narrow column must stay compact so the
     wrap fits the row band without growing the row or pushing the rows beneath
     it down.  A single line has no inter-line gap, so its leading never matters.
+
+    ``override`` (``Block.line_leading`` when > 0) wins: a rebuilt vector table's
+    cells are drawn with the tight table leading even though they are not
+    ``in_table`` (see ``_draw_ai_table``).
     """
+    if override > 0.0:
+        return override
     if in_table and n_lines > 1:
         return _TABLE_CELL_LEADING
     return _LOOSE_LEADING
@@ -3675,7 +3689,10 @@ def _draw_translated_block(page: fitz.Page, font, block: Block, text: str) -> No
     lines, fs = _fit_block(block, font, text)
     ascent = fs * font.ascender
     descent = -fs * font.descender
-    leading = _line_leading(font, in_table=block.in_table, n_lines=len(lines))
+    leading = _line_leading(
+        font, in_table=block.in_table, n_lines=len(lines),
+        override=getattr(block, "line_leading", 0.0),
+    )
 
     def height() -> float:
         return ascent + (len(lines) - 1) * fs * leading + descent
@@ -4108,7 +4125,10 @@ def _map_blocks_to_table_cells(blocks, tables) -> dict[int, tuple[int, int, int]
 def _measure_block_height(block: Block, font, text: str) -> float:
     """Height the translated ``text`` would occupy in ``block`` (via ``_fit_block``)."""
     lines, fs = _fit_block(block, font, text)
-    leading = _line_leading(font, in_table=block.in_table, n_lines=len(lines))
+    leading = _line_leading(
+        font, in_table=block.in_table, n_lines=len(lines),
+        override=getattr(block, "line_leading", 0.0),
+    )
     return fs * font.ascender + (len(lines) - 1) * fs * leading - fs * font.descender
 
 
@@ -4547,15 +4567,28 @@ def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font,
             text="", page=0, x0=xs[j] + _AI_TABLE_PAD, y0=top,
             x1=xs[j] + w - _AI_TABLE_PAD, y1=top + h,
             size=_AI_TABLE_FONT, align="right" if _is_numeric_cell(text) else "left",
-            single_line=False, in_table=False,
+            # ``in_table``: a rebuilt cell takes the *table* fit path — one line
+            # preferred down to the 6pt table floor, wrap only when one line is
+            # impossible — and the tight table leading (1.0×).  As a paragraph
+            # (``in_table=False``) the floor was the 7pt prose floor and the
+            # leading the loose 1.35×: a two-line label could neither shrink nor
+            # space out enough for its row, and the second line crossed the grid
+            # rule beneath it.
+            single_line=False, in_table=True,
+            line_leading=_TABLE_CELL_LEADING,
         )
 
     def cell_height(cell: str, j: int) -> float:
+        """Row height one cell needs — measured through the SAME fit the draw uses."""
         if not str(cell).strip():
             return 0.0
-        width = max(1.0, col_widths[j] - 2 * _AI_TABLE_PAD)
-        lines = _wrap(font, str(cell), width, _AI_TABLE_FONT)
-        return _wrapped_height(font, lines, _AI_TABLE_FONT, _LOOSE_LEADING)
+        cb = cell_block(j, 0.0, 1.0, str(cell))
+        lines, fs = _fit_block(cb, font, str(cell))
+        return _wrapped_height(
+            font, lines, fs,
+            _line_leading(font, in_table=cb.in_table, n_lines=len(lines),
+                          override=cb.line_leading),
+        )
 
     # Row heights: grow each row to fit its tallest cell (keep a minimum).
     row_hs = [max(_AI_TABLE_MIN_ROW, max((cell_height(c, j) for j, c in enumerate(r)), default=0.0))
@@ -4578,7 +4611,8 @@ def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font,
                 cb = Block(
                     text="", page=0, x0=xs[j] + _AI_TABLE_PAD, y0=y,
                     x1=xs[j + s] - _AI_TABLE_PAD, y1=y + h,
-                    size=_AI_TABLE_FONT, align="center", single_line=False, in_table=False,
+                    size=_AI_TABLE_FONT, align="center", single_line=False,
+                    in_table=True, line_leading=_TABLE_CELL_LEADING,
                 )
             else:
                 cb = cell_block(j, y, h, text)
