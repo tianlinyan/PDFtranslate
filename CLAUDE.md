@@ -16,6 +16,10 @@ python -m unittest tests.test_pdfio.PdfioTest.test_bilingual_pdf -v  # 运行单
 python check_translation.py 原文.pdf 译文.pdf [--lang English] [--strict] [--skip 24-27]
                                          # 导出后体检：数字一致性（exit 1，**按值比较**：全角/单位倍率/
                                          # 千分位风格差异不算错，分隔符错乱仍报）/残留中文/章节编号/页数
+python check_layout.py 原文.pdf 译文.pdf [--page 3,5-7] [--dpi 150]
+                                         # 导出后**排版**体检（exit 1 = 重叠/出页/压线/漏画）：
+                                         # 字形带重叠、越出页面、压在源页印刷线上、字号过小、漏画、
+                                         # 页数/页尺寸——判据全部与文档无关（见 README v0.5.37）
 python verify_real_run.py                 # 真机对照：用 models.json 的 qwen3.8 翻译 p24-27，
                                          # 测量表内格拟合结果（字号桶/行带越界）——需本地模型在线
 python verify_selfcheck.py               # 真模型走查：对样例页跑确定性审计工具 + AI 复核循环（同样需模型在线）
