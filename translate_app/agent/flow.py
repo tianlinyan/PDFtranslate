@@ -967,7 +967,13 @@ def _check_layout(state, page=None):
         page_indices = []
     font = _pdfio._CJK_FONT
     issues: list[dict[str, Any]] = []
-    offset = 0
+    # The flat index of the first block on the first audited page.  For a single
+    # ``page`` this is the ONLY offset that matters — starting at 0 made every
+    # layout finding on page N carry a page-local index, so the check measured
+    # page 0's translation against page N's box (false green when page 0 has
+    # fewer blocks, and an unfixable false red otherwise).  ``_audit_blocks``
+    # computes the same base for the other checks; keep one source of truth.
+    offset = sum(len(pg) for pg in src.pages[:page_indices[0]]) if page_indices else 0
     for p in page_indices:
         blocks = src.pages[p]
         for i, b in enumerate(blocks):
@@ -1182,7 +1188,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         if b is None:
             return {"ok": False, "error": f"bad index {index}"}
         if pdfio._is_numeric_cell(str(b.text)):
-            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
+            return {"ok": False, "error": "数字格不可被 AI 改写（保真）"}
         src = str(text) if text is not None else str(b.text)
         translated, ok = _translate(src, target_lang or state.lang)
         if not ok:
@@ -1216,10 +1222,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
             # Explicit indices are flat, but the model named a page: drop indices that
             # belong to ANOTHER page (a stale/page-local index must not rewrite a block
             # elsewhere) and say so, instead of silently writing across pages.
-            rng = _page_range(page)
-            raw = [int(i) for i in indices]
-            candidates = [i for i in raw if rng[0] <= i < rng[1]]
-            outside = [i for i in raw if not (rng[0] <= i < rng[1])]
+            candidates, outside = _explicit_candidates(page, indices)
             if outside and log:
                 log(f"  忽略不属于第 {int(page) + 1} 页的块索引：{outside}")
         picked: list[int] = []
@@ -1235,7 +1238,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
                 continue
             picked.append(idx)
         if not picked:
-            return {"ok": False, "error": "没有可翻译的块（全部为数字/代码/空块）"}
+            return {"ok": False, "error": "没有可翻译的块（全部为数字格/公式/空块）"}
         sources = [str(_block(i).text) for i in picked]
         result = engine.translate_blocks(
             sources, lang, log=log, cancel=cancel,
@@ -1267,6 +1270,20 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         base = sum(len(p) for p in src_doc.pages[: int(page)])
         return base, base + len(src_doc.pages[int(page)])
 
+    def _explicit_candidates(page: int, indices) -> tuple[list[int], list[int]]:
+        """Split model-supplied flat indices into ``(on_page, dropped)``.
+
+        The model names a page and passes flat block indices; a page-local index
+        (or a stale one from another page) must not silently rewrite a block
+        elsewhere, so every write tool filters through here and reports the drops.
+        """
+        raw = [int(i) for i in indices]
+        rng = _page_range(page)
+        if rng is None:
+            return [], raw
+        return ([i for i in raw if rng[0] <= i < rng[1]],
+                [i for i in raw if not (rng[0] <= i < rng[1])])
+
     def _check_index_on_page(page: int, index: int) -> str | None:
         """Error string when ``index`` is not a flat index of ``page`` (else ``None``).
 
@@ -1290,7 +1307,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         if b is None:
             return {"ok": False, "error": f"bad index {index}"}
         if pdfio._is_numeric_cell(str(b.text)):
-            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
+            return {"ok": False, "error": "数字格不可被 AI 改写（保真）"}
         _write(index, text)
         return {"ok": True, "index": index}
 
@@ -1339,7 +1356,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
             # Same fidelity guard as ``set_text``: a figure must never be rewritten by
             # an annotation (the audit's number check would then flag a block that the
             # AI is forbidden to fix).
-            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
+            return {"ok": False, "error": "数字格不可被 AI 改写（保真）"}
         _write(flat, str(text))
         state.record_op(tool="apply_annotation",
                         args={"page": page, "bbox": list(bbox), "action": action,
@@ -1351,7 +1368,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
 
     def retranslate_block(text: str, target_lang: str | None = None):
         if pdfio._is_numeric_cell(str(text)):
-            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
+            return {"ok": False, "error": "数字格不可被 AI 改写（保真）"}
         if retranslate is None:
             return {"ok": False, "error": "重译不可用（非视觉模型）"}
         return {"ok": True, "text": retranslate(str(text), target_lang or state.lang)}
@@ -1372,11 +1389,21 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
             return {"ok": False, "error": f"bad page {page}"}
         if retranslate_batch is None:
             return {"ok": False, "error": "批量重译不可用（非视觉模型）"}
+        ignored: list[int] = []
         if indices is None:
             base = sum(len(p) for p in src_doc.pages[: int(page)])
             candidates = [base + i for i in range(len(src_doc.pages[int(page)]))]
         else:
-            candidates = [int(i) for i in indices]
+            # Same page-ownership filter as ``translate_blocks``: a page-local (or
+            # stale) index must not silently re-translate a block on another page.
+            candidates, ignored = _explicit_candidates(page, indices)
+            if ignored:
+                if log:
+                    log(f"  忽略不属于第 {int(page) + 1} 页的块索引：{ignored}")
+                if not candidates:
+                    return {"ok": False,
+                            "error": f"块索引 {ignored} 不属于第 {int(page) + 1} 页",
+                            "ignored": ignored}
         picked: list[int] = []
         seen: set[int] = set()
         for idx in candidates:
@@ -1390,7 +1417,8 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
                 continue
             picked.append(idx)
         if not picked:
-            return {"ok": False, "error": "没有可重译的块（全部为数字/代码/空块）"}
+            return {"ok": False, "error": "没有可重译的块（全部为数字格/公式/空块）",
+                    "ignored": ignored}
         sources = [str(_block(i).text) for i in picked]
         results = retranslate_batch(sources, lang)
         written = 0
@@ -1404,7 +1432,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         return {"ok": True, "page": int(page), "count": written,
                 "indices": picked,
                 "translated": {str(i): _read(i) for i in picked if _read(i)},
-                "failed": failed}
+                "failed": failed, "ignored": ignored}
 
     def apply_terminology(source: str, target: str):
         state.user_decisions.setdefault("terminology", {})[str(source)] = str(target)
@@ -1762,6 +1790,11 @@ class DocumentSession:
                                              cancel=self.cancel, resume=False)
             glossary = ir_mod.infer_glossary(doc_ir, fn, lang=self.state.lang,
                                              log=self.log)
+        except ControlSignal:
+            # A cancellation is a control signal, not a terminology failure: it must
+            # propagate (the old ``except Exception`` logged it as
+            # "术语注入跳过（TranslationCancelled…）" and carried on).
+            raise
         except Exception as exc:  # noqa: BLE001 — terminology is best-effort, never fatal
             self.log(f"  术语注入跳过（{type(exc).__name__}: {exc}）。")
             return
@@ -1957,6 +1990,11 @@ class DocumentSession:
                           params={"page": page_index, "lang": self.state.lang, "kind": kind})
         except FlowCancelled:
             raise _tr.TranslationCancelled()
+        except ControlSignal:
+            # Same rule as ``_translate_one_normal``: a bare
+            # ``TranslationCancelled`` from a deterministic ToolStep must be
+            # re-raised, not recorded as "第 N 页翻译失败".
+            raise
         except Exception as exc:  # noqa: BLE001 — fail-closed to source
             self.log(f"  第 {page_index + 1} 页翻译失败：{type(exc).__name__}: {exc}（保留原文）。")
             return False
@@ -2109,6 +2147,9 @@ class DocumentSession:
                 )
             except FlowCancelled:
                 raise _tr.TranslationCancelled()
+            except ControlSignal:
+                # A cancellation must not be recorded as "第 N 页自检失败".
+                raise
             except Exception as exc:  # noqa: BLE001 — a failed review is not fatal
                 self.log(f"  第 {i + 1} 页自检失败：{type(exc).__name__}: {exc}（保留译文）。")
                 self.state.page(i).issues.append(f"自检失败：{type(exc).__name__}")

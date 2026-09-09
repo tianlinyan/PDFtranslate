@@ -13,7 +13,6 @@ from translate_app.main_window import (
     MainWindow,
     parse_preview_command,
     resolve_language,
-    resolve_reexport_target,
 )
 
 
@@ -87,67 +86,20 @@ class TranslationOutputPageTest(unittest.TestCase):
         self.assertEqual(2, MainWindow._translation_output_page(None, 2, "markdown"))
 
 
-class ResolveReexportTargetTest(unittest.TestCase):
-    """「重新导出」must overwrite the file actually produced last time.
+class ExportOverwriteTest(unittest.TestCase):
+    """v0.5.24: exports overwrite the target file instead of making ``(n)`` copies.
 
-    A normal run writes through ``pdfio.unique_path``: when ``test_English.pdf``
-    already exists the real output lands at ``test_English(1).pdf``.  Re-export
-    re-derives the base ``test_English.pdf`` from the UI and passed it to the
-    worker with ``overwrite=True``, so it clobbered an unrelated old file while
-    the real ``(1)`` output (the one the user was previewing) stayed stale.
+    The rename-on-collision behaviour (``unique_path``) is gone from the export
+    path, so 「重新导出」 and a normal run write the same path and there is no
+    ``doc_English(1).pdf`` to reconcile.
     """
 
-    def test_no_collision_keeps_the_same_path(self):
-        self.assertEqual(
-            r"C:\out\doc_English.pdf",
-            resolve_reexport_target(r"C:\out\doc_English.pdf", r"C:\out\doc_English.pdf"),
-        )
+    def test_unique_path_helper_still_exists_for_the_source_guard(self):
+        # The only remaining caller is the "output path == source PDF" guard in
+        # ``TranslateWorker._export``; the helper itself is unchanged.
+        from translate_app import pdfio
 
-    def test_collision_targets_the_actual_unique_file(self):
-        """Regression: base re-derived must not clobber; go back to the (1) file."""
-        self.assertEqual(
-            r"C:\out\doc_English(1).pdf",
-            resolve_reexport_target(r"C:\out\doc_English.pdf", r"C:\out\doc_English(1).pdf"),
-        )
-
-    def test_higher_unique_suffix_is_preserved(self):
-        self.assertEqual(
-            r"C:\out\doc_English(2).pdf",
-            resolve_reexport_target(r"C:\out\doc_English.pdf", r"C:\out\doc_English(2).pdf"),
-        )
-
-    def test_explicit_named_target_is_honoured(self):
-        """A requested name already carrying an ``(n)`` suffix is an explicit target."""
-        self.assertEqual(
-            r"C:\out\doc_English(1).pdf",
-            resolve_reexport_target(r"C:\out\doc_English(1).pdf", r"C:\out\doc_English.pdf"),
-        )
-
-    def test_no_last_output_falls_back_to_requested(self):
-        self.assertEqual(
-            r"C:\out\doc_English.pdf",
-            resolve_reexport_target(r"C:\out\doc_English.pdf", None),
-        )
-
-    def test_different_directory_is_honoured(self):
-        self.assertEqual(
-            r"D:\elsewhere\doc_English.pdf",
-            resolve_reexport_target(
-                r"D:\elsewhere\doc_English.pdf", r"C:\out\doc_English(1).pdf"),
-        )
-
-    def test_different_base_name_is_honoured(self):
-        self.assertEqual(
-            r"C:\out\my_doc.pdf",
-            resolve_reexport_target(r"C:\out\my_doc.pdf", r"C:\out\doc_English(1).pdf"),
-        )
-
-    def test_different_extension_is_honoured(self):
-        # User switched output type (e.g. to Markdown): a new file, not the old PDF.
-        self.assertEqual(
-            r"C:\out\doc_English.md",
-            resolve_reexport_target(r"C:\out\doc_English.md", r"C:\out\doc_English(1).pdf"),
-        )
+        self.assertTrue(callable(pdfio.unique_path))
 
 
 if __name__ == "__main__":

@@ -968,15 +968,16 @@ def extract_document_text(
             # a normal text page is never OCR'd just because it also embeds an
             # image or two.
             sparse_text = len(lines) <= 3
+            pending_ocr: list[Block] = []
             if ocr and (ocr_fn is not None or _needs_ocr(page)) and (not lines or sparse_text):
-                page_blocks: list[Block] = []
+                ocr_blocks: list[Block] = []
                 if page_index in ocr_cache:
                     # Old caches predate number normalization; renormalize on
                     # load so a stale cache cannot keep the garbled figures.
-                    page_blocks = [_block_from_dict(d) for d in ocr_cache[page_index]]
+                    ocr_blocks = [_block_from_dict(d) for d in ocr_cache[page_index]]
                     fixed_count, fixed_examples = 0, []
                     renorm: list[Block] = []
-                    for b in page_blocks:
+                    for b in ocr_blocks:
                         norm = _normalize_number(b.text)
                         if norm != b.text:
                             fixed_count += 1
@@ -984,21 +985,21 @@ def extract_document_text(
                                 fixed_examples.append(f"{b.text} → {norm}")
                             b = replace(b, text=norm)
                         renorm.append(b)
-                    page_blocks = renorm
+                    ocr_blocks = renorm
                     _log_number_fixes(log, page_index, fixed_count, fixed_examples)
                 else:
                     if log:
                         log(f"  OCR 第 {page_index + 1}/{doc.page_count} 页…")
                     if ocr_fn is None and _get_ocr_engine() is None:
                         _warn_ocr_unavailable(log)
-                        page_blocks = []
+                        ocr_blocks = []
                     else:
-                        page_blocks = _ocr_page_blocks(
+                        ocr_blocks = _ocr_page_blocks(
                             page_index, page, ocr_fn, cancel, log
                         )
-                        if page_blocks:
+                        if ocr_blocks:
                             ocr_cache[page_index] = [
-                                _block_to_dict(b) for b in page_blocks
+                                _block_to_dict(b) for b in ocr_blocks
                             ]
                             # Persist after *every* page: OCR is by far the
                             # slowest stage, so a cancel or a crash must not
@@ -1012,13 +1013,20 @@ def extract_document_text(
                                         f"{reason}），已识别页面不会被缓存，"
                                         f"重跑将重新 OCR：{ocr_cache_path}"
                                     )
-                if page_blocks:
-                    for b in page_blocks:
-                        result.blocks.append(b.text)
-                        result.block_pages.append(page_index)
-                    result.pages.append(page_blocks)
-                    result.ocr_count += 1
-                    continue
+                if ocr_blocks:
+                    if not lines:
+                        # A genuine scan: the OCR result IS the page.
+                        for b in ocr_blocks:
+                            result.blocks.append(b.text)
+                            result.block_pages.append(page_index)
+                        result.pages.append(ocr_blocks)
+                        result.ocr_count += 1
+                        continue
+                    # Sparse text layer (a cover / chapter page with a logo or a
+                    # figure): keep the extractable text and MERGE the OCR blocks
+                    # into it below.  Replacing the page dropped the title from
+                    # Markdown / plain-text exports entirely.
+                    pending_ocr = ocr_blocks
                 if not lines:
                     result.pages.append([])
                     continue
@@ -1057,6 +1065,14 @@ def extract_document_text(
                     table_lines, spans, page_x0, page_x1, page_index, cell_rects
                 )
             )
+
+            if pending_ocr:
+                # A sparse text layer + OCR: keep both (see ``_merge_ocr_blocks``).
+                merged = _merge_ocr_blocks(page_blocks, pending_ocr)
+                added = len(merged) - len(page_blocks)
+                if added and log:
+                    log(f"  第 {page_index + 1} 页文本层较少，已并入 OCR 结果（+{added} 块）。")
+                page_blocks = merged
 
             for block in page_blocks:
                 result.blocks.append(block.text)
@@ -1306,7 +1322,13 @@ def _ocr_cache_dir() -> Path:
 #: (``_drop_signature_items``).  A v5 cache still contains them as blocks, so a
 #: cached scan would keep romanizing the signature and covering the ink with the
 #: exporter's white rect — the exact behaviour the drop exists to prevent.
-_OCR_CACHE_VERSION = 6
+#:
+#: v7: ``fit_height`` is now set whenever a next row exists, even when the band is
+#: narrower than the glyph box (a v6 cache holds ``0`` for those dense rows, which
+#: means "no band, wrap unbounded" — the wrap then crossed the grid line below).
+#: v6 caches must be re-synthesized or the fix never applies to an already-cached
+#: document.
+_OCR_CACHE_VERSION = 7
 
 
 def _ocr_cache_path(doc_path: str | Path) -> Path:
@@ -1860,13 +1882,16 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
                     nxt = row_sorted[i + 1][1] if i + 1 < len(row_sorted) else page_right
                     fit_width = max(x1 - x0, (nxt - 2.0) - x0)
             # The wrap band down to the row below (minus a 1.5pt margin for the
-            # raster line itself).  Only when it exceeds the glyph box; the last
-            # row has no band and keeps the box.
+            # raster line itself).  It is used whenever a next row exists — even a
+            # band NARROWER than the glyph box: ``fit_height == 0`` means "no band,
+            # wrap unbounded", so dropping a tight band let a 2-3 line wrap at the
+            # 6pt floor cross the grid line below.  Measured on a real scanned
+            # statement (p24-27): 542 of 824 cells had a band narrower than their
+            # glyph box, and 537 of them could not hold a 2-line wrap at all.
+            # Only the last row (nothing below it) keeps 0.0.
             fit_height = 0.0
             if next_top is not None:
-                band = next_top - y0 - 1.5
-                if band > y1 - y0:
-                    fit_height = band
+                fit_height = max(0.0, next_top - y0 - 1.5)
             size = min(_MAX_FONT, max(5.0, (y1 - y0) / 1.2))
             blocks.append(
                 Block(
@@ -1935,6 +1960,52 @@ def _drop_signature_items(
             "已保留扫描原样（不翻译、不覆盖）。"
         )
     return kept
+
+
+def _boxes_overlap(a: Block, b: Block, *, min_ratio: float = 0.2) -> bool:
+    """True when ``a``'s box overlaps ``b``'s enough to be the same content."""
+    ix = max(0.0, min(a.x1, b.x1) - max(a.x0, b.x0))
+    iy = max(0.0, min(a.y1, b.y1) - max(a.y0, b.y0))
+    inter = ix * iy
+    if inter <= 0.0:
+        return False
+    cx, cy = (a.x0 + a.x1) / 2.0, (a.y0 + a.y1) / 2.0
+    if b.x0 <= cx <= b.x1 and b.y0 <= cy <= b.y1:
+        return True
+    area_a = max(1e-6, (a.x1 - a.x0) * (a.y1 - a.y0))
+    area_b = max(1e-6, (b.x1 - b.x0) * (b.y1 - b.y0))
+    return inter / min(area_a, area_b) >= min_ratio
+
+
+def _merge_ocr_blocks(text_blocks: Sequence[Block], ocr_blocks: Sequence[Block]) -> list[Block]:
+    """Merge OCR blocks into a sparse text layer instead of replacing it.
+
+    A page whose text layer holds only a title (a cover / chapter page that also
+    carries a logo or a figure) used to be *replaced* by the OCR result, so the
+    extractable title silently vanished from the Markdown / plain-text exports and
+    the translation only covered the logo text.  Keep the text layer and add only
+    OCR blocks that are genuinely new — same text, centre inside a text block, or
+    a ≥20% box overlap all count as duplicates — then sort the page by reading
+    order (y, then x).
+    """
+    def _norm(t: str) -> str:
+        return " ".join(str(t).split()).casefold()
+
+    seen = {_norm(b.text) for b in text_blocks if str(b.text).strip()}
+    kept: list[Block] = []
+    for b in ocr_blocks:
+        text = _norm(b.text)
+        if not text or text in seen:
+            continue
+        if any(_boxes_overlap(b, t) for t in text_blocks):
+            continue
+        kept.append(b)
+        seen.add(text)
+    if not kept:
+        return list(text_blocks)
+    merged = list(text_blocks) + kept
+    merged.sort(key=lambda b: (round(b.y0, 1), round(b.x0, 1)))
+    return merged
 
 
 def _synthesize_ocr_blocks(
@@ -3140,11 +3211,24 @@ def _fit_block(block: Block, font, text: str) -> tuple[list[str], float]:
             # Wrap at the readability floor instead; a scan row band
             # (``fit_height``) bounds the wrap so it stops before the grid
             # line of the row below (see ``_fit_band``).
-            lines = _wrap(font, flat, max_width, _MIN_TABLE_READABLE)
             band = getattr(block, "fit_height", 0.0)
             if band > 0.0:
-                return _fit_band(font, flat, max_width, band)
-            return lines, _MIN_TABLE_READABLE
+                lines, fs = _fit_band(font, flat, max_width, band)
+                # ``_fit_band`` cannot honour a band that is smaller than the
+                # wrapped text at the 3pt floor (a dense statement row, measured
+                # down to 3.4pt): it returns the 3pt wrap, which crosses the grid
+                # line below.  Prefer ONE line at the largest size the band can
+                # hold — horizontal overflow reaches the row's blank space, which
+                # ``fit_width`` already uses, while a vertical crossing overwrites
+                # the figures in the next row and cannot be undone.
+                if _wrapped_height(font, lines, fs, _TABLE_CELL_LEADING) > band + 0.05:
+                    asc_desc = max(0.1, font.ascender - font.descender)
+                    single_fs = min(fs, max(_MIN_TABLE_FLOOR, band / asc_desc))
+                    single = _fit_one_line(font, flat, max_width, single_fs,
+                                           floor=_MIN_TABLE_FLOOR)
+                    return single if single is not None else ([flat], single_fs)
+                return lines, fs
+            return _wrap(font, flat, max_width, _MIN_TABLE_READABLE), _MIN_TABLE_READABLE
         return _fit_exact_n(font, flat, max_width, fs, n_lines)
 
     lines = _wrap(font, text, max_width, fs)
@@ -3307,6 +3391,27 @@ def _is_number_atom(text: str) -> bool:
     return bool(_NUM_ATOM_RE.match(text))
 
 
+#: An amount-shaped token: a numeric core (digits plus ``, . / -`` separators) with a
+#: short currency/prefix or unit/suffix attached — ``US$1,234,567.89``,
+#: ``12,345,678.90元``, ``1,234.56万元``, ``2023-12-31``.  The affixes are capped at
+#: four characters so a word that merely *contains* a digit is still broken as
+#: prose (``iPhone15ProMax``, ``PT6A-140``, ``COVID-19``).
+_AMOUNT_ATOM_RE = re.compile(r"^[^\d]{0,4}\d[\d,./\-]*[^\d]{0,4}$")
+
+
+def _is_amount_atom(text: str) -> bool:
+    """True for a whole amount with a currency/unit affix (never split it).
+
+    A figure carrying a currency symbol or a unit (``US$1,234,567.89``,
+    ``1,234.56万元``) used to reach the Latin/CJK breakers because
+    :func:`_is_number_atom` only accepts digits and value punctuation — the
+    hyphenated result (``US$-`` / ``1,23-`` …) or a decimal-point split
+    (``12,345,678`` / ``.90元``) reads as a *changed figure*, which is the exact
+    failure the number-atomicity rule exists to prevent.
+    """
+    return bool(_AMOUNT_ATOM_RE.match(text))
+
+
 def _color_tuple(color: int) -> tuple[float, float, float]:
     """Convert a 24-bit color int (PyMuPDF span ``color``) to a float RGB triple."""
     return (
@@ -3370,16 +3475,18 @@ def _break_word(font, word: str, width: float, fontsize: float, lines: list[str]
     longer split into a bare ``Non-Perform`` + ``ing``.  A space-less CJK /
     symbol run is broken straight by glyph, as before.
     """
-    if _has_latin(word):
-        return _break_latin_word(font, word, width, fontsize, lines)
-    if _is_number_atom(word):
+    if _is_amount_atom(word):
         # A figure is never broken in two: ``292,712,933,925.17`` split as
         # ``...925.1`` / ``7`` looks exactly like a digit grew or lost a decimal
         # point, and in a financial statement a broken amount is worse than an
-        # amount that overflows its box slightly.  Keep it whole on its own
-        # line even when that line is a hair wider than the box.
+        # amount that overflows its box slightly.  The same holds when a currency
+        # symbol or unit is attached (``US$1,234,567.89``, ``1,234.56万元``), which
+        # is why the amount check runs BEFORE the Latin/CJK breakers.  Keep it whole
+        # on its own line even when that line is a hair wider than the box.
         lines.append(word)
         return ""
+    if _has_latin(word):
+        return _break_latin_word(font, word, width, fontsize, lines)
     remaining = font.text_length(word, fontsize=fontsize)
     while word and remaining > width:
         acc = 0.0
@@ -3462,8 +3569,18 @@ def save_interleaved_pdf(
         font = _CJK_FONT
         for i in range(src.page_count):
             new_doc.insert_pdf(src, from_page=i, to_page=i)
-            page_rect = src[i].rect
-            tpage = new_doc.new_page(width=page_rect.width, height=page_rect.height)
+            # The mirror page must be built in the SAME coordinate frame the blocks
+            # live in: block bboxes come from ``get_text("dict")``, i.e. the
+            # *unrotated* mediabox frame.  ``src[i].rect`` is the rotated view, so
+            # on a /Rotate 90/270 page it swaps width/height and every block below
+            # y = width is drawn off-page (its translation silently vanished).
+            # Mirror the OCR-redraw branch: unrotated mediabox + carry /Rotate.
+            src_page = src[i]
+            mb = src_page.mediabox
+            tpage = new_doc.new_page(width=mb.width, height=mb.height)
+            rotation = int(getattr(src_page, "rotation", 0) or 0)
+            if rotation:
+                tpage.set_rotation(rotation)
             blocks = pages[i] if pages is not None and i < len(pages) else []
             trans = per_page[i] if i < len(per_page) else []
             m = min(len(blocks), len(trans))
@@ -3497,6 +3614,14 @@ def _reconstruct_ocr_tables(blocks: Sequence[Block]) -> list[dict]:
     cols = _cluster_ocr_columns(items)
     if len(cols) < 2:
         return []
+    # Only treat the page as a table when it really looks like one — the same
+    # "at least one whole numeric column" rule ``_reconstruct_ocr_grid`` applies.
+    # Without it a two-column scanned *prose* page lined up into rows/columns and
+    # was reported as a table, so ``redraw_ocr`` blank-redrew it and dropped the
+    # raster background for good (a financial statement always has a figures
+    # column; a prose page never does).
+    if not any(_is_numeric_column(c) for c in cols):
+        return []
     # Map each OCR block to the column whose extent contains its centre, then
     # group into rows by y, emitting a cell rect per (row, column) intersection.
     col_edges = sorted(
@@ -3519,19 +3644,66 @@ def _reconstruct_ocr_tables(blocks: Sequence[Block]) -> list[dict]:
     return [{"bbox": bbox, "rows": row_rects, "col_edges": col_edges}]
 
 
+#: Longest text a *page-furniture* block may carry (page numbers, rules, symbols).
+_FURNITURE_MAX_CHARS = 12
+
+
+def _is_page_furniture(block: Block) -> bool:
+    """True for a tiny text-layer block that carries page furniture, not content.
+
+    A scanned table page often keeps a *sparse* text layer holding just the
+    printed page number (``22``) or a rule/symbol.  ``_merge_ocr_blocks`` merges
+    that block into the OCR page, so the page is no longer "pure OCR" and the
+    redraw gate used to hand the whole page to the in-place path — which made the
+    「OCR表格重建」 option silently do nothing on exactly the scanned reports it
+    exists for.  Such a block has no place in the reconstructed grid, but it is
+    also not content that must be kept as a *cell*: it can be re-drawn at its own
+    bbox on the rebuilt page (see ``_draw_page_furniture``).  Anything carrying a
+    letter or a CJK ideograph is treated as content and keeps the in-place path.
+    """
+    if getattr(block, "ocr", False) or getattr(block, "is_chart", False):
+        return False
+    text = " ".join(str(getattr(block, "text", "") or "").split())
+    if not text or len(text) > _FURNITURE_MAX_CHARS:
+        return False
+    # ``isalpha()`` is True for CJK ideographs as well as Latin letters, so this
+    # single test rejects both (a title or a footnote must never be furniture).
+    return not any(ch.isalpha() for ch in text)
+
+
 def _is_pure_ocr_table_page(blocks: Sequence[Block]) -> bool:
-    """True iff *every* block on the page is a redraw-eligible OCR table cell.
+    """True iff the page may be blank-redrawn from its OCR table cells.
 
     ``save_translated_pdf``'s ``redraw_ocr`` regenerates a scanned table page as a
     blank page holding only the OCR table cells — a chart node label
-    (``is_chart``) or a non-OCR (text-layer) footnote / page number has nowhere
-    to go, so it would be silently dropped.  Gate the redraw to genuinely pure
-    OCR-table pages: any block that is not a redraw-eligible cell means the page
-    must take the in-place path (which preserves every block) instead.
+    (``is_chart``) or a non-OCR (text-layer) footnote has nowhere to go, so it
+    would be silently dropped.  Gate the redraw to pages whose blocks are all
+    redraw-eligible cells *or* page furniture (a page number / rule outside the
+    table, which ``_draw_page_furniture`` puts back).  Anything else means the
+    page takes the in-place path, which preserves every block.
     """
-    return bool(blocks) and all(
-        getattr(b, "ocr", False) and not getattr(b, "is_chart", False) for b in blocks
-    )
+    cells = [
+        b for b in blocks
+        if getattr(b, "ocr", False) and not getattr(b, "is_chart", False)
+    ]
+    if not cells:
+        return False
+    tx0 = min(b.x0 for b in cells)
+    ty0 = min(b.y0 for b in cells)
+    tx1 = max(b.x1 for b in cells)
+    ty1 = max(b.y1 for b in cells)
+    for b in blocks:
+        if getattr(b, "ocr", False) and not getattr(b, "is_chart", False):
+            continue
+        if not _is_page_furniture(b):
+            return False
+        # Only furniture that sits *outside* the OCR table's bbox is droppable
+        # from the grid: a letterless short block inside it is a table value the
+        # text layer happens to carry, and re-drawing it at its own bbox on the
+        # rebuilt (re-laid-out) table would put it on the wrong row.
+        if not (b.y1 <= ty0 or b.y0 >= ty1 or b.x1 <= tx0 or b.x0 >= tx1):
+            return False
+    return True
 
 
 def _extract_tables(page) -> list[dict]:
@@ -3873,6 +4045,28 @@ def _draw_ocr_grid_page(
             _draw_translated_block(page, font, draw_b, t)
 
 
+def _draw_page_furniture(
+    page: "fitz.Page",
+    font,
+    blocks: Sequence[Block],
+    trans: Sequence[str],
+) -> None:
+    """Re-draw text-layer page furniture (page number / rule) on a redrawn page.
+
+    The redraw paths (``_draw_ocr_grid_page`` / ``_draw_ai_table``) draw only OCR
+    table cells, so a sparse text-layer block merged into a scanned page — the
+    printed page number — would vanish from the rebuilt page.
+    ``_is_pure_ocr_table_page`` accepts such blocks on that condition, so put each
+    one back at its own bbox with its own translation.  Blocks that are not
+    furniture are ignored (the redraw gate guarantees there are none).
+    """
+    for b, t in zip(blocks, trans):
+        if not _is_page_furniture(b):
+            continue
+        text = " ".join(str(b.text if t is None else t).split()) or b.text
+        _draw_translated_block(page, font, b, text)
+
+
 def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font,
                    merges: Sequence[dict] | None = None) -> None:
     """Draw a clean, regular N x M table from a translated 2D grid.
@@ -4032,7 +4226,9 @@ def save_translated_pdf(
     handwriting explicitly ignored (signatures are dropped at extraction).  Row
     heights are expanded to fit the translations, so a rebuilt table needs no
     shrinking to the readability floor.  Non-OCR / non-table pages keep the
-    in-place behaviour.
+    in-place behaviour.  A sparse text-layer *page furniture* block (the printed
+    page number of a scanned page) does not block the redraw: it is re-drawn at
+    its own bbox via ``_draw_page_furniture`` instead of being dropped.
 
     ``table_rebuild_fn`` is the AI-table rebuild callback (see
     ``translator.make_table_rebuild_fn``): when ``redraw_ocr`` is on and it is
@@ -4044,10 +4240,15 @@ def save_translated_pdf(
     out_doc = fitz.open()
     try:
         font = _CJK_FONT
-        n = min(src.page_count, len(per_page))
-        for i in range(n):
+        # Every source page must appear in the output: a shorter ``per_page`` (the
+        # source PDF was edited between extraction and export, or a caller passed a
+        # short list) used to truncate the document **silently** — the sibling
+        # ``save_interleaved_pdf`` already iterates ``range(src.page_count)`` and
+        # ``group_by_page`` raises on a length mismatch.  A page with no translation
+        # is inserted as-is (m == 0 below).
+        for i in range(src.page_count):
             blocks = pages[i] if i < len(pages) else []
-            trans = per_page[i]
+            trans = per_page[i] if i < len(per_page) else []
             m = min(len(blocks), len(trans))
             if m == 0:
                 out_doc.insert_pdf(src, from_page=i, to_page=i)
@@ -4121,6 +4322,10 @@ def save_translated_pdf(
                         if log:
                             log(f"  第 {i + 1} 页 AI 表格重建不可用，回退几何重绘。")
                         _draw_ocr_grid_page(page, blocks[:m], trans[:m], font)
+                    # Neither redraw path draws the sparse text layer's page
+                    # number / rule (it is not an OCR cell); the purity gate
+                    # accepted it on the promise that it is put back here.
+                    _draw_page_furniture(page, font, blocks[:m], trans[:m])
                     continue
 
             out_doc.insert_pdf(src, from_page=i, to_page=i)

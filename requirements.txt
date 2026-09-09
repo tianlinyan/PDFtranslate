@@ -1,6 +1,9 @@
 PyQt6>=6.6
 PyMuPDF>=1.24
 openai>=1.40
+# Chat image downscaling (``chat._downscale_png``): without it a full-page preview
+# screenshot is sent at full size and a small-context vision model errors out.
+Pillow>=10
 # OCR for scanned PDFs (bundled ch+en PP-OCRv3 models, offline).
 rapidocr_onnxruntime>=1.3
 # numpy 2.x has had compatibility issues across the onnxruntime/opencv stack

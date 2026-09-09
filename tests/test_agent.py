@@ -861,6 +861,32 @@ class PageExecutorsTest(unittest.TestCase):
         self.assertNotIn("crowding", per_page)
         self.assertEqual(per_page, whole)
 
+    def test_check_layout_uses_flat_indices_on_a_single_page(self):
+        # Regression: ``_check_layout`` accumulated ``offset`` only while iterating
+        # MULTIPLE pages, so a single-page call reported page-local indices and read
+        # the wrong page's translation (page 0's text measured against page N's box)
+        # — a false green when page 0 has fewer blocks, an unfixable false red
+        # otherwise.  The findings must carry the same flat index the other checks
+        # (``_audit_blocks``) use.
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("页一", page=0, x0=72, y0=100, x1=300, y1=112, size=11)],
+                   [pdfio.Block("页二", page=1, x0=72, y0=100, x1=300, y1=112, size=11)]],
+            blocks=["页一", "页二"], block_pages=[0, 1])
+        # Page 0 overflows, page 1 is fine → a page-local read would make page 1
+        # inherit page 0's overflow (and report index 0).
+        s.out_doc = {0: {"text": "长译文" * 40}, 1: {"text": "短"}}
+        self.assertEqual([], agent.flow._check_layout(s, 1)["issues"])
+        p0 = agent.flow._check_layout(s, 0)["issues"]
+        self.assertTrue(p0)
+        self.assertEqual([0], [i["index"] for i in p0])
+        # And the flat index of a page-1 finding really is 1.
+        s.out_doc = {0: {"text": "短"}, 1: {"text": "长译文" * 40}}
+        p1 = agent.flow._check_layout(s, 1)["issues"]
+        self.assertEqual([1], [i["index"] for i in p1])
+        audited = agent.flow.audit_page(s, 1, checks=["layout"])["issues"]
+        self.assertEqual([{**i, "check": "layout"} for i in p1], audited)
+
     def test_kept_verbatim_blocks_are_not_reported_as_missing(self):
         # A ``keep_original`` block (signature / seal region the rebuild pass marks) is
         # deliberately untranslated; reporting it as missing made the review loop try to
@@ -1269,6 +1295,34 @@ class PageExecutorsTest(unittest.TestCase):
         self.assertEqual("RT-总负债", s.out_doc[2]["text"])
         self.assertNotIn(1, (s.out_doc or {}))                   # numeric untouched
         self.assertEqual([], res["failed"])
+
+    def test_retranslate_blocks_rejects_indices_from_another_page(self):
+        # Regression: unlike ``translate_blocks``, ``retranslate_blocks`` applied the
+        # model's indices verbatim — a page-local index re-translated a block on a
+        # DIFFERENT page and still reported ok=True for the page the model named.
+        def fake_batch(texts, lang):
+            return [f"RT-{t}" for t in texts]
+
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("第一页", page=0, x0=0, y0=0, x1=50, y1=10)],
+                   [pdfio.Block("第二页", page=1, x0=0, y0=0, x1=50, y1=10)]],
+            blocks=["第一页", "第二页"], block_pages=[0, 1])
+        logs: list = []
+        with mock.patch.object(translator, "make_retranslate_batch_fn",
+                               lambda model, log=None: fake_batch):
+            tools = agent.make_page_executors(s, _dummy_model(), log=logs.append)
+        res = tools["retranslate_blocks"](1, indices=[0])       # page-local index
+        self.assertFalse(res["ok"], res)
+        self.assertIn("不属于第 2 页", res["error"])
+        self.assertNotIn(0, s.out_doc or {})                    # page 1 untouched
+        # A mixed call keeps the on-page index and reports what was dropped.
+        res = tools["retranslate_blocks"](1, indices=[1, 0])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([1], res["indices"])
+        self.assertEqual([0], res["ignored"])
+        self.assertEqual("RT-第二页", s.out_doc[1]["text"])
+        self.assertTrue(any("不属于第 2 页" in m for m in logs), logs)
 
     def test_retranslate_blocks_untouched_source_is_failed(self):
         # A block whose retranslation comes back as the source (model declined /

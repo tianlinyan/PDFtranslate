@@ -52,15 +52,34 @@ class MeasureLayoutTest(unittest.TestCase):
         self.assertEqual(report.total, 0)
 
     def test_in_table_band_violation(self):
-        # A table cell with a fixed row band (fit_height) and a long translation
-        # that wraps to >1 line and exceeds the band is flagged.
+        # A MULTI-LINE source cell keeps its line count (``_fit_exact_n``) and can
+        # still exceed the row band — that is what the metric reports.
+        cell = _block("amount\nnote", w=200, h=10, in_table=True,
+                      fit_width=200, fit_height=9.0)
+        long_text = ("Consolidated Statement of Comprehensive Income and "
+                     "Other Comprehensive Income For The Period")
+        report = measure_layout([cell], [long_text])
+        self.assertEqual(report.total, 1)
+        self.assertGreaterEqual(report.counts["band_violation"], 1)
+
+    def test_single_line_cell_stays_inside_its_band(self):
+        # A single-line source cell never reports a band violation any more: when
+        # the row band cannot hold the wrapped translation, ``_fit_block`` falls
+        # back to ONE line that fits the band (horizontal overflow beats crossing
+        # the grid line below), so the fitter's own output is inside the band.
         cell = _block("amount", w=60, h=10, in_table=True,
                       fit_width=60, fit_height=9.0)
         long_text = ("Consolidated Statement of Comprehensive Income and "
                      "Other Comprehensive Income For The Period")
         report = measure_layout([cell], [long_text])
         self.assertEqual(report.total, 1)
-        self.assertGreaterEqual(report.counts["band_violation"], 1)
+        self.assertEqual(0, report.counts["band_violation"])
+        lines, fs = pdfio._fit_block(cell, pdfio._CJK_FONT, long_text)
+        self.assertEqual(1, len(lines))
+        height = pdfio._wrapped_height(
+            pdfio._CJK_FONT, lines, fs,
+            pdfio._line_leading(pdfio._CJK_FONT, in_table=True, n_lines=1))
+        self.assertLessEqual(height, cell.fit_height + 0.05)
 
 
 class MeasureNumbersTest(unittest.TestCase):

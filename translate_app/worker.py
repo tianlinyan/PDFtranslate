@@ -450,7 +450,7 @@ class TranslateWorker(QObject):
             self.log.emit(f"  已应用 {changed} 处 AI 对话/标注编辑（受保护覆盖）。")
         per_page = pdfio.group_by_page(doc.block_pages, translated, doc.page_count)
         self.log.emit("正在生成输出文件…")
-        out_path = self._export(doc, per_page, overwrite=True)
+        out_path = self._export(doc, per_page)
         # Remember the exported PDF (if any) for the preview window's "译文" side; the
         # normal run() path does this too, and without it a re-export (which uses a fresh
         # worker instance) would leave _last_pdf None and the preview fell back to source.
@@ -613,11 +613,22 @@ class TranslateWorker(QObject):
 
     def _export(
         self, doc: pdfio.DocumentText, per_page: list[list[str]],
-        *, overwrite: bool = False,
     ) -> str:
-        # 首次导出不覆盖重名文件（name(1).ext）；「重新导出」是覆盖同一文件（用户明确
-        # 重出上一次的译文，堆积 (1)(2) 只会碍事）。
-        out = Path(self._output_path) if overwrite else pdfio.unique_path(self._output_path)
+        # 导出**直接覆盖**目标文件（v0.5.24 起不再生成 ``name(1).ext``：重复的
+        # (1)(2) 文件让用户分不清哪份是最新，且「重新导出」与首次导出行为一致）。
+        # 唯一例外：目标路径就是**源 PDF 本身**——覆盖会毁掉输入文件，此时仍另存
+        # 一份并记日志说明。
+        out = Path(self._output_path)
+        try:
+            same_as_source = out.resolve() == Path(self._source).resolve()
+        except OSError:
+            same_as_source = False
+        if same_as_source:
+            out = pdfio.unique_path(out)
+            self.log.emit(
+                f"  警告：输出路径与源 PDF 相同（{self._source}），"
+                f"为避免覆盖源文件，改存为：{out}"
+            )
         kind = self._output_type
         if kind == "bilingual_pdf":
             pdfio.save_interleaved_pdf(

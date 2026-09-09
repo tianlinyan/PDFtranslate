@@ -139,6 +139,12 @@ _AUDIT_ALIASES: dict[str, str] = {
 _SCOPE_RANGE_RE = re.compile(r"第?\s*(\d+)\s*页?\s*(?:-|到|~|至)\s*第?\s*(\d+)\s*页")
 _SCOPE_SINGLE_RE = re.compile(r"第\s*(\d+)\s*页")
 
+#: Cues that turn a page mention into an explicit *scope restriction*
+#: (``只翻第2-5页`` / ``仅翻译第3页``).  Deliberately excludes exclusion words
+#: (``跳过``/``除了``/``不要翻``): "跳过第3页" means translate everything *except*
+#: page 3, so treating it as a scope would translate only page 3.
+_SCOPE_CUE_RE = re.compile(r"(只|仅|仅限|限定|范围)")
+
 
 def _parse_checks(req: str) -> list[str] | None:
     # De-duplicate while preserving order: a word like 数字 matches both the
@@ -159,6 +165,24 @@ def _parse_scope(req: str) -> list[int] | None:
     m = _SCOPE_SINGLE_RE.search(req)
     if m:
         return [int(m.group(1)) - 1]
+    return None
+
+
+def parse_explicit_scope(req: str) -> list[int] | None:
+    """Page scope **only** when ``req`` explicitly restricts the pages.
+
+    :func:`_parse_scope` (used by :func:`compile_from_user`) treats *any* "第N页"
+    mention as a scope, which is right for an audit request ("检查第3到第8页") but
+    wrong for a translation requirement that merely *mentions* a page: a
+    requirement like "帮我翻译整篇年报，第5页的图表保留原文" used to narrow the run
+    to page 5, so every other page was exported untranslated while the tool still
+    reported success.  A scope is therefore only derived when the text carries an
+    explicit restriction cue ("只/仅/仅限/限定/范围") or an explicit range
+    ("第2到第5页"); a bare single-page mention stays a per-page instruction that
+    the translation agent reads from ``state.requirements``.
+    """
+    if _SCOPE_RANGE_RE.search(req) or _SCOPE_CUE_RE.search(req):
+        return _parse_scope(req)
     return None
 
 
@@ -249,7 +273,14 @@ def compile_from_user(req: str, *, default_base: str = "self_check_page",
         checks=_parse_checks(r),
         scope=_parse_scope(r),
         include_kept=("保留页也算" in r or "保留" in r and "算" in r),
-        auto_fix=False if any(k in r for k in ("只查", "只读", "不修改", "不改")) else None,
+        # ``auto_fix`` is OPT-IN: a plain "自检…" is read-only (the tool description
+        # and CLAUDE.md both promise that); the user must ask for a fix explicitly.
+        auto_fix=(
+            True if any(k in r for k in ("自动改", "自动修正", "自动修", "直接改",
+                                         "帮我改", "修一下", "修正一下"))
+            else False if any(k in r for k in ("只查", "只读", "不修改", "不改"))
+            else None
+        ),
     )
 
 

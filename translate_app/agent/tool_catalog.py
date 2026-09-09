@@ -204,14 +204,14 @@ TOOL_CATALOG: list[ToolDef] = [
     _tool("translate_blocks",
           "一次批量翻译多块并写入（单次请求、引擎自动按字符预算分批+并发）：传扁平块索引列表，或只传 page "
           "翻译整页所有可翻译块；返回 {count, indices, translated:{index:text}, failed}。整行/整表/整页应优先用它，"
-          "比逐块 translate_block 快得多；数字/代码/空块被自动跳过",
+          "比逐块 translate_block 快得多；数字格/公式/空块被自动跳过",
           {"page": {"type": "integer", "description": "页号（0 起）"},
            "indices": {"type": "array", "items": {"type": "integer"},
                        "description": "要批量翻译的扁平块索引列表（来自 read_page）；不传则翻译整页所有可翻译块"},
            "target_lang": {"type": "string", "description": "目标语言（默认当前页语言）"}},
           ["page"], CAT_CONTENT,
           returns="一次批量翻译并写入多块：{count, indices, translated:{index:text}, failed:[...]}——"
-                  "引擎自动按字符预算分批+并发，远快于逐块 translate_block；数字/代码/空块被自动跳过"),
+                  "引擎自动按字符预算分批+并发，远快于逐块 translate_block；数字格/公式/空块被自动跳过"),
     _tool("retranslate_block",
           "避开缓存强制重译一段文本，**只返回译文**（不会写入；需再用 set_text 把它写到目标块）。常用于残中/空缺修正",
           {"text": {"type": "string"}, "target_lang": {"type": "string"}},
@@ -220,7 +220,7 @@ TOOL_CATALOG: list[ToolDef] = [
     _tool("retranslate_blocks",
           "一次批量重译多个块并**直接写入**（单次请求、绕过缓存，避免复用旧译文）：传扁平块索引列表，或只传 page "
           "重译整页所有可翻译块；返回 {count, indices, translated:{index:text}, failed:[...]}。**修正多条 finding 时应优先用它**"
-          "（远快于逐条 retranslate_block）；数字/代码/空块被自动跳过",
+          "（远快于逐条 retranslate_block）；数字格/公式/空块被自动跳过",
           {"page": {"type": "integer", "description": "页号（0 起）"},
            "indices": {"type": "array", "items": {"type": "integer"},
                        "description": "要批量重译的扁平块索引列表（来自 read_page）；不传则重译整页所有可翻译块"},
@@ -228,8 +228,8 @@ TOOL_CATALOG: list[ToolDef] = [
           ["page"], CAT_CONTENT,
           returns="一次批量重译并写入多块：{count, indices, translated:{index:text}, failed:[...]}——"
                   "绕过缓存、单次请求，远快于逐条 retranslate_block（修正多条 finding 时首选）；"
-                  "数字/代码/空块被自动跳过"),
-    _tool("set_text", "把某块文本直接置为指定值（数字/代码块会被拒绝）",
+                  "数字格/公式/空块被自动跳过"),
+    _tool("set_text", "把某块文本直接置为指定值（数字格会被拒绝）",
           {"page": {"type": "integer"}, "index": {"type": "integer"}, "text": {"type": "string"}},
           ["page", "index", "text"], CAT_CONTENT,
           returns="是否成功（布尔）"),
@@ -245,7 +245,7 @@ TOOL_CATALOG: list[ToolDef] = [
           "检查某页是否有未翻译残留（目标为西文时看残留中文；目标为中文时看未译的英文成句；纯代码/缩写/单位不算）与空块",
           {"page": {"type": "integer"}}, ["page"], CAT_VERIFY,
           returns="残留块列表 [{index, text}]"),
-    _tool("check_missing", "检查某页是否有源有译文空的块（内容缺失；纯数字/代码块不算）",
+    _tool("check_missing", "检查某页是否有源有译文空的块（内容缺失；纯数字格/公式块不算）",
           {"page": {"type": "integer"}}, ["page"], CAT_VERIFY,
           returns="缺失块索引列表"),
     _tool("check_numbers",
@@ -319,7 +319,7 @@ TOOL_CATALOG: list[ToolDef] = [
                     "description": "渲染原文页还是当前译文页（默认 translation）"}},
           ["page"], CAT_READ, target="source", audience=("chat",)),
     _tool("set_block_text",
-          "把某块的译文直接置为指定文本（数字/代码块会被拒绝；写的是受保护的译文层）。",
+          "把某块的译文直接置为指定文本（数字格会被拒绝；写的是受保护的译文层）。",
           {"index": {"type": "integer", "description": "扁平块索引（来自 read_page）"},
            "text": {"type": "string"}},
           ["index", "text"], CAT_CONTENT, audience=("chat",)),
@@ -340,7 +340,7 @@ TOOL_CATALOG: list[ToolDef] = [
     _tool("retranslate",
           "**局部/定点重译**指定的块并写入受保护覆盖层（不用整篇重跑）：传 page 与（可选的扁平块）indices；"
           "indices 不传则重译整页所有可翻译块；返回 {count, indices, translated:{index:text}, failed:[...]}。"
-          "failed 是重译失败而**保留原文**的块（数字/代码块被自动跳过，不属于失败），应如实转告用户。改完提醒用户用 re_export 生成最新译文。",
+          "failed 是重译失败而**保留原文**的块（数字格/公式块被自动跳过，不属于失败），应如实转告用户。改完提醒用户用 re_export 生成最新译文。",
           {"page": {"type": "integer", "description": "页号（0 起）"},
            "indices": {"type": "array", "items": {"type": "integer"},
                        "description": "要重译的扁平块索引（来自 read_page）；不传则重译整页所有可翻译块"},
@@ -349,7 +349,7 @@ TOOL_CATALOG: list[ToolDef] = [
     _tool("run_flow",
           "把用户的一句话要求**编译成一个自定义流程**并执行（路径 A 参数化，需模型在线）：如“自检第3到第8页只查数字和表格，不修改”→ 解析页范围/检查子集/"
           "是否只读；如“第5页数字错了自动改”→ 会**就地修正**审计发现的问题块并写回覆盖层。可传 name 把该流程**登记为命名流程**（本次会话内可复用）。"
-          "默认只读审计；auto_fix=True 且重译通道可用时才写回覆盖层。"
+          "**默认只读审计**；只有用户明确要求“自动改/修一下”且重译通道可用时才写回覆盖层。"
           "注意：无可用模型时**不会降级**为规则解析，而是返回“需要模型在线”。",
           {"requirement": {"type": "string", "description": "用户的一句话要求（如“自检第3到第8页只查数字和表格，不修改”）"},
            "name": {"type": "string", "description": "可选：把该流程登记为命名流程（本次会话内可复用）"}},
@@ -365,8 +365,10 @@ TOOL_CATALOG: list[ToolDef] = [
           {"requirement": {"type": "string", "description": "用户的一句话要求（会分解成任务序列）"}},
           ["requirement"], CAT_CONTENT, audience=("chat",)),
     _tool("run_translate",
-          "用**当前设置**开始翻译（把用户的具体要求作为 requirement 传入，会随运行注入到 AI 编排层）。控制权交给翻译流水线，完成在主窗口日志/进度提示。",
-          {"requirement": {"type": "string", "description": "用户的具体要求（可选，如\"第3页公司名翻成Bank\"），会随运行注入 AI 编排层"}},
+          "用**当前设置**开始翻译（把用户的具体要求作为 requirement 传入，会随运行注入到 AI 编排层）。控制权交给翻译流水线，完成在主窗口日志/进度提示。"
+          "只有 requirement 明确限定了页范围（“只翻第2-5页”/“仅翻译第3页”）才会收窄到这些页；只是**提到**某一页"
+          "（“第5页图表保留原文”）不会收窄，要求会原样注入编排层。",
+          {"requirement": {"type": "string", "description": "用户的具体要求（可选，如\"第3页公司名翻成Bank\"），会随运行注入 AI 编排层；只有\"只翻/仅翻译第N页\"这类明确限定才会限定页范围"}},
           [], CAT_CONTENT, audience=("chat",)),
     _tool("set_setting",
           "修改翻译设置项（key 为 target_language 或 output_type，value 为语言名/输出格式键 translated_pdf|bilingual_pdf|markdown|plain_text），下次运行生效。",

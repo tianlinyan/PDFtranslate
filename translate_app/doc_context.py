@@ -126,6 +126,17 @@ class DocContext:
                 self._src_doc = new_doc
         return new_doc
 
+    def peek_doc(self) -> Any:
+        """The already-extracted document **without** triggering extraction.
+
+        GUI-thread callers must use this instead of :meth:`ensure_doc`: a lazy
+        extraction may OCR an entire scanned PDF, which would freeze the window
+        for minutes.  Returns ``None`` when nothing has been extracted yet (the
+        caller then falls back to the source page).
+        """
+        with self._lock:
+            return self._src_doc
+
     def has_source(self) -> bool:
         with self._lock:
             return bool(self.src_path)

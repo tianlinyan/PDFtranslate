@@ -84,6 +84,19 @@ def main():
         buckets = {"<4": 0, "4-5": 0, "5-6": 0, ">=6": 0}
         multi = 0
         n_in_table = 0
+        # The effective band for an OCR grid cell is the row pitch down to the next
+        # row's top, whether or not the cell carries ``fit_height``: gating the check
+        # on ``b.fit_height > 0`` hid every dense row (542/824 cells on p24-27),
+        # i.e. exactly the rows where a wrap is most likely to cross the grid line.
+        tops = sorted({round(b.y0, 1) for b in dt.pages[pno]
+                       if getattr(b, "in_table", False)})
+
+        def _band_of(b) -> float:
+            if b.fit_height > 0:
+                return b.fit_height
+            nxt = [t for t in tops if t > b.y0 + 0.5]
+            return max(0.0, nxt[0] - b.y0 - 1.5) if nxt else 0.0
+
         for b, t in zip(dt.pages[pno], per_page[k]):
             if not getattr(b, "in_table", False):
                 continue
@@ -106,12 +119,13 @@ def main():
                 buckets["5-6"] += 1
             else:
                 buckets[">=6"] += 1
+            band = _band_of(b)
             if len(lines) > 1:
                 multi += 1
-                if b.fit_height > 0 and h > b.fit_height + 0.05:
+                if band > 0 and h > band + 0.05:
                     violations.append((pno + 1, b.text[:20], t[:40], round(fs, 2),
-                                       round(h, 1), round(b.fit_height, 1)))
-            elif b.fit_height > 0 and h > b.fit_height + 0.05:
+                                       round(h, 1), round(band, 1)))
+            elif band > 0 and h > band + 0.05:
                 single_over += 1
         totals += n_in_table
         multi_total += multi

@@ -16,6 +16,7 @@ from check_translation import (
     _cjk_residual,
     _is_scan_like_text,
     _normalize_cjk_ordinals,
+    _numeric_diff,
     _section_numbers,
     _cn_to_int,
     main,
@@ -196,6 +197,50 @@ class CheckerTest(unittest.TestCase):
         checker = run_checks(src, tgt, lang="English")
         self.assertTrue(checker.numeric_ok(), checker.numeric)
         self.assertEqual(0, main([str(src), str(tgt)]))
+
+    def test_unit_conversions_are_not_number_mismatches(self):
+        # Regression: the checker compared surface digit strings, so a *correct*
+        # translation that converted 亿元 → million / 万元 → plain yuan was
+        # reported as a fatal 数字不一致 and the script exited 1.
+        src = _pdf(self.tmp / "src.pdf", [["总资产 3.14 亿元", "净利润 1,234.56 万元"]])
+        tgt = _pdf(
+            self.tmp / "tgt.pdf",
+            [["Total assets 314 million yuan",
+              "Net profit 12,345,600 yuan"]],
+        )
+        checker = run_checks(src, tgt, lang="English")
+        self.assertTrue(checker.numeric_ok(), checker.numeric)
+        self.assertEqual(0, main([str(src), str(tgt)]))
+
+    def test_unit_conversion_with_a_wrong_value_is_still_caught(self):
+        src = _pdf(self.tmp / "src.pdf", [["总资产 3.14 亿元"]])
+        tgt = _pdf(self.tmp / "tgt.pdf", [["Total assets 314 thousand yuan"]])
+        self.assertFalse(run_checks(src, tgt, lang="English").numeric_ok())
+
+    def test_full_width_digits_and_minus_compare_by_value(self):
+        # A full-width source page produced NO tokens at all, so its ASCII
+        # translation looked like "译文多出" numbers.
+        self.assertEqual([], _numeric_diff(
+            "总资产 １，２３４．５６ 万元", "Total assets 1,234.56 ten thousand yuan"))
+        self.assertEqual([], _numeric_diff("金额 －1,234.56", "Amount -1,234.56"))
+        self.assertTrue(_numeric_diff("金额 １，２３４．５６", "Amount 9,999.99"))
+
+    def test_unit_multiplier_table_matches_the_agent_number_audit(self):
+        # The checker mirrors ``translate_app.agent.flow._unit_multiplier`` (the
+        # canonical implementation for the in-app audit); this pins the two tables
+        # together so they cannot drift silently.
+        import check_translation as ct
+        from translate_app.agent import flow as agent_flow
+
+        for window in (" 亿元", "万元", " million yuan", "ten thousand", "hundred million",
+                       "billion", "trillion", "元", "yuan", "", " 行次"):
+            self.assertEqual(agent_flow._unit_multiplier(window), ct._unit_multiplier(window),
+                             window)
+
+    def test_separator_style_change_is_not_reported(self):
+        # Same value, different separator style: not a number defect (the value is
+        # what matters; formatting is a separate, advisory concern).
+        self.assertEqual([], _numeric_diff("金额 1,234.56", "Amount 1234.56"))
 
     def test_statement_codes_exempt_from_residual_cjk(self):
         # Statement / subject codes (会商银02表, 会企01表-1) are deliberately kept

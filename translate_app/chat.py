@@ -57,14 +57,24 @@ _CHAT_HISTORY_CAP = 32
 #: Downscale the long edge to this many px before attaching / re-injecting.
 _CHAT_IMAGE_MAX = 1024
 
+#: One-time flag: Pillow is a hard dependency in ``requirements.txt`` but imported
+#: lazily, so a missing install must be reported once instead of degrading silently.
+_PIL_WARNED = False
 
-def _downscale_png(png: bytes, max_side: int = _CHAT_IMAGE_MAX) -> bytes:
+
+def _downscale_png(png: bytes, max_side: int = _CHAT_IMAGE_MAX,
+                   log: Callable[[str], None] | None = None) -> bytes:
     """Shrink a PNG to ``max_side`` on the long edge (Pillow), cutting image tokens.
 
     A preview screenshot can be ~1.9k×2.5k px; a vision model charges a lot of image
     tokens for it, which on a small local context triggers ``exceed_context_size_error``.
     Returns the original bytes on any failure (never crashes the chat turn).
+
+    Pillow is listed in ``requirements.txt`` but imported lazily, so a machine
+    installed without it would silently send the full-size screenshot — the exact
+    failure this function exists to prevent.  Report that once through ``log``.
     """
+    global _PIL_WARNED
     try:
         from io import BytesIO
 
@@ -80,6 +90,13 @@ def _downscale_png(png: bytes, max_side: int = _CHAT_IMAGE_MAX) -> bytes:
         out = BytesIO()
         im.save(out, format="PNG")
         return out.getvalue()
+    except ImportError:
+        if not _PIL_WARNED:
+            _PIL_WARNED = True
+            if log:
+                log("  警告：未安装 Pillow，聊天图片不会压缩（可能触发上下文超限）；"
+                    "请执行 pip install Pillow。")
+        return png
     except Exception:  # noqa: BLE001 — a bad image shrinks to the original bytes
         return png
 
@@ -137,7 +154,7 @@ class ChatSession:
             content: Any = [
                 {"type": "text", "text": message},
                 {"type": "image_url", "image_url": {"url": _png_data_url(
-                    _downscale_png(image, _CHAT_IMAGE_MAX))}},
+                    _downscale_png(image, _CHAT_IMAGE_MAX, log=self.log))}},
             ]
         else:
             content = message
@@ -215,7 +232,7 @@ class ChatSession:
                     "content": [
                         {"type": "text", "text": "（下面是工具返回的页面图。）"},
                         {"type": "image_url", "image_url": {"url": _png_data_url(
-                            _downscale_png(pending_image, _CHAT_IMAGE_MAX))}},
+                            _downscale_png(pending_image, _CHAT_IMAGE_MAX, log=self.log))}},
                     ],
                 })
         # The model kept calling tools past the cap: give it one last chance to
@@ -254,23 +271,58 @@ class ChatSession:
         self.history.append({"role": "assistant", "content": f"{prefix}{q}"})
         self.history.append({"role": "user", "content": a})
 
+    @staticmethod
+    def _tool_group_is_complete(msgs: list[dict[str, Any]], i: int) -> bool:
+        """True when ``msgs[i]`` is an ``assistant(tool_calls)`` with ALL its replies.
+
+        A window may only start at a message that does not depend on anything before
+        it: a ``user`` turn, or a complete tool group.  Starting at the assistant of
+        an incomplete group (or at a bare ``tool`` message) makes the OpenAI API
+        reject the whole request (each ``tool`` needs its ``assistant`` and every
+        ``tool_call_id`` needs exactly one reply).
+        """
+        calls = msgs[i].get("tool_calls") or []
+        if not calls:
+            return False
+        want = {str(tc.get("id")) for tc in calls}
+        got: set[str] = set()
+        for m in msgs[i + 1:]:
+            if m.get("role") != "tool":
+                break
+            got.add(str(m.get("tool_call_id")))
+        return want <= got
+
     def _window_history(self) -> list[dict[str, Any]]:
         """A bounded, protocol-valid recent window of ``self.history``.
 
         The console history grows unbounded across turns; a small local context
         overflows (``exceed_context_size_error``) once history + image tokens pile up.
-        Keep the last ``_CHAT_HISTORY_CAP`` messages, then trim to a leading ``user``
-        turn so the role sequence the model sees stays valid for the chat API.
+        Keep the last ``_CHAT_HISTORY_CAP`` messages, then trim to a boundary the
+        chat API accepts: a ``user`` turn, or a *complete* tool group
+        (``assistant(tool_calls)`` + all of its ``tool`` replies).
+
+        The old "trim to the first ``user``, else fall back to the raw tail" rule
+        could hand the model a window that STARTS with a ``tool`` message: one turn
+        with more tool rounds than the cap leaves no ``user`` in the tail, so the
+        raw fallback began mid-group and the endpoint answered 400 — losing the
+        whole turn's work.
         """
         msgs = self.history
         if len(msgs) <= _CHAT_HISTORY_CAP:
             return list(msgs)
-        msgs = msgs[-_CHAT_HISTORY_CAP:]
-        while msgs and msgs[0].get("role") != "user":
-            msgs = msgs[1:]
-        if not msgs:  # degenerate — fall back to the raw tail
-            msgs = self.history[-_CHAT_HISTORY_CAP:]
-        return list(msgs)
+        tail = msgs[-_CHAT_HISTORY_CAP:]
+        for i, m in enumerate(tail):
+            role = m.get("role")
+            if role == "user":
+                return list(tail[i:])
+            if role == "assistant" and self._tool_group_is_complete(tail, i):
+                return list(tail[i:])
+        # No boundary inside the cap (a single turn with more tool rounds than the
+        # cap allows): keep the last user turn whole — correctness beats the bound.
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") == "user":
+                return list(msgs[i:])
+        return []
 
     def _call(self, *, tools: list[dict[str, Any]] | None,
               on_text: Callable[[str], None] | None = None) -> Any:

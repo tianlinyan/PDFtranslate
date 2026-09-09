@@ -60,18 +60,34 @@ def main():
     dt = pdfio.extract_document_text(SRC, ocr=True, log=lambda s: None)
     totals = {"<3": 0, "3-4": 0, "4-5": 0, "5-6": 0, ">=6": 0, "multi": 0}
     viols = []
+    skipped = 0
+    checked = 0
     for pno in PAGES:
         print(f"--- page {pno + 1} ---")
         page_blocks = dt.pages[pno]
         spans = old_english_spans(pno)
         buckets = {"<3": 0, "3-4": 0, "4-5": 0, "5-6": 0, ">=6": 0}
         multi = 0
+        # The effective band is the row pitch down to the next row's top, whether
+        # or not the cell carries ``fit_height``: gating on ``fit_height > 0`` hid
+        # every dense row (542/824 cells on p24-27) — exactly where a wrap crosses.
+        tops = sorted({round(b.y0, 1) for b in page_blocks
+                       if getattr(b, "in_table", False)})
+
+        def _band_of(b) -> float:
+            if b.fit_height > 0:
+                return b.fit_height
+            nxt = [t for t in tops if t > b.y0 + 0.5]
+            return max(0.0, nxt[0] - b.y0 - 1.5) if nxt else 0.0
+
         for b in page_blocks:
             if not getattr(b, "in_table", False):
                 continue
             trans = pair_translation(b, spans)
             if trans is None:
+                skipped += 1        # unpaired cells must stay visible in the count
                 continue
+            checked += 1
             lines, fs = pdfio._fit_block(b, font, trans)
             h = pdfio._wrapped_height(
                 font, lines, fs,
@@ -89,22 +105,25 @@ def main():
                 buckets[">=6"] += 1
             if len(lines) > 1:
                 multi += 1
-            if b.fit_height > 0 and h > b.fit_height + 0.01:
+            band = _band_of(b)
+            if band > 0 and h > band + 0.01:
                 viols.append((pno + 1, b.text[:20], trans[:60], round(fs, 2),
-                              round(h, 1), round(b.fit_height, 1)))
+                              round(h, 1), round(band, 1)))
         print(" ", buckets, f"multi-line={multi}")
         for k in buckets:
             totals[k] += buckets[k]
         totals["multi"] += multi
     print("=== totals ===")
     print(totals)
+    print(f"checked={checked} unpaired(skipped)={skipped}")
     if viols:
         print("=== BAND VIOLATIONS ===")
         for v in viols:
             print(v)
     else:
         print("no band violations — every wrap stops before the line below")
+    return 1 if viols else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

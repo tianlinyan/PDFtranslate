@@ -367,6 +367,39 @@ class OcrExtractionTest(_TempOcrCacheMixin, unittest.TestCase):
         self.assertEqual(0, len(off.blocks))
         self.assertEqual(0, off.ocr_count)
 
+    def test_sparse_text_layer_is_merged_with_ocr_not_replaced(self):
+        # A cover / chapter page carries a title in the text layer AND a logo that
+        # only OCR can read.  The OCR result used to REPLACE the page, so the title
+        # silently vanished from the Markdown / plain-text exports.
+        self._page_seq += 1
+        path = self.doc_dir / f"cover_{self._page_seq}.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 80), "Annual Report 2025", fontsize=16)
+        page.insert_text((72, 110), "Mintai Commercial Bank", fontsize=11)
+        page.draw_rect(fitz.Rect(72, 200, 300, 320), color=(0, 0, 0), fill=(1, 1, 1))
+        doc.save(str(path))
+        doc.close()
+
+        def ocr_fn(_page_index, _page):  # noqa: ARG001
+            return [
+                ([[80.0, 210.0], [260.0, 210.0], [260.0, 240.0], [80.0, 240.0]],
+                 "LOGO TEXT"),
+                ([[80.0, 250.0], [260.0, 250.0], [260.0, 280.0], [80.0, 280.0]],
+                 "EST. 1998"),
+            ]
+
+        logs: list[str] = []
+        result = pdfio.extract_document_text(path, ocr=True, ocr_fn=ocr_fn,
+                                             log=logs.append)
+        texts = list(result.blocks)
+        self.assertTrue(any("Annual Report 2025" in t for t in texts), texts)
+        self.assertTrue(any("Mintai Commercial Bank" in t for t in texts), texts)
+        self.assertIn("LOGO TEXT", texts)
+        self.assertIn("EST. 1998", texts)
+        self.assertEqual(0, result.ocr_count)          # the page HAD a text layer
+        self.assertTrue(any("已并入 OCR 结果" in m for m in logs), logs)
+
     def test_extract_honours_cancel(self):
         path = self._build_vector_page()
         with self.assertRaises(TranslationCancelled):

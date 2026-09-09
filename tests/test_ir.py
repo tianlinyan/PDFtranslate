@@ -207,6 +207,41 @@ class InferTermsTest(unittest.TestCase):
         for stop in ("The", "While", "Figure"):
             self.assertNotIn(stop, terms)
 
+    def test_infer_terms_finds_chinese_phrases_in_real_prose(self):
+        # Regression: the CJK side kept *maximal* ``[\u4e00-\u9fff]+`` runs of 2–4
+        # chars — in real Chinese prose a sentence is ONE long run, so the condition
+        # almost never held and the document-level glossary was silently EMPTY for
+        # every Chinese report (while the Latin side pinned Revenue/Total).
+        sentences = [
+            "本公司应收款项合计为1,234.56万元。",
+            "本公司应收款项同比增加。",
+            "资本充足率满足监管要求。",
+            "资本充足率较上年末提升。",
+            "本公司营业收入保持增长。",
+        ]
+        blocks = [
+            IRBlock(anchor=Block(t, 0, 0, 0, 100, 20), text=t, role="text", src_id=i)
+            for i, t in enumerate(sentences)
+        ]
+        terms = ir.infer_terms(IRDoc(title="t", pages=[IRPage(page=0, blocks=blocks)],
+                                     block_count=len(blocks)))
+        self.assertTrue(any("应收款项" in t for t in terms), terms)
+        self.assertIn("资本充足率", terms)
+        # Sliding windows of one phrase collapse to the maximal phrase, and a
+        # function-word fragment never becomes a term.
+        self.assertNotIn("款项", terms)
+        self.assertNotIn("充足率", terms)
+        self.assertNotIn("本公司", terms)
+
+    def test_infer_glossary_logs_when_no_candidates(self):
+        ir0 = IRDoc(title="t", pages=[IRPage(page=0, blocks=[
+            IRBlock(anchor=Block("hi", 0, 0, 0, 10, 10), text="hi", role="text", src_id=0),
+        ])])
+        logs: list[str] = []
+        got = ir.infer_glossary(ir0, lambda *a, **k: [], lang="English", log=logs.append)
+        self.assertEqual({}, got)
+        self.assertTrue(any("未抽到重复术语候选" in m for m in logs), logs)
+
     def test_translate_ir_infer_injects_computed_glossary(self):
         ir0 = self._ir()
         calls = []

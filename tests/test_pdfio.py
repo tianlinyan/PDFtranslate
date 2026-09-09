@@ -295,6 +295,63 @@ class PdfioTest(unittest.TestCase):
             self.assertLessEqual(rect.y0, block.y1 + 2.0)
         d.close()
 
+    def test_translated_pdf_keeps_pages_without_translations(self):
+        # Regression: ``save_translated_pdf`` looped ``min(src.page_count,
+        # len(per_page))``, so a shorter ``per_page`` (the source PDF was edited
+        # between extraction and export, or a caller passed a short list) truncated
+        # the document SILENTLY.  Pages without a translation must be kept as-is.
+        src = _OUT / "short_per_page.pdf"
+        build_sample_pdf(src, pages=3)
+        doc = pdfio.extract_document_text(src)
+        self.assertEqual(3, doc.page_count)
+        per_page = [["T" for _ in doc.pages[0]]]      # page 0 only
+        out = _OUT / "short_per_page_out.pdf"
+        pdfio.save_translated_pdf(src, doc.pages, per_page, out, "Chinese")
+        d = fitz.open(str(out))
+        try:
+            self.assertEqual(3, d.page_count)
+            self.assertIn("T", d[0].get_text())
+            # Pages 2-3 kept the original text (inserted verbatim).
+            self.assertIn("Page 2 heading text.", d[1].get_text())
+            self.assertIn("Page 3 heading text.", d[2].get_text())
+        finally:
+            d.close()
+
+    def test_bilingual_pdf_rotated_page_keeps_every_block(self):
+        # Regression: the mirror page was created with ``src[i].rect`` (the ROTATED
+        # view, 400x200) while block bboxes live in the unrotated mediabox frame
+        # (200x400), so every block below y=200 was drawn off-page and its
+        # translation silently vanished.  The mirror page must use the unrotated
+        # mediabox and carry the source page's /Rotate.
+        src = _OUT / "rotated_bi_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=200, height=400)
+        page.insert_text((20, 60), "TOP LABEL", fontsize=11)
+        page.insert_text((20, 350), "BOTTOM LABEL", fontsize=11)
+        page.set_rotation(90)
+        doc.save(str(src))
+        doc.close()
+
+        extracted = pdfio.extract_document_text(src)
+        self.assertEqual(2, len(extracted.pages[0]))
+        out = _OUT / "rotated_bi.pdf"
+        pdfio.save_interleaved_pdf(
+            src, [["TOP-TRANSLATED", "BOTTOM-TRANSLATED"]], out, "Chinese",
+            extracted.pages,
+        )
+        d = fitz.open(str(out))
+        try:
+            self.assertEqual(2, d.page_count)
+            mirror = d[1]
+            self.assertEqual(90, mirror.rotation)
+            self.assertAlmostEqual(200.0, mirror.mediabox.width, delta=1.0)
+            self.assertAlmostEqual(400.0, mirror.mediabox.height, delta=1.0)
+            text = mirror.get_text()
+            self.assertIn("TOP-TRANSLATED", text)
+            self.assertIn("BOTTOM-TRANSLATED", text)
+        finally:
+            d.close()
+
     def test_single_line_block_vertically_centered(self):
         doc = fitz.open()
         page = doc.new_page(width=400, height=300)
@@ -807,6 +864,34 @@ class OcrGridTest(unittest.TestCase):
         mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
         self.assertEqual(len(mapping), len(blocks))
 
+    def test_reconstruct_ocr_tables_rejects_a_prose_page(self):
+        # A two-column scanned PROSE page lines up into rows/columns but has no
+        # figures column.  Without the same numeric-column guard the grid
+        # reconstruction applies, ``redraw_ocr`` treated it as a table and
+        # blank-redrew the page, dropping the raster background for good.
+        texts = ["本公司营业收入同比增长", "本公司净利润同比下降",
+                 "主要业务保持稳健增长", "风险管理体系持续完善",
+                 "资本充足率满足监管要求", "资产质量总体保持稳定"]
+        coords = [(100.0, 60.0), (100.0, 300.0), (120.0, 60.0),
+                  (120.0, 300.0), (140.0, 60.0), (140.0, 300.0)]
+        blocks = [
+            pdfio.Block(text=t, page=0, x0=x, y0=y, x1=x + 120, y1=y + 10, ocr=True)
+            for t, (y, x) in zip(texts, coords)
+        ]
+        self.assertEqual([], pdfio._reconstruct_ocr_tables(blocks))
+        # The same shape with a figures column is still a table.
+        numeric = [
+            pdfio.Block(text="现金及存放中央银行款项", page=0, x0=60, y0=100, x1=180,
+                        y1=110, ocr=True),
+            pdfio.Block(text="17,485,938,749.91", page=0, x0=300, y0=100, x1=420,
+                        y1=110, ocr=True),
+            pdfio.Block(text="存放同业款项", page=0, x0=60, y0=120, x1=180,
+                        y1=130, ocr=True),
+            pdfio.Block(text="3,702,726,474.45", page=0, x0=300, y0=120, x1=420,
+                        y1=130, ocr=True),
+        ]
+        self.assertEqual(1, len(pdfio._reconstruct_ocr_tables(numeric)))
+
     def test_grid_subcolumn_header_gets_row_gap_as_fit_width(self):
         # The "合并"/"母公司" header cells live inside a figure sub-column whose
         # own OCR box only encloses the two printed characters; the translation
@@ -829,6 +914,35 @@ class OcrGridTest(unittest.TestCase):
         self.assertAlmostEqual(cell.fit_height, 165.0 - 130.0 - 1.5, delta=0.01)
         self.assertGreater(cell.fit_height, cell.y1 - cell.y0)
         self.assertEqual(by_text["发放贷款和垫款"].fit_height, 0.0)  # last row
+
+    def test_tight_rows_keep_a_band_and_stay_inside_it(self):
+        # Regression: the row band was dropped whenever it was NARROWER than the
+        # glyph box (``band > y1 - y0``), so dense statement rows fell back to
+        # ``fit_height == 0`` = "no band / wrap unbounded" and their 2-3 line wrap
+        # crossed the grid line below (542 of 824 cells on the real p24-27 scan).
+        items = [
+            (100.0, 78, 300, 109.6, "现金及存放中央银行款项"),
+            (100.0, 320, 420, 109.6, "17,485,938,749.91"),
+            (109.8, 78, 300, 119.4, "存放同业款项"),
+            (109.8, 320, 420, 119.4, "3,702,726,474.45"),
+            (119.6, 78, 300, 129.2, "发放贷款和垫款"),
+            (119.6, 320, 420, 129.2, "224,464,860,917.53"),
+        ]
+        blocks, _ = pdfio._reconstruct_ocr_grid(items)
+        by_text = {b.text: b for b in blocks}
+        cell = by_text["现金及存放中央银行款项"]
+        self.assertLess(cell.fit_height, cell.y1 - cell.y0)   # a narrow band
+        self.assertGreater(cell.fit_height, 0.0)              # but still a band
+        self.assertEqual(0.0, by_text["发放贷款和垫款"].fit_height)   # last row
+        # The wrap (or the single line chosen instead) must stay inside the band.
+        font = fitz.Font("cjk")
+        long_text = ("Cash and balances with the central bank and due from banks "
+                     "and other financial institutions")
+        lines, fs = pdfio._fit_block(cell, font, long_text)
+        height = pdfio._wrapped_height(
+            font, lines, fs, pdfio._line_leading(font, in_table=True, n_lines=len(lines)))
+        self.assertLessEqual(height, cell.fit_height + 0.05,
+                             (lines, fs, cell.fit_height))
 
     def test_grid_label_fit_width_stops_before_the_note_marker(self):
         # A row with the 附注 "(二)" band inside the label column: the label
@@ -942,6 +1056,32 @@ class NumberAtomicityTest(unittest.TestCase):
         self.assertEqual("".join(p.rstrip("-") for p in pieces), "Innovative")
         for piece in pieces:
             self.assertGreaterEqual(len(piece.rstrip("-")), 2, piece)
+
+    def test_currency_and_unit_amounts_are_never_split(self):
+        # Regression: ``_break_word`` checked ``_has_latin`` FIRST, so any amount
+        # with a currency symbol or unit reached the Latin/CJK breaker and came out
+        # as ``US$-`` / ``1,23-`` … or ``12,345,678`` + ``.90元`` — a figure that
+        # reads as *changed*, the exact failure the number-atomicity rule forbids.
+        font = fitz.Font("cjk")
+        for token in ("US$1,234,567.89", "1,234.56万元", "12,345,678.90元",
+                      "2023-12-31", "GB/T33436-2016"):
+            with self.subTest(token=token):
+                lines: list[str] = []
+                rest = pdfio._break_word(font, token, 30.0, 6.0, lines)
+                self.assertEqual([token], lines)
+                self.assertEqual("", rest)
+                self.assertTrue(pdfio._is_amount_atom(token))
+
+    def test_words_containing_a_digit_are_still_broken_as_prose(self):
+        # The amount guard must not swallow identifiers: a word whose numeric core
+        # is not the bulk of the token still wraps/hyphenates normally.
+        font = fitz.Font("cjk")
+        for token in ("iPhone15ProMax", "PT6A-140", "COVID-19"):
+            with self.subTest(token=token):
+                self.assertFalse(pdfio._is_amount_atom(token))
+                lines: list[str] = []
+                rest = pdfio._break_word(font, token, 10.0, 6.0, lines)
+                self.assertTrue(lines or rest != token, token)
 
 
 class VerticalLabelTest(unittest.TestCase):
@@ -1780,6 +1920,32 @@ class OcrTableRedrawTest(unittest.TestCase):
         finally:
             doc.close()
 
+    def test_redraw_keeps_sparse_text_layer_page_number(self):
+        # Real regression (v0.5.24): a scanned report page keeps a 2-char text layer
+        # holding the printed page number.  ``_merge_ocr_blocks`` merges it into the
+        # OCR page, which made the purity gate reject the page — so 「OCR表格重建」
+        # silently exported the scan unchanged.
+        src = _OUT / "redraw_pageno_src.pdf"
+        build_sample_pdf(src, pages=1)
+        blocks = self._ocr_table_blocks() + [
+            pdfio.Block(text="22", page=0, x0=292, y0=801, x1=303, y1=812,
+                        size=6.0, single_line=True),
+        ]
+        trans = ["Total assets", "1,234,567.89", "Total liabilities",
+                 "9,876,543.21", "22"]
+        out = _OUT / "redraw_pageno_out.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [trans], str(out), "English",
+                                  redraw_ocr=True)
+        doc = fitz.open(str(out))
+        try:
+            page = doc[0]
+            self.assertEqual(0, len(page.get_images(full=True)))  # scan dropped
+            text = page.get_text("text")
+            self.assertIn("Total assets", text)
+            self.assertIn("22", text)  # the page number is put back, not dropped
+        finally:
+            doc.close()
+
     def test_redraw_ocr_off_keeps_inplace(self):
         src = _OUT / "redraw_src2.pdf"
         build_sample_pdf(src, pages=1)
@@ -2037,7 +2203,9 @@ class PureOcrTablePageTest(unittest.TestCase):
     """``_is_pure_ocr_table_page`` decides whether a page may be blank-redrawn.
 
     The gate must reject any page that carries a block the redraw would drop —
-    a chart node label (``is_chart``) or a non-OCR (text-layer) block.
+    a chart node label (``is_chart``) or a non-OCR (text-layer) *content* block.
+    The one exception is page furniture (a page number / rule outside the table),
+    which ``_draw_page_furniture`` puts back on the rebuilt page.
     """
 
     def _cell(self, text="x", ocr=True, is_chart=False):
@@ -2061,6 +2229,45 @@ class PureOcrTablePageTest(unittest.TestCase):
 
     def test_empty_is_impure(self):
         self.assertFalse(pdfio._is_pure_ocr_table_page([]))
+
+    def test_page_number_below_the_table_is_accepted(self):
+        # A sparse text layer's page number sits outside the OCR table bbox and is
+        # re-drawn by ``_draw_page_furniture``, so it must not block the redraw.
+        cells = [self._cell(), self._cell(), self._cell(), self._cell()]
+        number = pdfio.Block(text="22", page=0, x0=292, y0=801, x1=303, y1=812,
+                             size=6.0, single_line=True)
+        self.assertTrue(pdfio._is_pure_ocr_table_page(cells + [number]))
+
+    def test_text_layer_caption_is_impure(self):
+        cells = [self._cell(), self._cell(), self._cell(), self._cell()]
+        caption = pdfio.Block(text="资产负债表", page=0, x0=60, y0=801, x1=140, y1=812,
+                              size=6.0, single_line=True)
+        self.assertFalse(pdfio._is_pure_ocr_table_page(cells + [caption]))
+
+    def test_letterless_block_inside_the_table_is_impure(self):
+        # A short letterless text-layer block *inside* the table bbox is a value the
+        # grid does not carry; drawing it at its own bbox on the re-laid-out table
+        # would misplace it, so the page stays on the in-place path.
+        cells = [self._cell(), self._cell(), self._cell(), self._cell()]
+        value = pdfio.Block(text="42", page=0, x0=60, y0=104, x1=90, y1=110,
+                            size=6.0, single_line=True)
+        self.assertFalse(pdfio._is_pure_ocr_table_page(cells + [value]))
+
+    def test_furniture_predicate_accepts_a_page_number(self):
+        self.assertTrue(pdfio._is_page_furniture(self._cell(text="22", ocr=False)))
+
+    def test_furniture_predicate_rejects_letters_and_cjk(self):
+        self.assertFalse(pdfio._is_page_furniture(self._cell(text="iv", ocr=False)))
+        self.assertFalse(pdfio._is_page_furniture(self._cell(text="第22页", ocr=False)))
+
+    def test_furniture_predicate_rejects_ocr_and_chart_blocks(self):
+        self.assertFalse(pdfio._is_page_furniture(self._cell(text="22", ocr=True)))
+        self.assertFalse(pdfio._is_page_furniture(
+            self._cell(text="22", ocr=False, is_chart=True)))
+
+    def test_furniture_predicate_rejects_long_text(self):
+        self.assertFalse(pdfio._is_page_furniture(
+            self._cell(text="1 2 3 4 5 6 7 8 9", ocr=False)))
 
 
 if __name__ == "__main__":

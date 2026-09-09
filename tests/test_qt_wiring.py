@@ -173,5 +173,57 @@ class PreviewSendRegionTest(unittest.TestCase):
         self.assertEqual([None], got)
 
 
+class ReExportForwardsExportFlagsTest(unittest.TestCase):
+    """v0.5.25: 「重新导出」 must honor the export knobs, like 「开始翻译」.
+
+    It used to pass only ``ocr``/``agent_mode``, so with 「OCR表格重建为矢量表格」 (or
+    「表格列宽重排」) ticked the re-export silently wrote the same scanned tables again
+    — the option looked broken.
+    """
+
+    def _window(self, tmp: str):
+        import pymupdf as fitz
+
+        from translate_app.settings import ModelConfig
+
+        win = MainWindow()
+        src = os.path.join(tmp, "src.pdf")
+        doc = fitz.open()
+        doc.new_page(width=595, height=842)
+        doc.save(src)
+        doc.close()
+        win.models = [ModelConfig(
+            id="t", name="t", type="chat",
+            endpoint="http://127.0.0.1:1/v1/chat/completions", model="m")]
+        win._source = src
+        win._last_translated_source = src
+        win._last_translated = [["x"]]         # per-page translations, non-empty
+        win._path_edit.setText(os.path.join(tmp, "out.pdf"))
+        return win
+
+    def test_re_export_forwards_reflow_and_rebuild_table(self):
+        import tempfile
+
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            win = self._window(tmp)
+            try:
+                # blockSignals: toggling would persist to the developer's real prefs.json
+                for check in (win._reflow_check, win._rebuild_table_check):
+                    check.blockSignals(True)
+                    check.setChecked(True)
+                    check.blockSignals(False)
+                captured: list = []
+                win._launch_worker = captured.append
+                win._re_export()
+                self.assertEqual(1, len(captured), "重新导出 did not start a worker")
+                worker = captured[0]
+                self.assertTrue(worker._reflow)
+                self.assertTrue(worker._rebuild_table)
+            finally:
+                win._chat_thread.quit()
+                win._chat_thread.wait(2000)
+
+
 if __name__ == "__main__":
     unittest.main()

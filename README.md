@@ -1,12 +1,54 @@
 # PDFtranslate
 
-> 当前版本：**v0.5.23**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
+> 当前版本：**v0.5.25**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
 > 各阶段性设计见 `docs/`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
 即可把文档翻译成指定语言并保存为双语 PDF、原位翻译 PDF、Markdown 或纯文本。
 
-> **v0.5.23（本轮）**：修复**翻译成功后异常退出**（`RuntimeError: wrapped C/C++ object of
+> **v0.5.25**：修复「**OCR表格重建选项失效**」——勾选后输出的仍是扫描（OCR）表格。
+> 原因是 v0.5.24 的 P1-6「稀疏文本层并入 OCR」：真实扫描报表页（如年报 p24-27）的文本层
+> 只有页码「22」，合并后该页多出一个非 OCR 块，`_is_pure_ocr_table_page` 因此判整页「不纯」、
+> `redraw_ocr` 分支被静默跳过（页面上看不出任何提示）。现改为：**页面家具**（非 OCR、非图表、
+> ≤12 字、不含字母/汉字、且位于 OCR 表格 bbox 之外）不再阻止重绘，由新增
+> `_draw_page_furniture` 在重绘页上按原 bbox 补画（页码不丢）；表内无字母短块仍走原位路径。
+> 同时「重新导出」补齐 `reflow`/`rebuild_table` 两个旋钮（旧实现只传 `ocr`/`agent_mode`，
+> 勾选后点「重新导出」同样输出扫描表格）。真机 p24-27 实测：勾选后输出页
+> `images=0`（扫描底图消失、网格线与译文为矢量），页码 22–25 保留在原位。
+
+> **v0.5.24（本轮）**：按代码审查报告修复 6 个 P0 缺陷（报告见
+> `docs/代码审查-v0.5.23.md`）：
+> ① `run_translate` 把 requirement 里**提到**的页号当成整篇页范围（“翻译整篇，第5页图表保留原文”
+> 只翻了第 5 页）——新增 `parse_explicit_scope`，只有「只/仅/仅限/限定/范围」或显式区间才收窄；
+> ② 旋转页（`/Rotate 90/270`）的双语译文页用了旋转后的 `page.rect` 建页，y 超过页宽的块译文整段丢失
+> ——改用未旋转 mediabox + 沿用 `/Rotate`；
+> ③ `_check_layout` 的扁平索引在单页调用时恒为 0（拿第 1 页译文度量第 N 页的框）——与 `_audit_blocks` 同源；
+> ④ OCR 网格 `fit_height` 在密集行上被 `band > y1-y0` 门槛丢弃（真机 824 格中 542 格），多行译文越过
+> 表格线；`_fit_block` 现改为「行带装不下换行时画单行」，`_OCR_CACHE_VERSION` 6→7，两个验证脚本
+> 按「推导行带」判定（旧门槛让「零越界」成为假绿）；
+> ⑤ `check_translation.py` 的数字比对按值比较（全角数字/负号、亿/万↔million/thousand 不再误报致命），
+> 分隔符错乱仍报；
+> ⑥ 对话历史裁剪不再产出以 `tool` 消息开头的窗口（单轮工具调用超过 cap 时会被 API 拒绝 400）；
+> ⑦ **导出不再生成重名副本**：目标文件已存在时**直接覆盖**（此前会写成 `名称(1).pdf`），
+> 「重新导出」与首次导出行为一致；唯一例外是输出路径等于源 PDF 时仍另存 `(1)` 并记日志，
+> 避免毁掉输入文件（v0.5.17/v0.5.21 的 `unique_path` 重命名逻辑随之取消）。
+>
+> **同批修复的 P1（两批 9 条）**：①`save_translated_pdf` 不再因 `per_page` 偏短而静默丢尾部页；
+> ②带币种/单位的金额（`US$1,234,567.89`、`1,234.56万元`）不再被断词切成两半（`_is_amount_atom`
+> 在断词前判定）；③`_inject_terminology`/`_translate_special_page`/`_ai_self_check` 不再把「取消」
+> 吞成「翻译失败」（`except ControlSignal: raise`）；④`Pillow` 进 `requirements.txt`，缺失时告警一次
+> 而不是静默不压缩图片；⑤`run_flow` 的 `auto_fix` 改为 **opt-in**（「自检…」默认只读，须明说
+> 「自动改/修一下」才写回覆盖层）；⑥稀疏文本层页（封面/扉页）的 OCR 结果**并入**文本层而非整页替换；
+> ⑦`retranslate_blocks` 与 `translate_blocks` 共用页归属过滤，不再跨页改写；⑧预览「译文」侧改用
+> `peek_doc()`，不再在 GUI 线程对整本扫描件 OCR；⑨`_reconstruct_ocr_tables` 补「至少一整列数字」
+> 守卫，扫描散文页不再被误判为表格而重绘；⑩**IR 文档级术语对中文年报真正生效**——原实现只收
+> 「2–4 字的极大中文游程」，而真实中文句子是一整条长游程，候选因此恒为空；现改为 2–12 字滑窗 +
+> 频次阈值 + **最长频繁 n-gram** 判定 + 虚词/数字编号过滤，抽到 0 条时记日志（不再静默）；
+> ⑪三处**文案修正**：`self_check_page` 不再声称「只复核真正翻译过的页」；错误文案/工具描述里的
+> 「数字/代码块」改为「数字格」（代码块检测从未实现）；`eval_harness` 明确必须显式选
+> `--pdf-only`/`--outdoc`，只给两个 PDF 的缺省模式尚未实现。
+
+> **v0.5.23**：修复**翻译成功后异常退出**（`RuntimeError: wrapped C/C++ object of
 > type TranslateWorker has been deleted`，进程直接 abort）。`stopped -> worker.deleteLater`
 > 在 worker 线程内释放 C++ 对象，而 `finished` 是排队投给 GUI 线程的，删除可能先到；此时
 > `_on_finished` 读 `_report` 就会落到 sip 上抛异常。`_report` 此前只在 agent 路径赋值，

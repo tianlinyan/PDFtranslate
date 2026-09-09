@@ -1,6 +1,7 @@
 """A-② 评估 harness：给「版面保真 + 译文保真」建立可复用、可对比、离线可复现的度量。
 
-两种输入模式::
+两种输入模式（**必须显式二选一**；「只给两个 PDF 就走版面度量」的缺省模式尚未实现，
+因为已导出的 PDF 没有 out_doc 的块几何）::
 
     python eval_harness.py --pdf-only 原文.pdf 译文.pdf [--lang English] [--json out.json]
     python eval_harness.py --outdoc   原文.pdf out_doc.json [--lang English]
@@ -9,9 +10,9 @@
 * ``--pdf-only`` —— 导出后**文本层后验**（复用 ``check_translation``：数字一致性 /
   残留中文 / 章节编号 / 页数）。适合「已导出的成品」。
 * ``--outdoc``  —— **逐块版面度量**。out_doc.json 是 worker/agent 的扁平
-  ``{flat_index: {"text": ...}}`` 译文叠加层；据此重建每页块 + 译文，跑
-  ``translate_app.eval`` 的版式/数字/完整性硬指标并聚合评分。适合 **A/B 对比**
-  （基线与候选各出一份 out_doc，``--compare`` 看 delta）。
+  ``{flat_index: {"text": ...}}`` 译文叠加层，**由调用方自行产出**（仓库里没有生产者）；
+  据此重建每页块 + 译文，跑 ``translate_app.eval`` 的版式/数字/完整性硬指标并聚合评分。
+  适合 **A/B 对比**（基线与候选各出一份 out_doc，``--compare`` 看 delta）。
 
 退出码：0 = 通过；1 = 检测到数字不一致 / 漏译 / 残留（或 --compare 下硬指标回归）；
 2 = 用法错误。度量逻辑与产线/审计共用一套原语，绝不另写一套（见 translate_app/eval.py）。

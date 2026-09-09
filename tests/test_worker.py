@@ -612,10 +612,10 @@ class RebuildPagesWorkerTest(_WorkerTestBase):
         self.assertIsNone(kw["merge_tool_fn"])
 
 
-class ExportUniquePathTest(_WorkerTestBase):
-    """导出不覆盖重名文件：第二次导出得到 name(1).ext。"""
+class ExportOverwriteTest(_WorkerTestBase):
+    """导出**直接覆盖**目标文件（v0.5.24：不再生成 ``name(1).ext``）。"""
 
-    def test_export_does_not_overwrite_existing_output(self):
+    def test_export_overwrites_instead_of_renaming(self):
         out = self.tmp / "o.txt"
         w = TranslateWorker(
             "x.pdf", self._model("http://127.0.0.1:9/v1"), "English",
@@ -623,26 +623,45 @@ class ExportUniquePathTest(_WorkerTestBase):
         doc = pdfio.DocumentText(
             pages=[[pdfio.Block("a", 0, 0, 0, 10, 10)]], blocks=["a"], block_pages=[0])
         p1 = Path(w._export(doc, [["A"]]))
-        p2 = Path(w._export(doc, [["A"]]))
+        p2 = Path(w._export(doc, [["B"]]))
         self.assertEqual(p1, out)
-        self.assertEqual(p2, self.tmp / "o(1).txt")
-        self.assertTrue(out.exists())
-        self.assertTrue((self.tmp / "o(1).txt").exists())
+        self.assertEqual(p2, out)                    # 同一路径：覆盖，不新建
+        self.assertFalse((self.tmp / "o(1).txt").exists())
+        self.assertIn("B", out.read_text(encoding="utf-8"))
+        self.assertNotIn("A", out.read_text(encoding="utf-8"))
 
-    def test_reexport_overwrites_existing_output(self):
-        # 「重新导出」覆盖同一文件（overwrite=True），不再堆积 (1)(2)。
+    def test_reexport_writes_the_same_path(self):
+        # 「重新导出」与首次导出行为一致：写同一路径、不堆积 (1)(2)。
         out = self.tmp / "r.txt"
         w = TranslateWorker(
             "x.pdf", self._model("http://127.0.0.1:9/v1"), "English",
             "plain_text", str(out), agent_mode=False)
         doc = pdfio.DocumentText(
             pages=[[pdfio.Block("a", 0, 0, 0, 10, 10)]], blocks=["a"], block_pages=[0])
-        p1 = Path(w._export(doc, [["A"]], overwrite=True))
-        p2 = Path(w._export(doc, [["B"]], overwrite=True))
+        p1 = Path(w._export(doc, [["A"]]))
+        p2 = Path(w._export(doc, [["B"]]))
         self.assertEqual(p1, out)
-        self.assertEqual(p2, out)                    # 同一路径：覆盖，不新建
+        self.assertEqual(p2, out)
         self.assertFalse((self.tmp / "r(1).txt").exists())
         self.assertIn("B", out.read_text(encoding="utf-8"))
+
+    def test_export_never_overwrites_the_source_pdf(self):
+        # The one exception: an output path that IS the source PDF would destroy
+        # the input, so it still falls back to a unique name (with a log line).
+        src = build_sample_pdf(self.tmp / "same.pdf", pages=1)
+        before = src.read_bytes()
+        with MockServer() as server:
+            worker = TranslateWorker(
+                str(src), self._model(server.endpoint), "Chinese",
+                "translated_pdf", str(src),   # == source!
+            )
+            logs: list[str] = []
+            worker.log.connect(logs.append)
+            self.assertEqual(["finished", "stopped"], self._run(worker))
+        self.assertEqual(before, src.read_bytes())          # source untouched
+        copies = sorted(self.tmp.glob("same(1).pdf"))
+        self.assertEqual(1, len(copies))
+        self.assertTrue(any("输出路径与源 PDF 相同" in m for m in logs), logs)
 
 
 class StructureModeWorkerTest(_WorkerTestBase):

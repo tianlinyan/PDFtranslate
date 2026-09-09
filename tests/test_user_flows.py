@@ -32,8 +32,33 @@ class CompileFromUserTest(unittest.TestCase):
         self.assertEqual([1, 2, 3, 4], uf._parse_scope("第2-5页"))
         self.assertEqual([1, 2, 3, 4], uf._parse_scope("自检第2到第5页"))
 
+    def test_explicit_scope_needs_a_restriction_cue(self):
+        # Regression: ``run_translate`` derived a page scope from *any* page mention,
+        # so "帮我翻译整篇年报，第5页的图表保留原文" translated ONLY page 5 (and reported
+        # success while every other page was exported untranslated).
+        self.assertIsNone(uf.parse_explicit_scope("帮我翻译整篇年报，第5页的图表保留原文"))
+        self.assertIsNone(uf.parse_explicit_scope("把第3页公司名翻成Bank"))
+        self.assertIsNone(uf.parse_explicit_scope("开始翻译"))
+        # A "skip" is an exclusion, not a scope: "跳过第3页" means translate the rest.
+        self.assertIsNone(uf.parse_explicit_scope("跳过第3页"))
+        # An explicit restriction does narrow the run.
+        self.assertEqual([4], uf.parse_explicit_scope("只翻第5页"))
+        self.assertEqual([1, 2, 3, 4], uf.parse_explicit_scope("只翻译第2到第5页"))
+        self.assertEqual([1, 2, 3, 4], uf.parse_explicit_scope("翻译第2-5页"))
+        self.assertEqual([2], uf.parse_explicit_scope("仅限第3页"))
+        self.assertEqual([0, 1], uf.parse_explicit_scope("范围第1到第2页"))
+
     def test_auto_fix_default_when_not_specified(self):
         self.assertIsNone(agent.compile_from_user("自检").auto_fix)
+
+    def test_auto_fix_is_opt_in(self):
+        # v0.5.24: a plain "自检…" stays read-only (the tool description promises
+        # it); only an explicit "自动改/修一下" turns the fix pass on.
+        self.assertIsNone(uf.compile_from_user("自检第1页").auto_fix)
+        self.assertIs(True, uf.compile_from_user("自检第1页，自动改").auto_fix)
+        self.assertIs(True, uf.compile_from_user("自检第1页，有问题帮我改").auto_fix)
+        self.assertIs(False, uf.compile_from_user("自检第1页，不修改").auto_fix)
+        self.assertIs(False, uf.compile_from_user("自检第1页，只查").auto_fix)
 
     def test_remap_base_export_and_retranslate(self):
         self.assertEqual("export", agent.compile_from_user("重新导出").base)

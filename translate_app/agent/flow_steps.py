@@ -467,7 +467,7 @@ def make_self_check_page() -> Flow:
     """
     return Flow(
         name="self_check_page",
-        description="对一页做确定性审计，并把发现的问题交给 AI 就地修正；只复核真正翻译过的页。",
+        description="对一页做确定性审计，并把发现的问题交给 AI 就地修正；复核哪些页由调用方决定（保留/跳过页除外）。",
         params={"page": 0, "checks": None, "auto_fix": True, "max_iter": 3},
         steps=[
             LoopStep(until=_clean, max_iter="{{max_iter}}", body=[

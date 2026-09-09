@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -319,6 +320,36 @@ class ChatSessionTest(unittest.TestCase):
         # A short history passes through untouched.
         self.assertEqual(3, len(s._window_history()[:3]))
 
+    def test_window_history_never_starts_mid_tool_group(self):
+        # Regression: one turn with more tool rounds than the cap leaves no ``user``
+        # in the tail, so the old raw-tail fallback handed the API a window that
+        # started with a ``tool`` message (no preceding assistant(tool_calls)) — the
+        # endpoint answered 400 and the whole turn's work was lost.
+        s = chat.ChatSession(_model())
+        s.history.append({"role": "user", "content": "帮我翻译并检查一下"})
+        for r in range(8):                       # 8 rounds × 3 tools = 34 messages
+            calls = [{"id": f"{r}-{i}", "type": "function",
+                      "function": {"name": "read_page", "arguments": "{}"}}
+                     for i in range(3)]
+            s.history.append({"role": "assistant", "content": "", "tool_calls": calls})
+            for i in range(3):
+                s.history.append({"role": "tool", "tool_call_id": f"{r}-{i}",
+                                  "content": "{}"})
+        s.history.append({"role": "assistant", "content": "完成"})
+        w = s._window_history()
+        self.assertTrue(w)
+        self.assertNotEqual("tool", w[0]["role"])
+        # Every tool message is preceded by its assistant, and every tool_call_id
+        # has exactly one reply inside the window.
+        pending: set[str] = set()
+        for m in w:
+            if m["role"] == "assistant":
+                pending = {tc["id"] for tc in (m.get("tool_calls") or [])}
+            elif m["role"] == "tool":
+                self.assertIn(m["tool_call_id"], pending, w[:3])
+                pending.discard(m["tool_call_id"])
+        self.assertFalse(pending)
+
     def test_call_sends_bounded_window(self):
         seen: list = []
         client = _FakeClient("ok", seen)
@@ -329,6 +360,20 @@ class ChatSessionTest(unittest.TestCase):
         session.reply("新消息")
         msgs = seen[0]["messages"]           # [system, ...windowed...]
         self.assertLessEqual(len(msgs), 1 + chat._CHAT_HISTORY_CAP)
+
+    def test_missing_pillow_is_reported_once(self):
+        # Pillow is a hard dependency in requirements.txt but imported lazily: a
+        # missing install silently sent the full-size screenshot (the exact cause of
+        # ``exceed_context_size_error``), so it must be reported — once.
+        logs: list[str] = []
+        with mock.patch.dict(sys.modules, {"PIL": None}), \
+             mock.patch.object(chat, "_PIL_WARNED", False):
+            first = chat._downscale_png(b"not-a-png", 10, log=logs.append)
+            second = chat._downscale_png(b"not-a-png", 10, log=logs.append)
+        self.assertEqual(b"not-a-png", first)
+        self.assertEqual(b"not-a-png", second)
+        self.assertEqual(1, len(logs), logs)
+        self.assertIn("Pillow", logs[0])
 
     def test_downscale_png_shrinks_large_image(self):
         from io import BytesIO

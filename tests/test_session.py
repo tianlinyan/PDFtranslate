@@ -143,6 +143,17 @@ class DocumentSessionTest(unittest.TestCase):
             session._preprocess()
         self.assertEqual(state.user_decisions["terminology"], {"总资产": "Total assets"})
 
+    def test_cancellation_in_a_special_page_is_not_swallowed(self):
+        # ``_translate_special_page``'s ``except Exception`` used to record a
+        # cancellation as "第 N 页翻译失败（保留原文）" and return False; a control
+        # signal must propagate so the run reports "已取消", not a failure.
+        doc = _mixed_doc()
+        state, session = self._session(doc, lambda *a, **k: state)
+        with mock.patch.object(agent.flow, "run_flow",
+                               side_effect=TranslationCancelled()):
+            with self.assertRaises(TranslationCancelled):
+                session._translate_special_page(1, "scan")
+
     def test_infer_terms_fails_closed_on_glossary_error(self):
         doc = _mixed_doc()
         state = agent.WorkflowState(src_path="a.pdf", lang="English")

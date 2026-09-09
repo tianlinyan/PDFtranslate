@@ -172,42 +172,6 @@ def parse_preview_command(text: str):
     return None
 
 
-def _stem_without_unique(p: Path) -> str:
-    """Stem with any trailing ``(n)`` suffix stripped (``test_English(1)``→``test_English``)."""
-    return re.sub(r"\(\d+\)$", "", p.stem)
-
-
-def resolve_reexport_target(requested: str | Path, last_output: str | Path | None) -> str:
-    """Resolve the file 「重新导出」 should write to.
-
-    A normal run writes through ``pdfio.unique_path``, so when the requested name
-    already exists the output lands at ``test_English(1).pdf`` (and ``_last_output``
-    is that ``(1)`` path).  Re-export must go back to that *exact* file and overwrite
-    it in place; re-deriving the base ``test_English.pdf`` would clobber an unrelated
-    older file while the real latest ``(1)`` output stays stale.  When the requested
-    name no longer belongs to the previous output (a different directory, a
-    different base name, a different extension — e.g. the user switched the output
-    type or language), fall back to it so the new setting wins.
-    """
-    req = Path(requested)
-    if not last_output:
-        return str(req)
-    last = Path(str(last_output))
-    # A requested name that already carries an explicit ``(n)`` suffix is an explicit
-    # target (the user typed it) — honour it instead of rewriting it to the previous
-    # output.  Any other name in ``last``'s family IS the previous export, so target
-    # the actual file and overwrite it.
-    if re.search(r"\(\d+\)$", req.stem):
-        return str(req)
-    if (
-        req.parent == last.parent
-        and _stem_without_unique(req) == _stem_without_unique(last)
-        and req.suffix == last.suffix
-    ):
-        return str(last)
-    return str(req)
-
-
 class _LogBridge(QObject):
     """Thread-safe log channel: emitting from any thread is marshalled to the GUI.
 
@@ -846,8 +810,12 @@ class MainWindow(QWidget):
         """
         if self.doc_ctx.get_last_translated() is None and not self.doc_ctx.overlay():
             return None
-        doc = self.doc_ctx.ensure_doc()
-        if doc is None or not (0 <= int(page) < len(doc.pages)):
+        # ``peek_doc`` — never ``ensure_doc``: a lazy extraction here would run a
+        # whole-document OCR on the GUI thread and freeze the window for minutes.
+        doc = self.doc_ctx.peek_doc()
+        if doc is None:
+            return None
+        if not (0 <= int(page) < len(doc.pages)):
             return None
         last = self.doc_ctx.get_last_translated()
         overlay = self.doc_ctx.overlay()
@@ -1213,13 +1181,9 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "重新导出", "没有可用模型，请检查 models.json 配置。")
             return
         key = self._type_combo.currentData()
-        requested = self._path_edit.text().strip() or self._default_output_path()
-        # Re-export must overwrite the file that was actually produced last time
-        # (which may carry a ``(n)`` suffix after a name collision), not a freshly
-        # re-derived base path — that would clobber an unrelated old file.
-        out_path = resolve_reexport_target(
-            requested, self._last_output,
-        )
+        # 导出直接覆盖目标文件（v0.5.24 起不再生成 ``(n)`` 副本），所以「重新导出」
+        # 就是重新写同一个路径——无需再从上次输出反推文件名。
+        out_path = self._path_edit.text().strip() or self._default_output_path()
         self._run_ok = False
         self._cancelled_by_user = False
         self._errored = False
@@ -1240,6 +1204,11 @@ class MainWindow(QWidget):
             overlay=self.doc_ctx.overlay(),
             re_export=True,
             last_translated=self._last_translated,
+            # 导出选项必须与「开始翻译」一致：旧实现只传 ocr/agent_mode，导致勾选了
+            # 「OCR表格重建为矢量表格」/「表格列宽重排」后点「重新导出」仍旧输出扫描
+            # 表格（用户看到的就是「选项失效」）。
+            reflow=self._reflow_check.isChecked(),
+            rebuild_table=self._rebuild_table_check.isChecked(),
         ))
 
     def _on_progress(self, done: int, total: int, stage: str) -> None:

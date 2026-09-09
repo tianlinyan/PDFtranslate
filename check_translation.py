@@ -28,6 +28,7 @@ from __future__ import annotations
 import re
 import sys
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Sequence
 
@@ -37,6 +38,41 @@ import pymupdf as fitz
 #: token must END in a digit (or %) so a trailing sentence period (``2025.``)
 #: is not swallowed into the number.
 _NUM_TOKEN_RE = re.compile(r"[+-]?[0-9][0-9,.，．]*[0-9%]|[+-]?[0-9]")
+
+#: Full-width digits / separators / signs → ASCII.  Without this a full-width
+#: source (``１，２３４．５６``) yielded NO tokens while its ASCII translation did,
+#: so a *correct* translation was reported as "译文多出 …".
+_FULLWIDTH_MAP = str.maketrans("０１２３４５６７８９，．％－＋", "0123456789,.%-+")
+#: Unicode minus / dashes → ASCII hyphen-minus.
+_MINUS_MAP = str.maketrans("−–—", "---")
+
+#: Unit words that legitimately rescale a value (``1,234.56 万元`` ==
+#: ``12,345,600 yuan``).  Kept in sync with the agent's number audit
+#: (``translate_app.agent.flow._unit_multiplier``); ``test_check_translation``
+#: pins the same sample table so the two cannot drift apart silently.
+_UNIT_EN_RE = re.compile(r"^\s*((?:ten|hundred)\s+)?(thousand|million|billion|trillion)\b",
+                         re.IGNORECASE)
+_UNIT_EN_POWER = {"thousand": 3, "million": 6, "billion": 9, "trillion": 12}
+_UNIT_CN_RE = re.compile(r"^\s*(万亿|亿|万)\s*")
+_UNIT_CN_POWER = {"万亿": 12, "亿": 8, "万": 4}
+#: Currency words carry no multiplier but DO mark the token as a value that may be
+#: rendered with a different surface form (``1,234.56 万元`` → ``12,345,600 yuan``).
+_CURRENCY_RE = re.compile(
+    r"^\s*(?:元|人民币|RMB|yuan|USD|CNY|dollars?)(?![A-Za-z])", re.IGNORECASE)
+
+
+def _unit_multiplier(window: str) -> Decimal:
+    """The scale a unit word right after a number applies to it (``1`` when none)."""
+    m = _UNIT_EN_RE.match(window)
+    if m:
+        power = _UNIT_EN_POWER[m.group(2).lower()]
+        prefix = (m.group(1) or "").lower().strip()
+        return Decimal(10) ** (power + (2 if prefix == "hundred" else
+                                        1 if prefix == "ten" else 0))
+    m = _UNIT_CN_RE.match(window)
+    if m:
+        return Decimal(10) ** _UNIT_CN_POWER[m.group(1)]
+    return Decimal(1)
 
 #: Arabic hierarchy at the start of a line: ``1.``、``1.1``、``1.1.2``.  The
 #: marker must be followed by a non-digit (a word), so table rows that merely
@@ -135,37 +171,100 @@ def _normalize_cjk_ordinals(text: str) -> str:
     return _CN_ORD_PATTERN.sub(repl, text)
 
 
-def _page_numbers(text: str) -> Counter[str]:
-    """All *amount-shaped* number tokens of a page, as canonical strings.
+def _amounts(text: str) -> tuple[Counter[str], Counter[Decimal]]:
+    """The amount-shaped numbers of a page as ``(role keys, value keys)``.
 
-    A bare integer (``1``, ``2025``, ``22``) is usually a section/ordinal marker,
-    a year or a ``Tier 1`` term, not a figure that a misread separator could
-    corrupt — so only tokens carrying a thousands/decimal separator or a ``%``
-    are compared.  Each kept token keeps its digits *and* the role of each
-    separator (``,`` -> C, ``.`` -> D): ``3,702,726,474.45`` becomes
-    ``3C702C726C474D45``, so a comma/dot swap like ``3,702.726,474.45``
-    is caught even though the digit sequences are identical, and the
-    leading zero is kept so a lost ``0.`` (a dropped decimal point)
-    shows up as well.
+    Two views of the same tokens, because the two failure modes need different
+    evidence:
+
+    * **role keys** keep the digits *and* the role of each separator (``,`` → C,
+      ``.`` → D): ``3,702,726,474.45`` becomes ``3C702C726C474D45``, so a
+      comma/dot swap (``3,702.726,474.45``, same digits) is caught even though the
+      values would look alike, and a dropped ``0.`` still shows up.
+    * **value keys** are the numeric values, with unit multipliers applied
+      (``1,234.56 万元`` and ``12,345,600 yuan`` are both ``12345600``).  Without
+      this, every unit-converted figure — the normal case for a CJK→Latin annual
+      report — was reported as a fatal number mismatch.
+
+    A bare integer (``1``, ``2025``, ``22``) is usually a section/ordinal marker, a
+    year or a ``Tier 1`` term, not a figure a misread separator could corrupt, so
+    it only counts when a unit word attaches to it (``314 million``).
     """
-    out: Counter[str] = Counter()
-    for tok in _NUM_TOKEN_RE.findall(text):
-        if not any(ch in ",.，．%" for ch in tok):
-            continue  # no amount structure — ordinal/year/"Tier 1", not a figure
+    roles: Counter[str] = Counter()
+    values: Counter[Decimal] = Counter()
+    t = str(text).translate(_FULLWIDTH_MAP).translate(_MINUS_MAP)
+    spans = list(_NUM_TOKEN_RE.finditer(t))
+    for i, m in enumerate(spans):
+        tok = m.group(0)
+        if tok in ("", "-", "+", "."):
+            continue
+        unit_win = (t[m.end():spans[i + 1].start()] if i + 1 < len(spans)
+                    else t[m.end():m.end() + 16])
+        mult = _unit_multiplier(unit_win)
+        currency = bool(_CURRENCY_RE.match(unit_win))
+        has_sep = any(ch in ",.%" for ch in tok)
+        if not (has_sep or mult != 1 or currency):
+            continue                      # bare integer without a unit: not a figure
         canonical: list[str] = []
         neg = False
         for ch in tok:
             if ch.isdigit():
                 canonical.append(ch)
-            elif ch in ".．":
+            elif ch == ".":
                 canonical.append("D")
-            elif ch in ",，":
+            elif ch == ",":
                 canonical.append("C")
             elif ch == "-":
                 neg = True
         if canonical:
-            out[("M" if neg else "") + "".join(canonical)] += 1
-    return out
+            roles[("M" if neg else "") + "".join(canonical)] += 1
+        try:
+            values[Decimal(tok.replace(",", "")) * mult] += 1
+        except InvalidOperation:
+            # A separator-swapped token (``3,702.726,474.45`` → ``3702.726474.45``)
+            # has no value: it stays unmatched at the value level too, so the swap
+            # is still reported (and never silently "explained away").
+            continue
+    return roles, values
+
+
+def _numeric_diff(src_text: str, tgt_text: str) -> list[str]:
+    """Human-readable differences between the two pages' amounts (empty = clean).
+
+    A token is only reported when it is unmatched **both** by separator pattern
+    and by value: an equivalent value rendered differently (unit conversion,
+    full-width digits, a comma/dot style change) is not a number defect, while a
+    dropped/altered/invented digit, or a separator swap, changes the value or the
+    pattern and is still reported.
+    """
+    src_roles, src_vals = _amounts(src_text)
+    tgt_roles, tgt_vals = _amounts(tgt_text)
+    only_src_roles = src_roles - tgt_roles
+    only_tgt_roles = tgt_roles - src_roles
+    if not only_src_roles and not only_tgt_roles:
+        return []
+    only_src_vals = src_vals - tgt_vals
+    only_tgt_vals = tgt_vals - src_vals
+    if not only_src_vals and not only_tgt_vals:
+        return []                        # same values, different surface form
+    diffs: list[str] = []
+    if only_src_vals or only_tgt_vals:
+        for value, n in only_src_vals.most_common():
+            diffs.append(f"原文 {n} 次「{value}」在译文中缺失")
+        for value, n in only_tgt_vals.most_common():
+            diffs.append(f"译文多出 {n} 次「{value}」（不在原文中出现）")
+        return diffs
+    # Values agree but the separator pattern does not: a comma/dot swap.
+    for key, n in only_src_roles.most_common():
+        diffs.append(f"原文 {n} 次「{key}」在译文中缺失")
+    for key, n in only_tgt_roles.most_common():
+        diffs.append(f"译文多出 {n} 次「{key}」（不在原文中出现）")
+    return diffs
+
+
+def _page_numbers(text: str) -> Counter[str]:
+    """Amount-shaped tokens of a page as separator-role keys (see :func:`_amounts`)."""
+    return _amounts(text)[0]
 
 
 def _section_numbers(text: str) -> list[tuple[str, int]]:
@@ -366,24 +465,15 @@ class Checker:
         if skip_scan and _is_scan_like_text(src_text):
             return "mixed"  # 扫描页（文本层仅页码/无内容）：数字来自 OCR，不能作为基准
 
-        # 1) 数字一致性：逐位比较数字序列。先归一化中文序数（一、→1.、 二、→2.、（四）→(4)、
-        #    第X节→Section X），否则这些预期转换会被当作“译文多出的数字”。
-        src_nums = _page_numbers(_normalize_cjk_ordinals(src_text))
-        tgt_nums = _page_numbers(_normalize_cjk_ordinals(tgt_text))
-        only_src = src_nums - tgt_nums
-        only_tgt = tgt_nums - src_nums
-        if only_src or only_tgt:
-            diffs: list[str] = []
-            for d, n in only_src.most_common():
-                diffs.append(f"原文 {n} 次「{d}」在译文中缺失")
-                if len(diffs) >= self.max_reported:
-                    break
-            for d, n in only_tgt.most_common():
-                if len(diffs) >= self.max_reported:
-                    break
-                diffs.append(f"译文多出 {n} 次「{d}」（不在原文中出现）")
+        # 1) 数字一致性：按「值」比较（单位倍率、全角数字、千分位风格差异不算错），
+        #    并保留分隔符角色比较以抓千分位/小数点错乱。先归一化中文序数（一、→1.、
+        #    二、→2.、（四）→(4)、第X节→Section X），否则这些预期转换会被当作
+        #    “译文多出的数字”。
+        diffs = _numeric_diff(_normalize_cjk_ordinals(src_text),
+                              _normalize_cjk_ordinals(tgt_text))
+        if diffs:
             self.numeric.append(
-                f"{where}: 数字序列不一致：" + "；".join(diffs)
+                f"{where}: 数字序列不一致：" + "；".join(diffs[:self.max_reported])
             )
 
         # 2) 残留中文（仅西文目标）。报表/科目号（会商银02表、会企01表-1）按规则保留

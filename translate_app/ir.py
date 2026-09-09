@@ -470,37 +470,92 @@ _INFER_STOPWORDS_CJK = frozenset({
     "本报告", "本公司", "本公司及", "年度", "单位", "项目", "其中", "合计", "本期", "上年",
 })
 
+#: Candidate n-gram length range for CJK terms (2–12 characters).  Counting runs up to
+#: ``_INFER_CJK_COUNT`` so a phrase's longer context is known; only the shorter ones are
+#: reported (a 20-char sentence fragment is not a useful glossary entry).
+_INFER_CJK_MIN = 2
+_INFER_CJK_MAX = 12
+_INFER_CJK_COUNT = 20
+
+#: Chinese numerals / 附注 markers: a phrase made only of these is numbering, not a term.
+_INFER_CJK_NUMERALS = frozenset("零一二三四五六七八九十百千")
+#: Particles/auxiliaries that do not start or end a *term* (a phrase is not cut at a
+#: content character like 对/以/为/所/无, which legitimately begin terms).
+_INFER_CJK_EDGE = frozenset("的了与及和之等也都就而则且但很更最较又并或若因故即")
+
+
+def _cjk_candidates(texts: Sequence[str], min_freq: int) -> list[str]:
+    """Repeated *maximal* CJK n-grams (2–10 chars) that look like terminology.
+
+    ``infer_terms`` used to keep the *maximal* CJK runs (``[\\u4e00-\\u9fff]+``) whose
+    length is 2–4 — in real Chinese prose a sentence is ONE long run, so that condition
+    almost never held and the document-level glossary was silently empty for every
+    Chinese report (while the Latin side happily pinned ``Revenue``/``Total``).
+
+    Instead, count every 2–16 char window over each run, keep the frequent ones, and
+    keep only the **maximal** ones: a gram is dropped when the gram extended by the
+    character that actually precedes/follows it is *also* frequent.  That is what
+    turns sliding windows of one phrase (``动产生的现金`` / ``活动产生的现`` …) into the
+    single phrase (``经营活动产生的现金流量净额``) and keeps ``其他综合收益`` instead of
+    its 5-char tail ``他综合收益``.
+    """
+    counts: Counter[str] = Counter()
+    before: dict[str, Counter[str]] = {}
+    after: dict[str, Counter[str]] = {}
+    for t in texts:
+        for m in re.finditer(r"[\u4e00-\u9fff]{2,}", t):
+            run = m.group(0)
+            for n in range(_INFER_CJK_MIN, min(_INFER_CJK_COUNT, len(run)) + 1):
+                for i in range(len(run) - n + 1):
+                    gram = run[i:i + n]
+                    counts[gram] += 1
+                    if i > 0:
+                        before.setdefault(gram, Counter())[run[i - 1]] += 1
+                    if i + n < len(run):
+                        after.setdefault(gram, Counter())[run[i + n]] += 1
+    frequent = {g for g, c in counts.items() if c >= min_freq}
+    out: list[str] = []
+    for gram in frequent:
+        if len(gram) > _INFER_CJK_MAX:
+            continue
+        if all(ch in _INFER_CJK_NUMERALS for ch in gram):
+            continue                      # 附注编号（三十、十四…）不是术语
+        if gram[0] in _INFER_CJK_EDGE or gram[-1] in _INFER_CJK_EDGE:
+            continue                      # 以虚词起止的片段（"的现金净额"、"支付其他与"）
+        if any(prev + gram in frequent for prev in before.get(gram, ())):
+            continue
+        if any(gram + nxt in frequent for nxt in after.get(gram, ())):
+            continue
+        out.append(gram)
+    # Frequent first, then longer (a longer phrase is the more useful entry).
+    out.sort(key=lambda g: (-counts[g], -len(g), g))
+    return out
+
 
 def infer_terms(ir: IRDoc, *, max_terms: int | None = None) -> list[str]:
     """Conservative document-level terminology candidates (C-⑥).
 
     Source-only (no translation): call :func:`translate_ir` with ``infer=True`` to
     translate them once and inject the result as ``IRDoc.terms``, giving every
-    occurrence the same target across pages.  Candidates are CJK phrases (2–4 chars)
-    and TitleCase / ALL-CAPS Latin words that appear >=2 times, capped at
-    ``max_terms``.  Stopwords (function words, "Figure", "Type", …) are filtered out:
-    a pinned "The" is injected as a must-use term into every request, so a noisy
-    candidate is not harmless — it actively distorts the translation.
+    occurrence the same target across pages.  Candidates are repeated CJK phrases
+    (2–6 chars, maximal and trimmed at function characters) and repeated TitleCase /
+    ALL-CAPS Latin words, capped at ``max_terms``.  Stopwords (function words,
+    "Figure", "Type", …) are filtered out: a pinned "The" is injected as a must-use
+    term into every request, so a noisy candidate is not harmless — it actively
+    distorts the translation.
     """
-    cjk: Counter[str] = Counter()
+    texts = [str(b.text) for ipage in ir.pages for b in ipage.blocks
+             if not is_structural_role(b.role) and not _is_verbatim(b.anchor)]
+    cands = [t for t in _cjk_candidates(texts, _INFER_MIN_FREQ)
+             if t not in _INFER_STOPWORDS_CJK]
     latin: Counter[str] = Counter()
-    for ipage in ir.pages:
-        for b in ipage.blocks:
-            if is_structural_role(b.role) or _is_verbatim(b.anchor):
-                continue
-            t = str(b.text)
-            for m in re.finditer(r"[\u4e00-\u9fff]+", t):
-                run = m.group(0)
-                if 2 <= len(run) <= 4:   # a term is short; a long CJK run is prose
-                    cjk[run] += 1
-            for w in re.findall(r"\b[A-Z][a-z]{2,}\b|\b[A-Z]{3,}\b", t):
-                latin[w] += 1
-    cands = [t for t, n in cjk.items()
-             if n >= _INFER_MIN_FREQ and t not in _INFER_STOPWORDS_CJK]
+    for t in texts:
+        for w in re.findall(r"\b[A-Z][a-z]{2,}\b|\b[A-Z]{3,}\b", t):
+            latin[w] += 1
     cands += [w for w, n in latin.items()
               if n >= _INFER_MIN_FREQ and w.casefold() not in _INFER_STOPWORDS]
-    # ``cands`` is already unique (CJK runs and Latin words are disjoint key sets),
-    # so de-duplication is redundant; just cap the count.
+    # ``cands`` is already unique (the CJK and Latin key sets are disjoint), so
+    # de-duplication is redundant; just cap the count.
     return cands[:(max_terms or _INFER_MAX_TERMS)]
 
 
@@ -523,6 +578,11 @@ def infer_glossary(
     """
     terms = infer_terms(ir)
     if not terms:
+        # Say so: an empty candidate list used to look exactly like "terminology
+        # injection ran and found nothing to do", which hid the broken CJK
+        # extraction for every Chinese report.
+        if log:
+            log("[ir] 未抽到重复术语候选，本次不注入文档级术语。")
         return {}
     got = translate_fn(terms, lang=lang, extra_glossary={})
     if len(got) != len(terms):

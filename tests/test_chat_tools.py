@@ -188,6 +188,17 @@ class ChatToolsTest(_CtxTest):
 
     # ---- run_flow: an ``auto_fix`` flow can re-translate problem blocks ----
 
+    def test_peek_doc_never_triggers_extraction(self):
+        # The preview's "译文" side runs on the GUI thread: ``ensure_doc`` may OCR a
+        # whole scanned PDF and freeze the window, so that path must use ``peek_doc``.
+        from translate_app import pdfio
+
+        ctx = DocContext()
+        ctx.set_source("nope.pdf", lang="English", ocr=True)
+        with mock.patch.object(pdfio, "extract_document_text",
+                               side_effect=AssertionError("must not extract")):
+            self.assertIsNone(ctx.peek_doc())
+
     def test_run_flow_stays_read_only_when_channel_missing(self):
         # No translation channel → mode read_only (existing behaviour).
         res = self._flow_tools()["run_flow"]("自检只查数字，第1页")
@@ -202,11 +213,23 @@ class ChatToolsTest(_CtxTest):
         self.assertFalse(res["ok"], res)
         self.assertIn("需要模型在线", res["error"])
 
-    def test_run_flow_fixes_in_place_when_channel_wired(self):
+    def test_run_flow_is_read_only_by_default(self):
+        # v0.5.24: a plain "自检…" is a READ-ONLY audit (the tool description says
+        # so); auto-fix requires an explicit request.  The old default rewrote the
+        # translation while the AI told the user it had only checked.
         tools = self._flow_tools(translate_texts=lambda texts, lang: ["Translated text"] * len(texts))
         res = tools["run_flow"]("自检第1页残留和漏译")
         self.assertTrue(res["ok"], res)
         self.assertEqual("self_check_page", res["base"])
+        self.assertEqual("read_only", res["mode"])
+        self.assertEqual(0, res["fixed_blocks"])
+        self.assertGreater(res["remaining_issue_count"], 0)
+        self.assertFalse(self.ctx.overlay())      # nothing was written
+
+    def test_run_flow_fixes_in_place_when_the_user_asks_for_it(self):
+        tools = self._flow_tools(translate_texts=lambda texts, lang: ["Translated text"] * len(texts))
+        res = tools["run_flow"]("自检第1页残留和漏译，自动改")
+        self.assertTrue(res["ok"], res)
         self.assertEqual("fixed", res["mode"])
         self.assertGreater(res["fixed_blocks"], 0)
         self.assertEqual(0, res["remaining_issue_count"])
@@ -226,7 +249,7 @@ class ChatToolsTest(_CtxTest):
     def test_run_flow_reports_unfixable_blocks(self):
         # The model keeps the source → those blocks stay untranslated and are reported.
         tools = self._flow_tools(translate_texts=lambda texts, lang: list(texts))
-        res = tools["run_flow"]("自检第1页残留和漏译")
+        res = tools["run_flow"]("自检第1页残留和漏译，自动改")
         self.assertTrue(res["ok"], res)
         self.assertEqual("fixed", res["mode"])
         self.assertGreater(res["failed_blocks"], [])
@@ -448,10 +471,15 @@ class ChatToolsTest(_CtxTest):
     def test_run_translate_calls_channel_with_requirement(self):
         calls: list = []
         tools = chat_tools.make_chat_tools(self.ctx,
-                                           start_translate=lambda req, _scope=None: calls.append(req))
+                                           start_translate=lambda req, scope=None:
+                                           calls.append((req, scope)))
         res = tools["run_translate"]("第3页公司名翻成Bank")
         self.assertTrue(res["ok"])
-        self.assertEqual(["第3页公司名翻成Bank"], calls)
+        # A page *mention* must not narrow the run (regression: it used to translate
+        # only page 3 and report success while the rest stayed untranslated).
+        self.assertEqual([("第3页公司名翻成Bank", None)], calls)
+        tools["run_translate"]("只翻译第2到第5页")
+        self.assertEqual([1, 2, 3, 4], calls[-1][1])
 
     def test_set_setting_validates_and_calls_channel(self):
         calls: list = []

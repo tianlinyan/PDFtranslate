@@ -299,7 +299,7 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": f"越界块索引 {index}"}
         src = str(blocks[int(index)].text)
         if pdfio._is_numeric_cell(src):
-            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
+            return {"ok": False, "error": "数字格不可被 AI 改写（保真）"}
         ctx.set_overlay(int(index), str(text), action="set")
         return {"ok": True, "index": int(index), "text": str(text)}
 
@@ -326,7 +326,7 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         if text is None:
             return {"ok": False, "error": "action=set 需要 text"}
         if pdfio._is_numeric_cell(str(block.text)):
-            return {"ok": False, "error": "数字/代码块不可被 AI 改写（保真）"}
+            return {"ok": False, "error": "数字格不可被 AI 改写（保真）"}
         ctx.set_overlay(flat, str(text), action="set")
         return {"ok": True, "page": page, "index": flat, "action": action,
                 "text": str(text)}
@@ -390,7 +390,7 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             cands = [int(i) for i in indices]
         picked = _pick_translatable(cands, blocks)
         if not picked:
-            return {"ok": False, "error": "没有可重译的块（全部为数字/代码/空块）"}
+            return {"ok": False, "error": "没有可重译的块（全部为数字格/公式/空块）"}
         lang = _target_lang(target_lang)
         sources = [str(blocks[i].text) for i in picked]
         try:
@@ -508,13 +508,17 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": "请先选择一个 PDF 源文件（点「打开 PDF…」或拖入窗口）。"}
         if start_translate is None:
             return {"ok": False, "error": "开始翻译通道未接线"}
-        # U1: a page range in the requirement (e.g. "只翻第2-5页") becomes the run's
-        # page scope, so the console defines WHAT to translate and the pipeline limits
-        # itself to those pages (None = the whole document).
+        # U1: an **explicitly restricted** page range in the requirement (e.g.
+        # "只翻第2-5页") becomes the run's page scope, so the console defines WHAT
+        # to translate and the pipeline limits itself to those pages (None = the
+        # whole document).  A requirement that merely *mentions* a page ("翻译整篇，
+        # 第5页图表保留原文") must NOT narrow the run — that used to translate only
+        # page 5 and report success while every other page stayed untranslated;
+        # such a mention stays a per-page instruction the agent reads from
+        # ``state.requirements``.
         from . import agent as _agent
         try:
-            page_scope = _agent.compile_from_user(
-                str(requirement or ""), default_base="translate_page").scope
+            page_scope = _agent.parse_explicit_scope(str(requirement or ""))
         except Exception:  # noqa: BLE001 — a bad parse degrades to the whole document
             page_scope = None
         try:
@@ -597,9 +601,13 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         scope = spec.scope if spec.scope is not None else list(range(total))
         scope = [p for p in scope if 0 <= p < total]
         checks = spec.checks
-        # ``auto_fix`` is True unless the user said 只查/只读/不修改.  It can only
-        # actually fix when a translation channel is wired; otherwise it stays read-only.
-        auto_fix = bool(spec.auto_fix) if spec.auto_fix is not None else True
+        # ``auto_fix`` is OPT-IN (v0.5.24): a plain "自检第3到第8页" is a READ-ONLY
+        # audit — the tool description and CLAUDE.md both say so, and silently
+        # rewriting the translation (and the protected overlay, which then wins at
+        # export) is exactly the kind of surprise the human-in-the-loop design
+        # avoids.  A fix only happens when the user asked for one ("自动改/修一下")
+        # and a translation channel is wired; otherwise it stays read-only.
+        auto_fix = bool(spec.auto_fix) if spec.auto_fix is not None else False
         body = _audit_scope(scope, checks, auto_fix, _target_lang(None))
 
         promoted = False
