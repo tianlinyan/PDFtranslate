@@ -552,10 +552,10 @@ class TableCellFitTest(unittest.TestCase):
     def test_build_table_blocks_widens_cells_and_sets_in_table(self):
         # Native ruled-table cells are flagged in_table and widened to the whole
         # cell (minus a small gutter) so a longer translation can use the column.
-        cell_rects = [fitz.Rect(100, 100, 300, 120)]
+        cell_rects = [fitz.Rect(100, 100, 200, 120), fitz.Rect(200, 100, 300, 120)]
         lines = [
             self._line(150, 210, 105, 115, "名称"),
-            self._line(150, 250, 105, 115, "1,234,567"),
+            self._line(250, 300, 105, 115, "1,234,567"),
         ]
         blocks = pdfio._build_table_blocks(lines, [], 0, 600, 0, cell_rects)
         self.assertEqual(len(blocks), 2)
@@ -564,12 +564,47 @@ class TableCellFitTest(unittest.TestCase):
         num = by_text["1,234,567"]
         self.assertTrue(name.in_table)
         self.assertTrue(num.in_table)
-        # Widened to the cell width (with the small gutter), not the text extent.
+        # Widened to its own cell width (with the small gutter), not the text extent.
         self.assertAlmostEqual(name.x0, 100 + pdfio._TABLE_CELL_PAD, delta=0.01)
-        self.assertAlmostEqual(name.x1, 300 - pdfio._TABLE_CELL_PAD, delta=0.01)
+        self.assertAlmostEqual(name.x1, 200 - pdfio._TABLE_CELL_PAD, delta=0.01)
+        self.assertAlmostEqual(num.x0, 200 + pdfio._TABLE_CELL_PAD, delta=0.01)
+        self.assertAlmostEqual(num.x1, 300 - pdfio._TABLE_CELL_PAD, delta=0.01)
         # Text cells centre; figure cells right-align.
         self.assertEqual(name.align, "center")
         self.assertEqual(num.align, "right")
+
+    def test_multiline_cell_lines_merge_into_one_block(self):
+        # P0-2: a cell whose source text wraps over two lines used to emit two
+        # blocks; the exporter anchors every multi-line translation at the ROW's
+        # top, so both were drawn from the same y and overprinted each other.
+        # They must come out as ONE block carrying the real source line count.
+        cell_rects = [fitz.Rect(100, 100, 300, 140)]
+        lines = [
+            self._line(110, 190, 105, 115, "非经常性"),
+            self._line(110, 190, 119, 129, "损益项目"),
+        ]
+        blocks = pdfio._build_table_blocks(lines, [], 0, 600, 0, cell_rects)
+        self.assertEqual(1, len(blocks))
+        b = blocks[0]
+        self.assertEqual("非经常性\n损益项目", b.text)
+        self.assertFalse(b.single_line)          # two source lines
+        self.assertTrue(b.in_table)
+        self.assertAlmostEqual(b.y0, 105.0, delta=0.01)
+        self.assertAlmostEqual(b.y1, 129.0, delta=0.01)
+
+    def test_same_baseline_runs_in_one_cell_stay_one_line(self):
+        # Two runs of ONE visual line in the same cell (a label and its inline
+        # value) must not be turned into a two-line block: they join with a space
+        # and stay single_line, so the cell keeps its one-line fit.
+        cell_rects = [fitz.Rect(100, 100, 300, 120)]
+        lines = [
+            self._line(110, 160, 105, 115, "Capacity:"),
+            self._line(165, 250, 105, 115, "Two Passengers"),
+        ]
+        blocks = pdfio._build_table_blocks(lines, [], 0, 600, 0, cell_rects)
+        self.assertEqual(1, len(blocks))
+        self.assertEqual("Capacity: Two Passengers", blocks[0].text)
+        self.assertTrue(blocks[0].single_line)
 
     def _line_with_spans(self, x0, x1, y0, y1, text, spans):
         d = self._line(x0, x1, y0, y1, text)
@@ -2197,6 +2232,139 @@ class OcrTableRedrawTest(unittest.TestCase):
         self.assertIn("Consolidated", text)
         self.assertIn("Parent Company", text)
         self.assertIn("Total assets", text)
+
+
+class ChartNotATableTest(unittest.TestCase):
+    """P0-1: ``find_tables`` only looks for ruling lines, so a chart whose plot
+    area has a full grid *and* text inside the cells was reported as a table — and
+    the export's scoped table redaction then deleted the plot's own line art."""
+
+    @staticmethod
+    def _chart_pdf(path):
+        """A 4-column chart: frame + full grid + a bar in each column + data labels."""
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        rect = fitz.Rect(80, 120, 500, 400)
+        page.draw_rect(rect, color=(0, 0, 0), width=1)
+        xs = [rect.x0 + rect.width / 5 * i for i in range(1, 5)]
+        ys = [rect.y0 + rect.height / 4 * i for i in range(1, 4)]
+        for y in ys:
+            page.draw_line(fitz.Point(rect.x0, y), fitz.Point(rect.x1, y),
+                           color=(0.6, 0.6, 0.6))
+        for x in xs:
+            page.draw_line(fitz.Point(x, rect.y0), fitz.Point(x, rect.y1),
+                           color=(0.6, 0.6, 0.6))
+        bar = None
+        for i in range(3):
+            x0 = rect.x0 + 20 + i * 120
+            y0 = rect.y1 - 40 - i * 30
+            r = fitz.Rect(x0, y0, x0 + 50, rect.y1 - 8)
+            page.draw_rect(r, color=None, fill=(0.2, 0.4, 0.8))
+            if i == 1:
+                bar = r
+        # Data labels inside the cells: this is what makes ``find_tables`` see a grid.
+        for ri, y in enumerate([rect.y0] + ys):
+            for ci, x in enumerate([rect.x0] + xs):
+                if ci < 5 and ri < 4:
+                    page.insert_text((x + 6, y + 16), f"{ri}{ci}", fontsize=8)
+        doc.save(str(path))
+        doc.close()
+        return bar
+
+    def test_chart_with_grid_and_labels_is_not_a_table(self):
+        src = _OUT / "chart_grid.pdf"
+        self._chart_pdf(src)
+        doc = fitz.open(str(src))
+        try:
+            # Sanity: PyMuPDF itself does report a table here (the trap).
+            self.assertTrue(getattr(doc[0].find_tables(), "tables", None))
+            self.assertEqual([], pdfio._extract_tables(doc[0]))
+            self.assertEqual([], pdfio._detect_table_cell_rects(doc[0]))
+        finally:
+            doc.close()
+
+    def test_chart_labels_stay_prose_blocks(self):
+        src = _OUT / "chart_grid2.pdf"
+        self._chart_pdf(src)
+        dt = pdfio.extract_document_text(src, log=lambda _m: None)
+        self.assertTrue(dt.pages[0])
+        self.assertFalse(any(b.in_table for b in dt.pages[0]))
+
+    def test_chart_bars_survive_the_inplace_export(self):
+        src = _OUT / "chart_grid3.pdf"
+        bar = self._chart_pdf(src)
+        dt = pdfio.extract_document_text(src, log=lambda _m: None)
+        trans = [["T" + b.text for b in dt.pages[0]]]
+        out = _OUT / "chart_grid_out.pdf"
+        pdfio.save_translated_pdf(src, dt.pages, trans, str(out), "English")
+        doc = fitz.open(str(out))
+        try:
+            pix = doc[0].get_pixmap(dpi=72)
+            cx = int((bar.x0 + bar.x1) / 2)
+            cy = int((bar.y0 + bar.y1) / 2)
+            self.assertEqual((51, 102, 204), tuple(pix.pixel(cx, cy)))
+        finally:
+            doc.close()
+
+
+class TablePageBottomClampTest(unittest.TestCase):
+    """P0-3: row expansion must never push rows (or the prose below) past the page
+    bottom — the source text is already redacted by then, so off-page content was
+    silently lost."""
+
+    def _table(self, first_top: float = 260.0, height: float = 10.0):
+        cells, rows = [], []
+        y = first_top
+        for i, label in enumerate(("营业收入", "营业成本", "营业利润")):
+            top, bot = y, y + height
+            cells.append(pdfio.Block(
+                text=label, page=0, x0=60, y0=top + 1, x1=140, y1=bot - 1,
+                size=9.0, single_line=True, in_table=True))
+            cells.append(pdfio.Block(
+                text=f"{i},234", page=0, x0=150, y0=top + 1, x1=230, y1=bot - 1,
+                size=9.0, single_line=True, in_table=True))
+            rows.append([fitz.Rect(60, top, 140, bot), fitz.Rect(150, top, 230, bot)])
+            y = bot
+        tables = [{"bbox": fitz.Rect(60, first_top, 230, y), "rows": rows,
+                   "col_edges": [60.0, 140.0, 230.0]}]
+        mapping = {i: (0, i // 2, i % 2) for i in range(len(cells))}
+        long = "Operating revenue from the bank's core lending business for the year"
+        trans = []
+        for _ in range(len(cells) // 2):
+            trans += [long, "1,234"]
+        return tables, mapping, cells, trans
+
+    def test_growth_is_clamped_to_the_page_bottom(self):
+        font = fitz.Font("cjk")
+        tables, mapping, cells, trans = self._table()
+        logs: list[str] = []
+        _shifts, new_bottoms, grid, _bboxes = pdfio._compute_table_layout(
+            tables, mapping, cells, trans, font,
+            page_height=300.0, log=logs.append)
+        limit = 300.0 - pdfio._TABLE_BOTTOM_MARGIN
+        self.assertTrue(new_bottoms)
+        for bottom in new_bottoms.values():
+            self.assertLessEqual(bottom, limit + 0.01)
+        self.assertLessEqual(max(g[3] for g in grid if g[0] == "h"), limit + 0.01)
+        self.assertTrue(any("超出页底" in m for m in logs), logs)
+
+    def test_without_a_page_height_growth_stays_unbounded(self):
+        # Documents the old behaviour: no page height -> no clamp.
+        font = fitz.Font("cjk")
+        tables, mapping, cells, trans = self._table()
+        _shifts, new_bottoms, _grid, _bboxes = pdfio._compute_table_layout(
+            tables, mapping, cells, trans, font)
+        self.assertGreater(max(new_bottoms.values()), 300.0)
+
+    def test_table_that_fits_is_not_touched(self):
+        # A table well inside the page must keep its exact expansion (no clamp).
+        font = fitz.Font("cjk")
+        tables, mapping, cells, trans = self._table(first_top=100.0)
+        clamped = pdfio._compute_table_layout(
+            tables, mapping, cells, trans, font, page_height=842.0, log=lambda _m: None)
+        free = pdfio._compute_table_layout(tables, mapping, cells, trans, font)
+        self.assertEqual(free[0], clamped[0])
+        self.assertEqual(free[1], clamped[1])
 
 
 class PureOcrTablePageTest(unittest.TestCase):

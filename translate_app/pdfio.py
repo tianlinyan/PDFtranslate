@@ -1047,7 +1047,10 @@ def extract_document_text(
             # the prose pipeline (which merges flowing paragraphs) never sees
             # them — otherwise its relaxed vertical-gap break would collapse the
             # table's rows into one another.
-            cell_rects = _detect_table_cell_rects(page)
+            cell_rects = _detect_table_cell_rects(
+                page,
+                log=(lambda m: log(f"  第 {page_index + 1} 页：{m}")) if log else None,
+            )
             if cell_rects:
                 table_lines = [ln for ln in lines if _line_center_in_rects(ln, cell_rects)]
                 text_lines = [ln for ln in lines if not _line_center_in_rects(ln, cell_rects)]
@@ -2634,7 +2637,94 @@ def _cell_for_line(ln: dict, rects: Sequence[fitz.Rect]) -> fitz.Rect | None:
     return None
 
 
-def _detect_table_cell_rects(page) -> list[fitz.Rect]:
+#: A fill narrower than this fraction of a detected "table" can be a chart bar; a
+#: shaded header row / band spans (almost) the whole table width and is left alone.
+_CHART_FILL_MAX_WIDTH = 0.6
+#: Minimum height (fraction of the "table" height) for such a fill to count as a bar.
+_CHART_FILL_MIN_HEIGHT = 0.15
+#: A fill thinner than this in either direction is a *rule* drawn as a filled rect —
+#: extremely common in Word/Excel-generated PDFs (measured on a real annual report:
+#: every table line is a 1x1..1x33pt filled rect).  It must never count as a bar.
+_CHART_FILL_MIN_THICKNESS = 2.0
+
+
+def _fill_looks_like_a_bar(fill) -> bool:
+    """True when a fill's colour could be a chart bar.
+
+    Cell *shading* is white or a light grey (Word/Excel emit white cell
+    backgrounds as filled rects — measured on the real annual report), while a
+    chart's bars are coloured or dark.  Without this test a white cell background
+    reads as a "bar" and the whole table is thrown away.
+    """
+    if fill is None:
+        return False
+    try:
+        vals = [float(v) for v in (fill if isinstance(fill, (tuple, list)) else (fill,))]
+    except (TypeError, ValueError):
+        return False
+    if not vals:
+        return False
+    return (max(vals) - min(vals)) >= 0.15 or max(vals) <= 0.6
+
+
+def _table_has_chart_art(page, bbox) -> bool:
+    """True when a ``find_tables`` hit at ``bbox`` is really a *chart*, not a table.
+
+    ``find_tables`` only looks for ruling lines, so a chart whose plot area has a
+    full grid **and text inside the cells** (data labels, a value grid, a heat map)
+    is reported as a table.  Treating it as one is destructive: the export redraws
+    a plain black grid and its second redaction pass deletes the plot's own line
+    art — measured on a 4-bar chart, the bars disappeared and their pixel turned
+    white.  Two signatures are unambiguous and cheap to test inside the bbox:
+
+    * a *fill* that looks like a bar — narrower than most of the table but a
+      substantial fraction of its height (cell shading is a full-width band, an
+      in-cell icon is small in both directions);
+    * any *non-axis-aligned* stroke (a curve or a diagonal) — a table's rules are
+      only horizontal and vertical, while line/area/pie charts are not.
+
+    A false positive only costs the page its table re-layout (the in-place path
+    still translates every block and keeps the art), so the test errs towards
+    "chart" — losing a chart is far worse than losing a row-expansion.
+    """
+    if bbox.width <= 0 or bbox.height <= 0:
+        return False
+    try:
+        drawings = page.get_drawings()
+    except Exception:  # noqa: BLE001 — detection is best-effort
+        return False
+    area = max(1e-6, bbox.get_area())
+    for d in drawings:
+        try:
+            r = fitz.Rect(d.get("rect") or (0, 0, 0, 0))
+        except Exception:  # noqa: BLE001
+            continue
+        if not r.intersects(bbox):
+            continue
+        for item in d.get("items") or []:
+            if not item:
+                continue
+            if item[0] == "c":
+                return True
+            if item[0] == "l":
+                p1, p2 = item[1], item[2]
+                if abs(p1.x - p2.x) > 0.5 and abs(p1.y - p2.y) > 0.5:
+                    return True
+        if not _fill_looks_like_a_bar(d.get("fill")):
+            continue
+        if min(r.width, r.height) <= _CHART_FILL_MIN_THICKNESS:
+            continue  # a table rule drawn as a thin filled rect, not a bar
+        if r.width > _CHART_FILL_MAX_WIDTH * bbox.width:
+            continue
+        if (r.height >= _CHART_FILL_MIN_HEIGHT * bbox.height
+                or r.get_area() >= 0.005 * area):
+            return True
+    return False
+
+
+def _detect_table_cell_rects(
+    page, log: Callable[[str], None] | None = None
+) -> list[fitz.Rect]:
     """Return every detected table cell's rect on ``page`` (empty when no table).
 
     PyMuPDF's ``find_tables`` reliably separates the cells of a ruled table.  We
@@ -2643,6 +2733,10 @@ def _detect_table_cell_rects(page) -> list[fitz.Rect]:
     that pipeline can safely merge flowing paragraphs (its vertical-gap break is
     too tight for the loose line leading this report uses).  A page with no
     detectable table returns ``[]`` and the caller falls back to the old path.
+
+    A hit that is really a chart (``_table_has_chart_art``) is dropped so its
+    labels stay ordinary prose blocks and the export never runs the destructive
+    table redraw over the plot.
     """
     try:
         tabs = page.find_tables()
@@ -2650,6 +2744,14 @@ def _detect_table_cell_rects(page) -> list[fitz.Rect]:
         return []
     rects: list[fitz.Rect] = []
     for t in getattr(tabs, "tables", None) or []:
+        try:
+            tb = fitz.Rect(t.bbox)
+        except Exception:  # noqa: BLE001
+            continue
+        if _table_has_chart_art(page, tb):
+            if log:
+                log("检测到疑似图表（网格 + 图形），已按非表格处理（图形与标签保持原样）。")
+            continue
         for row in getattr(t, "rows", None) or []:
             # ``find_tables`` may report a ``None`` cell for a ragged / empty
             # slot (e.g. a merged or missing column).  Casting that to a Rect
@@ -2798,52 +2900,102 @@ def _build_table_blocks(
     cells).  The cell is inset by :data:`_TABLE_CELL_PAD` on each side so the
     one-line text does not touch the borders.  A line with no per-span data (a
     caller-constructed line) keeps the whole-line behaviour.
+
+    **One block per cell, not per visual line.**  A cell whose source text wraps
+    over several lines used to emit one block per line; the exporter anchors every
+    multi-line translation at its *row's* top border, so both blocks were drawn
+    from the same y and overprinted each other (measured: the same text painted
+    twice at an identical position).  Lines of the same cell are therefore merged
+    into one block (``\\n``-joined, ``single_line=False``) so ``_fit_block`` sees
+    the real source line count and takes the ``_fit_exact_n`` path once.
     """
-    blocks: list[Block] = []
+    acc: dict[tuple, dict] = {}
+
+    def _accumulate(key, text, ln, meta, *, x0, x1, y0, y1, in_table) -> None:
+        """Add one visual line's text to its cell's accumulator entry."""
+        cur = acc.get(key)
+        if cur is None:
+            acc[key] = {
+                "x0": x0, "x1": x1, "y0": y0, "y1": y1, "texts": [text],
+                "lines": 1, "color": ln["color"], "meta": dict(meta),
+                "in_table": in_table, "numeric": _is_numeric_cell(text),
+            }
+            return
+        # Same baseline = two runs of ONE visual line (a space joins them); a
+        # different baseline = the cell's source text wrapped, so keep the break
+        # (``_fit_block`` reads the source line count from the ``\n``s).
+        if abs(cur["y0"] - y0) <= 1.0:
+            cur["texts"][-1] += " " + text
+        else:
+            cur["texts"].append(text)
+            cur["lines"] += 1
+        cur["y0"] = min(cur["y0"], y0)
+        cur["y1"] = max(cur["y1"], y1)
+        cur["x0"] = min(cur["x0"], x0)
+        cur["x1"] = max(cur["x1"], x1)
+        cur["numeric"] = cur["numeric"] and _is_numeric_cell(text)
+
     cell_rects = list(cell_rects)
     for ln in sorted(table_lines, key=_table_cell_key):
         if not ln["text"].strip() or _is_pure_symbol(ln["text"]):
             continue
-        x0, y0, x1, y1 = ln["x0"], ln["y0"], ln["x1"], ln["y1"]
+        y0, y1 = ln["y0"], ln["y1"]
         groups = _line_cell_groups(ln, cell_rects)
         if groups is None:
             # No per-span info (test-constructed line): keep the single-block,
             # whole-line behaviour so a whole row is one cell.
-            meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1, n_lines=1)
+            meta = _block_meta(fitz.Rect(ln["x0"], y0, ln["x1"], y1), spans,
+                               page_x0, page_x1, n_lines=1)
             cell = _cell_for_line(ln, cell_rects)
             if cell is not None:
-                x0, x1 = cell.x0 + _TABLE_CELL_PAD, cell.x1 - _TABLE_CELL_PAD
                 # Re-derive alignment for the widened cell: numeric columns
                 # right-align (figures share a flush right edge), others centre.
                 meta["align"] = "right" if _is_numeric_cell(ln["text"]) else "center"
-            blocks.append(
-                Block(
-                    text=ln["text"], page=page_index, x0=x0, y0=y0, x1=x1, y1=y1,
-                    color=ln["color"], in_table=cell is not None, **meta,
+                _accumulate(
+                    ("cell", round(cell.x0, 1), round(cell.y0, 1),
+                     round(cell.x1, 1), round(cell.y1, 1)),
+                    ln["text"], ln, meta,
+                    x0=cell.x0 + _TABLE_CELL_PAD, x1=cell.x1 - _TABLE_CELL_PAD,
+                    y0=y0, y1=y1, in_table=True,
                 )
-            )
+            else:
+                _accumulate(
+                    ("line", len(acc)), ln["text"], ln, meta,
+                    x0=ln["x0"], x1=ln["x1"], y0=y0, y1=y1, in_table=False,
+                )
             continue
         for cell, text, extent in groups:
             if cell is not None:
-                cx0, cx1 = cell.x0 + _TABLE_CELL_PAD, cell.x1 - _TABLE_CELL_PAD
                 meta = _block_meta(cell, spans, page_x0, page_x1, n_lines=1)
                 meta["align"] = "right" if _is_numeric_cell(text) else "center"
-                blocks.append(
-                    Block(
-                        text=text, page=page_index, x0=cx0, y0=y0, x1=cx1, y1=y1,
-                        color=ln["color"], in_table=True, **meta,
-                    )
+                _accumulate(
+                    ("cell", round(cell.x0, 1), round(cell.y0, 1),
+                     round(cell.x1, 1), round(cell.y1, 1)),
+                    text, ln, meta,
+                    x0=cell.x0 + _TABLE_CELL_PAD, x1=cell.x1 - _TABLE_CELL_PAD,
+                    y0=y0, y1=y1, in_table=True,
                 )
             else:
                 # A span that sits outside any content cell: paragraph-style block.
                 meta = _block_meta(extent, spans, page_x0, page_x1, n_lines=1)
-                blocks.append(
-                    Block(
-                        text=text, page=page_index, x0=extent.x0, y0=extent.y0,
-                        x1=extent.x1, y1=extent.y1, color=ln["color"],
-                        in_table=False, **meta,
-                    )
+                _accumulate(
+                    ("line", len(acc)), text, ln, meta,
+                    x0=extent.x0, x1=extent.x1, y0=extent.y0, y1=extent.y1,
+                    in_table=False,
                 )
+    blocks: list[Block] = []
+    for a in acc.values():
+        meta = a["meta"]
+        meta["single_line"] = a["lines"] == 1
+        if a["numeric"]:
+            meta["align"] = "right"
+        blocks.append(
+            Block(
+                text="\n".join(a["texts"]), page=page_index, x0=a["x0"], y0=a["y0"],
+                x1=a["x1"], y1=a["y1"], color=a["color"], in_table=a["in_table"],
+                **meta,
+            )
+        )
     return blocks
 
 
@@ -3706,12 +3858,14 @@ def _is_pure_ocr_table_page(blocks: Sequence[Block]) -> bool:
     return True
 
 
-def _extract_tables(page) -> list[dict]:
+def _extract_tables(page, log: Callable[[str], None] | None = None) -> list[dict]:
     """Return every ruled table on ``page`` as ``{"bbox", "rows", "col_edges"}``.
 
     ``rows`` is the table's rows as a list of cell rects (left-to-right); the
     rects come straight from ``find_tables`` so they are authoritative.  A page
-    with no detectable table returns ``[]``.
+    with no detectable table returns ``[]``.  A hit that is really a chart is
+    dropped (``_table_has_chart_art``): the row expansion would be meaningless and
+    the scoped redaction pass would delete the plot's own line art.
     """
     try:
         tabs = page.find_tables()
@@ -3731,6 +3885,10 @@ def _extract_tables(page) -> list[dict]:
             min(c.x0 for c in all_cells), min(c.y0 for c in all_cells),
             max(c.x1 for c in all_cells), max(c.y1 for c in all_cells),
         )
+        if _table_has_chart_art(page, bbox):
+            if log:
+                log("检测到疑似图表（网格 + 图形），已按非表格处理（图形与标签保持原样）。")
+            continue
         col_edges = sorted(
             {round(c.x0, 1) for c in all_cells} | {round(c.x1, 1) for c in all_cells}
         )
@@ -3842,7 +4000,21 @@ def _rebalance_table_columns(tables, mapping, blocks, trans, font):
     return col_boxes, new_col_edges
 
 
-def _compute_table_layout(tables, mapping, blocks, trans, font):
+#: Kept clear of the page's bottom edge when clamping a table's row growth: a rule
+#: drawn exactly on the boundary is clipped, and 2pt of slack costs nothing.
+_TABLE_BOTTOM_MARGIN = 2.0
+
+
+def _compute_table_layout(
+    tables,
+    mapping,
+    blocks,
+    trans,
+    font,
+    *,
+    page_height: float | None = None,
+    log: Callable[[str], None] | None = None,
+):
     """Work out how far every table row must be pushed down so translations fit.
 
     Returns ``(shifts, new_bottoms, grid, bboxes)``:
@@ -3854,13 +4026,21 @@ def _compute_table_layout(tables, mapping, blocks, trans, font):
     * ``grid``: ``("h"|"v", ...)`` line specs to redraw at the new positions.
     * ``bboxes``: each detected table's original extent, to be redacted so the
       stale grid lines don't stay behind at the old row positions.
+
+    ``page_height`` (the *unrotated* page height, i.e. the frame the block boxes
+    live in) bounds the total growth: without it a table near the page bottom
+    pushed its lower rows — and any prose below it — past the page edge, where the
+    text and the redrawn rules are invisible (the source text is redacted by then,
+    so the content was silently lost).  When the growth would not fit, every row's
+    extra height is scaled by the same factor and the clamp is reported through
+    ``log``.
     """
     if not tables:
         return {}, {}, [], []
-    # Per table: measure the rows and the within-table cumulative shift.
+    # Per table: measure the rows.  ``cum``/``extra`` are filled in *after* the
+    # page-bottom clamp below, because the clamp changes every row's extra.
     tinfo: list[dict] = []
     for ti, tb in enumerate(tables):
-        row_count = len(tb["rows"])
         orig_top = [min(c.y0 for c in row) for row in tb["rows"]]
         orig_h = [max(c.y1 for c in row) - min(c.y0 for c in row) for row in tb["rows"]]
         needed_h = list(orig_h)
@@ -3868,17 +4048,45 @@ def _compute_table_layout(tables, mapping, blocks, trans, font):
             if key[0] == ti and bi < len(trans):
                 r = key[1]
                 needed_h[r] = max(needed_h[r], _measure_block_height(blocks[bi], font, trans[bi]))
-        cum: list[float] = []
-        run = 0.0
-        for r in range(row_count):
-            cum.append(run)
-            run += max(0.0, needed_h[r] - orig_h[r])
         tinfo.append(
             {
-                "orig_top": orig_top, "needed_h": needed_h, "cum": cum,
-                "extra": run, "bbox": tb["bbox"], "col_edges": tb["col_edges"],
+                "orig_top": orig_top, "orig_h": orig_h, "needed_h": needed_h,
+                "bbox": tb["bbox"], "col_edges": tb["col_edges"],
             }
         )
+    # P0-3: a rigid-body push-down may not leave the page.  Total growth above the
+    # lowest element decides the scale factor; the clamp keeps every row's relative
+    # share (a taller row stays the taller one) and never grows a row.
+    total_extra = sum(
+        max(0.0, need - orig)
+        for t in tinfo for need, orig in zip(t["needed_h"], t["orig_h"])
+    )
+    if page_height is not None and total_extra > 0.0:
+        limit = page_height - _TABLE_BOTTOM_MARGIN
+        lowest = max(
+            [b.y1 for b in blocks]
+            + [max(c.y1 for c in row) for tb in tables for row in tb["rows"]]
+        )
+        if lowest + total_extra > limit:
+            factor = max(0.0, min(1.0, (limit - lowest) / total_extra))
+            for t in tinfo:
+                t["needed_h"] = [
+                    orig + (need - orig) * factor
+                    for need, orig in zip(t["needed_h"], t["orig_h"])
+                ]
+            if log:
+                log(
+                    "表格译文超出页底，已压缩行高至 %.0f%%（否则末行与表格线会落到"
+                    "页面外）。" % (factor * 100.0)
+                )
+    for t in tinfo:
+        cum: list[float] = []
+        run = 0.0
+        for r in range(len(t["orig_top"])):
+            cum.append(run)
+            run += max(0.0, t["needed_h"][r] - t["orig_h"][r])
+        t["cum"] = cum
+        t["extra"] = run
     # Rigid-body push-down over the whole page: every element is pushed by the
     # total extra of the elements above it, so a heading between two tables (and
     # the lower table itself) shifts down by the growth of the upper table while
@@ -4344,7 +4552,9 @@ def save_translated_pdf(
             # was pushed ~355 pt down — several table rows below its own cell.
             # Scan geometry is kept as-is and the cells' single-line fit (which
             # shrinks the font instead) keeps the rows from overlapping.
-            tables = _extract_tables(page)
+            tables = _extract_tables(
+                page, log=(lambda m: log(f"  第 {i + 1} 页：{m}")) if log else None
+            )
             ocr_table = False
             if not tables:
                 tables = _reconstruct_ocr_tables(blocks)
@@ -4372,8 +4582,14 @@ def save_translated_pdf(
                 # 靠单元格行带换行 + 缩字兜底。
                 shifts, new_bottoms, grid, bboxes = {}, {}, [], []
             else:
+                # ``page_height`` must be the UNROTATED frame the block boxes live
+                # in (a /Rotate page's ``rect.height`` is the page *width*), and the
+                # clamp keeps the expanded rows — and the prose below them — on the
+                # sheet instead of drawing them past the bottom edge.
                 shifts, new_bottoms, grid, bboxes = _compute_table_layout(
-                    tables, mapping, layout_blocks, trans, font
+                    tables, mapping, layout_blocks, trans, font,
+                    page_height=page.cropbox.y1,
+                    log=(lambda m: log(f"  第 {i + 1} 页：{m}")) if log else None,
                 )
 
             # Remove the original text (keep images and other line art/graphics).
