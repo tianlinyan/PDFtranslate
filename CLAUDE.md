@@ -19,6 +19,8 @@ python check_translation.py 原文.pdf 译文.pdf [--lang English] [--strict] [-
 python verify_real_run.py                 # 真机对照：用 models.json 的 qwen3.8 翻译 p24-27，
                                          # 测量表内格拟合结果（字号桶/行带越界）——需本地模型在线
 python verify_selfcheck.py               # 真模型走查：对样例页跑确定性审计工具 + AI 复核循环（同样需模型在线）
+python make_diverse_test_pdf.py [out.pdf] # 生成 5 页多样化测试 PDF（文本双栏 / 文本+图片+表格 /
+                                         # OCR 文本页 / OCR 表格页 / OCR 混合页）——手动验证各处理路径用
 ```
 
 测试离线运行：`tests/_helpers.py` 提供本地 mock chat-completions HTTP 服务（按块回显 `[n] MOCK:<原文>`），`build_sample_pdf()` 用于生成小型测试 PDF（拉丁 + CJK 文本）。测试模块：`test_settings`（配置解析）、`test_pdfio`（提取与导出/数字原子性/竖排标签）、`test_translator`（分批/对齐/缓存/致命错误/术语表）、`test_ocr`（OCR 管道与缓存/数字归一化）、`test_worker`（worker 信号契约与姓名列方向门控，直接同步调用 `run()`，无需 `QApplication`）、`test_ui`（`main_window` 中与 Qt 无关的纯函数）、`test_preview`（预览窗口纯函数：裁剪/坐标映射）、`test_agent`（agent 基础：状态骨架+工具注册表）、`test_session`（M1/M2：文档信息分型+DocumentSession 会话控制器）、`test_chat`（常驻对话）、`test_chat_tools`（文档上下文+交互聊天工具）、`test_check_translation`（校对脚本）。所有测试通过 `PDFTRANSLATE_CACHE_DIR` / `PDFTRANSLATE_OCR_CACHE_DIR` 把缓存重定向到临时目录——**新增涉及缓存的测试务必照做**，否则会污染开发者 home 并因热缓存而假绿。未配置 linter 或格式化工具。
