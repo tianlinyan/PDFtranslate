@@ -117,14 +117,21 @@ class PdfioTest(unittest.TestCase):
         # in-place exporter must cover the original (scanned) pixels with a
         # white rectangle instead of redacting text — otherwise the
         # translation overprints the original.
+        #
+        # v0.5.33: the cover hugs the *printed glyph band*, measured from the
+        # rendered page, instead of the whole OCR box — the box reaches the row
+        # rules on a scanned statement and covering it clipped them (user
+        # screenshot: white boxes cutting the dotted row lines).
         src = _OUT / "scan_src.pdf"
         doc = fitz.open()
         page = doc.new_page(width=400, height=300)
-        # White paper with a dark line of "printed text": a scan of printed text is
-        # mostly white, which is what keeps the cover (see the photo test below).
+        # White paper with a line of "printed text" (letter-like segments, so the
+        # row is glyph ink, not a filled rule) plus a printed rule below it.
         pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 300, 70), 0)
         pix.set_rect(fitz.IRect(0, 0, 300, 70), (255,))
-        pix.set_rect(fitz.IRect(0, 25, 300, 45), (30,))  # the printed line
+        for x in range(4, 296, 14):                      # the printed line
+            pix.set_rect(fitz.IRect(x, 25, x + 8, 45), (30,))
+        pix.set_rect(fitz.IRect(0, 60, 300, 62), (30,))  # the row rule
         page.insert_image(fitz.Rect(50, 50, 350, 120), pixmap=pix)
         doc.save(str(src))
         doc.close()
@@ -138,26 +145,108 @@ class PdfioTest(unittest.TestCase):
 
         d = fitz.open(str(out))
         page = d[0]
-        # The translation must be present.
-        self.assertIn("translated text", page.get_text())
-        # A white-filled rectangle must cover the OCR block's bbox (the block
-        # rect expanded by 0.5 on each side).
-        found_white = False
-        for dr in page.get_drawings():
-            fill = dr.get("fill")
-            if fill is None:
-                continue
-            r = dr["rect"]
-            if (
-                all(abs(c - 1.0) < 0.01 for c in fill)
-                and abs(r.x0 - 49.5) < 1.0
-                and abs(r.y0 - 49.5) < 1.0
-                and abs(r.x1 - 350.5) < 1.0
-                and abs(r.y1 - 120.5) < 1.0
-            ):
-                found_white = True
-        d.close()
-        self.assertTrue(found_white, "expected a white cover rectangle over the OCR block")
+        try:
+            # The translation must be present.
+            self.assertIn("translated text", page.get_text())
+            covers = [
+                dr["rect"] for dr in page.get_drawings()
+                if dr.get("fill") and all(abs(c - 1.0) < 0.01 for c in dr["fill"])
+            ]
+            self.assertTrue(covers, "expected a white cover rectangle over the OCR block")
+            top = min(r.y0 for r in covers)
+            bottom = max(r.y1 for r in covers)
+            # Hugs the printed line (page y 75..95) instead of the OCR box (50..120).
+            self.assertGreaterEqual(top, 72.0)
+            self.assertLessEqual(top, 77.0)
+            self.assertGreaterEqual(bottom, 93.0)
+            self.assertLessEqual(bottom, 98.0)
+            # ... and never reaches the rule at page y = 110.
+            for r in covers:
+                self.assertFalse(
+                    r.y0 < 110.5 < r.y1 and r.x0 < 300 and r.x1 > 100,
+                    f"white cover clipped the printed rule: {r}",
+                )
+        finally:
+            d.close()
+
+    def test_ocr_cover_never_clips_a_printed_rule_between_two_lines(self):
+        # A multi-line OCR box whose lines are separated by a printed rule gets one
+        # tight white rect per line; the rule between them must survive.
+        src = _OUT / "scan_rules_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 300, 140), 0)
+        pix.set_rect(fitz.IRect(0, 0, 300, 140), (255,))
+        for x in range(4, 296, 14):
+            pix.set_rect(fitz.IRect(x, 20, x + 8, 40), (30,))    # line 1
+            pix.set_rect(fitz.IRect(x, 90, x + 8, 110), (30,))   # line 2
+        pix.set_rect(fitz.IRect(0, 62, 300, 64), (30,))          # the rule between them
+        page.insert_image(fitz.Rect(50, 50, 350, 190), pixmap=pix)
+        doc.save(str(src))
+        doc.close()
+
+        ocr_block = pdfio.Block(
+            text="line one\nline two", page=0, x0=50, y0=50, x1=350, y1=190,
+            size=12.0, align="left", bold=False, single_line=False, ocr=True,
+        )
+        out = _OUT / "translated_ocr_rules.pdf"
+        pdfio.save_translated_pdf(src, [[ocr_block]], [["translated text"]], out, "Chinese")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            covers = [
+                dr["rect"] for dr in page.get_drawings()
+                if dr.get("fill") and all(abs(c - 1.0) < 0.01 for c in dr["fill"])
+            ]
+            self.assertGreaterEqual(len(covers), 2, covers)
+            for r in covers:
+                self.assertFalse(
+                    r.y0 < 112.5 < r.y1 and r.x0 < 300 and r.x1 > 100,
+                    f"white cover clipped the printed rule: {r}",
+                )
+        finally:
+            d.close()
+
+    def test_ocr_cover_band_bounds_the_translation(self):
+        # The translation is fitted into the measured band too, so it cannot be
+        # drawn past the row rule (the second half of "避免压线").
+        src = _OUT / "scan_text_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 300, 70), 0)
+        pix.set_rect(fitz.IRect(0, 0, 300, 70), (255,))
+        for x in range(4, 296, 14):
+            pix.set_rect(fitz.IRect(x, 25, x + 8, 45), (30,))
+        pix.set_rect(fitz.IRect(0, 60, 300, 62), (30,))
+        page.insert_image(fitz.Rect(50, 50, 350, 120), pixmap=pix)
+        doc.save(str(src))
+        doc.close()
+
+        ocr_block = pdfio.Block(
+            text="scanned text", page=0, x0=50, y0=50, x1=350, y1=120,
+            size=12.0, align="left", bold=False, single_line=False, ocr=True,
+        )
+        out = _OUT / "translated_ocr_text.pdf"
+        pdfio.save_translated_pdf(src, [[ocr_block]], [["translated text"]], out, "Chinese")
+
+        d = fitz.open(str(out))
+        page = d[0]
+        try:
+            spans = [
+                s for blk in page.get_text("dict")["blocks"] if "lines" in blk
+                for line in blk["lines"] for s in line["spans"]
+                if "translated" in s["text"]
+            ]
+            self.assertTrue(spans, "translation span missing")
+            for s in spans:
+                self.assertLessEqual(
+                    s["bbox"][3], 98.0,
+                    f"translation drawn below the measured band: {s['bbox']}",
+                )
+                self.assertLess(s["bbox"][3], 110.0)   # never onto the rule
+        finally:
+            d.close()
 
     def test_translated_pdf_does_not_cover_an_ocr_block_on_a_photo(self):
         # P1-3: text detected on a photo / coloured logo must NOT get the opaque
