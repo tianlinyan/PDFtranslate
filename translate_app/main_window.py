@@ -141,6 +141,42 @@ def parse_preview_command(text: str):
     return None
 
 
+def _stem_without_unique(p: Path) -> str:
+    """Stem with any trailing ``(n)`` suffix stripped (``test_English(1)``→``test_English``)."""
+    return re.sub(r"\(\d+\)$", "", p.stem)
+
+
+def resolve_reexport_target(requested: str | Path, last_output: str | Path | None) -> str:
+    """Resolve the file 「重新导出」 should write to.
+
+    A normal run writes through ``pdfio.unique_path``, so when the requested name
+    already exists the output lands at ``test_English(1).pdf`` (and ``_last_output``
+    is that ``(1)`` path).  Re-export must go back to that *exact* file and overwrite
+    it in place; re-deriving the base ``test_English.pdf`` would clobber an unrelated
+    older file while the real latest ``(1)`` output stays stale.  When the requested
+    name no longer belongs to the previous output (a different directory, a
+    different base name, a different extension — e.g. the user switched the output
+    type or language), fall back to it so the new setting wins.
+    """
+    req = Path(requested)
+    if not last_output:
+        return str(req)
+    last = Path(str(last_output))
+    # A requested name that already carries an explicit ``(n)`` suffix is an explicit
+    # target (the user typed it) — honour it instead of rewriting it to the previous
+    # output.  Any other name in ``last``'s family IS the previous export, so target
+    # the actual file and overwrite it.
+    if re.search(r"\(\d+\)$", req.stem):
+        return str(req)
+    if (
+        req.parent == last.parent
+        and _stem_without_unique(req) == _stem_without_unique(last)
+        and req.suffix == last.suffix
+    ):
+        return str(last)
+    return str(req)
+
+
 class _LogBridge(QObject):
     """Thread-safe log channel: emitting from any thread is marshalled to the GUI.
 
@@ -1129,7 +1165,13 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "重新导出", "没有可用模型，请检查 models.json 配置。")
             return
         key = self._type_combo.currentData()
-        out_path = self._path_edit.text().strip() or self._default_output_path()
+        requested = self._path_edit.text().strip() or self._default_output_path()
+        # Re-export must overwrite the file that was actually produced last time
+        # (which may carry a ``(n)`` suffix after a name collision), not a freshly
+        # re-derived base path — that would clobber an unrelated old file.
+        out_path = resolve_reexport_target(
+            requested, self._last_output,
+        )
         self._run_ok = False
         self._cancelled_by_user = False
         self._errored = False
