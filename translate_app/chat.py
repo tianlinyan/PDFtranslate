@@ -30,6 +30,7 @@ from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from . import prompts
 from . import translator as _tr
+from .control import ControlSignal
 from .settings import ModelConfig
 
 #: Bound on how many model→tool→result round-trips a single chat turn may run
@@ -58,7 +59,7 @@ _CHAT_HISTORY_CAP = 32
 _CHAT_IMAGE_MAX = 1024
 
 
-class ChatCancelled(Exception):
+class ChatCancelled(ControlSignal):
     """Raised inside :meth:`ChatSession.reply` when the user cancelled the turn.
 
     The watchdog can only abort a *blocked request* (it closes the httpx client).
@@ -66,6 +67,11 @@ class ChatCancelled(Exception):
     round used the refreshed client and the model kept calling tools (measured:
     7 more tools + 8 model calls after "取消"), so the user's edits kept being
     written even though the sidebar said the turn was cancelled.
+
+    A :class:`~translate_app.control.ControlSignal` (like ``TranslationCancelled``
+    and ``FlowCancelled``) so no ``except Exception`` may swallow it: the final
+    fallback in :meth:`ChatSession.reply` used to catch it and return a stale
+    reply instead of propagating the cancel.
     """
 
 #: One-time flag: Pillow is a hard dependency in ``requirements.txt`` but imported
@@ -287,6 +293,10 @@ class ChatSession:
             if content:
                 self.history.append({"role": "assistant", "content": content})
                 return content
+        except ControlSignal:
+            # ``_check()`` above raised ChatCancelled: a control signal, not a
+            # failure to degrade from — it must reach the worker as "已取消".
+            raise
         except Exception:  # noqa: BLE001 — degrade to the last assistant text
             pass
         last = next(

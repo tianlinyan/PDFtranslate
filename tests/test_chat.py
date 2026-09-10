@@ -292,6 +292,34 @@ class ChatSessionTest(unittest.TestCase):
         self.assertEqual(declared, answered,
                          "every declared tool_call needs a tool reply in history")
 
+    def test_a_cancel_at_the_final_fallback_is_not_swallowed(self):
+        # P2-1: ``ChatCancelled`` was a plain ``Exception``, so the final
+        # "give it one more chance" fallback's ``except Exception`` caught it and
+        # returned a stale reply instead of propagating the cancel (the reply's
+        # own docstring says it raises ChatCancelled).
+        calls = {"n": 0}
+        tc = _FakeToolCall("a", {}, "c1")
+        responses = [_FakeToolResp([tc], "") for _ in range(chat._MAX_TOOL_ROUNDS)]
+        client = _FakeToolClient(responses)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: client):
+            session = chat.ChatSession(_model())
+
+        def cancel():
+            calls["n"] += 1
+            # ``_check`` runs twice per round (top of the loop + before the tool),
+            # so the final fallback's check is poll #(2 * MAX + 1).
+            return calls["n"] >= 2 * chat._MAX_TOOL_ROUNDS + 1
+
+        with self.assertRaises(chat.ChatCancelled):
+            session.reply(
+                "一直调工具",
+                tools=[{"type": "function",
+                        "function": {"name": "a", "parameters": {}}}],
+                executor=lambda _n, _a: {"ok": True},
+                cancel=cancel,
+            )
+        self.assertTrue(issubclass(chat.ChatCancelled, chat.ControlSignal),
+                        "a control signal must be distinguishable from a failure")
     def test_reply_reinjects_tool_image_for_vision_model(self):
         # A tool result carrying ``image`` is stripped from the tool text message and
         # re-injected as an ``image_url`` user message (a fresh visual observation).

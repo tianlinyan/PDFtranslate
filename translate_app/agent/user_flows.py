@@ -147,8 +147,14 @@ _SCOPE_SINGLE_RE = re.compile(r"第\s*(\d+)\s*页")
 #: The cue must be a restriction *phrase*, not a bare 只/仅: 只要 / 不仅 / 不只 are
 #: ordinary conjunctions, and matching them narrowed a whole-document request to a
 #: single page (``帮我翻译整篇年报，只要第5页的数字没错`` → scope [4]).
+#:
+#: The verb list covers the phrasings users actually write — including
+#: 保留/留/想要/需要/想 (``只保留第3页``): those were absent, so the request was
+#: silently widened to the whole document.  ``要`` alone stays out on purpose —
+#: it would make the conjunction 只要 match again.
 _SCOPE_CUE_RE = re.compile(
-    r"(?:只|仅)(?:翻|翻译|译|查|检查|看|审|审计|处理|导出|跑|做|改|重译)"
+    r"(?:只|仅)(?:翻|翻译|译|查|检查|看|审|审计|处理|导出|跑|做|改|重译"
+    r"|保留|留|想要|需要|需|想)"
     r"|仅限|限定|范围"
     r"|(?<![不])[只仅]\s*第\s*\d+\s*页"
 )

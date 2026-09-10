@@ -286,11 +286,74 @@ class CheckerTest(unittest.TestCase):
         residual = _cjk_residual("正文 中文 会商银02表 残留")
         self.assertEqual("正文中文残留", "".join(residual))
 
+    def test_language_codes_are_recognised_as_cjk_targets(self):
+        # P2-7: ``--lang zh`` / ``cn`` were treated as Western targets, so an
+        # intended Chinese translation was reported as residual Chinese.
+        from check_translation import _has_cjk
+
+        for code in ("zh", "cn", "ZH", "zh-CN", "zh_Hans", "Chinese",
+                     "简体中文", "ja", "jp", "ko"):
+            with self.subTest(code=code):
+                self.assertTrue(_has_cjk(code))
+        for code in ("English", "en", "French", "de", "Spanish"):
+            with self.subTest(code=code):
+                self.assertFalse(_has_cjk(code))
     def test_scan_like_text_detector(self):
         self.assertTrue(_is_scan_like_text(""))
         self.assertTrue(_is_scan_like_text("22"))
         self.assertFalse(_is_scan_like_text("二、公司组织架构图"))
         self.assertFalse(_is_scan_like_text("Total assets"))
+
+
+class BilingualPairingTest(unittest.TestCase):
+    """A bilingual target pairs source page i with translation page 2i+1 (P0).
+
+    ``Checker.check`` used to walk ``tgt[i]`` unconditionally.  On a bilingual
+    export (source page + translation page interleaved) that compared a source
+    page with the *next* pair's source page, so the real translation page was
+    never inspected — a wrong figure in it was reported clean.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def _bilingual(self, src_line: str, tgt_line: str) -> tuple[Path, Path]:
+        from translate_app import pdfio
+
+        src = self.tmp / "src.pdf"
+        out = self.tmp / "bi.pdf"
+        doc = fitz.open()
+        doc.new_page(width=300, height=300).insert_text((40, 60), src_line, fontsize=11)
+        doc.save(str(src))
+        doc.close()
+        dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        pdfio.save_interleaved_pdf(
+            str(src), [[tgt_line for _ in dt.pages[0]]], str(out), "English",
+            pages=dt.pages,
+        )
+        return src, out
+
+    def test_wrong_number_in_the_translation_page_is_reported(self):
+        src, out = self._bilingual("Total assets 123,456.78 yuan",
+                                   "Total assets 999,999.99 yuan")
+        checker = run_checks(src, out, lang="English")
+        self.assertFalse(checker.numeric_ok(), checker.numeric)
+        # The diff prints the parsed Decimal value, so the thousands separator
+        # is gone (``999999.99``, not ``999,999.99``).
+        self.assertTrue(any("999999.99" in m for m in checker.numeric),
+                        checker.numeric)
+        self.assertFalse(checker.all_clear())
+
+    def test_correct_bilingual_translation_is_clean(self):
+        # Negative control: the same fixture with the right figure stays clean,
+        # so this is not "always complain about bilingual products".
+        src, out = self._bilingual("Total assets 123,456.78 yuan",
+                                   "Total assets 123,456.78 yuan")
+        checker = run_checks(src, out, lang="English")
+        self.assertTrue(checker.numeric_ok(), checker.numeric)
+        self.assertTrue(checker.all_clear(), checker.numeric + checker.cjk)
 
 
 if __name__ == "__main__":

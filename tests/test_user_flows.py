@@ -55,6 +55,14 @@ class CompileFromUserTest(unittest.TestCase):
         self.assertEqual([1, 2, 3, 4], uf.parse_explicit_scope("翻译第2-5页"))
         self.assertEqual([2], uf.parse_explicit_scope("仅限第3页"))
         self.assertEqual([0, 1], uf.parse_explicit_scope("范围第1到第2页"))
+        # P2-2: the verb list was too narrow, so these were silently widened to
+        # the whole document (only 要 is deliberately absent — it would make the
+        # conjunction 只要 match again).
+        self.assertEqual([2], uf.parse_explicit_scope("只保留第3页"))
+        self.assertEqual([2], uf.parse_explicit_scope("只留第3页"))
+        self.assertEqual([2], uf.parse_explicit_scope("只想要第3页"))
+        self.assertEqual([2], uf.parse_explicit_scope("只需要第3页"))
+        self.assertEqual([2], uf.parse_explicit_scope("只想第3页"))
 
     def test_auto_fix_default_when_not_specified(self):
         self.assertIsNone(agent.compile_from_user("自检").auto_fix)

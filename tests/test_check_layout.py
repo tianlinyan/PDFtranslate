@@ -259,6 +259,34 @@ class EndToEndTest(unittest.TestCase):
         self.assertTrue(report.overlap, "collisions on them must be checked")
         self.assertEqual(1, check_layout.main([str(src), str(tgt)]))
 
+    def test_extraction_failure_does_not_report_a_clean_pass(self):
+        # P2-6: ``_text_layer_blocks`` used to return ``{}`` when the source
+        # extraction raised — indistinguishable from "no text layer".  Every page
+        # then counted as a scan, the missing check was skipped, and the CLI
+        # printed 体检通过 with exit 0.
+        from unittest import mock
+
+        src = _OUT / "fail_src.pdf"
+        tgt = _OUT / "fail_tgt.pdf"
+        doc = fitz.open()
+        doc.new_page(width=300, height=300).insert_text((40, 60), "SOURCE TEXT",
+                                                        fontsize=11)
+        doc.save(str(src))
+        doc.close()
+        doc = fitz.open()
+        doc.new_page(width=300, height=300)
+        doc.save(str(tgt))
+        doc.close()
+        boom = mock.patch.object(check_layout.pdfio, "extract_document_text",
+                                 side_effect=RuntimeError("boom"))
+        with boom:
+            report = check_layout.check_document(src, tgt)
+            self.assertTrue(report.pages_issue, report.pages_issue)
+            self.assertNotIn(1, report.scanned_pages,
+                             "a failed extraction is not 'a scanned page'")
+            self.assertTrue(report.structural())
+            self.assertEqual(1, check_layout.main([str(src), str(tgt)]),
+                             "a failed extraction must not exit 0")
 
 class RealExportTest(unittest.TestCase):
     """The checker must agree with what the *exporter* actually produces.
@@ -330,6 +358,15 @@ class RealExportTest(unittest.TestCase):
         self.assertEqual(2, check_layout.main([str(src), str(out), "--page", "2-1"]))
         self.assertEqual(0, check_layout.main([str(src), str(out), "--page", "1"]))
 
+    def test_missing_inputs_are_a_usage_error_not_a_traceback(self):
+        # P2-9: a missing / unreadable file used to escape as a traceback with exit
+        # 1 — the same code as "there are structural problems" — and the probe only
+        # ran for --page invocations.
+        src, out = self._export("missing", lines=1)
+        self.assertEqual(2, check_layout.main([str(src), str(out) + ".nope"]))
+        self.assertEqual(2, check_layout.main([str(src) + ".nope", str(out)]))
+        self.assertEqual(2, check_layout.main([str(src) + ".nope", str(out),
+                                              "--page", "1"]))
 
 if __name__ == "__main__":
     unittest.main()

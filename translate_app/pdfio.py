@@ -394,13 +394,15 @@ def _fuse_structure(
         else:
             inds = sorted({offset + i for i, b in enumerate(blocks) if _point_in_bbox(b, bbox)})
         # A figure / formula region describes the **picture**, which is kept verbatim.
-        # Text recovered from *inside* a picture (``Block.in_image``, the figure-text
-        # OCR of v0.5.44) is text, not the picture: claiming it here hands it the
-        # structural role, and ``ir.translate_ir`` reads that role as "keep the
-        # source" — so a chart's own labels came back verbatim English in a Chinese
-        # export (measured with the DocLayout backend, which really does detect a
-        # figure region; the geometric backend has none, which is why the plain
-        # pipeline was unaffected).  The region's bbox still covers the picture.
+        # An org chart / architecture diagram is exactly this case: its node labels
+        # are deliberately kept as the source (product decision — translate the page,
+        # not the diagram), and the figure region is what hands them the structural
+        # role that ``ir.translate_ir`` reads as "keep the source".  The only blocks
+        # released from the region are the ones the *figure-text* OCR recovered on a
+        # text-layer page (``Block.in_image``, v0.5.44), because those were explicitly
+        # requested to be translated; a **scanned** chart's whole-page OCR blocks
+        # (``ocr`` without ``in_image``) stay claimed, i.e. stay original.
+        # The region's bbox still covers the picture.
         if _DOCLAYOUT_KIND_MAP.get(kind, kind) in ("figure", "formula"):
             inds = [x for x in inds
                     if not getattr(blocks[x - offset], "in_image", False)]
@@ -2496,6 +2498,13 @@ def _close_gaps(mask, axis: int, gap: int):
 #: whose "text" is not prose (measured: the 5-page sample's figures are ~234x175pt).
 _IMAGE_MIN_SIDE_PT = 24.0
 _IMAGE_MIN_AREA_PT2 = 2000.0
+#: Minimum non-whitespace characters a figure region must yield before it is
+#: worth translating.  This is the conservative gate the design calls for
+#: (``line_count >= 1 and char_count >= 4 and paper_share >= 0.6``): a 1–3
+#: character OCR fragment on a paper-like image is far more likely to be an
+#: icon / logo / ornament misread than prose, and covering + redrawing it
+#: damages the picture for nothing.
+_IMAGE_MIN_CHARS = 4
 #: Images covering more than this share of the page are full-page scans (handled
 #: by the whole-page OCR path) or page-size art, where an in-place cover is unsafe.
 _IMAGE_MAX_PAGE_SHARE = 0.95
@@ -2683,6 +2692,15 @@ def _image_text_blocks(
                 log(f"  第 {page_index + 1} 页图 {k + 1}：图内没有可翻译的文字"
                     f"（{len(results)} 行均为数字/符号），保留原图。")
             continue
+        # The design's conservative char gate: a 1–3 character OCR fragment on
+        # a paper-like image is usually an icon / ornament misread, and the
+        # cover would damage the picture for an untranslatable scrap.
+        chars = sum(len("".join(it[4].split())) for it in items)
+        if chars < _IMAGE_MIN_CHARS:
+            if log:
+                log(f"  第 {page_index + 1} 页图 {k + 1}：图内文字过少"
+                    f"（{chars} 字符 < {_IMAGE_MIN_CHARS}），保留原图。")
+            continue
         blocks = _figure_block_bands(
             [replace(b, in_image=True, image_index=k)
              for b in _ocr_plain_blocks(items, page_index)],
@@ -2696,8 +2714,15 @@ def _image_text_blocks(
 
 
 def _containing_image_rect(page, block) -> fitz.Rect | None:
-    """The raster image region a figure block came from (``None`` when unknown)."""
-    for r in _partial_image_rects(page):
+    """The raster image region a figure block came from (``None`` when unknown).
+
+    Uses the *same* region list as the extractor (:func:`_image_regions_for_ocr`,
+    up to ``_IMAGE_MAX_PAGE_SHARE`` of the page).  The old
+    ``_partial_image_rects`` (≤ 50 % of the page) could not find a **large**
+    figure's own rect, so that block's cover fell back to plain white and was not
+    clipped to the image — a white patch on a tinted background.
+    """
+    for r in _image_regions_for_ocr(page):
         if _rect_covered_ratio(block, r) >= 0.6:
             return r
     return None
@@ -5047,7 +5072,16 @@ def save_interleaved_pdf(
             blocks = pages[i] if pages is not None and i < len(pages) else []
             trans = per_page[i] if i < len(per_page) else []
             m = min(len(blocks), len(trans))
-            keep_art = bool(_partial_image_rects(src_page)) or bool(src_page.get_drawings())
+            # A kept org chart / architecture diagram (see ``save_translated_pdf``):
+            # its OCR labels are not redrawn, the source copy carries them.
+            chart_page = classify_page(blocks[:m]) == PAGE_CHART if m else False
+            # ``_image_regions_for_ocr`` adds the 0.5–0.95 page-area raster
+            # figure that ``_partial_image_rects`` excludes (a large chart /
+            # screenshot).  Without it the translation page was a blank sheet:
+            # the figure was dropped while its translated labels floated.
+            keep_art = (bool(_partial_image_rects(src_page))
+                        or bool(_image_regions_for_ocr(src_page))
+                        or bool(src_page.get_drawings()))
             if keep_art:
                 # A copy of the source page with its text redacted: pictures, photos
                 # and vector art survive on the translation page too.
@@ -5069,6 +5103,9 @@ def save_interleaved_pdf(
                     b = blocks[j]
                     if b.is_chart:
                         # A diagram node label keeps its source (as in-place).
+                        continue
+                    if chart_page and b.ocr:
+                        # Kept diagram: the source copy already shows these labels.
                         continue
                     if b.ocr:
                         if getattr(b, "in_image", False):
@@ -5924,6 +5961,13 @@ def save_translated_pdf(
             if m == 0:
                 out_doc.insert_pdf(src, from_page=i, to_page=i)
                 continue
+            # An org chart / architecture diagram (the ``chart`` signature: ≥3
+            # narrow-tall node boxes) is a picture: its OCR labels stay the source
+            # pixels — never covered, never redrawn.  Redrawing them produced
+            # overlapping boxes on a real annual report (7 overlaps; the source was
+            # clean) and shrank every label to ~5 pt.  Text-layer blocks (the page
+            # heading) still translate.
+            chart_page = classify_page(blocks[:m]) == PAGE_CHART
 
             # Clean redraw of an OCR table page: start from a blank page, draw
             # only the reconstructed grid rules + translated cells, and ignore
@@ -6185,6 +6229,10 @@ def save_translated_pdf(
                 if getattr(b, "keep_original", False) and getattr(b, "ocr", False):
                     # Non-text region (handwritten signature / seal): do not draw a
                     # translation over it — the original scan pixels stay verbatim.
+                    continue
+                if chart_page and b.ocr:
+                    # Kept diagram: the scan already shows these labels, and
+                    # covering + redrawing them only degrades them.
                     continue
                 draw_b = b
                 if j in shifts and shifts[j]:

@@ -3501,12 +3501,12 @@ class FigureTextTest(unittest.TestCase):
     _LABEL_BOX = [(70.0, 270.0), (210.0, 270.0), (210.0, 286.0), (70.0, 286.0)]
 
     @staticmethod
-    def _raster(text: str, *, dark: bool = False) -> bytes:
+    def _raster(text: str, *, dark: bool = False, fill=None) -> bytes:
         """A PNG panel with ``text`` on it (``dark`` = a photo-like background)."""
         doc = fitz.open()
         page = doc.new_page(width=160, height=80)
-        page.draw_rect(fitz.Rect(0, 0, 160, 80), color=None,
-                       fill=(0.05, 0.05, 0.08) if dark else (1, 1, 1))
+        bg = fill if fill is not None else ((0.05, 0.05, 0.08) if dark else (1, 1, 1))
+        page.draw_rect(fitz.Rect(0, 0, 160, 80), color=None, fill=bg)
         page.insert_text((12, 34), text, fontsize=12,
                          color=(1, 1, 1) if dark else (0, 0, 0))
         png = page.get_pixmap(dpi=150).tobytes("png")
@@ -3527,11 +3527,84 @@ class FigureTextTest(unittest.TestCase):
         doc.save(str(path))
         doc.close()
 
+    def _large_figure_page(self, path: Path) -> fitz.Rect:
+        """A page whose *only* art is one tinted figure covering > 50 % of it.
+
+        ``_partial_image_rects`` stops at 50 % of the page, so this used to look
+        like "no partial image": the figure block's cover fell back to plain
+        white and the bilingual translation page was a blank sheet (the figure
+        was dropped while its translated labels floated).
+        """
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=600)
+        page.insert_textbox(
+            fitz.Rect(40, 40, 360, 220),
+            " ".join(["Prose line of the source document."] * 20), fontsize=10)
+        rect = fitz.Rect(40, 230, 380, 600)          # 340×370 = 0.524 × page
+        # ``keep_proportion=False``: the default letterboxes the image inside
+        # the rect, which would shrink the region below the 50 % the test needs.
+        page.insert_image(rect, keep_proportion=False,
+                          stream=self._raster("CHART LABEL", fill=(0.9, 0.9, 0.95)))
+        doc.save(str(path))
+        doc.close()
+        return rect
     def _ocr_fn(self, *extra):
         def fn(_page_index, _page):
             return [(self._LABEL_BOX, "CHART LABEL"), *extra]
         return fn
 
+    def test_a_short_ocr_fragment_is_not_translated(self):
+        # P1-2: the design's conservative gate (char_count >= 4).  A 1–3 char
+        # scrap on a paper-like image is usually an icon / ornament misread, and
+        # covering + redrawing it would damage the picture for nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mixed.pdf"
+            self._mixed_page(src)
+            dt = pdfio.extract_document_text(
+                str(src), ocr=True,
+                ocr_fn=lambda _i, _p: [(self._LABEL_BOX, "TM")],
+                log=lambda _m: None)
+            self.assertEqual(
+                [], [b for b in dt.pages[0] if getattr(b, "in_image", False)])
+
+    def test_a_large_figure_keeps_its_own_cover_colour(self):
+        # P1-1: a figure covering > 50 % of the page is still that block's
+        # figure.  Its cover must be clipped to the image and filled with the
+        # image's own background — the old 50 % cap could not find the image, so
+        # the cover was plain white and unclipped.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "large.pdf"
+            self._large_figure_page(src)
+            dt = pdfio.extract_document_text(
+                str(src), ocr=True, ocr_fn=self._ocr_fn(), log=lambda _m: None)
+            figs = [b for b in dt.pages[0] if getattr(b, "in_image", False)]
+            self.assertEqual(["CHART LABEL"], [b.text for b in figs])
+            with fitz.open(str(src)) as d:
+                page = d[0]
+                self.assertEqual([], pdfio._partial_image_rects(page))
+                containing = pdfio._containing_image_rect(page, figs[0])
+                self.assertIsNotNone(containing)
+                colour = pdfio._image_cover_color(page, containing)
+            self.assertNotEqual(
+                (1.0, 1.0, 1.0), colour,
+                "the cover must take the figure's own background, not white")
+
+    def test_bilingual_page_keeps_a_large_figure(self):
+        # P1-1 (second consequence): the translation page of a > 50 % figure
+        # used to be a blank sheet — the figure was dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "large.pdf"
+            out = Path(tmp) / "bi.pdf"
+            self._large_figure_page(src)
+            dt = pdfio.extract_document_text(
+                str(src), ocr=True, ocr_fn=self._ocr_fn(), log=lambda _m: None)
+            per_page = [[f"图:{b.text}" if getattr(b, "in_image", False)
+                         else f"T:{b.text}" for b in dt.pages[0]]]
+            pdfio.save_interleaved_pdf(
+                str(src), per_page, str(out), "Simplified Chinese", pages=dt.pages)
+            with fitz.open(str(out)) as o:
+                self.assertEqual(1, len(o[1].get_image_info()),
+                                 "the >50% figure must survive on the translation page")
     def test_figure_text_on_paper_becomes_an_in_image_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "mixed.pdf"
@@ -3727,6 +3800,111 @@ class FigureTextRoleTest(unittest.TestCase):
             out = ir_mod.translate_ir(irdoc, translate_fn, lang="Simplified Chinese",
                                       group_prose=False)
             self.assertIn(target, seen, "图内文字必须进入翻译请求")
+
+
+class ScannedChartRoleTest(unittest.TestCase):
+    """A *scanned* org chart / architecture diagram keeps its labels as source.
+
+    Product decision: an org chart is a picture — its node labels stay verbatim
+    (translate the page, not the diagram).  The ``figure`` region is the mechanism
+    that hands them the structural role ``translate_ir`` reads as "keep source".
+    The v0.5.45 guard releases only ``in_image`` blocks (the figure-text OCR of a
+    *text-layer* page); a scanned chart's whole-page OCR (``ocr`` without
+    ``in_image``) stays claimed — verified against page 5 of the Mintai annual
+    report (58 labels, kept in the English export).
+    """
+
+    def test_a_figure_region_keeps_scanned_ocr_text_verbatim(self):
+        import translate_app.ir as ir_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "scan.pdf"
+            doc = fitz.open()
+            doc.new_page(width=400, height=400)          # no text layer at all
+            doc.save(str(src))
+            doc.close()
+
+            boxes = {
+                "股东大会": [(40.0, 60.0), (120.0, 60.0), (120.0, 76.0), (40.0, 76.0)],
+                "风险管理部": [(40.0, 120.0), (70.0, 120.0), (70.0, 160.0), (40.0, 160.0)],
+            }
+
+            def ocr_fn(_i, _p):
+                return [(box, text) for text, box in boxes.items()]
+
+            dt = pdfio.extract_document_text(str(src), ocr=True, ocr_fn=ocr_fn,
+                                             log=lambda _m: None)
+            n = len(dt.pages[0])
+            self.assertEqual(2, n)
+            self.assertTrue(all(b.ocr for b in dt.pages[0]))
+            self.assertFalse(any(getattr(b, "in_image", False)
+                                 for b in dt.pages[0]),
+                             "a scan must not be an in_image block")
+
+            # A semantic backend reports the scanned chart as a figure region.
+            def structure_fn(_page_index, _page, _blocks):
+                return [{"kind": "figure", "bbox": [0, 0, 400, 400],
+                         "block_indices": list(range(n))}]
+
+            pdfio.build_structure(str(src), dt, structure_fn, parser="test")
+            structure = dt.page_structure[0]
+            elements = [e for e in structure.elements if e["kind"] == "figure"]
+            self.assertEqual(list(range(n)), elements[0]["block_indices"],
+                             "扫描图的节点标签属于图片本体，保留原文")
+            self.assertEqual(("figure", 0), ir_mod._role_of(0, structure))
+
+            # …and the labels reach the translator.
+            irdoc = ir_mod.build_ir(dt, lang="English")
+            seen: list[str] = []
+
+            def translate_fn(texts, **_kw):
+                seen.extend(texts)
+                return ["EN:" + t for t in texts]
+
+            out = ir_mod.translate_ir(irdoc, translate_fn, lang="English",
+                                      group_prose=False)
+            self.assertEqual([], seen, "组织架构图节点标签不应进入翻译请求")
+            self.assertTrue(all(v in boxes for v in out.values()), out)
+
+
+class KeptOcrPixelsTest(unittest.TestCase):
+    """A kept org chart / architecture diagram is not covered or redrawn.
+
+    ``classify_page`` marks a page with ≥3 narrow-tall node boxes as ``chart``.
+    Its OCR labels are the picture: covering them with white rects and drawing the
+    OCR glyphs back produced overlapping boxes on a real annual report (7 overlaps;
+    the source was clean) and shrank every label to ~5 pt.  A chart page keeps its
+    original pixels — only its text-layer blocks (the heading) translate.
+    """
+
+    def test_chart_page_keeps_its_ocr_pixels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "chart.pdf"
+            out = Path(tmp) / "out.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=200)
+            # A black marker behind the node boxes: a white cover erases it.
+            page.draw_rect(fitz.Rect(40, 80, 240, 140), color=None, fill=(0, 0, 0))
+            doc.save(str(src))
+            doc.close()
+
+            # A heading (text layer) + three narrow-tall node boxes = chart page.
+            blocks = [pdfio.Block("标题", 0, 20, 20, 120, 35, size=12)]
+            blocks += [pdfio.Block(f"节点{i}", 0, 60 + 40 * i, 90, 75 + 40 * i, 130,
+                                   size=8, ocr=True, single_line=True)
+                       for i in range(3)]
+            self.assertEqual(pdfio.PAGE_CHART, pdfio.classify_page(blocks))
+            pdfio.save_translated_pdf(str(src), [blocks], [[b.text for b in blocks]],
+                                      str(out), "English", log=lambda _m: None)
+            with fitz.open(str(out)) as o:
+                pix = o[0].get_pixmap(clip=fitz.Rect(60, 90, 75, 130), dpi=72,
+                                      alpha=False)
+                self.assertEqual(0, min(pix.samples),
+                                 "the chart must not be painted over")
+                self.assertNotIn("节点0", o[0].get_text(),
+                                 "the node labels must not be redrawn")
+                self.assertIn("标题", o[0].get_text(),
+                              "the heading is text and must still be exported")
 
 
 if __name__ == "__main__":

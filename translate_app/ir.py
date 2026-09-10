@@ -631,11 +631,12 @@ def translate_ir(
     out: dict[int, str] = {}
     for b in blocks:
         # Fail-safe for the structural gate: a block whose text was OCR'd out of a
-        # raster figure (``Block.in_image``) is *text* and must be translated, even
-        # if some backend still hands it a structural role.  ``build_structure``
-        # already keeps such blocks out of a figure/formula region's members; this
-        # guards the decision point itself (a chart's labels otherwise export
-        # verbatim — see the fix note there).
+        # raster figure **on a text-layer page** (``Block.in_image``) is *text* and
+        # must be translated, even if some backend still hands it a structural role.
+        # ``build_structure`` already keeps such blocks out of a figure region's
+        # members; this guards the decision point itself.  A plain ``ocr`` block is
+        # deliberately NOT released: a scanned org chart / architecture diagram keeps
+        # its node labels as the source (product decision).
         structural = is_structural_role(b.role) and not getattr(b.anchor, "in_image", False)
         if structural or _is_verbatim(b.anchor):
             out[b.src_id] = b.text      # formula/figure/numeric → keep source

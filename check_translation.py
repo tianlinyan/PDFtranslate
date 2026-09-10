@@ -17,7 +17,9 @@
 3. **章节编号**：比对双方「行首编号」（``1.`` / ``1.1`` / ``第4章`` /
    ``Chapter 4``）的数字序列，顺序或数量不一致即告警；译文全文的编号
    风格（点分层次 / 中文 / 单词前缀）也应统一。
-4. **页数合理性**：译文页数不应少于原文；少了即告警。
+4. **页数合理性**：译文页数不应少于原文；少了即告警。**双语（交错）产物
+   按「源页 i ↔ 译文页 2i+1」配对**检查（页数为 2×原文时），不再把原文页当
+   译文页比对——那会让真正的译文页从不被检查（错误的数字也判「体检通过」）。
 
 退出码：0 = 全部通过；1 = 数字不一致（或 ``--strict`` 下任意告警）；
 2 = 用法错误。
@@ -345,11 +347,18 @@ def _has_cjk(text: str) -> bool:
     # script (``Simplified Chinese`` is ASCII but its script is CJK).  Without the
     # name branch, a Chinese-target run was treated as Western and every intended
     # Chinese translation was falsely reported as "残留中文".
-    t = str(text or "").lower()
+    t = str(text or "").strip().lower()
     if any("一" <= c <= "鿿" for c in t):
         return True
+    # Short language *codes* are matched exactly (``zh`` must not match inside
+    # another word); ``--lang zh`` / ``cn`` used to be treated as a Western
+    # target, so a Chinese translation was falsely reported as residual CJK.
+    code = re.sub(r"[^a-z]", "", t)
+    if code in {"zh", "cn", "zho", "chi", "zhcn", "zhhans", "zhtw",
+                "zhhant", "ja", "jp", "jpn", "ko", "kor"}:
+        return True
     return any(k in t for k in (
-        "chinese", "中文", "汉语", "普通话",
+        "chinese", "中文", "汉语", "普通话", "简体", "繁体",
         "japanese", "日语", "korean", "韩语", "한국어", "日本語",
     ))
 
@@ -436,12 +445,26 @@ class Checker:
             tgt = fitz.open(str(target))
             try:
                 self._check_page_counts(src, tgt)
-                n = min(src.page_count, tgt.page_count)
+                # A bilingual product interleaves each source page with its
+                # translation page (``src[i]`` ↔ ``tgt[2i+1]``).  Pairing
+                # ``tgt[i]`` there compared a source page with the *next*
+                # pair's source page, so the real translation page was never
+                # looked at: a wrong figure in it passed as clean (measured —
+                # a bilingual export whose translation page read ``999,999.99``
+                # where the source said ``123,456.78`` reported no numeric
+                # issue at all).
+                interleaved = (src.page_count > 0
+                               and tgt.page_count == 2 * src.page_count)
+                n = (src.page_count if interleaved
+                     else min(src.page_count, tgt.page_count))
                 tgt_styles: list[str] = []
                 for i in range(n):
                     if i + 1 in self.skip:
                         continue
-                    style = self._check_page(src[i], tgt[i], i, skip_scan)
+                    ti = 2 * i + 1 if interleaved else i
+                    if ti >= tgt.page_count:
+                        continue
+                    style = self._check_page(src[i], tgt[ti], i, skip_scan)
                     if style and style != "mixed":
                         tgt_styles.append(style)
                 if len(set(tgt_styles)) > 1:

@@ -364,6 +364,15 @@ def check_document(source: Path, target: Path,
             report.pages_issue.append(
                 f"译文 {tgt.page_count} 页少于原文 {src.page_count} 页")
         text_layers = _text_layer_blocks(src)
+        text_layer_known = text_layers is not None
+        if not text_layer_known:
+            # Fail-closed: a failed extraction is not "no text layer".  Report it
+            # as a page issue (exit 1) instead of silently skipping every missing
+            # check and printing 体检通过.
+            report.pages_issue.append(
+                "无法提取源文档文本层（pdfio.extract_document_text 失败），"
+                "本次未做漏画检查，结论不可视为通过。")
+            text_layers = {}
         sizes: list[float] = []
         visited: set[int] = set()
         for i in range(src.page_count):
@@ -408,7 +417,9 @@ def check_document(source: Path, target: Path,
             # The missing check needs no pixels (it compares text spans), so it
             # runs even when the page could not be sampled — an unsampled page
             # used to skip it silently.
-            if text_layers.get(i):
+            if not text_layer_known:
+                pass               # already reported as a pages_issue above
+            elif text_layers.get(i):
                 report.missing += find_missing(text_layers[i], spans)
             else:
                 report.scanned_pages.append(i + 1)
@@ -442,14 +453,21 @@ def check_document(source: Path, target: Path,
     return report
 
 
-def _text_layer_blocks(src: fitz.Document) -> dict[int, list[object]]:
-    """Per-page source blocks that have a text layer (empty dict when none)."""
+def _text_layer_blocks(src: fitz.Document) -> dict[int, list[object]] | None:
+    """Per-page source blocks that have a text layer.
+
+    ``{}``  = the document has no text layer at all (a pure scan: the missing
+    check does not apply).
+    ``None`` = the extraction **failed**, which must not be read as "no text
+    layer": that turned every page into a "scan", skipped the missing check
+    and still printed 体检通过 (a silent false green).
+    """
     if not any(src[i].get_text("text").strip() for i in range(src.page_count)):
         return {}
     try:
         doc = pdfio.extract_document_text(Path(src.name), ocr=False)
-    except Exception:                  # noqa: BLE001 — best-effort check
-        return {}
+    except Exception:                  # noqa: BLE001 — the caller reports it
+        return None
     return {i: list(blocks) for i, blocks in enumerate(doc.pages)}
 
 
@@ -521,15 +539,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(__doc__, file=sys.stderr)
         return 2
 
+    # Open both inputs up front: a missing / encrypted file is a *usage* error
+    # (exit 2), never an uncaught traceback — which used to exit 1, the same code
+    # as "there are structural problems".  The probe lived inside ``if pages:``,
+    # so it only ran for --page invocations.
+    try:
+        with fitz.open(files[0]) as probe:
+            total = probe.page_count
+        with fitz.open(files[1]):
+            pass
+    except Exception as exc:               # noqa: BLE001 — missing/encrypted input
+        print(f"无法打开文件：{exc}", file=sys.stderr)
+        return 2
+
     if pages:
         # An out-of-range --page used to select nothing and still print
         # "体检通过" with exit 0 — a silent false green.
-        try:
-            with fitz.open(files[0]) as probe:
-                total = probe.page_count
-        except Exception as exc:           # noqa: BLE001 — bad/encrypted input
-            print(f"无法打开原文：{exc}", file=sys.stderr)
-            return 2
         bad = sorted(p for p in pages if p < 1 or p > total)
         if bad:
             print(f"页码越界：{bad}（原文共 {total} 页）", file=sys.stderr)
