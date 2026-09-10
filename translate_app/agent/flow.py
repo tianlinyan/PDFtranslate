@@ -1143,6 +1143,12 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
 
     def _write(index: int, text: str) -> None:
         _out().setdefault(index, {})["text"] = str(text)
+        # A translation overrides the "kept as source" default (a chart page's
+        # diagram labels): drop the flag so the exporter draws it and the audit
+        # checks it like any other block.
+        b = _block(index)
+        if b is not None:
+            b.keep_original = False
 
     def _read(index: int) -> str:
         return str((_out().get(index) or {}).get("text", ""))
@@ -1315,12 +1321,20 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
         err = _check_index_on_page(page, index)
         if err:
             return {"ok": False, "error": err}
+        # "Keep this block as the source" is a decision the audit must honour,
+        # otherwise the review loop translates it back (a chart label, a proper
+        # noun the user wants untouched).
+        b = _block(index)
+        if b is not None:
+            b.keep_original = True
         if index in _out():
             _out()[index].pop("text", None)
             if not _out()[index]:
                 _out().pop(index, None)
             return {"ok": True, "index": index}
-        return {"ok": False, "error": f"no translation for index {index}"}
+        if b is not None:
+            return {"ok": True, "index": index, "note": "该块本就保留原文"}
+        return {"ok": False, "error": f"bad index {index}"}
 
     def apply_annotation(page: int, bbox, text: str | None = None, action: str = "set"):
         """M6: edit the block under a user-drawn region on the preview.
@@ -1345,6 +1359,7 @@ def make_page_executors(state: WorkflowState, model, log: Callable[[str], None] 
                 out[flat].pop("text", None)
                 if not out[flat]:
                     out.pop(flat, None)
+            block.keep_original = True     # user annotation: keep the source
             state.record_op(tool="apply_annotation",
                             args={"page": page, "bbox": list(bbox), "action": action},
                             target=f"page:{page} block:{flat}", reason="用户标注：删除该块",
@@ -1767,9 +1782,40 @@ class DocumentSession:
             f"扫描 {d.scan_pages} 页，图表 {d.chart_pages} 页，表格 {d.table_pages} 页，"
             f"待确认 {d.uncertain_pages} 页。"
         )
+        self._mark_kept_diagrams()
         self.progress(0, d.pages, "预处理")
         if self.infer_terms:
             self._inject_terminology()
+
+    def _mark_kept_diagrams(self) -> None:
+        """Default content policy: a chart page's diagram labels keep the source.
+
+        ``classify_page`` flags an org chart / architecture diagram (≥3 narrow-tall
+        node boxes).  Its **OCR** blocks are marked ``keep_original`` so the
+        exporter leaves the raster pixels alone (no white cover, no redraw — the
+        redraw overlapped and shrank the labels on a real annual report) and the
+        audit (``_audit_protected``) does not report them as untranslated.
+
+        This is a *default*, not a lock: writing a translation clears the flag
+        again (:func:`_write`), so the AI can translate a diagram when the user
+        asks for it.
+        """
+        from .. import pdfio
+
+        src = self.doc
+        if src is None:
+            return
+        kept = 0
+        for i, tri in (self.state.triage or {}).items():
+            if tri.kind != pdfio.PAGE_CHART or not (0 <= i < len(src.pages)):
+                continue
+            for b in src.pages[i]:
+                if getattr(b, "ocr", False) and not getattr(b, "keep_original", False):
+                    b.keep_original = True
+                    kept += 1
+        if kept:
+            self.log(f"  图表页：{kept} 个图内文本块默认保留原文"
+                     f"（需要翻译时 AI 可逐块覆盖）。")
 
     def _inject_terminology(self) -> None:
         """Extract + translate document-level terms once, then inject them for the agent.

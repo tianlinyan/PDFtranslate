@@ -3906,6 +3906,33 @@ class KeptOcrPixelsTest(unittest.TestCase):
                 self.assertIn("标题", o[0].get_text(),
                               "the heading is text and must still be exported")
 
+    def test_a_translated_chart_label_overrides_the_default(self):
+        # The keep rule is a *default*, not a lock: a block the AI actually
+        # translated is drawn, so the AI decides per block what to translate.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "chart.pdf"
+            out = Path(tmp) / "out.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=200)
+            page.draw_rect(fitz.Rect(40, 80, 240, 140), color=None, fill=(0, 0, 0))
+            doc.save(str(src))
+            doc.close()
+
+            blocks = [pdfio.Block("标题", 0, 20, 20, 120, 35, size=12)]
+            blocks += [pdfio.Block(f"节点{i}", 0, 60 + 40 * i, 90, 75 + 40 * i, 130,
+                                   size=8, ocr=True, single_line=True)
+                       for i in range(3)]
+            self.assertEqual(pdfio.PAGE_CHART, pdfio.classify_page(blocks))
+            per = [["标题", "Translated node", "节点1", "节点2"]]
+            pdfio.save_translated_pdf(str(src), [blocks], per, str(out),
+                                      "English", log=lambda _m: None)
+            with fitz.open(str(out)) as o:
+                text = o[0].get_text()
+                self.assertIn("Translated node", text,
+                              "a translated diagram label must be drawn")
+                self.assertNotIn("节点1", text, "kept labels stay pixels")
+                self.assertNotIn("节点2", text, "kept labels stay pixels")
+
 
 if __name__ == "__main__":
     unittest.main()

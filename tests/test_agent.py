@@ -930,6 +930,38 @@ class PageExecutorsTest(unittest.TestCase):
         self.assertTrue(tools["set_text"](1, 1, "Second page")["ok"])
         self.assertFalse(tools["delete_block"](0, 1)["ok"])
 
+    def test_page_task_keeps_a_chart_diagram_by_default(self):
+        from translate_app import prompts
+
+        # The one deliberate exception to "translate every block": an org chart /
+        # architecture diagram keeps its labels, and the model is told it may still
+        # translate them when the user explicitly asked.
+        chart = prompts.page_task(2, "English", kind="chart")
+        self.assertIn("组织结构图", chart)
+        self.assertIn("保留原文", chart)
+        self.assertIn("明确", chart)                 # the override path
+        normal = prompts.page_task(2, "English", kind="normal")
+        self.assertIn("所有文本块", normal)
+        self.assertNotIn("保留原文", normal)
+
+    def test_write_clears_keep_original_and_delete_sets_it(self):
+        # A chart page's labels default to ``keep_original``; translating one must
+        # clear the flag (so the exporter draws it and the audit checks it), and
+        # "delete_block" re-asserts it (keep the source).
+        s = agent.WorkflowState("a.pdf", "English")
+        b = pdfio.Block("董事会", page=0, x0=0, y0=0, x1=10, y1=30,
+                        ocr=True, single_line=True)
+        s.src_doc = pdfio.DocumentText(pages=[[b]], blocks=["董事会"],
+                                       block_pages=[0])
+        tools = agent.make_page_executors(s, _dummy_model())
+        b.keep_original = True                       # the chart default
+        self.assertTrue(tools["set_text"](0, 0, "Board of Directors")["ok"])
+        self.assertFalse(b.keep_original,
+                         "a translation must override the keep default")
+        self.assertTrue(tools["delete_block"](0, 0)["ok"])
+        self.assertTrue(b.keep_original, "delete = keep the source")
+
+
     def test_apply_annotation_refuses_a_numeric_block(self):
         s = agent.WorkflowState("a.pdf", "English")
         s.src_doc = pdfio.DocumentText(

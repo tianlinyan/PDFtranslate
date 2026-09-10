@@ -251,9 +251,27 @@ def page_task(page_index: int, lang: str, kind: str | None = None) -> str:
     and the model may not stop while ``check_residual`` still reports untranslated
     content.  This avoids "翻译不完全" where the model skips blocks it judged not to
     need translating.
+
+    **``kind == "chart"`` is the one deliberate exception**: an org chart /
+    architecture diagram keeps its node labels as the source (product decision) —
+    redrawing those narrow boxes into the target language overlaps and shrinks
+    them.  The model is told to translate only the text *outside* the diagram, and
+    that it may still translate diagram blocks when the user explicitly asked for
+    it (the export honours a translated block by drawing it).
     """
     n = page_index + 1
     head = f"这是文档第 {n} 页" + (f"（{kind} 页）" if kind else "") + "。"
+    if kind == "chart":
+        return (
+            f"{head}这是**组织结构图 / 架构图**：图内节点标签默认**保留原文**"
+            "（这些窄高框把译文重画进去只会压字、缩字号），**不要**翻译图内的块。\n"
+            f"只把图**外**的文本（大标题、图注、页眉页脚等）译成 {lang}。\n"
+            "① read_page(page) 读本页并记下各块 index；② 图外的可译块用 "
+            "translate_blocks(page) 或 set_text 处理；③ 若本轮用户要求里**明确**说要翻译"
+            "这张图，才对这些块用 translate_block / translate_blocks——翻译过的块会覆盖"
+            "默认、正常绘出；④ check_residual 若把图内保留的中文报成残留，**不要**为了"
+            f"消残留去翻译图表；确认图外文本已全部译成 {lang} 即可结束。"
+        )
     return (
         f"{head}请把本页**所有文本块**均翻译成 {lang}——整页最终应**全部是 {lang}**；"
         "只有纯数字/金额/公式/单位块保持原样。\n"

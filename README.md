@@ -1,10 +1,22 @@
 # PDFtranslate
 
-> 当前版本：**v0.6.0**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
+> 当前版本：**v0.6.1**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
 > 各阶段性设计见 `docs/`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
 即可把文档翻译成指定语言并保存为双语 PDF、原位翻译 PDF、Markdown 或纯文本。
+
+> **v0.6.1**：**组织架构图/架构图的「保留原文」改为可被 AI 逐块覆盖**（用例 818 → **822 全绿**）。
+> v0.6.0 的「chart 页 OCR 块一律不覆盖不重画」是硬规则，现在降为**默认策略**：
+> ① 导出端只跳过**未被翻译**的 chart 页 OCR 块（译文==原文），翻译过的块照常绘出；
+> ② `page_task` 的 `kind == "chart"` 分支明确告诉模型「图内标签默认保留原文、只译图外文本；
+> 本轮用户**明确**要求时才用 `translate_block`/`translate_blocks` 覆盖」；
+> ③ `DocumentSession._preprocess` 把图表页 OCR 块标 `keep_original`（导出保留原像素、审计
+> `_audit_protected` 不当漏译），**写译文**（`_write`）清除该标记、**`delete_block`/标注删除**
+> 重新设置该标记——AI 由此可按内容逐块决定翻不翻；
+> ④ **红线不变**：数字格、照片/彩色底、签字/印章、公式、丢页、控制信号仍不可被 AI 触碰。
+> 回归 +4：`KeptOcrPixelsTest`（默认 + 逐块覆盖）、`test_page_task_keeps_a_chart_diagram_by_default`、
+> `test_write_clears_keep_original_and_delete_sets_it`、`test_preprocess_keeps_a_scanned_diagrams_labels`。
 
 > **v0.6.0**：**代码审查修复批次 + 组织架构图/架构图改为保留原图**（用例 807 → **818 全绿**）。
 > ① **体检工具可信度**：`check_translation` 对双语产物改按「源页 i ↔ 译文页 2i+1」配对（此前拿原文页

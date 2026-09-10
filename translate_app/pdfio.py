@@ -5073,7 +5073,8 @@ def save_interleaved_pdf(
             trans = per_page[i] if i < len(per_page) else []
             m = min(len(blocks), len(trans))
             # A kept org chart / architecture diagram (see ``save_translated_pdf``):
-            # its OCR labels are not redrawn, the source copy carries them.
+            # its *untranslated* OCR labels are not redrawn — the source copy
+            # carries them; a block the AI translated is drawn as usual.
             chart_page = classify_page(blocks[:m]) == PAGE_CHART if m else False
             # ``_image_regions_for_ocr`` adds the 0.5–0.95 page-area raster
             # figure that ``_partial_image_rects`` excludes (a large chart /
@@ -5104,8 +5105,10 @@ def save_interleaved_pdf(
                     if b.is_chart:
                         # A diagram node label keeps its source (as in-place).
                         continue
-                    if chart_page and b.ocr:
-                        # Kept diagram: the source copy already shows these labels.
+                    if (chart_page and b.ocr
+                            and str(trans[j]).strip() == str(b.text).strip()):
+                        # Diagram default: the source copy already shows these
+                        # labels; a translated one is drawn below.
                         continue
                     if b.ocr:
                         if getattr(b, "in_image", False):
@@ -5962,11 +5965,12 @@ def save_translated_pdf(
                 out_doc.insert_pdf(src, from_page=i, to_page=i)
                 continue
             # An org chart / architecture diagram (the ``chart`` signature: ≥3
-            # narrow-tall node boxes) is a picture: its OCR labels stay the source
-            # pixels — never covered, never redrawn.  Redrawing them produced
-            # overlapping boxes on a real annual report (7 overlaps; the source was
-            # clean) and shrank every label to ~5 pt.  Text-layer blocks (the page
-            # heading) still translate.
+            # narrow-tall node boxes) keeps its labels as the source pixels — a
+            # *default*, not a lock: a block the AI/user actually translated is
+            # drawn like any other block (see the ``chart_page`` skip below).
+            # Redrawing the untouched OCR labels only degraded them on a real
+            # annual report (7 overlaps; the source was clean, labels shrank to
+            # ~5 pt).  Text-layer blocks (the page heading) translate as usual.
             chart_page = classify_page(blocks[:m]) == PAGE_CHART
 
             # Clean redraw of an OCR table page: start from a blank page, draw
@@ -6230,9 +6234,12 @@ def save_translated_pdf(
                     # Non-text region (handwritten signature / seal): do not draw a
                     # translation over it — the original scan pixels stay verbatim.
                     continue
-                if chart_page and b.ocr:
-                    # Kept diagram: the scan already shows these labels, and
-                    # covering + redrawing them only degrades them.
+                if (chart_page and b.ocr
+                        and str(trans[j]).strip() == str(b.text).strip()):
+                    # Diagram default: an UNTRANSLATED label keeps the raster
+                    # pixels (covering + redrawing it only degrades them).  A
+                    # block with a real translation falls through and is drawn,
+                    # so the AI can override the default per block.
                     continue
                 draw_b = b
                 if j in shifts and shifts[j]:

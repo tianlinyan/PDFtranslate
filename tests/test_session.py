@@ -143,6 +143,30 @@ class DocumentSessionTest(unittest.TestCase):
             session._preprocess()
         self.assertEqual(state.user_decisions["terminology"], {"总资产": "Total assets"})
 
+    def test_preprocess_keeps_a_scanned_diagrams_labels(self):
+        # Step 1: a chart page's OCR labels default to "keep the source"
+        # (``keep_original``), which both the exporter (no cover / no redraw) and
+        # the audit (``_audit_protected``) honour.  A text-layer block on the page
+        # (the heading) is NOT marked, so its translation is still required.
+        from translate_app.agent import flow as flow_mod
+
+        heading = pdfio.Block("标题", page=0, x0=10, y0=10, x1=60, y1=20,
+                              size=12, single_line=True)
+        nodes = [pdfio.Block(t, page=0, x0=50, y0=y, x1=57.4, y1=y + 29.5,
+                             size=10.0, ocr=True, single_line=True)
+                 for t, y in (("董事会", 50), ("监事会", 90), ("经理层", 130))]
+        page = [heading, *nodes]
+        doc = pdfio.DocumentText(pages=[page], blocks=[b.text for b in page],
+                                 block_pages=[0, 0, 0, 0], title="图")
+        state, session = self._session(doc, lambda st, p, m, **kw: st)
+        session._preprocess()
+        self.assertEqual("chart", state.triage[0].kind)
+        self.assertTrue(all(b.keep_original for b in nodes))
+        self.assertFalse(heading.keep_original,
+                         "page text is not part of the diagram")
+        self.assertTrue(flow_mod._audit_protected(state, nodes[0]))
+        self.assertFalse(flow_mod._audit_protected(state, heading))
+
     def test_cancellation_in_a_special_page_is_not_swallowed(self):
         # ``_translate_special_page``'s ``except Exception`` used to record a
         # cancellation as "第 N 页翻译失败（保留原文）" and return False; a control
