@@ -119,6 +119,74 @@ class TranslateIrTest(unittest.TestCase):
         self.assertEqual(out[2], "1,234.56")
         self.assertEqual(out[0], "BETA")
 
+    def _figure_ir(self):
+        """One prose block and one figure block on page 0."""
+        ir0 = IRDoc(title="t", block_count=2)
+        ir0.pages.append(IRPage(page=0, blocks=[
+            IRBlock(anchor=Block("alpha", 0, 0, 0, 100, 20), text="alpha",
+                    role="text", src_id=0),
+            IRBlock(anchor=Block("Org", 0, 0, 30, 100, 50), text="Org",
+                    role="figure", src_id=1),
+        ]))
+        return ir0
+
+    def test_a_figure_keeps_the_source_by_default(self):
+        ir0 = self._figure_ir()
+        sent: list[str] = []
+
+        def fn(texts, *, lang, extra_glossary=None):
+            sent.extend(texts)
+            return ["T|" + t for t in texts]
+
+        out = ir.translate_ir(ir0, fn, lang="English")
+        self.assertEqual("Org", out[1])
+        self.assertEqual(["alpha"], sent)
+
+    def test_a_released_figure_is_translated(self):
+        # The AI content policy released this figure because the requirement asked
+        # for that diagram: it now goes to the model like any other text.
+        ir0 = self._figure_ir()
+        out = ir.translate_ir(
+            ir0, lambda texts, *, lang, extra_glossary=None: ["T|" + t for t in texts],
+            lang="English", release={1})
+        self.assertEqual("T|Org", out[1])
+
+    def test_a_release_never_frees_a_formula_or_an_amount(self):
+        # The red lines are enforced at the decision point, not by the caller: even a
+        # buggy (or hostile) decision cannot send an amount or a formula to the model.
+        ir0 = self._ir()
+        seen: list[str] = []
+
+        def fn(texts, *, lang, extra_glossary=None):
+            seen.extend(texts)
+            return ["T|" + t for t in texts]
+
+        out = ir.translate_ir(ir0, fn, lang="English", release={1, 2})
+        self.assertEqual("x^2 + y^2 = z^2", out[1])
+        self.assertEqual("1,234.56", out[2])
+        self.assertEqual(["alpha"], seen)
+
+    def test_keep_original_keeps_a_plain_block(self):
+        # ``Block.keep_original`` is the channel the AI content policy writes: a
+        # scanned seal is not sent to the model and is not merged into the prose
+        # unit of its neighbours either.
+        ir0 = IRDoc(title="t", block_count=2)
+        ir0.pages.append(IRPage(page=0, blocks=[
+            IRBlock(anchor=Block("alpha", 0, 0, 0, 100, 20), text="alpha",
+                    role="text", src_id=0),
+            IRBlock(anchor=Block("seal", 0, 0, 30, 100, 50, keep_original=True),
+                    text="seal", role="text", src_id=1),
+        ]))
+        seen: list[str] = []
+
+        def fn(texts, *, lang, extra_glossary=None):
+            seen.extend(texts)
+            return ["T|" + t for t in texts]
+
+        out = ir.translate_ir(ir0, fn, lang="English")
+        self.assertEqual("seal", out[1])
+        self.assertEqual(["alpha"], seen)
+
     def test_glossary_passed_through(self):
         ir0 = self._ir()
         seen = {}

@@ -605,6 +605,52 @@ class IrModeWorkerTest(_WorkerTestBase):
         self.assertEqual(result.translated[1], "1,234.56")
         self.assertEqual(result.translated[0], "T|alpha")
 
+    def test_run_ir_applies_the_ai_content_policy(self):
+        # The content policy can keep a scanned block (a seal / handwriting whose
+        # pixels ARE the content) that no deterministic rule can tell from text.
+        w = self._worker(ir_mode=True,
+                         policy_fn=lambda cands, **kw: ({1: "keep"}, "印章"))
+        doc = self._doc(["alpha", "SEAL"])
+        doc.pages[0][1].ocr = True
+        result = w._run_ir(doc, self._fake_engine())
+        self.assertEqual("SEAL", result.translated[1], "a kept block stays the source")
+        self.assertEqual("T|alpha", result.translated[0])
+        self.assertTrue(doc.pages[0][1].keep_original)
+
+    def test_run_ir_releases_a_figure_the_ai_asked_for(self):
+        # A figure region is kept by default; a release (the requirement explicitly
+        # asked for that diagram) sends its labels to the model like any prose.
+        w = self._worker(
+            ir_mode=True,
+            policy_fn=lambda cands, **kw: ({1: "translate"}, "用户要求翻译该图"))
+        doc = self._doc(["alpha", "Org"])
+        doc.page_structure = [pdfio.PageStructure(
+            page=0, parser="mock",
+            elements=[{"kind": "figure", "bbox": (0, 0, 1, 1),
+                       "block_indices": [1]}])]
+        result = w._run_ir(doc, self._fake_engine())
+        self.assertEqual("T|Org", result.translated[1])
+
+    def test_a_failing_content_policy_leaves_the_deterministic_defaults(self):
+        def boom(cands, **kw):
+            raise RuntimeError("no model")
+
+        w = self._worker(ir_mode=True, policy_fn=boom)
+        doc = self._doc(["alpha", "Org"])
+        doc.page_structure = [pdfio.PageStructure(
+            page=0, parser="mock",
+            elements=[{"kind": "figure", "bbox": (0, 0, 1, 1),
+                       "block_indices": [1]}])]
+        result = w._run_ir(doc, self._fake_engine())
+        # Fail-open: the figure keeps its source, and the run is not disturbed.
+        self.assertEqual("Org", result.translated[1])
+        self.assertEqual("T|alpha", result.translated[0])
+
+    def test_the_content_policy_is_env_gated(self):
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_CONTENT_POLICY": "0"}):
+            self.assertFalse(self._worker()._content_policy_on)
+        self.assertTrue(self._worker()._content_policy_on)
+
     def test_ir_mode_default_off_and_env_gated(self):
         self.assertFalse(self._worker()._ir_mode)
         with mock.patch.dict(os.environ, {"PDFTRANSLATE_IR_MODE": "1"}):

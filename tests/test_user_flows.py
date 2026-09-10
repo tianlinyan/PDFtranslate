@@ -370,5 +370,29 @@ class FlowCompilerTest(unittest.TestCase):
         self.assertEqual(768, client.calls[0]["max_tokens"])
 
 
+class AiScopeTest(unittest.TestCase):
+    """The model reads the page scope; the rule parser is only the offline fallback."""
+
+    def test_reads_the_scope_and_reason(self):
+        self.assertEqual(
+            ([1, 2], "只翻第2-3页"),
+            uf.ai_scope("只翻第2-3页", lambda _r: {"scope": [1, 2],
+                                                "reason": "只翻第2-3页"}))
+        # duplicates collapse, order is normalised
+        self.assertEqual(([1, 2], ""),
+                         uf.ai_scope("x", lambda _r: {"scope": [2, 1, 2]}))
+
+    def test_unusable_answers_fail_open_to_the_whole_document(self):
+        # No restriction must never come out of a broken reply: fail-open = None.
+        for reply in (None, {}, {"scope": None}, {"scope": []}, {"scope": "2-3"},
+                      {"scope": ["a"]}, {"scope": [-1]}, {"scope": [1.5]}):
+            with self.subTest(reply=reply):
+                self.assertEqual((None, ""), uf.ai_scope("只翻第2-3页",
+                                                          lambda _r, r=reply: r))
+        def boom(_req):
+            raise RuntimeError("no model")
+        self.assertEqual((None, ""), uf.ai_scope("只翻第2-3页", boom))
+
+
 if __name__ == "__main__":
     unittest.main()

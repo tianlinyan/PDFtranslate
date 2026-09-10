@@ -530,19 +530,35 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": "请先选择一个 PDF 源文件（点「打开 PDF…」或拖入窗口）。"}
         if start_translate is None:
             return {"ok": False, "error": "开始翻译通道未接线"}
-        # U1: an **explicitly restricted** page range in the requirement (e.g.
-        # "只翻第2-5页") becomes the run's page scope, so the console defines WHAT
-        # to translate and the pipeline limits itself to those pages (None = the
-        # whole document).  A requirement that merely *mentions* a page ("翻译整篇，
-        # 第5页图表保留原文") must NOT narrow the run — that used to translate only
-        # page 5 and report success while every other page stayed untranslated;
-        # such a mention stays a per-page instruction the agent reads from
+        # U1: a page range in the requirement ("只翻第2-5页") becomes the run's page
+        # scope, so the console defines WHAT to translate and the pipeline limits
+        # itself to those pages (None = the whole document).  A requirement that
+        # merely *mentions* a page ("翻译整篇，第5页图表保留原文") must NOT narrow the
+        # run — such a mention stays a per-page instruction the agent reads from
         # ``state.requirements``.
+        #
+        # The MODEL reads it now: arbitrary phrasing beats the keyword rules that
+        # used to pre-empt the AI here (they missed 只保留/只留/想要 and mis-fired on
+        # 只要/不仅).  The deterministic ``parse_explicit_scope`` remains only the
+        # offline fallback.  Fail-open: on any AI failure the scope stays None
+        # (= translate everything) and the decision is logged, because silently
+        # translating *fewer* pages than asked for is the worse failure.
         from . import agent as _agent
-        try:
-            page_scope = _agent.parse_explicit_scope(str(requirement or ""))
-        except Exception:  # noqa: BLE001 — a bad parse degrades to the whole document
-            page_scope = None
+        page_scope: list[int] | None = None
+        if llm is not None:
+            page_scope, ai_reason = _agent.ai_scope(str(requirement or ""), llm)
+            if log:
+                if page_scope:
+                    pages = "、".join(str(p + 1) for p in page_scope)
+                    log(f"  [编排] AI 理解为只翻第 {pages} 页"
+                        + (f"（{ai_reason}）" if ai_reason else "") + "。")
+                elif ai_reason:
+                    log(f"  [编排] AI 理解为整篇（{ai_reason}）。")
+        else:
+            try:
+                page_scope = _agent.parse_explicit_scope(str(requirement or ""))
+            except Exception:  # noqa: BLE001 — bad parse degrades to whole document
+                page_scope = None
         try:
             start_translate(str(requirement or ""), page_scope)
         except Exception as exc:  # noqa: BLE001 — fail-closed

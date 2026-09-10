@@ -282,6 +282,52 @@ def page_task(page_index: int, lang: str, kind: str | None = None) -> str:
     )
 
 
+def content_policy_task(entries, lang: str, requirement: str = "") -> str:
+    """Ask the model which of the listed blocks must keep their source text.
+
+    ``entries`` is a sequence of ``(index, page, kind, default_keep, text)`` tuples
+    (page is **1-based** for display) covering only the *ambiguous* blocks: the ones
+    the deterministic rules kept although they might be translatable (a figure
+    region) and the ones they scheduled for translation although their content may
+    be an image (a scanned seal / stamp / handwriting).  Numbers, amounts and
+    formulas are never listed — they are a red line of the pipeline, not a decision.
+
+    The reply is a JSON object with two index arrays (``release`` / ``keep``).  The
+    ``release`` direction is deliberately narrow: redrawing a scanned diagram's
+    labels overlaps and shrinks them (measured on a real annual report), so it is
+    only for a requirement that *explicitly* asks for that figure to be translated.
+    """
+    lines = []
+    for index, page, kind, default_keep, text in entries:
+        shown = " ".join(str(text or "").split())
+        if len(shown) > 60:
+            shown = shown[:60] + "…"
+        lines.append(f"[{index}] 第{page}页 类型={kind} "
+                     f"默认={'保留原文' if default_keep else '翻译'} | 文本: {shown}")
+    listed = "\n".join(lines)
+    want = str(requirement or "").strip()
+    return (
+        "你是 PDF 翻译流水线的**内容策略**判定器。下面是文档里「该不该保留原文」"
+        "有歧义的块（编号 = 块索引）。数字/金额/公式块是流水线红线、永不翻译，"
+        "也不会出现在列表里，无需你判断。\n\n"
+        "判断规则：\n"
+        "1. **release（放行翻译）**：把「默认保留原文」的块放行、交给翻译。"
+        "仅当本轮用户要求里**明确**说要翻译这张图/这个图表时才用。"
+        "扫描图表的译文会被重画，窄格可能压字、缩字号（实测过），"
+        "没有明确要求就**不要**放行。\n"
+        "2. **keep（保留原文）**：块的内容本身就是图像/身份/装饰，翻过去只会破坏它。"
+        "典型：扫描件上的**印章/公章/签名手迹**、二维码/条形码、纯装饰字、"
+        "烧在图片里的水印。**绝不**把普通正文、标题、表格单元格、金额、公司名、"
+        "日期、编号判成 keep——那些必须翻译；判断不确定就别动它（留空即可）。\n\n"
+        "只输出一个 JSON 对象，不要解释、不要 markdown 围栏：\n"
+        '{"release": [索引...], "keep": [索引...], "reason": "一句话说明"}\n'
+        "索引必须是下面列表里出现过的编号；不需要改动就留空数组。\n\n"
+        f"目标语言：{lang}\n"
+        f"本轮用户要求：{want or '（无）'}\n\n"
+        f"待判定的块（共 {len(lines)} 个）：\n{listed}"
+    )
+
+
 def special_page_question(page_index: int, kind: str) -> tuple[str, list[str]]:
     """The per-kind *natural-language* question for a special page (M3 negotiation).
 

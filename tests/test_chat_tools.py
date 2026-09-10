@@ -120,6 +120,38 @@ class ChatToolsTest(_CtxTest):
         self.assertIn("不要为了「开始翻译」先调它", descs["get_settings"])
         self.assertIn("不要反问用户", descs["re_export"])
 
+    def test_run_translate_uses_the_ai_scope(self):
+        # The requirement is read by the MODEL now (the rule parser pre-empted it
+        # before); the compiled scope reaches the translation channel.
+        calls: list = []
+        tools = chat_tools.make_chat_tools(
+            self.ctx,
+            llm=lambda _r: {"scope": [1, 2], "reason": "只翻第2-3页"},
+            start_translate=lambda req, scope=None: calls.append((req, scope)))
+        res = tools["run_translate"]("只翻第2-3页")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(("只翻第2-3页", [1, 2]), calls[0])
+
+    def test_run_translate_ai_failure_fails_open_to_the_whole_document(self):
+        calls: list = []
+        def boom(_req):
+            raise RuntimeError("no model")
+        tools = chat_tools.make_chat_tools(
+            self.ctx, llm=boom, log=lambda _m: None,
+            start_translate=lambda req, scope=None: calls.append((req, scope)))
+        res = tools["run_translate"]("只翻第2-3页")
+        self.assertTrue(res["ok"], res)
+        self.assertIsNone(calls[0][1], "fail-open = whole document, never a guess")
+
+    def test_run_translate_without_a_model_keeps_the_rule_parser(self):
+        calls: list = []
+        tools = chat_tools.make_chat_tools(
+            self.ctx,
+            start_translate=lambda req, scope=None: calls.append((req, scope)))
+        tools["run_translate"]("只翻第2-3页")
+        self.assertEqual([1, 2], calls[0][1])
+
+
     def test_chat_semantic_tools_reported_by_specs(self):
         # The two semantic tools are advertised in the OpenAI schema list too.
         names = {t["function"]["name"] for t in chat_tools.CHAT_TOOL_SPECS}

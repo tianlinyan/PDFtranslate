@@ -200,6 +200,50 @@ def parse_explicit_scope(req: str) -> list[int] | None:
     return None
 
 
+def _coerce_scope(raw) -> list[int] | None:
+    """0-based page list from a model's ``scope`` value; ``None`` = no restriction.
+
+    A non-list / unparsable / all-negative value is *unusable*, not a restriction:
+    the caller treats it as "the whole document" (fail-open).
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    out: list[int] = []
+    for x in raw:
+        if isinstance(x, bool):            # True would silently become page 1
+            return None
+        if isinstance(x, float) and not x.is_integer():
+            return None                    # 1.5 is off-contract, not page 1
+        try:
+            out.append(int(x))
+        except (TypeError, ValueError):
+            return None
+    pages = sorted({p for p in out if p >= 0})
+    return pages or None
+
+
+def ai_scope(req: str, llm) -> tuple[list[int] | None, str]:
+    """Read the page scope out of a requirement with the **model** (Path A).
+
+    Returns ``(0-based pages or None, reason)``.  ``llm`` is the same AI
+    slot-filler ``run_flow`` uses (``make_llm_flow_compiler``) — its JSON contract
+    already carries ``scope`` plus an optional ``reason`` for the log echo.
+    :func:`parse_explicit_scope` stays the caller's *offline* fallback only.
+
+    Any failure — no client, network, malformed JSON, an unusable ``scope`` —
+    degrades to ``(None, "")`` = "no restriction".  That fail-open is deliberate:
+    silently translating *fewer* pages than asked for is worse than translating the
+    whole document, and the caller logs the decision so the user can correct it.
+    """
+    try:
+        data = llm(str(req or "")) or {}
+    except Exception:  # noqa: BLE001 — a failing model is not a restriction
+        return None, ""
+    if not isinstance(data, dict):
+        return None, ""
+    return _coerce_scope(data.get("scope")), str(data.get("reason") or "").strip()
+
+
 def _base_from(req: str, default: str) -> str:
     if "重新导出" in req or "重新生成" in req:
         return "export"
@@ -304,7 +348,8 @@ _FLOW_COMPILE_PROMPT = (
     "把下面这句话解析成一个 JSON 对象（只输出一个 JSON 对象，不要任何解释、不要 markdown 代码围栏）：\n"
     "字段（都可省略）：base = self_check_page|translate_page|export（默认 self_check_page）；"
     "checks = 字符串数组，取值 layout/residual/missing/numbers/table；"
-    "scope = 0 起的页号整数数组；auto_fix = 布尔；include_kept = 布尔。\n"
+    "scope = 0 起的页号整数数组；auto_fix = 布尔；include_kept = 布尔；"
+    "reason = 一句话说明你的理解（可选，用于日志回显）。\n"
     "要求：{req}"
 )
 

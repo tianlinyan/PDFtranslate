@@ -441,6 +441,34 @@ def _is_verbatim(block: Block) -> bool:
     return not _needs_translation(str(block.text)) or pdfio._is_numeric_cell(str(block.text))
 
 
+def _keeps_source(block: IRBlock, released: bool = False) -> bool:
+    """True when a block keeps its source text and is never sent to the model.
+
+    Three tiers, checked in this order:
+
+    * **hard** — a verbatim block (numeric / no letters) and a formula never leave
+      the pipeline at all, and nothing can release them: the AI content policy
+      (see policy.py) may not reformat an amount or re-typeset a formula.
+    * **released** — the AI explicitly released a figure because the user asked for
+      that diagram to be translated; its labels then translate like prose.
+    * **default** — a figure region is kept (redrawing its narrow labels overlaps
+      and shrinks them — measured on a real annual report).  A Block.keep_original
+      mark keeps anything, whoever set it (AI content policy, delete_block, a user
+      annotation): that is the "translate less" direction.
+    """
+    anchor = block.anchor
+    if _is_verbatim(anchor):
+        return True
+    in_image = bool(getattr(anchor, "in_image", False))
+    if block.role == "formula" and not in_image:
+        return True
+    if released:
+        return False
+    if getattr(anchor, "keep_original", False):
+        return True
+    return is_structural_role(block.role) and not in_image
+
+
 #: A ``translate_fn`` maps a list of source texts to a same-length list of target
 #: texts, honouring a glossary: ``fn(texts, *, lang, extra_glossary) -> list[str]``.
 #: The default bound by :func:`make_ir_translate_fn` calls
@@ -602,6 +630,7 @@ def translate_ir(
     log: Callable[[str], None] | None = None,
     infer: bool = False,
     group_prose: bool | None = None,
+    release: "set[int] | None" = None,
 ) -> dict[int, str]:
     """IR-level translation → ``{src_id: translated_text}``.
 
@@ -620,6 +649,12 @@ def translate_ir(
     :func:`prose_units` — and re-splits the answer back onto the blocks with
     :func:`split_translation`, so block indices (the exporter / overlay / audit
     primary keys) are untouched.
+
+    ``release`` is the AI content policy's answer (``policy.py``): the flat indices of
+    *figure* blocks the requirement asked to translate.  Everything else about the
+    policy is already on the blocks (``Block.keep_original``, which :func:`_keeps_source`
+    reads) — only a release has no block-level place to live, because the block has no
+    "kept by a structural rule" flag to clear.
     """
     glossary = dict(ir.terms) if extra_glossary is None else dict(extra_glossary)
     blocks = [b for ipage in ir.pages for b in ipage.blocks]
@@ -627,19 +662,17 @@ def translate_ir(
         glossary = infer_glossary(ir, translate_fn, lang=lang, log=log)
         if glossary:
             ir.terms = glossary
+    # ``release`` — the AI content policy (policy.py) looked at this document and
+    # released a figure because the requirement asked for it.  The hard rules are
+    # enforced inside ``_keeps_source``, not here, so whatever the decision says, a
+    # formula / amount never reaches the model and an ``in_image`` block (text OCR'd
+    # out of a raster figure **on a text-layer page**) always does.
+    released = set(release or ())
     translatable: list[IRBlock] = []
     out: dict[int, str] = {}
     for b in blocks:
-        # Fail-safe for the structural gate: a block whose text was OCR'd out of a
-        # raster figure **on a text-layer page** (``Block.in_image``) is *text* and
-        # must be translated, even if some backend still hands it a structural role.
-        # ``build_structure`` already keeps such blocks out of a figure region's
-        # members; this guards the decision point itself.  A plain ``ocr`` block is
-        # deliberately NOT released: a scanned org chart / architecture diagram keeps
-        # its node labels as the source (product decision).
-        structural = is_structural_role(b.role) and not getattr(b.anchor, "in_image", False)
-        if structural or _is_verbatim(b.anchor):
-            out[b.src_id] = b.text      # formula/figure/numeric → keep source
+        if _keeps_source(b, b.src_id in released):
+            out[b.src_id] = b.text      # hard rule / default keep → source
         else:
             translatable.append(b)
     if not translatable:

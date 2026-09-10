@@ -1,11 +1,33 @@
 # PDFtranslate
 
-> 当前版本：**v0.6.1**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
+> 当前版本：**v0.6.2**（版本号定义于 `translate_app/__init__.py` 的 `__version__`；
 > 各阶段性设计见 `docs/`）
 
 一个 Windows 桌面 **PDF AI 翻译**工具。打开一个 PDF，选择 AI 模型与目标语言，
 即可把文档翻译成指定语言并保存为双语 PDF、原位翻译 PDF、Markdown 或纯文本。
 
+> **v0.6.2**：**「翻什么 / 不翻什么」由模型判定（第 1、2 步）**（用例 822 → **856 全绿**）。
+> 两步都把「不经模型、硬性生效」的确定性决策降级为**默认值**，模型只在其上做判断；
+> 每一步都规定了失败方向，且**红线一律不进候选、也不可被答案触碰**。
+> ① **页范围（第 1 步）**：`run_translate` 改由模型读用户要求里的页范围——
+> `agent.ai_scope(requirement, llm)` 复用 `make_llm_flow_compiler` 的槽填充（JSON 的 `scope` +
+> 可选 `reason`），日志回显「AI 理解为只翻第 N 页（reason）」；任意解析失败 **fail-open 到整篇**
+> （静默少翻比多翻更糟）。`parse_explicit_scope` 退为**无模型时的离线兜底**。
+> ② **内容策略（第 2 步，新增 `translate_app/policy.py`）**：第 1 步只让 **agent** 路径能逐块覆盖
+> 图表默认，**IR 管线与确定性回退路径上没有任何 AI 决策点**；现在 `TranslateWorker._content_policy`
+> 在两条路径上都先问一次模型，候选只有两类——`role == "figure"` 且非 `in_image`（默认保留，可
+> **放行**翻译）、`ocr` 且非 `in_table` 且未保留（默认翻译，可**保留**原文，对应扫描印章/公章/
+> 手迹/二维码）；提示词 `prompts.content_policy_task`（每页 ≤6、全篇 ≤120，未列出的一律沿用默认）
+> 回 `{"release": [...], "keep": [...], "reason": ...}`，`parse_policy_json` 只接受**候选集内**的
+> 整数索引；keep 写成 `Block.keep_original`（导出/审计/prose 分组共用的唯一通道），release 交给
+> `translate_ir(release=…)`。**红线块从不进入候选**（数字/金额、公式、表格单元格、`is_chart`），
+> 且 `ir._keeps_source` 把红线判断放在 release **之前**——即使答案里写了公式或金额的索引，
+> 它们照样保留原文。默认开启，`PDFTRANSLATE_CONTENT_POLICY=0` 可关闭；**失败一律 fail-open 到
+> 确定性默认**（无模型/网络错/坏 JSON/回调抛异常 → 空决策，两条路径与改动前逐字一致）。
+> ③ 回归 **+29**：新增 `tests/test_policy.py`（21 例：候选筛选/红线排除/上限/JSON 解析/apply/
+> LLM 槽与失败路径）、`test_ir.py` +4（figure 默认保留、release 后照常翻译、release 放不动红线、
+> `keep_original` 不送模型也不并入段落）、`test_worker.py` +4（两条路径接线、失败 fail-open、环境开关）。
+>
 > **v0.6.1**：**组织架构图/架构图的「保留原文」改为可被 AI 逐块覆盖**（用例 818 → **822 全绿**）。
 > v0.6.0 的「chart 页 OCR 块一律不覆盖不重画」是硬规则，现在降为**默认策略**：
 > ① 导出端只跳过**未被翻译**的 chart 页 OCR 块（译文==原文），翻译过的块照常绘出；

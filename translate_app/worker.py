@@ -85,6 +85,7 @@ class TranslateWorker(QObject):
         reflow: bool = True,
         rebuild_table: bool = False,
         image_text: bool | None = None,
+        policy_fn=None,
     ):
         super().__init__()
         self._source = source_path
@@ -123,6 +124,13 @@ class TranslateWorker(QObject):
         #: User requirements seeded into the agent at start (from the "开始翻译+要求"
         #: chat entry).  ``add_user_requirement`` appends more live, during a run.
         self._requirements: list[str] = list(requirements or [])
+        #: AI content policy（哪些内容保留原文）在 **IR / 确定性回退** 两条路径上由模型
+        #: 判定：默认开启，``PDFTRANSLATE_CONTENT_POLICY=0`` 强制关闭（与其它 IR 旋钮同款，
+        #: 供排查用）。agent 路径逐页自行判断，不走这里。
+        self._content_policy_on = (
+            os.environ.get("PDFTRANSLATE_CONTENT_POLICY", "1") != "0")
+        #: 注入的 AI 内容策略回调（测试用）；为 None 时按模型惰性构造。
+        self._policy_fn = policy_fn
         #: U1 scope: translate / negotiate only these 0-based pages (None = all).
         self._page_scope: list[int] | None = list(page_scope) if page_scope else None
         #: The PDF this run exported (set only for a PDF output type).  The preview
@@ -245,9 +253,10 @@ class TranslateWorker(QObject):
             self.log.emit(f"模型：{self._model.name} ({self._model.model})")
 
             # v0.3.0: the hardcoded special-casing (org-chart / signature / name
-            # cells) is removed — those are decided by the AI orchestrator at
-            # runtime.  ``keep_original`` starts empty; the agent determines what
-            # to keep.  In the deterministic fallback every block is translated.
+            # cells) is removed — those are decided by the AI at runtime.  The agent
+            # path keeps its decisions on the agent state; the other two paths take
+            # them from the AI content policy (``_content_policy``) instead, so this
+            # starts empty and is filled below.
             keep_original: set[int] = set()
 
             translate_started = time.monotonic()
@@ -265,9 +274,16 @@ class TranslateWorker(QObject):
                 # everything — say so instead of silently matching the old behaviour.
                 self.log.emit(
                     "已回退到确定性批次流水线（当前模型不支持视觉）。"
-                    "注意：组织结构图节点/姓名列/扫描件手写签字将不再自动保留原文，"
-                    "统一按文本翻译；如需保留请改用支持视觉的模型。"
+                    "注意：组织结构图节点/姓名列不再自动保留原文，统一按文本翻译；"
+                    "扫描件上的印章/手迹等由内容策略判定（见下）；如需逐页视觉判断"
+                    "请改用支持视觉的模型。"
                 )
+                # The content policy is text-only, so it runs here too: it can keep a
+                # scanned seal / stamp / handwriting block, which no deterministic rule
+                # can tell apart from printed text.  Its keeps come back on the blocks.
+                self._content_policy(doc, engine)
+                keep_original = {i for i, b in enumerate(doc.blocks)
+                                 if getattr(b, "keep_original", False)}
                 result = engine.translate_blocks(
                     doc.blocks,
                     self._lang,
@@ -378,6 +394,69 @@ class TranslateWorker(QObject):
         """Request cancellation (safe to call from the GUI thread)."""
         self._cancelled.set()
 
+    def _content_policy(self, doc: pdfio.DocumentText,
+                        engine: TranslationEngine | None = None) -> set[int]:
+        """Let the model decide which blocks keep their source (AI content policy).
+
+        Returns the flat indices the AI **released** (meaningful on the IR path only:
+        the direct path has no structural gate to release) and writes the *keeps*
+        straight onto the blocks — ``Block.keep_original`` is the one channel the
+        exporter (no cover / no redraw), the audit and the IR prose grouper all read.
+
+        Fail-open in both directions: with no model, a network error or a malformed
+        reply the deterministic defaults stand unchanged.  A keep the model failed to
+        make costs a translation the user can see is missing; a wrong release erases
+        content silently — so an unavailable model must never move the dial.
+        """
+        from . import policy as policy_mod
+
+        if not self._content_policy_on:
+            return set()
+        try:
+            cands = policy_mod.candidates(doc)
+        except Exception as exc:  # noqa: BLE001 —候选筛选失败 → 沿用默认策略
+            self.log.emit(f"  内容策略候选筛选失败：{type(exc).__name__}: {exc}"
+                          "（沿用默认策略）。")
+            return set()
+        if not cands:
+            return set()
+        fn = self._policy_fn
+        if fn is None:
+            # Reuse the engine's client when there is one: one connection pool per
+            # run instead of a second one just for this single request.
+            fn = policy_mod.make_llm_policy_fn(
+                self._model, client=getattr(engine, "client", None),
+                log=lambda m: self.log.emit(m))
+            if fn is None:
+                return set()
+            self._policy_fn = fn
+        try:
+            decision, reason = fn(cands, lang=self._lang,
+                                  requirement="；".join(self._requirements))
+        except TranslationCancelled:
+            raise                     # a cancel is a control signal, never swallowed
+        except Exception as exc:  # noqa: BLE001 — best-effort: keep the defaults
+            self.log.emit(f"  内容策略判定失败：{type(exc).__name__}: {exc}"
+                          "（沿用默认策略）。")
+            return set()
+        if not decision:
+            if reason:
+                self.log.emit(f"  内容策略：AI 查看了 {len(cands)} 个歧义块，无需调整"
+                              f"（{reason}）。")
+            return set()
+        applied = policy_mod.apply_policy(doc, decision,
+                                          log=lambda m: self.log.emit(m))
+        kept, released = applied["kept"], applied["released"]
+        parts = []
+        if kept:
+            parts.append(f"保留 {kept} 个块原文")
+        if released:
+            parts.append(f"放行 {len(released)} 个图表块翻译")
+        if parts:
+            self.log.emit("  内容策略：" + "、".join(parts)
+                          + (f"（{reason}）" if reason else "") + "。")
+        return set(released)
+
     def _run_ir(self, doc: pdfio.DocumentText, engine: TranslationEngine) -> TranslationResult:
         """C-⑥ IR-mode translation: build IR, translate at the IR level, map back.
 
@@ -396,6 +475,13 @@ class TranslateWorker(QObject):
 
         src_texts = list(doc.blocks)
         doc_ir = ir_mod.build_ir(doc, lang=self._lang)
+        # AI content policy: the model looks at the ambiguous blocks (a figure region
+        # it might be asked to translate, a scanned block whose pixels may be a seal /
+        # stamp / signature) and may keep or release them.  Everything not listed keeps
+        # the deterministic default, and the hard rules (amounts, formulas) are not
+        # reachable from the answer at all.  Keeps land on the blocks; releases come
+        # back as a set for ``translate_ir``.
+        released = self._content_policy(doc, engine)
         translate_fn = ir_mod.make_ir_translate_fn(
             engine, doc_path=Path(self._source), log=lambda m: self.log.emit(m),
             cancel=lambda: self._cancelled.is_set(),
@@ -406,7 +492,7 @@ class TranslateWorker(QObject):
         # and translate repeated terms once, then inject as the cross-page glossary).
         translated = ir_mod.translate_ir(
             doc_ir, translate_fn, lang=self._lang,
-            log=lambda m: self.log.emit(m), infer=True)
+            log=lambda m: self.log.emit(m), infer=True, release=released)
         out_texts = [str(translated.get(i, src_texts[i])) for i in range(len(src_texts))]
         # C-⑥ 缓存键细化：把段落组批切回的块级译文按块写缓存，让默认单块
         # 模式重跑时能跨模式复用（磁盘持久化启用时生效，尽力而为）。测试
