@@ -176,9 +176,9 @@ class PreviewSendRegionTest(unittest.TestCase):
 class ReExportForwardsExportFlagsTest(unittest.TestCase):
     """v0.5.25: 「重新导出」 must honor the export knobs, like 「开始翻译」.
 
-    It used to pass only ``ocr``/``agent_mode``, so with 「OCR表格重建为矢量表格」 (or
-    「表格列宽重排」) ticked the re-export silently wrote the same scanned tables again
-    — the option looked broken.
+    It used to pass only ``ocr``/``agent_mode``, so with 「OCR表格重建为矢量表格」 ticked
+    the re-export silently wrote the same scanned tables again — the option looked
+    broken.  (「表格列宽重排」自 v0.5.47 起恒为默认值，不再是界面旋钮。)
     """
 
     def _window(self, tmp: str):
@@ -201,7 +201,7 @@ class ReExportForwardsExportFlagsTest(unittest.TestCase):
         win._path_edit.setText(os.path.join(tmp, "out.pdf"))
         return win
 
-    def test_re_export_forwards_reflow_and_rebuild_table(self):
+    def test_re_export_forwards_rebuild_table_and_default_reflow(self):
         import tempfile
 
         _app()
@@ -209,20 +209,76 @@ class ReExportForwardsExportFlagsTest(unittest.TestCase):
             win = self._window(tmp)
             try:
                 # blockSignals: toggling would persist to the developer's real prefs.json
-                for check in (win._reflow_check, win._rebuild_table_check):
-                    check.blockSignals(True)
-                    check.setChecked(True)
-                    check.blockSignals(False)
+                win._rebuild_table_check.blockSignals(True)
+                win._rebuild_table_check.setChecked(True)
+                win._rebuild_table_check.blockSignals(False)
                 captured: list = []
                 win._launch_worker = captured.append
                 win._re_export()
                 self.assertEqual(1, len(captured), "重新导出 did not start a worker")
                 worker = captured[0]
+                # v0.5.47：reflow 不再是界面旋钮，重导出的 worker 取默认值（开）。
                 self.assertTrue(worker._reflow)
                 self.assertTrue(worker._rebuild_table)
             finally:
                 win._chat_thread.quit()
                 win._chat_thread.wait(2000)
+
+    def test_the_figure_text_checkbox_is_wired_and_on_by_default(self):
+        import tempfile
+
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            win = self._window(tmp)
+            try:
+                self.assertTrue(win._image_text_check.isChecked(),
+                                "图内文字默认开启（v0.5.44/patch 起的行为）")
+                self.assertIn("图内文字", win._image_text_check.toolTip())
+                captured: list = []
+                win._launch_worker = captured.append
+                win._image_text_check.blockSignals(True)
+                win._image_text_check.setChecked(False)
+                win._image_text_check.blockSignals(False)
+                win._re_export()
+                self.assertEqual(1, len(captured))
+                self.assertIs(False, captured[0]._image_text,
+                              "勾选框状态必须传给重新导出的 worker")
+            finally:
+                win._chat_thread.quit()
+                win._chat_thread.wait(2000)
+
+    def test_re_export_reextracts_when_the_figure_text_setting_changed(self):
+        # The flag is applied at extraction time: reusing a document extracted with
+        # the other setting would silently ignore the checkbox.
+        import tempfile
+
+        import pymupdf as fitz
+
+        from translate_app import pdfio
+        from translate_app.worker import TranslateWorker
+        from translate_app.settings import ModelConfig
+
+        _app()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src.pdf")
+            doc = fitz.open()
+            doc.new_page(width=300, height=300)
+            doc.save(src)
+            doc.close()
+            model = ModelConfig(id="t", name="t", type="chat",
+                                endpoint="http://127.0.0.1:1/v1/chat/completions",
+                                model="m")
+            stale = pdfio.DocumentText(title="stale", image_text=False)
+            worker = TranslateWorker(src, model, "English", "translated_pdf",
+                                     os.path.join(tmp, "out.pdf"),
+                                     ocr=True, re_export=True,
+                                     last_translated=["x"], last_doc=stale,
+                                     image_text=True)
+            seen: list[int] = []
+            worker._extract_doc = lambda: (seen.append(1),
+                                           pdfio.DocumentText(title="fresh"))[1]
+            worker._run_re_export()
+            self.assertTrue(seen, "设置不一致时必须重新提取，而不是复用旧文档")
 
 
 class StartButtonAlwaysStartsTest(unittest.TestCase):

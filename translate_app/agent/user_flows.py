@@ -140,10 +140,18 @@ _SCOPE_RANGE_RE = re.compile(r"第?\s*(\d+)\s*页?\s*(?:-|到|~|至)\s*第?\s*(\
 _SCOPE_SINGLE_RE = re.compile(r"第\s*(\d+)\s*页")
 
 #: Cues that turn a page mention into an explicit *scope restriction*
-#: (``只翻第2-5页`` / ``仅翻译第3页``).  Deliberately excludes exclusion words
-#: (``跳过``/``除了``/``不要翻``): "跳过第3页" means translate everything *except*
+#: (``只翻第2-5页`` / ``仅翻译第3页`` / ``只第3页``).  Deliberately excludes exclusion
+#: words (``跳过``/``除了``/``不要翻``): "跳过第3页" means translate everything *except*
 #: page 3, so treating it as a scope would translate only page 3.
-_SCOPE_CUE_RE = re.compile(r"(只|仅|仅限|限定|范围)")
+#:
+#: The cue must be a restriction *phrase*, not a bare 只/仅: 只要 / 不仅 / 不只 are
+#: ordinary conjunctions, and matching them narrowed a whole-document request to a
+#: single page (``帮我翻译整篇年报，只要第5页的数字没错`` → scope [4]).
+_SCOPE_CUE_RE = re.compile(
+    r"(?:只|仅)(?:翻|翻译|译|查|检查|看|审|审计|处理|导出|跑|做|改|重译)"
+    r"|仅限|限定|范围"
+    r"|(?<![不])[只仅]\s*第\s*\d+\s*页"
+)
 
 
 def _parse_checks(req: str) -> list[str] | None:

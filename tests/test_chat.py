@@ -229,6 +229,69 @@ class ChatSessionTest(unittest.TestCase):
         self.assertEqual("auto", first["tool_choice"])
         self.assertTrue(first["tools"])
 
+    def test_reply_stops_when_cancelled_between_tool_calls(self):
+        # Regression (v0.5.42): the watchdog can only abort a *blocked request*, so a
+        # cancel that landed while a tool was running left the loop untouched — it kept
+        # executing the remaining tools (measured: 7 more tools + 8 model calls) while
+        # the sidebar already said "已取消".
+        executed: list = []
+        state = {"cancel": False}
+
+        def executor(name, args):
+            executed.append(name)
+            state["cancel"] = True          # the user cancels while tool "a" runs
+            return {"ok": True}
+
+        responses = [
+            _FakeToolResp([_FakeToolCall("a", {}, "c1"), _FakeToolCall("b", {}, "c2")], ""),
+            _FakeToolResp(None, "不该走到这里"),
+        ]
+        client = _FakeToolClient(responses)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: client):
+            session = chat.ChatSession(_model())
+        with self.assertRaises(chat.ChatCancelled):
+            session.reply(
+                "跑两个工具",
+                tools=[{"type": "function", "function": {"name": "a", "parameters": {}}}],
+                executor=executor,
+                cancel=lambda: state["cancel"],
+            )
+        self.assertEqual(["a"], executed)      # the second tool never ran
+        # Only one model call happened: the next round was never started.
+        self.assertEqual(1, len(client.chat.completions.seen))
+
+    def test_cancel_keeps_every_tool_call_answered(self):
+        # A declared ``tool_call`` with no matching ``tool`` reply makes the whole
+        # history invalid, so the *next* user message would be rejected by the
+        # server (400): a cancel must answer the calls it will not run.
+        state = {"cancel": False}
+
+        def executor(name, args):
+            state["cancel"] = True          # the user cancels while tool "a" runs
+            return {"ok": True}
+
+        responses = [
+            _FakeToolResp([_FakeToolCall("a", {}, "c1"), _FakeToolCall("b", {}, "c2")], ""),
+            _FakeToolResp(None, "不该走到这里"),
+        ]
+        client = _FakeToolClient(responses)
+        with mock.patch.object(chat, "OpenAI", lambda **_k: client):
+            session = chat.ChatSession(_model())
+        with self.assertRaises(chat.ChatCancelled):
+            session.reply(
+                "跑两个工具",
+                tools=[{"type": "function", "function": {"name": "a", "parameters": {}}}],
+                executor=executor,
+                cancel=lambda: state["cancel"],
+            )
+        declared = [t["id"] for h in session.history if h.get("tool_calls")
+                    for t in h["tool_calls"]]
+        answered = [h.get("tool_call_id") for h in session.history
+                    if h.get("role") == "tool"]
+        self.assertEqual(["c1", "c2"], declared)
+        self.assertEqual(declared, answered,
+                         "every declared tool_call needs a tool reply in history")
+
     def test_reply_reinjects_tool_image_for_vision_model(self):
         # A tool result carrying ``image`` is stripped from the tool text message and
         # re-injected as an ``image_url`` user message (a fresh visual observation).

@@ -57,6 +57,17 @@ _CHAT_HISTORY_CAP = 32
 #: Downscale the long edge to this many px before attaching / re-injecting.
 _CHAT_IMAGE_MAX = 1024
 
+
+class ChatCancelled(Exception):
+    """Raised inside :meth:`ChatSession.reply` when the user cancelled the turn.
+
+    The watchdog can only abort a *blocked request* (it closes the httpx client).
+    A cancel that lands while a tool is running left the loop untouched: the next
+    round used the refreshed client and the model kept calling tools (measured:
+    7 more tools + 8 model calls after "取消"), so the user's edits kept being
+    written even though the sidebar said the turn was cancelled.
+    """
+
 #: One-time flag: Pillow is a hard dependency in ``requirements.txt`` but imported
 #: lazily, so a missing install must be reported once instead of degrading silently.
 _PIL_WARNED = False
@@ -141,6 +152,7 @@ class ChatSession:
         executor: Callable[[str, dict[str, Any]], Any] | None = None,
         image: bytes | None = None,
         on_chunk: Callable[[str], None] | None = None,
+        cancel: Callable[[], bool] | None = None,
     ) -> str:
         """Append the user message, ask the interaction model, record and return the reply.
 
@@ -149,7 +161,33 @@ class ChatSession:
         ``tools`` / ``executor`` are given, the model may call tools; each tool
         result is fed back (``tool`` role message) and the model is asked again, up to
         :data:`_MAX_TOOL_ROUNDS`, until it returns plain content.
+
+        ``cancel`` is polled before every model call and before every tool call; when
+        it returns True the turn raises :class:`ChatCancelled` instead of running the
+        remaining rounds (the watchdog alone only aborts a blocked request).  Tool
+        calls that will never run are answered with a ``tool`` message first, so the
+        recorded history stays valid for the next turn.
         """
+        def _check() -> None:
+            if cancel is not None and cancel():
+                raise ChatCancelled()
+
+        def _answer_pending(rest) -> None:
+            """Reply to tool calls that will never execute.
+
+            Every ``tool_call`` of an assistant message must be followed by a
+            matching ``tool`` message; leaving one unanswered makes the whole
+            history invalid, so the *next* user message would be rejected by the
+            server (``400``) — a cancel would break the conversation for good.
+            """
+            for tc in rest:
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps({"ok": False, "error": "已取消"},
+                                          ensure_ascii=False),
+                })
+
         if image and getattr(self.model, "vision", False):
             content: Any = [
                 {"type": "text", "text": message},
@@ -161,6 +199,7 @@ class ChatSession:
         self.history.append({"role": "user", "content": content})
         empty_rescued = False
         for _ in range(_MAX_TOOL_ROUNDS):
+            _check()
             msg = self._call(tools=tools, on_text=on_chunk)
             tcs = getattr(msg, "tool_calls", None)
             if not tcs:
@@ -199,7 +238,10 @@ class ChatSession:
                 ],
             })
             pending_image: bytes | None = None
-            for tc in tcs:
+            for pos, tc in enumerate(tcs):
+                if cancel is not None and cancel():
+                    _answer_pending(tcs[pos:])
+                    raise ChatCancelled()
                 name = tc.function.name
                 try:
                     args = json.loads(tc.function.arguments or "{}")
@@ -239,6 +281,7 @@ class ChatSession:
         # answer plainly (no more tool calls) instead of looping forever — but
         # if that call fails too, fall back to the last assistant text.
         try:
+            _check()
             msg = self._call(tools=None, on_text=on_chunk)
             content = (getattr(msg, "content", None) or "").strip()
             if content:
@@ -527,13 +570,18 @@ class ChatWorker(QObject):
             threading.Thread(target=_watchdog, daemon=True).start()
             try:
                 reply = session.reply(str(text), tools=tools, executor=executor,
-                                      image=image, on_chunk=self._emit_chunk)
+                                      image=image, on_chunk=self._emit_chunk,
+                                      cancel=self._cancel_ev.is_set)
             finally:
                 done.set()
             if self._cancel_ev.is_set():
                 self.cancelled.emit("已取消")
                 return
             self.reply_ready.emit(reply)
+        except ChatCancelled:
+            # A cancel that landed while a tool was running (the watchdog only
+            # aborts a blocked request).
+            self.cancelled.emit("已取消")
         except Exception as exc:  # noqa: BLE001 — best-effort, never crash the thread
             if self._cancel_ev.is_set():
                 self.cancelled.emit("已取消")

@@ -203,6 +203,27 @@ class ChatToolsTest(_CtxTest):
         self.assertFalse(res["ok"])
         self.assertIn("bad page", res["error"])
 
+    def test_retranslate_rejects_indices_from_another_page(self):
+        # Regression (v0.5.42): page-local indices were taken as flat indices, so
+        # "重译第2页的第0/1块" silently rewrote blocks of page 1 and reported ok=True.
+        src = build_sample_pdf(self.tmp / "two.pdf", pages=2)
+        ctx = DocContext()
+        ctx.set_source(str(src))
+        tools = chat_tools.make_chat_tools(
+            ctx, translate_texts=lambda texts, lang: ["Fixed " + t for t in texts])
+        page1 = tools["read_page"](1)["blocks"]
+        self.assertTrue(page1)
+        first_flat = page1[0]["index"]
+        self.assertGreater(first_flat, 0)          # page 2 does not start at 0
+        res = tools["retranslate"](1, [0, 1])      # page-local indices
+        self.assertFalse(res["ok"], res)
+        self.assertIn("不属于第 2 页", res["error"])
+        self.assertEqual({}, ctx.overlay())        # nothing written on any page
+        # The correct flat indices still work.
+        ok = tools["retranslate"](1, [first_flat])
+        self.assertTrue(ok["ok"], ok)
+        self.assertEqual([first_flat], ok["indices"])
+
     def test_retranslate_call_failure_is_transparent(self):
         # The translation call itself raises → fail-closed, all picked blocks reported.
         tools = self._retranslate_tools(lambda texts, lang: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -336,16 +357,69 @@ class ChatToolsTest(_CtxTest):
 
         fake_plan_llm = lambda req: {"tasks": [
             {"tier": "atomic", "name": "run_translate",
-             "params": {"requirement": "把第3页公司名翻成Bank", "scope": [2]}},
+             "params": {"requirement": "把第3页公司名翻成Bank", "scope": [0]}},
         ], "note": "开始翻译"}
         tools = ct.make_chat_tools(self.ctx, start_translate=fake_start_translate,
                                    plan_llm=fake_plan_llm)
         res = tools["run_plan"]("把第3页公司名翻成Bank")
         self.assertTrue(res["ok"], res)
         self.assertEqual("把第3页公司名翻成Bank", seen.get("requirement"))
-        self.assertEqual([2], seen.get("scope"))
+        self.assertEqual([0], seen.get("scope"))
         self.assertEqual("run_translate", res["results"][0]["name"])
         self.assertTrue(res["results"][0]["ok"])
+
+    def test_run_plan_rejects_a_non_list_scope(self):
+        # Regression (v0.5.42): the model's ``params.scope`` was forwarded verbatim, so
+        # a string ("3-8") reached the pipeline and made ``i in scope`` raise mid-run,
+        # while a list of strings silently translated nothing yet reported ok=True.
+        import translate_app.chat_tools as ct
+        for bad in ("3-8", ["3"], [None], [5]):     # [5] is out of range (1-page doc)
+            with self.subTest(scope=bad):
+                tools = ct.make_chat_tools(
+                    self.ctx, start_translate=lambda req, scope: None,
+                    plan_llm=lambda req, s=bad: {"tasks": [
+                        {"tier": "atomic", "name": "run_translate",
+                         "params": {"requirement": "翻译", "scope": s}},
+                    ]})
+                res = tools["run_plan"]("翻译")
+                self.assertFalse(res["ok"], res)
+                self.assertIn("scope", res["error"])
+
+    def test_run_plan_self_check_is_read_only_by_default(self):
+        # Regression (v0.5.42): run_plan's audit dispatch defaulted ``auto_fix`` to
+        # True, so a plan task "self_check_page" rewrote the protected overlay although
+        # neither the user nor the tool description asked for it (run_flow was
+        # read-only).  An explicit ``auto_fix: true`` still fixes in place.
+        import translate_app.chat_tools as ct
+        writes: list = []
+
+        def translate_texts(texts, lang):
+            writes.append(list(texts))
+            return ["Fixed " + t for t in texts]
+
+        tools = ct.make_chat_tools(
+            self.ctx, translate_texts=translate_texts,
+            plan_llm=lambda req: {"tasks": [
+                {"tier": "process", "name": "self_check_page",
+                 "params": {"page": 0, "checks": ["residual"]}},
+            ]})
+        res = tools["run_plan"]("自检第1页")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual("read_only", res["results"][0]["mode"])
+        self.assertEqual([], writes)
+        self.assertEqual({}, self.ctx.overlay())
+
+        tools = ct.make_chat_tools(
+            self.ctx, translate_texts=translate_texts,
+            plan_llm=lambda req: {"tasks": [
+                {"tier": "process", "name": "self_check_page",
+                 "params": {"page": 0, "checks": ["residual"], "auto_fix": True}},
+            ]})
+        res = tools["run_plan"]("自检第1页并自动改")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual("fixed", res["results"][0]["mode"])
+        self.assertTrue(writes)
+        self.assertTrue(self.ctx.overlay())
 
     def test_render_page_returns_image(self):
         # The chat's ``render_page`` renders a page to PNG (a vision observation).
@@ -408,6 +482,17 @@ class ChatToolsTest(_CtxTest):
         self.assertFalse(res["ok"])
         self.assertIn("数字", res["error"])
         self.assertIsNone(num_ctx.get_overlay(idx))
+
+    def test_set_block_text_rejects_a_missing_or_blank_text(self):
+        # Regression (v0.5.42): ``str(text)`` turned a missing/None argument into the
+        # literal "None" and wrote it into the protected overlay — which wins at
+        # export, so the reader saw "None" instead of a translation.
+        idx = self.tools["read_page"](0)["blocks"][0]["index"]
+        for bad in (None, "", "   "):
+            with self.subTest(text=bad):
+                res = self.tools["set_block_text"](idx, bad)
+                self.assertFalse(res["ok"], res)
+                self.assertIsNone(self.ctx.get_overlay(idx))
 
     def test_delete_block_text(self):
         idx = self.tools["read_page"](0)["blocks"][0]["index"]

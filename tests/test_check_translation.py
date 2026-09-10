@@ -242,6 +242,42 @@ class CheckerTest(unittest.TestCase):
         # what matters; formatting is a separate, advisory concern).
         self.assertEqual([], _numeric_diff("金额 1,234.56", "Amount 1234.56"))
 
+    def test_lost_unit_multiplier_is_reported(self):
+        # Regression: ``1,234.56 万元`` and ``1,234.56 yuan`` have the SAME separator
+        # roles (the unit is not part of the token), so the old "roles equal →
+        # clean" short-circuit skipped the value check and a translation that
+        # dropped the 万 multiplier was reported as consistent.
+        self.assertTrue(_numeric_diff("总资产 1,234.56 万元", "Total assets 1,234.56 yuan"))
+        # A correct conversion is still clean (negative control).
+        self.assertEqual([], _numeric_diff("总资产 1,234.56 万元",
+                                           "Total assets 12,345,600 yuan"))
+
+    def test_changed_percentage_is_reported(self):
+        # ``%`` was not stripped before ``Decimal`` (so the token got no value at
+        # all) and a 10× percentage change compared "consistent".
+        self.assertTrue(_numeric_diff("毛利率 92.5%", "Gross margin 9.25%"))
+        self.assertEqual([], _numeric_diff("毛利率 92.5%", "Gross margin 92.5%"))
+
+    def test_accounting_parenthesis_sign_is_compared(self):
+        # The sign of ``（1,234.56）`` lives outside the numeric token; losing it
+        # used to compare equal to the positive value.
+        self.assertTrue(_numeric_diff("金额 （1,234.56）", "Amount 1,234.56"))
+        self.assertEqual([], _numeric_diff("金额 （1,234.56）", "Amount -1,234.56"))
+        self.assertTrue(_numeric_diff("金额 -1,234.56", "Amount 1,234.56"))
+
+    def test_scan_page_still_checks_residual_cjk(self):
+        # A scan-like source page (only a page number in the text layer) skips the
+        # digit comparison — but the residual-CJK check needs no numbers, and the
+        # whole-page early return used to skip it too (750 Han chars on a real
+        # sample went unreported).
+        src = _pdf(self.tmp / "scan_src.pdf", [["22"]])
+        tgt = _pdf(self.tmp / "scan_tgt.pdf",
+                   [["22", "Net interest income 汪建法 123,456.78"]])
+        checker = run_checks(src, tgt, lang="English")
+        self.assertTrue(checker.numeric_ok(), checker.numeric)
+        self.assertTrue(checker.cjk, "residual Chinese on a scanned page not reported")
+        self.assertIn("汪建法", checker.cjk[0])
+
     def test_statement_codes_exempt_from_residual_cjk(self):
         # Statement / subject codes (会商银02表, 会企01表-1) are deliberately kept
         # verbatim; their CJK must not be reported as residual Chinese.

@@ -630,7 +630,14 @@ def translate_ir(
     translatable: list[IRBlock] = []
     out: dict[int, str] = {}
     for b in blocks:
-        if is_structural_role(b.role) or _is_verbatim(b.anchor):
+        # Fail-safe for the structural gate: a block whose text was OCR'd out of a
+        # raster figure (``Block.in_image``) is *text* and must be translated, even
+        # if some backend still hands it a structural role.  ``build_structure``
+        # already keeps such blocks out of a figure/formula region's members; this
+        # guards the decision point itself (a chart's labels otherwise export
+        # verbatim — see the fix note there).
+        structural = is_structural_role(b.role) and not getattr(b.anchor, "in_image", False)
+        if structural or _is_verbatim(b.anchor):
             out[b.src_id] = b.text      # formula/figure/numeric → keep source
         else:
             translatable.append(b)

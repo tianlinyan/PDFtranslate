@@ -76,13 +76,15 @@ class TranslateWorker(QObject):
         overlay: dict[int, dict] | None = None,
         re_export: bool = False,
         last_translated: list[str] | None = None,
+        last_doc: "pdfio.DocumentText | None" = None,
         requirements: list[str] | None = None,
         page_scope: list[int] | None = None,
         ir_mode: bool = False,
         structure_mode: bool = False,
         agent_terms: bool = True,
-        reflow: bool = False,
+        reflow: bool = True,
         rebuild_table: bool = False,
+        image_text: bool | None = None,
     ):
         super().__init__()
         self._source = source_path
@@ -91,6 +93,10 @@ class TranslateWorker(QObject):
         self._output_type = output_type
         self._output_path = output_path
         self._ocr = ocr
+        #: 混合页（有文本层 + 位图图片）里的图内文字是否 OCR 并原位转译。
+        #: ``None``（默认）＝跟随 ``ocr``——旧调用点（测试、脚本）行为不变；界面
+        #: 的「翻译图内文字」勾选框显式传 True/False。
+        self._image_text: bool | None = image_text
         #: The persistent, protected translation overlay (from the interaction
         #: chat's ``DocContext``): flat block index → ``{"text": ...}``.  Applied on
         #: top of whatever the run produced, so a chat/AI edit always wins at export.
@@ -106,6 +112,14 @@ class TranslateWorker(QObject):
         self._re_export = re_export
         if re_export and last_translated:
             self._last_translated = list(last_translated)
+        #: The ``DocumentText`` the previous run was aligned against (see
+        #: ``_run_re_export``).  Reusing it keeps a re-export on the *same* block
+        #: list and geometry, so no second OCR pass is needed and the positional
+        #: pairing cannot drift.
+        self._last_doc: pdfio.DocumentText | None = last_doc
+        #: The document this run extracted (set in ``run``), so ``MainWindow`` can
+        #: hand it to a later "重新导出" worker.
+        self._doc: pdfio.DocumentText | None = None
         #: User requirements seeded into the agent at start (from the "开始翻译+要求"
         #: chat entry).  ``add_user_requirement`` appends more live, during a run.
         self._requirements: list[str] = list(requirements or [])
@@ -149,8 +163,10 @@ class TranslateWorker(QObject):
         self._agent_terms = bool(agent_terms) and (
             os.environ.get("PDFTRANSLATE_AGENT_TERMS", "1") != "0")
         #: C-⑥ reflow（保守层）：文本层表格列宽按译文重分配（数字列不缩）。
-        #: 默认关闭；GUI 复选框开启，或 PDFTRANSLATE_REFLOW=1 强制开启。
-        self._reflow = bool(reflow) or (os.environ.get("PDFTRANSLATE_REFLOW") == "1")
+        #: 默认开启（v0.5.47 起界面复选框已移除）；PDFTRANSLATE_REFLOW=0 可强制关闭
+        #: （与 PDFTRANSLATE_AGENT_TERMS 同款，供排查用）。
+        self._reflow = bool(reflow) and (
+            os.environ.get("PDFTRANSLATE_REFLOW", "1") != "0")
         #: C-⑥ 重建扫描表格为矢量表格（默认关闭，0.2.7 版做法）：OCR 表格页被重绘
         #: 为一张干净空白页（只画矢量网格线 + 译文，行高按译文扩展），扫描底图/
         #: 印章/签字不再保留；模型支持视觉时先由模型重建「译文 2D 网格」（+合并
@@ -211,6 +227,10 @@ class TranslateWorker(QObject):
                 self.log.emit("已启用 OCR（自动识别原文语言），将识别无文本层的扫描页。")
             self.progress.emit(0, 0, "提取文本…")
             doc = self._extract_doc()
+            # Keep it for a later "重新导出" (``MainWindow`` reads this field and
+            # passes it back), so the re-export does not have to OCR the document
+            # a second time nor re-derive a possibly different block list.
+            self._doc = doc
             if doc.ocr_count:
                 self.log.emit(f"有 {doc.ocr_count} 个页面无文本层，已通过 OCR 提取。")
             extract_elapsed = time.monotonic() - started
@@ -343,13 +363,15 @@ class TranslateWorker(QObject):
             return pdfio.extract_document_structured(
                 self._source, parser=parser, ocr=self._ocr, ocr_fn=ocr_fn,
                 cancel=lambda: self._cancelled.is_set(),
-                log=lambda m: self.log.emit(m))
+                log=lambda m: self.log.emit(m),
+                image_text=self._image_text)
         return pdfio.extract_document_text(
             self._source,
             ocr=self._ocr,
             ocr_fn=ocr_fn,
             cancel=lambda: self._cancelled.is_set(),
             log=lambda m: self.log.emit(m),
+            image_text=self._image_text,
         )
 
     def cancel(self) -> None:
@@ -443,24 +465,53 @@ class TranslateWorker(QObject):
     def _run_re_export(self) -> None:
         """Re-write the output from the last translation with the current overlay.
 
-        Skips extraction/translation entirely: reuse ``self._last_translated`` (the
-        previous run's committed output), apply the *current* protected overlay (the
-        chat / annotation edits made after that run), and re-run the export step.  The
-        document is re-extracted (cached, so cheap) only to rebuild the per-page
-        block lists the exporter needs.
+        Skips translation entirely: reuse ``self._last_translated`` (the previous
+        run's committed output), apply the *current* protected overlay (the chat /
+        annotation edits made after that run), and re-run the export step.
+
+        The document the last run was aligned against (``last_doc``) is reused when
+        available.  Re-extracting here was not the "cached, so cheap" path the old
+        docstring promised: production keeps no OCR cache, so every re-export OCR'd
+        the whole scan again (measured 7-13 s per page); it also ignored
+        ``structure_mode`` and dropped the ``PDFTRANSLATE_OCR_BACKEND`` choice
+        (``_extract_doc`` honours both), so a VLM-OCR run re-exported through
+        RapidOCR and produced a different block list — which then failed the
+        positional pairing with a technical ``block_pages … must be parallel
+        lists`` error instead of a usable message.
         """
         if not self._last_translated:
             self.error.emit("没有上一次的译文可重新导出。")
             return
         self.log.emit(self._options_line())
         self.log.emit(f"正在导出：已应用当前对话/标注编辑，重新生成 {self._source} 的译文…")
-        doc = pdfio.extract_document_text(
-            self._source,
-            ocr=self._ocr,
-            cancel=lambda: self._cancelled.is_set(),
-            log=lambda m: self.log.emit(m),
-        )
+        doc = self._last_doc
+        # The 图内文字 setting is applied at *extraction* time, so a document from a
+        # run with a different setting cannot serve this one: reusing it would
+        # silently ignore the checkbox the user just changed (turning it on would
+        # keep the figure text untranslated, turning it off would keep figure blocks
+        # in the block list).  Re-extract in that case.
+        want_image_text = (bool(self._ocr) if self._image_text is None
+                           else bool(self._image_text))
+        if doc is not None and bool(getattr(doc, "image_text", False)) != want_image_text:
+            if self._last_doc is not None:
+                self.log.emit("提取设置已变（图内文字），已重新提取源文件以套用当前选项。")
+            doc = None
+        if doc is None:
+            # No document from the previous run (e.g. a re-export without one in
+            # this session): extract through the SAME path a normal run uses, so
+            # the OCR backend / structure mode stay consistent.
+            doc = self._extract_doc()
         translated = list(self._last_translated)
+        if len(doc.block_pages) != len(translated):
+            # The source file changed (or the extraction options did): the old
+            # translation no longer lines up.  Say so in words the user can act on
+            # instead of raising "block_pages (N) and values (M) must be parallel
+            # lists" from deep inside the exporter.
+            self.error.emit(
+                f"源文件或提取结果已变（块数 {len(doc.block_pages)} ≠ 上次 {len(translated)}），"
+                "上一次的译文不再适用，请点「开始翻译」重新翻译。"
+            )
+            return
         changed = self._apply_overlay_text(translated)
         if changed:
             self.log.emit(f"  已应用 {changed} 处 AI 对话/标注编辑（受保护覆盖）。")

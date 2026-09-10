@@ -2164,11 +2164,17 @@ class DocumentSession:
                 self.progress(done, total, "复核")
                 continue
             audit = rs.result.get("audit_page", {})
-            if audit.get("clean", True):
+            # fail-closed: a missing ``clean`` key means the audit result did not
+            # come back at all, which must not be read as "passed".
+            if audit.get("clean") is True:
                 self.log(f"  第 {i + 1} 页复核通过。")
                 self.state.page(i).issues.append("已复核")
             else:
                 n = len(audit.get("issues", []))
-                self.log(f"  第 {i + 1} 页仍有 {n} 处问题（达到复核上限）。")
-                self.state.page(i).issues.append(f"已复核（仍 {n} 处问题）")
+                if not audit:
+                    self.log(f"  第 {i + 1} 页自检未返回审计结果（保留译文）。")
+                    self.state.page(i).issues.append("自检未返回结果")
+                else:
+                    self.log(f"  第 {i + 1} 页仍有 {n} 处问题（达到复核上限）。")
+                    self.state.page(i).issues.append(f"已复核（仍 {n} 处问题）")
             self.progress(done, total, "复核")

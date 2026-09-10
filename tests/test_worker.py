@@ -481,6 +481,78 @@ class OverlayApplyTest(_WorkerTestBase):
         self.assertFalse(out.exists())
 
 
+class ReExportPathTest(_WorkerTestBase):
+    """P1-33/P1-34/P1-26: a re-export must stay on the last run's extraction.
+
+    Re-extracting meant a second OCR pass over the whole scan (7-13 s/page in
+    production, which keeps no OCR cache), silently dropped
+    ``PDFTRANSLATE_OCR_BACKEND`` / structure mode (``_run_re_export`` called
+    ``extract_document_text`` directly), and could produce a different block list —
+    which then failed the positional pairing with a technical
+    ``block_pages … must be parallel lists`` error.
+    """
+
+    def test_re_export_reuses_the_last_document_without_extracting(self):
+        src = build_sample_pdf(self.tmp / "reuse.pdf", pages=1)
+        out = self.tmp / "reuse.txt"
+        doc = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "Chinese",
+            "plain_text", str(out),
+            overlay={0: {"text": "复用的编辑"}},
+            re_export=True, last_translated=list(doc.blocks), last_doc=doc,
+        )
+        with mock.patch.object(worker_module.pdfio, "extract_document_text",
+                               side_effect=AssertionError("must not re-extract")), \
+             mock.patch.object(worker_module.pdfio, "extract_document_structured",
+                               side_effect=AssertionError("must not re-extract")):
+            events = self._run(worker)
+        self.assertEqual(["finished", "stopped"], events)
+        self.assertIn("复用的编辑", out.read_text("utf-8"))
+
+    def test_re_export_reports_a_block_count_mismatch(self):
+        # The source changed (or the extraction options did): the old translation no
+        # longer lines up.  A readable error, never a raw ValueError from the
+        # exporter.
+        src = build_sample_pdf(self.tmp / "mismatch.pdf", pages=1)
+        out = self.tmp / "mismatch.txt"
+        doc = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "Chinese",
+            "plain_text", str(out),
+            re_export=True, last_translated=["only one block"], last_doc=doc,
+        )
+        events: list[str] = []
+        errors: list[str] = []
+        worker.finished.connect(lambda _p: events.append("finished"))
+        worker.error.connect(lambda m: (events.append("error"), errors.append(m)))
+        worker.stopped.connect(lambda: events.append("stopped"))
+        worker.run()
+        self.assertEqual(["error", "stopped"], events)
+        self.assertIn("不再适用", errors[0])
+        self.assertFalse(out.exists())
+
+    def test_re_export_without_a_document_uses_the_structured_extractor(self):
+        # Fallback path (no document from the previous run): it must go through
+        # ``_extract_doc`` so structure mode / the OCR backend env var still apply.
+        src = build_sample_pdf(self.tmp / "structured.pdf", pages=1)
+        out = self.tmp / "structured.txt"
+        doc = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "Chinese",
+            "plain_text", str(out),
+            re_export=True, last_translated=list(doc.blocks),
+            structure_mode=True,
+        )
+        with mock.patch.object(worker_module.pdfio, "extract_document_structured",
+                               return_value=doc) as structured, \
+             mock.patch.object(worker_module.pdfio, "extract_document_text",
+                               side_effect=AssertionError("plain extractor used")):
+            events = self._run(worker)
+        self.assertEqual(["finished", "stopped"], events)
+        self.assertTrue(structured.called)
+
+
 class IrModeWorkerTest(_WorkerTestBase):
     """C-⑥: IR-mode translation in the worker (gated, default off)."""
 
@@ -550,13 +622,14 @@ class IrModeWorkerTest(_WorkerTestBase):
         with mock.patch.dict(os.environ, {"PDFTRANSLATE_AGENT_TERMS": "0"}):
             self.assertFalse(self._worker(agent_terms=True)._agent_terms)
 
-    def test_reflow_default_off_and_env_gated(self):
-        # C-⑥ reflow（保守层）默认关（与 agent_terms 相反）。
-        self.assertFalse(self._worker()._reflow)
-        self.assertTrue(self._worker(reflow=True)._reflow)
-        # env=1 forces it on.
-        with mock.patch.dict(os.environ, {"PDFTRANSLATE_REFLOW": "1"}):
-            self.assertTrue(self._worker()._reflow)
+    def test_reflow_default_on_and_env_gated(self):
+        # v0.5.47：界面复选框已移除，C-⑥ reflow（保守层）默认生效（与 agent_terms 同款）。
+        self.assertTrue(self._worker()._reflow)
+        # 显式 False 仍可关闭（API / 测试用）。
+        self.assertFalse(self._worker(reflow=False)._reflow)
+        # env=0 forces it off (higher priority), even when the flag is on.
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_REFLOW": "0"}):
+            self.assertFalse(self._worker(reflow=True)._reflow)
 
     def test_rebuild_table_default_off_and_env_gated(self):
         # C-⑥ 扫描表格重建为矢量表格（默认关）。
@@ -573,13 +646,15 @@ class RebuildPagesWorkerTest(_WorkerTestBase):
         super().setUp()
         self._src = build_sample_pdf(self.tmp / "src.pdf", pages=2)
 
-    def _worker(self, *, vision: bool = True, rebuild_table: bool = True) -> TranslateWorker:
+    def _worker(self, *, vision: bool = True, rebuild_table: bool = True,
+                reflow: bool = True) -> TranslateWorker:
         model = ModelConfig(
             id="vision", name="vision", type="openai",
             endpoint="http://127.0.0.1:9/v1", model="m", vision=vision)
         return TranslateWorker(
             str(self._src), model, "English", "translated_pdf",
-            str(self.tmp / "o.pdf"), agent_mode=False, rebuild_table=rebuild_table)
+            str(self.tmp / "o.pdf"), agent_mode=False, rebuild_table=rebuild_table,
+            reflow=reflow)
 
     def _export_kwargs(self, worker: TranslateWorker) -> dict:
         doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
@@ -615,8 +690,10 @@ class RebuildPagesWorkerTest(_WorkerTestBase):
         # The user must be able to verify from the log that the checkbox reached
         # the worker: 「OCR表格重建」 is read when the run starts.
         on = self._worker()
-        self.assertIn("OCR表格重建=开", on._options_line())
-        off = self._worker(rebuild_table=False)
+        line = on._options_line()
+        self.assertIn("OCR表格重建=开", line)
+        self.assertIn("表格列宽重排=开", line)      # v0.5.47 起默认生效
+        off = self._worker(rebuild_table=False, reflow=False)
         line = off._options_line()
         self.assertIn("OCR表格重建=关", line)
         self.assertIn("表格列宽重排=关", line)

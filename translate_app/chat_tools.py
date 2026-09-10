@@ -300,6 +300,11 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         src = str(blocks[int(index)].text)
         if pdfio._is_numeric_cell(src):
             return {"ok": False, "error": "数字格不可被 AI 改写（保真）"}
+        # ``str(text)`` would turn a missing/None argument into the literal "None"
+        # and write it into the protected overlay — which wins at export, so the
+        # reader saw "None" instead of the translation.
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "error": "set_text 需要非空字符串 text"}
         ctx.set_overlay(int(index), str(text), action="set")
         return {"ok": True, "index": int(index), "text": str(text)}
 
@@ -325,6 +330,8 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": True, "page": page, "index": flat, "action": action}
         if text is None:
             return {"ok": False, "error": "action=set 需要 text"}
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "error": "action=set 需要非空字符串 text"}
         if pdfio._is_numeric_cell(str(block.text)):
             return {"ok": False, "error": "数字格不可被 AI 改写（保真）"}
         ctx.set_overlay(flat, str(text), action="set")
@@ -384,10 +391,25 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False, "error": f"bad page {page}"}
         blocks = _flat_block_list()
         offset = sum(len(p) for p in doc.pages[: int(page)])
+        page_end = offset + len(doc.pages[int(page)])
         if indices is None:
-            cands = list(range(offset, offset + len(doc.pages[int(page)])))
+            cands = list(range(offset, page_end))
         else:
+            # A "重译第 N 页" request must never touch another page: the model
+            # sometimes passes page-local indices, which used to be taken as flat
+            # indices and silently rewrote blocks of a *different* page (while
+            # still reporting ok=True).  Keep only the indices that belong to
+            # ``page`` and say so when none do.
             cands = [int(i) for i in indices]
+            in_page = [i for i in cands if offset <= i < page_end]
+            if not in_page:
+                return {
+                    "ok": False,
+                    "error": (f"indices {cands} 不属于第 {int(page) + 1} 页"
+                              f"（该页的扁平索引范围 {offset}..{page_end - 1}）；"
+                              "请用 read_page 返回的扁平索引。"),
+                }
+            cands = in_page
         picked = _pick_translatable(cands, blocks)
         if not picked:
             return {"ok": False, "error": "没有可重译的块（全部为数字格/公式/空块）"}
@@ -641,6 +663,30 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         "re_export": _re_export,
     }
 
+    def _validated_scope(scope):
+        """Normalise a plan/flow ``scope`` coming from the model's JSON.
+
+        Returns ``(scope, error)``: a list of ints clamped to the document, or an
+        error string.  A string (``"3-8"``) used to reach the pipeline and make
+        ``i in scope`` raise mid-run, while a list of strings silently matched no
+        page — the run then "succeeded" without translating anything.
+        """
+        if scope is None:
+            return None, None
+        if not isinstance(scope, list):
+            return None, "scope 必须是整数页码列表（0 起）"
+        try:
+            scope = [int(p) for p in scope]
+        except (TypeError, ValueError):
+            return None, "scope 必须是整数页码列表（0 起）"
+        state = _audit_state(ctx)
+        if state is not None:
+            total = len(state.src_doc.pages)
+            scope = [p for p in scope if 0 <= p < total]
+            if not scope:
+                return None, f"scope 中没有有效页码（共 {total} 页）"
+        return scope, None
+
     def _dispatch_plan_task(task) -> dict:
         """Execute one path-B :class:`Task` (atomic tool or a process/composite flow)."""
         from . import agent as _agent
@@ -654,12 +700,14 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
                 # A plan may legitimately start a translation mid-sequence.
                 if start_translate is None:
                     return {"ok": False, "error": "开始翻译通道未接线"}
+                scope, err = _validated_scope(params.get("scope"))
+                if err:
+                    return {"ok": False, "base": "run_translate", "error": err}
                 try:
-                    start_translate(params.get("requirement", ""),
-                                    params.get("scope"))
+                    start_translate(params.get("requirement", ""), scope)
                 except Exception as exc:  # noqa: BLE001 — fail-closed
                     return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                return {"ok": True, "base": "run_translate",
+                return {"ok": True, "base": "run_translate", "scope": scope,
                         "message": "已触发翻译（后台执行）。"}
             if task.name in ("run_flow", "run_plan"):
                 return {"ok": False,
@@ -678,12 +726,14 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
                     "translate_doc", "preprocess"):
             if start_translate is None:
                 return {"ok": False, "base": name, "error": "开始翻译通道未接线"}
+            scope, err = _validated_scope(params.get("scope"))
+            if err:
+                return {"ok": False, "base": name, "error": err}
             try:
-                start_translate(params.get("requirement", "") or "",
-                                params.get("scope"))
+                start_translate(params.get("requirement", "") or "", scope)
             except Exception as exc:  # noqa: BLE001 — fail-closed
                 return {"ok": False, "base": name, "error": f"{type(exc).__name__}: {exc}"}
-            return {"ok": True, "base": name, "scope": params.get("scope"),
+            return {"ok": True, "base": name, "scope": scope,
                     "message": "已触发翻译（按当前要求后台执行，完成会在主窗口日志/进度提示）。"}
         if name == "export":
             if re_export is None:
@@ -702,7 +752,10 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             scope = ([p for p in scope if 0 <= p < total] if isinstance(scope, list)
                      else list(range(total)))
             checks = params.get("checks")
-            auto_fix = bool(params.get("auto_fix", True))
+            # OPT-IN, mirroring ``run_flow``: a plain "自检" is a READ-ONLY audit —
+            # only an explicit ``auto_fix: true`` in the plan may rewrite the
+            # protected overlay (the tool description promises exactly that).
+            auto_fix = bool(params.get("auto_fix", False))
             body = _audit_scope(scope, checks, auto_fix, _target_lang(params.get("lang")))
             return {"ok": True, "base": name, **body}
         return {"ok": False, "base": name, "error": f"该流程（{name}）暂不能在对话中直接执行。"}

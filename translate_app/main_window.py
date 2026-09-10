@@ -225,6 +225,10 @@ class MainWindow(QWidget):
         #: annotation edits without re-translating.
         self._last_translated: list[str] | None = None
         self._last_translated_source: str | None = None
+        #: The ``DocumentText`` that translation was aligned against.  Passed to the
+        #: "重新导出" worker so it re-exports the *same* block list (no second OCR
+        #: pass, no drift between the translation and a fresh extraction).
+        self._last_doc = None
         # Run outcome, used by ``_cleanup`` to decide whether to reset the
         # progress bar / stage (a cancelled run leaves the bar spinning).
         self._run_ok = False
@@ -342,16 +346,10 @@ class MainWindow(QWidget):
         self._agent_terms_check.setChecked(bool(prefs.get("agent_terms", True)))
         self._agent_terms_check.toggled.connect(self._persist_agent_terms)
 
-        # --- 表格列宽重排（reflow 保守层，默认关闭） ---
-        self._reflow_check = QCheckBox("表格列宽重排")
-        self._reflow_check.setToolTip(
-            "勾选后，文本层表格的列宽按译文需求重分配：长译文列借用相邻列的空白，"
-            "数字列保持不缩，表格总宽不变。\n"
-            "只影响「仅译文/原位」PDF 的文本层（矢量线）表格；扫描件位图表格线与"
-            "双语 PDF 不受影响。环境变量 PDFTRANSLATE_REFLOW=1 可强制开启。"
-        )
-        self._reflow_check.setChecked(bool(prefs.get("reflow", False)))
-        self._reflow_check.toggled.connect(self._persist_reflow)
+        # --- 表格列宽重排（reflow 保守层）自 v0.5.47 起默认生效、不再提供界面开关 ---
+        # 文本层表格的列宽按译文需求重分配：长译文列借用相邻列的空白，数字列保持
+        # 不缩，表格总宽不变。只影响「仅译文/原位」PDF 的文本层（矢量线）表格；
+        # 扫描件位图表格线与双语 PDF 不受影响。需要排查时可设 PDFTRANSLATE_REFLOW=0。
 
         # --- 扫描表格重绘为矢量表格（默认关闭） ---
         self._rebuild_table_check = QCheckBox("OCR表格重建为矢量表格")
@@ -366,23 +364,37 @@ class MainWindow(QWidget):
         self._rebuild_table_check.setChecked(bool(prefs.get("rebuild_table", False)))
         self._rebuild_table_check.toggled.connect(self._persist_rebuild_table)
 
-        # 四个选项排成两行、每行两个，用 QGridLayout 对齐两列：左列标签右对齐、
-        # 勾选框左对齐，两行的标签/勾选框在同一竖直线上（HBox 拼装会因标签字数
-        # 不同而左右错位）。
+        # --- 混合页（文本+图片）图内文字翻译（默认开启） ---
+        self._image_text_check = QCheckBox("翻译图内文字")
+        self._image_text_check.setToolTip(
+            "勾选后，**混合页**（本身有文本层、又嵌了位图图片的页）里**烧在图片上的文字**"
+            "会被 OCR 识别、按图片背景色覆盖，再在原位画出译文——论文的柱状图标题/轴标签、"
+            "截图、流程图框内文字都属于这一类。\n"
+            "安全边界（无论如何都不会做）：图片整体背景不是纸面（照片、彩色底）时**整张图一律"
+            "不动**；图内纯数字/坐标刻度不翻译（覆盖后重画同一串数字只有风险）；图内文字块不会"
+            "被当成表格/图表参与网格重建；换行由图片自身的行距约束，不会压到图里下一行。\n"
+            "取消勾选则图内文字保持原样（与旧版一致）。扫描页（整页位图）的 OCR 不受此项影响。"
+        )
+        self._image_text_check.setChecked(bool(prefs.get("image_text", True)))
+        self._image_text_check.toggled.connect(self._persist_image_text)
+
+        # 选项排成两行、每行两个，用 QGridLayout 对齐两列：左列标签右对齐、勾选框
+        # 左对齐，各行的标签/勾选框在同一竖直线上（HBox 拼装会因标签字数不同而左右
+        # 错位）。
         opt_grid = QGridLayout()
         opt_grid.setContentsMargins(0, 0, 0, 0)
         opt_grid.setHorizontalSpacing(16)
         opt_grid.setVerticalSpacing(4)
         for row, (lab1, cb1, lab2, cb2) in enumerate((
             ("翻译管线", self._ir_check, "术语注入", self._agent_terms_check),
-            ("重排版", self._reflow_check, "扫描重建", self._rebuild_table_check),
+            ("扫描重建", self._rebuild_table_check, "图内文字", self._image_text_check),
         )):
             left = QLabel(lab1)
             left.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            right = QLabel(lab2)
-            right.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             opt_grid.addWidget(left, row, 0)
             opt_grid.addWidget(cb1, row, 1)
+            right = QLabel(lab2)
+            right.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             opt_grid.addWidget(right, row, 2)
             opt_grid.addWidget(cb2, row, 3)
         # 第 1、3 列（勾选框列）不参与拉伸，保证两列选项各自成一条竖线。
@@ -1059,8 +1071,8 @@ class MainWindow(QWidget):
             agent_mode=True,
             ir_mode=self._ir_check.isChecked(),
             agent_terms=self._agent_terms_check.isChecked(),
-            reflow=self._reflow_check.isChecked(),
             rebuild_table=self._rebuild_table_check.isChecked(),
+            image_text=self._image_text_check.isChecked(),
             overlay=self.doc_ctx.overlay(),
             requirements=[requirement] if requirement else None,
             page_scope=page_scope,
@@ -1121,8 +1133,8 @@ class MainWindow(QWidget):
                     "output_type": output_key,
                     "ir_mode": bool(self._ir_check.isChecked()),
                     "agent_terms": bool(self._agent_terms_check.isChecked()),
-                    "reflow": bool(self._reflow_check.isChecked()),
                     "rebuild_table": bool(self._rebuild_table_check.isChecked()),
+                    "image_text": bool(self._image_text_check.isChecked()),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )
@@ -1161,17 +1173,6 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-    def _persist_reflow(self, checked: bool) -> None:
-        """Save the reflow checkbox the moment it is toggled."""
-        try:
-            prefs = load_prefs()
-            prefs["reflow"] = bool(checked)
-            reason = save_prefs(prefs)
-            if reason and hasattr(self, "_log"):
-                self._append_log(f"  警告：用户偏好保存失败（{reason}），重排版开关不会被记住。")
-        except Exception:
-            pass
-
     def _persist_rebuild_table(self, checked: bool) -> None:
         """Save the rebuild-table checkbox the moment it is toggled."""
         try:
@@ -1180,6 +1181,17 @@ class MainWindow(QWidget):
             reason = save_prefs(prefs)
             if reason and hasattr(self, "_log"):
                 self._append_log(f"  警告：用户偏好保存失败（{reason}），扫描重建开关不会被记住。")
+        except Exception:
+            pass
+
+    def _persist_image_text(self, checked: bool) -> None:
+        """Save the figure-text checkbox the moment it is toggled."""
+        try:
+            prefs = load_prefs()
+            prefs["image_text"] = bool(checked)
+            reason = save_prefs(prefs)
+            if reason and hasattr(self, "_log"):
+                self._append_log(f"  警告：用户偏好保存失败（{reason}），图内文字开关不会被记住。")
         except Exception:
             pass
 
@@ -1241,11 +1253,12 @@ class MainWindow(QWidget):
             overlay=self.doc_ctx.overlay(),
             re_export=True,
             last_translated=self._last_translated,
+            last_doc=self._last_doc,
             # 导出选项必须与「开始翻译」一致：旧实现只传 ocr/agent_mode，导致勾选了
-            # 「OCR表格重建为矢量表格」/「表格列宽重排」后点「重新导出」仍旧输出扫描
-            # 表格（用户看到的就是「选项失效」）。
-            reflow=self._reflow_check.isChecked(),
+            # 「OCR表格重建为矢量表格」后点「重新导出」仍旧输出扫描表格（用户看到的
+            # 就是「选项失效」）。表格列宽重排自 v0.5.47 起恒为默认值，无需传参。
             rebuild_table=self._rebuild_table_check.isChecked(),
+            image_text=self._image_text_check.isChecked(),
         ))
 
     def _on_progress(self, done: int, total: int, stage: str) -> None:
@@ -1305,6 +1318,10 @@ class MainWindow(QWidget):
             self.doc_ctx.set_last_translated(last_translated)
             self._last_translated = list(last_translated)
             self._last_translated_source = self._source
+            # Keep the document that translation was aligned against, so a later
+            # "重新导出" reuses it instead of re-OCRing the source (and possibly
+            # producing a different block list).
+            self._last_doc = worker_field(worker, "_doc")
             self._re_export_btn.setEnabled(True)
         # Remember the exported PDF + its type so the preview's "译文" side can
         # render the REAL translated output after the run.  ``_cleanup`` drops the

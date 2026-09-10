@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 import hashlib
 import json
+import math
 import os
 import re
 import statistics
@@ -85,6 +86,17 @@ class Block:
     #: wrapped table rows are what push the following rows down and misalign the
     #: table.  The fit helper shrinks the font to a single line when possible.
     in_table: bool = False
+    #: True when this block's text was recovered from a **raster figure on a page
+    #: that has its own text layer** (a chart / screenshot / diagram with baked-in
+    #: text).  The page OCR path never saw it — it only runs for pages without (or
+    #: almost without) a text layer — so it is extracted separately.  Unlike a
+    #: scan's ``ocr`` block, the cover must be *this block's own box* clipped to
+    #: ``image_rect``, filled with the sampled background colour: the scan path's
+    #: measured ink bands read a chart's **bars** as ink and would paint them out.
+    in_image: bool = False
+    #: Index of the raster image this block came from (within
+    #: :func:`_image_regions_for_ocr`), for logging and per-image policy.
+    image_index: int = -1
     #: When > 0, the width the translation fitter may use, overriding the bbox
     #: width.  A scanned statement's OCR box only encloses the printed glyphs —
     #: a 2-char "合并" header box is ~18pt while the figure sub-column it heads is
@@ -159,6 +171,12 @@ class DocumentText:
     #: advisory metadata, never used by the deterministic exporter.
     page_structure: list[PageStructure] = field(default_factory=list)
     structure_parser: str = ""   # backend name ("doclayout"/"docling"); "" = none
+    #: Whether this extraction ran the mixed-page figure-text OCR (``image_text``,
+    #: v0.5.44).  Recorded so a later "重新导出" can tell whether reusing this
+    #: document would honour the *current* checkbox state (see
+    #: ``TranslateWorker._run_re_export``): reusing a document extracted with the
+    #: setting off would silently drop the figure text the user just enabled.
+    image_text: bool = False
 
     @property
     def page_count(self) -> int:
@@ -375,6 +393,17 @@ def _fuse_structure(
             inds = sorted({offset + x for x in inds_raw if x < len(blocks)})
         else:
             inds = sorted({offset + i for i, b in enumerate(blocks) if _point_in_bbox(b, bbox)})
+        # A figure / formula region describes the **picture**, which is kept verbatim.
+        # Text recovered from *inside* a picture (``Block.in_image``, the figure-text
+        # OCR of v0.5.44) is text, not the picture: claiming it here hands it the
+        # structural role, and ``ir.translate_ir`` reads that role as "keep the
+        # source" — so a chart's own labels came back verbatim English in a Chinese
+        # export (measured with the DocLayout backend, which really does detect a
+        # figure region; the geometric backend has none, which is why the plain
+        # pipeline was unaffected).  The region's bbox still covers the picture.
+        if _DOCLAYOUT_KIND_MAP.get(kind, kind) in ("figure", "formula"):
+            inds = [x for x in inds
+                    if not getattr(blocks[x - offset], "in_image", False)]
         inds = [x for x in inds if x not in claimed]
         claimed.update(inds)
         element = {
@@ -437,6 +466,7 @@ def extract_structured(
     ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
     cancel: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
+    image_text: bool | None = None,
 ) -> DocumentText:
     """Extract text then populate the B-④ structure layer, in one call.
 
@@ -446,7 +476,7 @@ def extract_structured(
     point a worker/session uses when a structure parser is configured.
     """
     dt = extract_document_text(path, title=title, ocr=ocr, ocr_fn=ocr_fn,
-                               cancel=cancel, log=log)
+                               cancel=cancel, log=log, image_text=image_text)
     try:
         build_structure(path, dt, structure_fn, parser=parser)
     except Exception as exc:  # noqa: BLE001 — a backend outage degrades, never aborts
@@ -464,6 +494,7 @@ def extract_document_structured(
     ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
     cancel: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
+    image_text: bool | None = None,
 ) -> DocumentText:
     """One-call entry that *runs the semantic layer* on a PDF (B-④/B-⑤).
 
@@ -492,7 +523,8 @@ def extract_document_structured(
         structure_fn = make_geometric_structure_fn()
         parser = "geo"
     dt = extract_structured(path, structure_fn, parser=parser,
-                            ocr=ocr, title=title, ocr_fn=ocr_fn, cancel=cancel, log=log)
+                            ocr=ocr, title=title, ocr_fn=ocr_fn, cancel=cancel, log=log,
+                            image_text=image_text)
     if requested == "doclayout" and import_ok and not getattr(structure_fn, "_used_doclayout", False):
         # Importable but the model never produced a real region (model download or a
         # predict failure) → report honestly as geometric so the caller can tell "真正
@@ -912,6 +944,7 @@ def extract_document_text(
     ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None = None,
     cancel: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
+    image_text: bool | None = None,
 ) -> DocumentText:
     """Extract text blocks from ``path`` in reading order.
 
@@ -941,9 +974,17 @@ def extract_document_text(
     written after every page, so a cancelled run keeps what it already did.
     ``cancel`` is polled per page (raising :class:`TranslationCancelled`), and
     ``log`` receives per-page OCR progress.
+
+    ``image_text`` (default: follow ``ocr``) additionally OCRs the **raster figures
+    of pages that have their own text layer** — text burnt into a chart, a
+    screenshot or a diagram is neither in the text layer nor covered by the page
+    OCR above, so it used to survive translation untouched.  Those blocks carry
+    ``in_image=True`` and are only produced for figures on paper-like background
+    (a photo is left alone, see :func:`_image_text_blocks`).
     """
+    image_text = bool(ocr) if image_text is None else bool(image_text)
     doc = fitz.open(str(path))
-    result = DocumentText(title=title or Path(path).stem)
+    result = DocumentText(title=title or Path(path).stem, image_text=image_text)
     ocr_cache: dict[int, list[dict]] = {}
     ocr_cache_path: Path | None = None
     ocr_cache_warned = False
@@ -1083,6 +1124,22 @@ def extract_document_text(
                 if added and log:
                     log(f"  第 {page_index + 1} 页文本层较少，已并入 OCR 结果（+{added} 块）。")
                 page_blocks = merged
+
+            if image_text and lines and not sparse_text:
+                # A page with its own text layer never went through the OCR branch
+                # above (that one is for scans / covers), so text baked into its
+                # *figures* was invisible: extract it figure by figure.
+                # ``_image_text_blocks`` only returns figures on paper-like
+                # background, and ``_merge_ocr_blocks`` drops anything the text
+                # layer already carries (a figure caption is real text already).
+                image_blocks = _image_text_blocks(page, page_index, ocr_fn, log)
+                if image_blocks:
+                    merged = _merge_ocr_blocks(page_blocks, image_blocks)
+                    added = len(merged) - len(page_blocks)
+                    if log:
+                        log(f"  第 {page_index + 1} 页图内文字已并入"
+                            f"（+{added} 块）{'' if added else '（与文本层重复，已跳过）'}。")
+                    page_blocks = merged
 
             for block in page_blocks:
                 result.blocks.append(block.text)
@@ -1358,7 +1415,13 @@ def _ocr_cache_dir() -> Path:
 #: v8: ``fit_height`` is floored at the cell's own glyph height (a "next row" that
 #: starts inside a tall label's box used to squeeze the translation to 3 pt where
 #: 4.5 pt was available).  A v7 cache holds the squeezed values.
-_OCR_CACHE_VERSION = 8
+#:
+#: v9: ``fit_height`` is the *real* gap to the row below again — the v8 floor
+#: inflated the wrap budget, so a cell whose next row starts inside its box wrapped
+#: a second line into the next row's space.  The single-line readability case is
+#: now handled inside ``_fit_block`` (a lone line may use the glyph height).  A v8
+#: cache holds the inflated bands.
+_OCR_CACHE_VERSION = 9
 
 
 def _ocr_cache_path(doc_path: str | Path) -> Path:
@@ -1575,17 +1638,30 @@ def _block_from_dict(data: dict) -> Block:
 #: are *numbers by content*, so a whole table column of them is right-aligned
 #: (matching the source) and none of them is ever sent to the model.  Letters/CJK
 #: never match, so an ordinary label (``营业收入``) is not mistaken for a figure.
+#:
+#: An **ungrouped** figure is a figure too: scanned statements often print
+#: ``1000`` / ``1234.56`` / ``2025`` with no thousands separator, and the old
+#: 1–3-digit grouped-only pattern rejected them — a whole column of such values
+#: then failed ``_is_numeric_column`` and the page was rebuilt as *prose* instead
+#: of a grid (no row bands, no right alignment, whole-box covers).
 _NUMERIC_CELL_RE = re.compile(
     r"^\s*[（(－\-−]?\s*"
-    r"\d{1,3}(?:\s*[，,]\s*\d{3})*(?:\s*[.．]\s*\d+)?"
+    r"(?:\d{1,3}(?:\s*[，,]\s*\d{3})+(?:\s*[.．]\s*\d+)?"     # grouped: 1,234 / 1,234.56
+    r"|\d+(?:\s*[.．]\s*\d+)?)"                               # ungrouped: 1000 / 1234.56
     r"\s*[%％]?\s*[）)]?\s*$"
 )
 
 
 def _is_numeric_cell(text: str) -> bool:
-    """True when ``text`` is a pure figure / amount cell (not a label)."""
+    """True when ``text`` is a pure figure / amount cell (not a label).
+
+    A note / ordinal marker (``(1)``、``（二）``、``八)``) is **not** a figure: it is
+    a label by another name.  Counting it made a scanned *prose* page with a
+    numbered column look like a table (``_is_numeric_column``), and ``redraw_ocr``
+    then blank-redrew the page and dropped the scan's raster background.
+    """
     t = str(text).strip()
-    if not t:
+    if not t or _NOTE_MARK_RE.match(t):
         return False
     if _NUMERIC_CELL_RE.match(t):
         return True
@@ -1719,12 +1795,26 @@ def _cluster_ocr_columns(items: Sequence[tuple], xtol: float = 4.0) -> list[list
     return cols
 
 
+#: A *strong* figure: a grouped / decimal / percent number or a 4+ digit run — the
+#: signal that a column holds amounts rather than a numbered list or a 行次 column.
+_STRONG_FIGURE_RE = re.compile(r"\d[\d\s]*[.,，．%％]|\d{4,}")
+
+
 def _is_numeric_column(items: Sequence[tuple]) -> bool:
-    """True when a column's cells are mostly figures (so they should right-align)."""
+    """True when a column's cells are mostly figures (so they should right-align).
+
+    At least one cell must carry a *strong* figure (a separator, a decimal point, a
+    percent or 4+ digits): a column of ``1``/``2``/``3`` note or 行次 numbers is
+    mostly numeric yet says nothing about the page being a table — accepting it
+    made a two-column scanned *prose* page look like a table, and ``redraw_ocr``
+    then blank-redrew that page and dropped the scan's raster background.
+    """
     if not items:
         return False
-    numeric = sum(1 for it in items if _is_numeric_cell(it[4]))
-    return numeric > 0 and numeric >= max(1, int(len(items) * 0.5))
+    numeric = [it for it in items if _is_numeric_cell(it[4])]
+    if not numeric or len(numeric) < max(1, int(len(items) * 0.5)):
+        return False
+    return any(_STRONG_FIGURE_RE.search(str(it[4])) for it in numeric)
 
 
 #: A pure 附注-by-reference cell: ``(二)``, ``八)``, ``(十一)`` — the note marker
@@ -1999,15 +2089,15 @@ def _reconstruct_ocr_grid(items: Sequence[tuple]) -> tuple[list[Block], list[dic
             # glyph box, and 537 of them could not hold a 2-line wrap at all.
             # Only the last row (nothing below it) keeps 0.0.
             #
-            # The band is never smaller than the cell's own glyph height: the source
-            # text demonstrably fit in its own box, so a "next row" that starts
-            # inside this box (a taller label beside short numeric cells) must not
-            # squeeze the translation below what the source used — that produced
-            # 3 pt cells where 4.5 pt was available (measured: band 3.5 vs box 8.1).
+            # The band is the real gap to the row below — nothing more.  It used to
+            # be raised to the cell's own glyph height ("the source fit there"), but
+            # that inflated the *wrap* budget: a cell whose next row starts inside
+            # its box then wrapped a second line into the next row's space.  The
+            # readability of a too-tight single-line cell is handled in
+            # ``_fit_block`` instead (a single line may use the glyph height).
             fit_height = 0.0
             if next_top is not None:
                 fit_height = max(0.0, next_top - y0 - 1.5)
-                fit_height = max(fit_height, y1 - y0)
             size = min(_MAX_FONT, max(5.0, (y1 - y0) / 1.2))
             blocks.append(
                 Block(
@@ -2274,6 +2364,11 @@ def _photo_ocr_blocks(page, blocks: Sequence[Block],
     in the picture — so the cover is skipped (the translation is still drawn).  A
     scan of printed text is mostly paper and keeps its cover.  ``pix``/``luma``/
     ``levels`` let the caller reuse the page render it already made.
+
+    The block box is mapped into the *rendered* frame before sampling (the luma
+    comes from ``get_pixmap``, which renders the displayed/rotated cropbox): on a
+    rotated page the unrotated box sampled the transposed location, which read as
+    white paper and drew the cover straight over a photo.
     """
     partial = _partial_image_rects(page)
     if not partial:
@@ -2281,6 +2376,10 @@ def _photo_ocr_blocks(page, blocks: Sequence[Block],
     candidates = [
         j for j, b in enumerate(blocks)
         if getattr(b, "ocr", False)
+        # A figure block (text burnt into a raster figure on a text-layer page) has
+        # its own cover path: its box is covered in the *figure's* background colour
+        # (``_cover_image_text``), so neither this verdict nor its log line applies.
+        and not getattr(b, "in_image", False)
         and any(_rect_covered_ratio(b, r) >= 0.6 for r in partial)
     ]
     if not candidates:
@@ -2300,7 +2399,12 @@ def _photo_ocr_blocks(page, blocks: Sequence[Block],
         levels = _page_levels(luma, scale)
     out = {
         j for j in candidates
-        if not _region_is_paper(luma, blocks[j], levels, page)
+        if not _region_is_paper(
+            luma,
+            _rot_map_rect(fitz.Rect(blocks[j].x0, blocks[j].y0,
+                                    blocks[j].x1, blocks[j].y1), page),
+            levels, page,
+        )
     }
     if out and log:
         log(f"{len(out)} 个 OCR 文本块位于图片区域，已保留原图像素（不画白底）。")
@@ -2387,6 +2491,273 @@ def _close_gaps(mask, axis: int, gap: int):
     return out if axis == 1 else out.T
 
 
+#: A partial-page raster image is worth OCR'ing when it is at least this big on
+#: both sides and this large in area.  Smaller ones are icons / logos / QR codes
+#: whose "text" is not prose (measured: the 5-page sample's figures are ~234x175pt).
+_IMAGE_MIN_SIDE_PT = 24.0
+_IMAGE_MIN_AREA_PT2 = 2000.0
+#: Images covering more than this share of the page are full-page scans (handled
+#: by the whole-page OCR path) or page-size art, where an in-place cover is unsafe.
+_IMAGE_MAX_PAGE_SHARE = 0.95
+#: Cap per page: a page of dozens of small photos must not turn into a long OCR run.
+_IMAGE_MAX_REGIONS_PER_PAGE = 4
+#: DPI the figure's background colour is sampled at.
+_IMAGE_COVER_SAMPLE_DPI = 72
+
+
+def _image_regions_for_ocr(page) -> list[fitz.Rect]:
+    """Raster image regions of a page that has **its own text layer**.
+
+    ``_partial_image_rects`` answers "which images may carry text on a *scan*";
+    this answers "which images are figures whose baked-in text the pipeline never
+    saw".  ``extract_document_text`` only OCRs a page with no (or almost no) text
+    layer, so text burnt into a figure on a normal page was invisible: it was
+    neither in the text layer nor OCR'd (measured: a paper's bar chart kept its
+    English axis labels and title in the Chinese output, pixel for pixel).
+
+    Full-page images are excluded — that is the scan path — and so are icons.
+    """
+    try:
+        infos = page.get_image_info()
+    except Exception:                  # noqa: BLE001 — best-effort
+        return []
+    page_area = max(1.0, abs(page.rect.width * page.rect.height))
+    out: list[fitz.Rect] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for info in infos or []:
+        try:
+            r = fitz.Rect(info["bbox"])
+        except Exception:              # noqa: BLE001
+            continue
+        if r.width < _IMAGE_MIN_SIDE_PT or r.height < _IMAGE_MIN_SIDE_PT:
+            continue
+        area = r.get_area()
+        if area < _IMAGE_MIN_AREA_PT2 or area > _IMAGE_MAX_PAGE_SHARE * page_area:
+            continue
+        key = (round(r.x0), round(r.y0), round(r.x1), round(r.y1))
+        if key in seen:                # a tiled image appears once per tile
+            continue
+        seen.add(key)
+        out.append(r)
+    return out[:_IMAGE_MAX_REGIONS_PER_PAGE]
+
+
+def _region_to_array(page, rect: fitz.Rect) -> tuple[object, float]:
+    """Render one region of ``page`` to a BGR array plus pixel-per-point zoom.
+
+    Only the figure is rasterised (a whole-page render per figure would waste the
+    OCR engine on the page's own prose), and the RGB→BGR / contiguous-array rules
+    of :func:`_page_to_array` are repeated here because RapidOCR (OpenCV) rejects
+    a negative-stride view.
+    """
+    import numpy as np
+
+    zoom = _OCR_DPI / 72.0
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(zoom, zoom), clip=rect, alpha=False,
+        colorspace=fitz.csRGB,
+    )
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+        pix.height, pix.width, pix.n
+    )
+    if pix.n >= 3:
+        img = np.ascontiguousarray(img[:, :, :3][:, :, ::-1])
+    return img, zoom
+
+
+def _box_center_in(box, rect: fitz.Rect) -> bool:
+    """True when an OCR box's centre falls inside ``rect`` (region filter)."""
+    try:
+        pts = [(float(p[0]), float(p[1])) for p in box]
+    except (TypeError, IndexError, ValueError, KeyError):
+        return False
+    if not pts:
+        return False
+    cx = (min(p[0] for p in pts) + max(p[0] for p in pts)) / 2.0
+    cy = (min(p[1] for p in pts) + max(p[1] for p in pts)) / 2.0
+    return rect.x0 <= cx <= rect.x1 and rect.y0 <= cy <= rect.y1
+
+
+def _figure_block_bands(blocks: Sequence[Block], image_rect: fitz.Rect) -> list[Block]:
+    """Bound a figure's text blocks the way a grid bounds its cells.
+
+    The *figure* decided this layout, not us: the next line of the figure (an axis
+    title under the tick labels, the next legend entry) cannot move out of the way,
+    so a translation that wraps has to stay inside its own row band — measured: a
+    tick label's second line otherwise landed on the axis title.  ``fit_height`` is
+    the real gap to the next line's top (the v0.5.40 semantics for a grid row) and
+    ``fit_width`` the room up to the next block on the same line (else the image's
+    own right edge), so a wrap is bounded in both directions instead of running into
+    the neighbouring label.
+    """
+    out: list[Block] = []
+    for b in blocks:
+        below = [o.y0 for o in blocks if o.y0 > b.y1 + 0.5]
+        next_top = min(below) if below else None
+        fit_h = max(0.0, next_top - b.y0 - 1.5) if next_top is not None else 0.0
+        right = [o.x0 for o in blocks
+                 if o.x0 > b.x0 + 1.0 and o.y1 > b.y0 and o.y0 < b.y1]
+        edge = min(right) if right else float(image_rect.x1)
+        fit_w = max(1.0, edge - 2.0 - b.x0)
+        out.append(replace(b, fit_height=fit_h, fit_width=fit_w))
+    return out
+
+
+def _image_text_blocks(
+    page, page_index: int,
+    ocr_fn: Callable[[int, "fitz.Page"], list[tuple[list, str]]] | None,
+    log: Callable[[str], None] | None = None,
+) -> list[Block]:
+    """OCR the raster figures of a text-layer page into ``in_image`` blocks.
+
+    Only figures sitting on **paper-like** background are returned: a cover is
+    only legitimate there (a photo's pixels *are* the content, so its text is left
+    alone and the skip is logged).  Pure figures (``0.684``, ``1,234.56``) are not
+    turned into blocks at all — a chart's axis ticks and value labels are language
+    neutral, and covering them to redraw the same digits only risks damage.
+
+    Rotation is not handled yet: a rotated page is skipped with a log line rather
+    than risking a transposed sample (the frame defect class the v0.5.39 fixes
+    were about).  ``ocr_fn`` (the test seam) receives the whole page and its boxes
+    are in page coordinates, exactly as the page-OCR seam does.
+    """
+    regions = _image_regions_for_ocr(page)
+    if not regions:
+        return []
+    if int(getattr(page, "rotation", 0) or 0) % 360:
+        if log:
+            log(f"  第 {page_index + 1} 页：图内文字暂不处理旋转页，已保留原图。")
+        return []
+    # One page render decides "printed figure on paper" for every region.
+    luma = levels = None
+    try:
+        luma = _pixmap_luma(page.get_pixmap(dpi=_PHOTO_SAMPLE_DPI))
+        if luma is not None:
+            levels = _page_levels(
+                luma, luma.shape[1] / max(1e-6, float(page.rect.width))
+            )
+    except Exception:                  # noqa: BLE001 — sampling is best-effort
+        luma = levels = None
+    engine = None
+    if ocr_fn is None:
+        engine = _get_ocr_engine()
+        if engine is None:
+            _warn_ocr_unavailable(log)
+            return []
+    page_results: list[tuple[list, str]] | None = None
+    out: list[Block] = []
+    for k, rect in enumerate(regions):
+        if not _region_is_paper(luma, rect, levels, page):
+            if log:
+                log(f"  第 {page_index + 1} 页图 {k + 1}：背景非纸面（照片/彩色底），"
+                    f"图内文字保留原样。")
+            continue
+        try:
+            if ocr_fn is not None:
+                if page_results is None:
+                    page_results = list(ocr_fn(page_index, page))
+                raws = [(box, t) for box, t in page_results if _box_center_in(box, rect)]
+                results = raws
+            else:
+                img, zoom = _region_to_array(page, rect)
+                # Clip renders are region-relative: shift into page coordinates.
+                results = [
+                    ([[p[0] + rect.x0, p[1] + rect.y0] for p in box], text)
+                    for box, text in _ocr_results_from_img(
+                        engine, img, zoom, page_index, log=log
+                    )
+                ]
+        except Exception as exc:       # noqa: BLE001 — one figure, never the page
+            if log:
+                log(f"  第 {page_index + 1} 页图 {k + 1}：图内文字识别失败"
+                    f"（{type(exc).__name__}: {exc}），已保留原图。")
+            continue
+        items, fixed_count, fixed_examples, bad_boxes = _ocr_items_from_results(results)
+        if bad_boxes and log:
+            log(f"  第 {page_index + 1} 页图 {k + 1}：{bad_boxes} 个 OCR 框坐标非法，已跳过。")
+        _log_number_fixes(log, page_index, fixed_count, fixed_examples)
+        items = [it for it in items
+                 if not _is_pure_symbol(it[4]) and not _is_numeric_cell(it[4])]
+        if not items:
+            if log:
+                log(f"  第 {page_index + 1} 页图 {k + 1}：图内没有可翻译的文字"
+                    f"（{len(results)} 行均为数字/符号），保留原图。")
+            continue
+        blocks = _figure_block_bands(
+            [replace(b, in_image=True, image_index=k)
+             for b in _ocr_plain_blocks(items, page_index)],
+            rect,
+        )
+        if log:
+            log(f"  第 {page_index + 1} 页图 {k + 1}：识别到 {len(blocks)} 行图内文字，"
+                f"将原位转译。")
+        out.extend(blocks)
+    return out
+
+
+def _containing_image_rect(page, block) -> fitz.Rect | None:
+    """The raster image region a figure block came from (``None`` when unknown)."""
+    for r in _partial_image_rects(page):
+        if _rect_covered_ratio(block, r) >= 0.6:
+            return r
+    return None
+
+
+def _image_cover_color(page, image_rect: fitz.Rect | None) -> tuple[float, float, float]:
+    """The figure's own background colour (fallback: white).
+
+    Sampled from a thin ring just **inside the image's border**: a figure's outer
+    margin is its background, while the ring around a *text box* is easily polluted
+    by a neighbouring chart element (measured: the ring under a bar chart's x-axis
+    labels picked up the bar colour, and the box of a chart title is half filled by
+    its own glyphs — which is also why the scan path's block-level
+    ``_region_is_paper`` test cannot be used for a tight figure box).  A median over
+    the ring absorbs a hairline frame drawn around the picture.
+    """
+    if image_rect is None or image_rect.is_empty:
+        return (1.0, 1.0, 1.0)
+    try:
+        import numpy as np
+
+        pix = page.get_pixmap(clip=image_rect, dpi=_IMAGE_COVER_SAMPLE_DPI,
+                              alpha=False, colorspace=fitz.csRGB)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width, pix.n
+        )
+        if arr.size == 0:
+            return (1.0, 1.0, 1.0)
+        inset = max(1, min(arr.shape[0], arr.shape[1]) // 20)
+        rows = arr[inset:-inset] if arr.shape[0] > 2 * inset else arr
+        cols = arr[:, inset:-inset] if arr.shape[1] > 2 * inset else arr
+        ring = np.concatenate([rows[0], rows[-1], cols[:, 0], cols[:, -1]])
+        med = np.median(ring[:, :3], axis=0) / 255.0
+        return (float(med[0]), float(med[1]), float(med[2]))
+    except Exception:                  # noqa: BLE001 — best-effort, white is safe
+        return (1.0, 1.0, 1.0)
+
+
+def _cover_image_text(page, block, log: Callable[[str], None] | None = None) -> bool:
+    """Paint the patch that hides an ``in_image`` block's source pixels.
+
+    Returns True when a cover was drawn.  The rect is the block's **own OCR box**,
+    clipped to the raster image it came from, filled with the figure's background
+    colour.  It is deliberately *not* the scan path's measured ink band: on a chart
+    the bars are large dark runs, so a band measured there would be painted out —
+    erasing the chart the figure is made of.  ``False`` means "do not draw the
+    translation either" (an uncovered overprint would double the text).
+    """
+    rect = fitz.Rect(block.x0 - 0.5, block.y0 - 0.5, block.x1 + 0.5, block.y1 + 0.5)
+    img = _containing_image_rect(page, block)
+    if img is not None:
+        rect = rect & img
+    if rect.is_empty or rect.width <= 0.0 or rect.height <= 0.0:
+        if log:
+            log(f"“{block.text[:20]}”的图内文字框越出图片范围，保留原文。")
+        return False
+    page.draw_rect(rect, color=None, fill=_image_cover_color(page, img))
+    return True
+
+
 def _page_rule_mask(luma, levels, scale: float):
     """Boolean mask of printed RULES (table lines / underlines), not glyphs.
 
@@ -2433,15 +2804,22 @@ def _page_rule_mask(luma, levels, scale: float):
 def _rot_map_rect(rect: fitz.Rect, page, inverse: bool = False) -> fitz.Rect:
     """Map a rect between the page's unrotated frame and its rendered frame.
 
-    ``Block`` coordinates live in the unrotated frame while ``get_pixmap`` renders
-    the *displayed* (rotated) page, so a rotated scan needs the mapping to be
+    ``Block`` coordinates live in the unrotated **cropbox** frame (origin at the
+    cropbox's top-left, see ``get_text``), while ``get_pixmap`` renders the
+    *displayed* (rotated) cropbox, so a rotated scan needs the mapping to be
     sampled at all.  The transform is a pure axis swap/mirror, so rects stay rects.
+
+    The dimensions must come from ``page.cropbox``, not ``page.mediabox``: on a
+    page whose CropBox crops the sheet (common in scanned books) the mediabox is
+    larger, and the mapping — and therefore every ink-band sample — was offset by
+    the crop margin.
     """
     rot = int(getattr(page, "rotation", 0) or 0) % 360
     if rot == 0:
         return fitz.Rect(rect)
-    w = float(page.mediabox.width)
-    h = float(page.mediabox.height)
+    cb = page.cropbox
+    w = float(cb.width)
+    h = float(cb.height)
     r = rect
     if inverse:
         if rot == 90:      # (x, y) = (y', H - x')
@@ -2701,18 +3079,30 @@ def _merge_ocr_blocks(text_blocks: Sequence[Block], ocr_blocks: Sequence[Block])
     OCR blocks that are genuinely new, then sort the page by reading order (y, then
     x).
 
-    A duplicate must match on **both text and position** (same normalized text,
-    OCR box at least :data:`_MERGE_DUP_COVER` covered by that text block):
+    A duplicate must match on **both text and position** (same normalized text, or
+    one containing the other, with the OCR box at least :data:`_MERGE_DUP_COVER`
+    covered by that text block):
 
     * text alone is not enough — a scanned statement repeats values (two rows of
       ``100.00``, a page number that equals a table cell) and the old page-wide
       text set silently dropped the second occurrence;
     * overlap alone is not enough — OCR often reads extra text baked into an image
       (a logo whose line sits inside a text-layer block), which the old
-      "centre inside / ≥20% of the smaller area" test threw away.
+      "centre inside / ≥20% of the smaller area" test threw away;
+    * exact equality alone is not enough either — the text layer merges a two-line
+      title into ONE block while OCR returns one block per line, so the title was
+      added a second time (containment covers both directions, the position test
+      still guards it).
     """
     def _norm(t: str) -> str:
         return " ".join(str(t).split()).casefold()
+
+    def _same_text(ocr_text: str, text_text: str) -> bool:
+        if not ocr_text or not text_text:
+            return False
+        return (ocr_text == text_text
+                or ocr_text in text_text
+                or text_text in ocr_text)
 
     kept: list[Block] = []
     for b in ocr_blocks:
@@ -2720,7 +3110,7 @@ def _merge_ocr_blocks(text_blocks: Sequence[Block], ocr_blocks: Sequence[Block])
         if not text:
             continue
         if any(
-            _norm(t.text) == text and _covered_ratio(b, t) >= _MERGE_DUP_COVER
+            _same_text(text, _norm(t.text)) and _covered_ratio(b, t) >= _MERGE_DUP_COVER
             for t in text_blocks
         ):
             continue
@@ -2730,6 +3120,52 @@ def _merge_ocr_blocks(text_blocks: Sequence[Block], ocr_blocks: Sequence[Block])
     merged = list(text_blocks) + kept
     merged.sort(key=lambda b: (round(b.y0, 1), round(b.x0, 1)))
     return merged
+
+
+def _ocr_items_from_results(
+    results: Sequence[tuple[list, str]],
+) -> tuple[list[tuple], int, list[str], int]:
+    """Sanitise raw OCR ``[(box, text), ...]`` into ``(y0, x0, x1, y1, text)`` items.
+
+    The single source of box validation / number normalization for **both** OCR
+    paths (whole-page scans and the figures of a text-layer page): boxes come from
+    an OCR engine or an injected ``ocr_fn`` (e.g. a VLM backend), so a malformed
+    one must cost that single item, never the caller's whole result.  An
+    unparsable box used to raise ``TypeError`` and discard the page's results; a
+    NaN/inf coordinate propagated into ``Block`` and made the export die later
+    (``ValueError: cannot convert float NaN to integer``) after the model had
+    already translated everything.
+
+    Returns ``(items, fixed_count, fixed_examples, bad_boxes)`` — the caller logs,
+    because the message order differs between the two paths.
+    """
+    items: list[tuple] = []
+    fixed_count = 0
+    fixed_examples: list[str] = []
+    bad_boxes = 0
+    for box, text in results:
+        cleaned = _clean_text(text)
+        if not cleaned:
+            continue
+        try:
+            pts = [(float(p[0]), float(p[1])) for p in box]
+        except (TypeError, IndexError, ValueError, KeyError):
+            bad_boxes += 1
+            continue
+        if len(pts) < 2 or not all(
+            math.isfinite(v) for pt in pts for v in pt
+        ):
+            bad_boxes += 1
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        normalized = _normalize_number(cleaned)
+        if normalized != cleaned:
+            fixed_count += 1
+            if len(fixed_examples) < 2:
+                fixed_examples.append(f"{cleaned} → {normalized}")
+        items.append((min(ys), min(xs), max(xs), max(ys), normalized))
+    return items, fixed_count, fixed_examples, bad_boxes
 
 
 def _synthesize_ocr_blocks(
@@ -2755,21 +3191,9 @@ def _synthesize_ocr_blocks(
     each fix is reported through ``log`` so corrupted values never reach the
     reader silently.
     """
-    items: list[tuple] = []
-    fixed_count = 0
-    fixed_examples: list[str] = []
-    for box, text in results:
-        cleaned = _clean_text(text)
-        if not cleaned:
-            continue
-        normalized = _normalize_number(cleaned)
-        if normalized != cleaned:
-            fixed_count += 1
-            if len(fixed_examples) < 2:
-                fixed_examples.append(f"{cleaned} → {normalized}")
-        xs = [float(p[0]) for p in box]
-        ys = [float(p[1]) for p in box]
-        items.append((min(ys), min(xs), max(xs), max(ys), normalized))
+    items, fixed_count, fixed_examples, bad_boxes = _ocr_items_from_results(results)
+    if bad_boxes and log:
+        log(f"  第 {page_index + 1} 页：{bad_boxes} 个 OCR 框坐标非法，已跳过。")
     if not items:
         return []
     items = _drop_signature_items(items, page_height, log, page_index)
@@ -4057,10 +4481,13 @@ def _split_line_half(line: str) -> tuple[str, str] | None:
     Returns ``None`` when the line cannot usefully be cut: a single character,
     or a whole figure atom — a number broken in half looks exactly like a digit
     grew or lost a decimal point (the same reason a figure is never wrap-broken
-    by :func:`_break_word`).
+    by :func:`_break_word`).  ``_is_amount_atom`` covers the currency/unit form
+    (``US$1,234,567.89``, ``1,234.56万元``): checking only ``_is_number_atom``
+    let the rebalancer cut such an amount in half — ``US$1,23`` + ``4,567.89``
+    reads as two figures, which is the exact failure the atomicity rule forbids.
     """
     t = line.strip()
-    if len(t) < 2 or _is_number_atom(t):
+    if len(t) < 2 or _is_number_atom(t) or _is_amount_atom(t):
         return None
     half = len(t) // 2
     best = None
@@ -4212,16 +4639,23 @@ def _fit_block(block: Block, font, text: str,
             band = getattr(block, "fit_height", 0.0)
             if band > 0.0:
                 lines, fs = _fit_band(font, flat, max_width, band)
-                # ``_fit_band`` cannot honour a band that is smaller than the
-                # wrapped text at the 3pt floor (a dense statement row, measured
-                # down to 3.4pt): it returns the 3pt wrap, which crosses the grid
-                # line below.  Prefer ONE line at the largest size the band can
-                # hold — horizontal overflow reaches the row's blank space, which
-                # ``fit_width`` already uses, while a vertical crossing overwrites
-                # the figures in the next row and cannot be undone.
+                # ``_fit_band`` cannot honour a band smaller than the wrapped text
+                # at the 3pt floor (a dense statement row, measured down to 3.4pt):
+                # it returns the 3pt wrap, whose second line crosses the grid line
+                # below.  Prefer ONE line instead — horizontal overflow reaches the
+                # row's blank space (``fit_width`` already uses it), while a vertical
+                # crossing overwrites the figures in the next row and cannot be
+                # undone.  Its size may use the cell's own glyph height (the source
+                # text demonstrably fit in that box; a *neighbouring* column's
+                # taller cell is what makes the band narrower), capped by the
+                # source size and floored at 3pt.
                 if _wrapped_height(font, lines, fs, _TABLE_CELL_LEADING) > band + 0.05:
                     asc_desc = max(0.1, font.ascender - font.descender)
-                    single_fs = min(fs, max(_MIN_TABLE_FLOOR, band / asc_desc))
+                    room = max(band, r.height)
+                    single_fs = max(
+                        _MIN_TABLE_FLOOR,
+                        min(block.size, room / asc_desc),
+                    )
                     single = _fit_one_line(font, flat, max_width, single_fs,
                                            floor=_MIN_TABLE_FLOOR)
                     return single if single is not None else ([flat], single_fs)
@@ -4247,6 +4681,12 @@ def _fit_block(block: Block, font, text: str,
     # could undershoot it, e.g. 7.2 -> 6.48).
     floor = min(fs, _MIN_READABLE)
     box_h = r.height
+    if getattr(block, "in_image", False):
+        # A figure's text shares the sheet with the figure's *other* lines, which
+        # cannot be moved: the row band (``fit_height``, the real gap to the next
+        # line's top) is the height budget, so a wrapped label stops above the next
+        # line instead of landing on it.  The box height is the floor of the budget.
+        box_h = max(box_h, float(getattr(block, "fit_height", 0.0) or 0.0))
     if avoid_below is not None and avoid_below > r.y0:
         # ``avoid_below`` (the next printed rule) is a *height budget*: the text
         # may not reach it, even when the source box does.
@@ -4325,9 +4765,12 @@ def _draw_vertical_label(page: fitz.Page, font, block: Block, text: str) -> None
     py = r.y0 + (r.height + length) / 2.0
     # An over-long run must stay on the page (glyphs past the crop get clipped
     # out of the extracted and rendered text): push the run's bottom so it
-    # starts near the page top rather than sailing off the sheet.
-    pmin = page.rect.y0 + 2.0 + length
-    pmax = page.rect.y1 - 2.0
+    # starts near the page top rather than sailing off the sheet.  The bound is
+    # the **unrotated cropbox** frame the block coordinates live in — using
+    # ``page.rect`` on a /Rotate 90 page clamps to the page *width* and moved a
+    # y=300..390 label up to y≈160 (187pt away from its box).
+    pmin = 2.0 + length
+    pmax = float(page.cropbox.height) - 2.0
     if pmax >= pmin:
         py = min(max(py, pmin), pmax)
     else:  # the run itself is taller than the page
@@ -4627,12 +5070,20 @@ def save_interleaved_pdf(
                     if b.is_chart:
                         # A diagram node label keeps its source (as in-place).
                         continue
-                    if b.ocr and j not in on_photo:
-                        tpage.draw_rect(
-                            fitz.Rect(b.x0 - 0.5, b.y0 - 0.5,
-                                      b.x1 + 0.5, b.y1 + 0.5),
-                            color=None, fill=(1, 1, 1),
-                        )
+                    if b.ocr:
+                        if getattr(b, "in_image", False):
+                            # Figure text: cover it in the figure's own background
+                            # colour.  The block-level photo verdict is not used here
+                            # (see ``save_translated_pdf``); if the cover cannot be
+                            # drawn, keep the source pixels instead of overprinting.
+                            if not _cover_image_text(tpage, b):
+                                continue
+                        elif j not in on_photo:
+                            tpage.draw_rect(
+                                fitz.Rect(b.x0 - 0.5, b.y0 - 0.5,
+                                          b.x1 + 0.5, b.y1 + 0.5),
+                                color=None, fill=(1, 1, 1),
+                            )
                     _draw_translated_block(tpage, font, b, trans[j])
                 continue
             # The mirror page must be built in the SAME coordinate frame the blocks
@@ -5146,6 +5597,7 @@ def _draw_ocr_grid_page(
     blocks: Sequence[Block],
     trans: Sequence[str],
     font,
+    log: Callable[[str], None] | None = None,
 ) -> None:
     """Regenerate a scanned table page as a clean table.
 
@@ -5189,17 +5641,39 @@ def _draw_ocr_grid_page(
     # Expand each row to fit its longest translated cell, then lay the rows out
     # top-to-bottom (a taller row pushes the ones below it down).  The first row
     # keeps its original top, so the table stays where the scan put it.
-    row_tops: list[float] = []
-    row_bots: list[float] = []
-    cur = min(it[0] for it in rows_sorted[0])
+    first_top = min(it[0] for it in rows_sorted[0])
+    heights: list[tuple[float, float]] = []
     for r in rows_sorted:
         orig_h = max(it[3] for it in r) - min(it[0] for it in r)
         need = orig_h
         for it in r:
             b, t = ocr[it[5]]
             need = max(need, _needed_height(b, t))
+        heights.append((orig_h, need))
+    # The redraw starts from a *blank* page, so a row pushed past the bottom edge
+    # would be lost with no trace.  Scale the total growth down when it does not
+    # fit (the same proportional clamp ``_compute_table_layout`` applies).
+    #
+    # The limit is *this page's* bottom in the frame the rows are drawn in: the
+    # page was created with ``new_page`` (so its cropbox equals its mediabox and
+    # its own bottom is ``mediabox.height``).  This is not the same frame as
+    # ``_compute_table_layout``'s ``page_height`` — that one re-lays out a *copy of
+    # the source page* and therefore needs the source cropbox height.
+    limit = float(page.mediabox.height) - _TABLE_BOTTOM_MARGIN
+    base = sum(orig for orig, _need in heights)
+    extra = sum(max(0.0, need - orig) for orig, need in heights)
+    if extra > 0.0 and first_top + base + extra > limit:
+        factor = max(0.0, min(1.0, (limit - first_top - base) / extra))
+        heights = [(orig, orig + (need - orig) * factor) for orig, need in heights]
+        if log:
+            log(f"扫描表格译文超出页底，已压缩行高至 {factor * 100:.0f}%"
+                f"（否则末行与表格线会落到页面外）。")
+    row_tops: list[float] = []
+    row_bots: list[float] = []
+    cur = first_top
+    for orig_h, need_h in heights:
         row_tops.append(cur)
-        cur += max(orig_h, need)
+        cur += max(orig_h, need_h)
         row_bots.append(cur)
 
     # Column boundaries: one line per gap between the (left-to-right) columns,
@@ -5473,11 +5947,21 @@ def save_translated_pdf(
                     and len(table_blocks) >= 4
                     and _reconstruct_ocr_tables(table_blocks)
                 ):
-                    # The blank page must use the source's UNROTATED mediabox: OCR
-                    # blocks live in that frame (see ``_ocr_results_from_img``), so a
-                    # /Rotate page's visual rect (transposed) put every grid line and
-                    # cell off-page.  The rotation is re-applied to the new page so it
-                    # still displays in the same orientation as the source.
+                    # The blank page must use the source's UNROTATED mediabox: a
+                    # /Rotate page's visual rect (transposed) put every grid line
+                    # and cell off-page.  The rotation is re-applied to the new
+                    # page so it still displays in the same orientation as the
+                    # source.
+                    #
+                    # Two frames meet here: OCR block boxes come out of a
+                    # ``get_pixmap`` render, so they are **cropbox**-relative
+                    # (measured: the rendered ink sits exactly at the ``get_text``
+                    # bbox), while this page is created at *mediabox* size.  For an
+                    # uncropped scan — the normal case — the two coincide; a scan
+                    # whose CropBox crops the sheet gets a page slightly larger than
+                    # the block frame.  Nothing is lost (the clamp uses this page's
+                    # own bottom and the blocks stay well inside it), but the
+                    # redrawn grid is not registered to the source crop frame.
                     src_page = src[i]
                     mb = src_page.mediabox
                     page = out_doc.new_page(width=mb.width, height=mb.height)
@@ -5515,11 +5999,15 @@ def save_translated_pdf(
                         else:
                             if log:
                                 log(f"  第 {i + 1} 页过小，无法重画 AI 表格，回退几何重绘。")
-                            _draw_ocr_grid_page(page, blocks[:m], trans[:m], font)
+                            _draw_ocr_grid_page(page, blocks[:m], trans[:m], font,
+                                                log=(lambda msg: log(f"  第 {i + 1} 页：{msg}"))
+                                                if log else None)
                     else:
                         if log:
                             log(f"  第 {i + 1} 页 AI 表格重建不可用，回退几何重绘。")
-                        _draw_ocr_grid_page(page, blocks[:m], trans[:m], font)
+                        _draw_ocr_grid_page(page, blocks[:m], trans[:m], font,
+                                            log=(lambda msg: log(f"  第 {i + 1} 页：{msg}"))
+                                            if log else None)
                     # Neither redraw path draws the sparse text layer's page
                     # number / rule (it is not an OCR cell); the purity gate
                     # accepted it on the promise that it is put back here.
@@ -5575,10 +6063,13 @@ def save_translated_pdf(
                 # ``page_height`` must be the UNROTATED frame the block boxes live
                 # in (a /Rotate page's ``rect.height`` is the page *width*), and the
                 # clamp keeps the expanded rows — and the prose below them — on the
-                # sheet instead of drawing them past the bottom edge.
+                # sheet instead of drawing them past the bottom edge.  It is the
+                # cropbox's **height**, not its ``y1``: block coordinates are
+                # cropbox-relative, so a CropBox whose origin is not 0 (scanned
+                # books) made the limit too large and the clamp never fired.
                 shifts, new_bottoms, grid, bboxes = _compute_table_layout(
                     tables, mapping, layout_blocks, trans, font,
-                    page_height=page.cropbox.y1,
+                    page_height=page.cropbox.height,
                     log=(lambda m: log(f"  第 {i + 1} 页：{m}")) if log else None,
                 )
 
@@ -5626,6 +6117,10 @@ def save_translated_pdf(
             cover_idx = [
                 j for j in range(m)
                 if getattr(blocks[j], "ocr", False) and j not in on_photo
+                # A figure block is covered by its own box with the sampled
+                # background colour (below): measuring ink bands here would read a
+                # chart's *bars* as ink and paint them out.
+                and not getattr(blocks[j], "in_image", False)
             ]
             if ink_luma is not None:
                 for j in cover_idx:
@@ -5732,7 +6227,13 @@ def save_translated_pdf(
                     below = _rule_below(ink_rules, page, draw_b.y1, b.x0, b.x1)
                     if below is not None:
                         avoid = below if avoid is None else min(avoid, below)
-                if b.ocr and j not in on_photo:
+                # A figure block is covered whatever the block-level "is this box on
+                # paper" verdict says (``on_photo``): a *tight* figure box fails that
+                # test because its own glyphs fill half of it, and a box next to a
+                # coloured bar fails it because its neighbourhood is polluted — while
+                # the figure-level gate at extraction already established that this
+                # figure stands on a light, uniform background.
+                if b.ocr and (j not in on_photo or getattr(b, "in_image", False)):
                     # Cover the underlying scan pixels so the translation does
                     # not overprint the original (raster) text.  The cover hugs
                     # the *measured* glyph band (v0.5.33): one white rect per text
@@ -5781,14 +6282,22 @@ def save_translated_pdf(
                                     ),
                                 )
                     else:
-                        page.draw_rect(
-                            fitz.Rect(
-                                draw_b.x0 - 0.5, draw_b.y0 - 0.5,
-                                draw_b.x1 + 0.5, draw_b.y1 + 0.5,
-                            ),
-                            color=None,
-                            fill=(1, 1, 1),
-                        )
+                        if getattr(b, "in_image", False):
+                            # Figure text: cover this block's own box, clipped to
+                            # the raster image, in the figure's background colour.
+                            # If it cannot be covered, keep the source pixels rather
+                            # than overprint them with a translation.
+                            if not _cover_image_text(page, draw_b, log):
+                                continue
+                        else:
+                            page.draw_rect(
+                                fitz.Rect(
+                                    draw_b.x0 - 0.5, draw_b.y0 - 0.5,
+                                    draw_b.x1 + 0.5, draw_b.y1 + 0.5,
+                                ),
+                                color=None,
+                                fill=(1, 1, 1),
+                            )
                 _draw_translated_block(page, font, draw_b, trans[j], avoid_below=avoid)
 
             # Redraw the table grid over the expanded rows.

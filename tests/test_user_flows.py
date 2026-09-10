@@ -41,8 +41,16 @@ class CompileFromUserTest(unittest.TestCase):
         self.assertIsNone(uf.parse_explicit_scope("开始翻译"))
         # A "skip" is an exclusion, not a scope: "跳过第3页" means translate the rest.
         self.assertIsNone(uf.parse_explicit_scope("跳过第3页"))
+        # Regression (v0.5.42): the cue list contained a BARE 只/仅, so 只要 / 不仅 /
+        # 不只 were read as scope restrictions and the run translated one page only.
+        self.assertIsNone(uf.parse_explicit_scope("帮我翻译整篇年报，只要第5页的数字没错"))
+        self.assertIsNone(uf.parse_explicit_scope("不仅第3页，整篇都要翻"))
+        self.assertIsNone(uf.parse_explicit_scope("不只是第2页"))
         # An explicit restriction does narrow the run.
         self.assertEqual([4], uf.parse_explicit_scope("只翻第5页"))
+        self.assertEqual([4], uf.parse_explicit_scope("只查第5页"))
+        self.assertEqual([4], uf.parse_explicit_scope("只看第5页"))
+        self.assertEqual([4], uf.parse_explicit_scope("只第5页"))
         self.assertEqual([1, 2, 3, 4], uf.parse_explicit_scope("只翻译第2到第5页"))
         self.assertEqual([1, 2, 3, 4], uf.parse_explicit_scope("翻译第2-5页"))
         self.assertEqual([2], uf.parse_explicit_scope("仅限第3页"))

@@ -633,6 +633,27 @@ class DocumentSessionTest(unittest.TestCase):
                         audit=fake_audit, scope=[1, 2])._ai_self_check()
         self.assertEqual([1, 2], audited)
 
+    def test_ai_self_check_is_fail_closed_when_the_audit_returns_nothing(self):
+        # Regression (v0.5.42): ``audit.get("clean", True)`` read a *missing* result
+        # as "passed", so a review step that returned nothing was recorded as 已复核.
+        doc = _mixed_doc()
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        state.triage = {i: agent.PageTriage(page=i, kind="normal", decided=True,
+                                            decision="translate")
+                        for i in range(len(doc.pages))}
+        logs: list[str] = []
+
+        def empty_audit(page=None, checks=None):
+            return {}
+
+        DocumentSession(state, doc, model=object(), log=logs.append,
+                        translate_page=lambda st, page, _m, *, task, **kw: st,
+                        audit=empty_audit, scope=[0])._ai_self_check()
+        issues = state.page(0).issues
+        self.assertNotIn("已复核", issues, issues)
+        self.assertTrue(any("未返回" in m for m in logs), logs)
+
     def test_parallel_cancel_does_not_run_queued_pages(self):
         # Regression: ``with ThreadPoolExecutor(...)`` calls ``shutdown(wait=True)``, so
         # a cancel still STARTED every queued page loop.  Count the page loops entered.

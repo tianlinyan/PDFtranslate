@@ -1279,6 +1279,20 @@ class TableCellFitTest(unittest.TestCase):
         self.assertLess(fs, pdfio._MIN_TABLE_READABLE)
         self.assertEqual("".join(lines).replace(" ", ""), long_name.replace(" ", ""))
 
+    def test_fit_block_band_too_tight_for_a_wrap_gives_one_tall_line(self):
+        # P1-5: the band is the real row gap.  A cell whose band cannot hold even a
+        # 3pt wrap gets ONE line sized by its own glyph box (the source fit there),
+        # never a second line crossing the row rule below.
+        font = fitz.Font("cjk")
+        block = pdfio.Block(
+            text="其他综合收益", page=0, x0=10, y0=100, x1=50, y1=108.1,
+            size=6.75, single_line=True, in_table=True,
+            fit_height=3.5, fit_width=40.0,
+        )
+        lines, fs = pdfio._fit_block(block, font, "Other comprehensive income")
+        self.assertEqual(1, len(lines))
+        self.assertGreater(fs, pdfio._MIN_TABLE_FLOOR)
+
     def test_non_table_block_still_wraps(self):
         # A flowing paragraph (not a table cell) is unaffected: it wraps and keeps
         # its own box rather than being forced onto one line.
@@ -1436,6 +1450,51 @@ class OcrGridTest(unittest.TestCase):
         mapping = pdfio._map_blocks_to_table_cells(blocks, tables)
         self.assertEqual(len(mapping), len(blocks))
 
+    def test_ungrouped_figures_still_form_a_numeric_column(self):
+        # P1-6: scanned statements often print plain ``1000`` / ``1234.56`` with no
+        # thousands separator.  The grouped-only pattern rejected them, so the whole
+        # page failed the numeric-column guard and was rebuilt as *prose* — no grid,
+        # no row bands, no right alignment.
+        items = []
+        for i in range(5):
+            y0, y1 = 100.0 + 12 * i, 108.0 + 12 * i
+            items.append((y0, 80, 200, y1, f"项目{i + 1}"))
+            items.append((y0, 240, 320, y1, str(1000 + i)))
+            items.append((y0, 360, 440, y1, f"{1000.5 + i:.2f}"))
+        blocks, tables = pdfio._reconstruct_ocr_grid(items)
+        self.assertEqual(1, len(tables))
+        self.assertTrue(blocks)
+        by_text = {b.text: b for b in blocks}
+        self.assertEqual("right", by_text["1000"].align)
+        self.assertEqual("right", by_text["1000.50"].align)
+
+    def test_note_marker_column_does_not_make_a_prose_page_a_table(self):
+        # P1-7: a column of ``(1)(2)…`` note markers (or bare ``1..8`` list numbers)
+        # made a two-column scanned PROSE page look like a table; with
+        # ``redraw_ocr`` on, the page was then blank-redrawn and the scan's raster
+        # background was lost for good.
+        for marker in (lambda n: f"({n})", str):
+            with self.subTest(marker=marker(1)):
+                items = []
+                for i in range(8):
+                    y0, y1 = 100.0 + 14 * i, 108.0 + 14 * i
+                    items.append((y0, 60, 90, y1, marker(i + 1)))
+                    items.append((y0, 120, 420, y1,
+                                  "The Group recorded revenue growth during the year"))
+                    items.append((y0, 440, 740, y1,
+                                  "operating expenses increased accordingly"))
+                blocks, tables = pdfio._reconstruct_ocr_grid(items)
+                self.assertEqual([], tables)
+                self.assertEqual([], blocks)   # caller falls back to plain blocks
+        # The same shape with a real figures column is still a table.
+        items = []
+        for i in range(8):
+            y0, y1 = 100.0 + 14 * i, 108.0 + 14 * i
+            items.append((y0, 60, 300, y1, f"营业收入项目{i + 1}"))
+            items.append((y0, 340, 500, y1, f"{1000 + i:,}.00"))
+        _blocks, tables = pdfio._reconstruct_ocr_grid(items)
+        self.assertEqual(1, len(tables))
+
     def test_reconstruct_ocr_tables_rejects_a_prose_page(self):
         # A two-column scanned PROSE page lines up into rows/columns but has no
         # figures column.  Without the same numeric-column guard the grid
@@ -1494,10 +1553,10 @@ class OcrGridTest(unittest.TestCase):
         # ``fit_height == 0`` = "no band / wrap unbounded" and their 2-3 line wrap
         # crossed the grid line below (542 of 824 cells on the real p24-27 scan).
         #
-        # v0.5.36: the band is also floored at the cell's own glyph height — the
-        # source text demonstrably fit there, and a "next row" that starts inside
-        # this box (a tall label beside short numeric cells) used to squeeze the
-        # translation to 3 pt when 4.5 pt was available.
+        # v0.5.40: the band is the REAL gap to the next row.  v0.5.36 had floored it
+        # at the cell's own glyph height, which inflated the *wrap* budget and let a
+        # second line run into the next row's space; the too-tight cell now gets ONE
+        # line at the glyph-height size instead (see ``_fit_block``).
         items = [
             (100.0, 78, 300, 109.6, "现金及存放中央银行款项"),
             (100.0, 320, 420, 109.6, "17,485,938,749.91"),
@@ -1509,19 +1568,21 @@ class OcrGridTest(unittest.TestCase):
         blocks, _ = pdfio._reconstruct_ocr_grid(items)
         by_text = {b.text: b for b in blocks}
         cell = by_text["现金及存放中央银行款项"]
-        self.assertGreaterEqual(
-            cell.fit_height, cell.y1 - cell.y0 - 0.01)   # at least its own height
-        self.assertLess(cell.fit_height, 165.0)          # never into the next row
+        # The band is the row pitch, nothing more: next row's top − y0 − 1.5.
+        self.assertAlmostEqual(cell.fit_height, 109.8 - 100.0 - 1.5, delta=0.2)
+        self.assertLess(cell.fit_height, cell.y1 - cell.y0)   # tighter than the box
         self.assertEqual(0.0, by_text["发放贷款和垫款"].fit_height)   # last row
-        # The wrap (or the single line chosen instead) must stay inside the band.
         font = fitz.Font("cjk")
         long_text = ("Cash and balances with the central bank and due from banks "
                      "and other financial institutions")
         lines, fs = pdfio._fit_block(cell, font, long_text)
         height = pdfio._wrapped_height(
             font, lines, fs, pdfio._line_leading(font, in_table=True, n_lines=len(lines)))
-        self.assertLessEqual(height, cell.fit_height + 0.05,
-                             (lines, fs, cell.fit_height))
+        # Either the wrap fits the band, or the fitter fell back to ONE line (a wide
+        # line into the neighbouring blank space beats a second line crossing the
+        # rule) — never a multi-line wrap that overflows the band.
+        self.assertTrue(len(lines) == 1 or height <= cell.fit_height + 0.05,
+                        (lines, fs, cell.fit_height))
 
     def test_grid_label_fit_width_stops_before_the_note_marker(self):
         # A row with the 附注 "(二)" band inside the label column: the label
@@ -1581,6 +1642,69 @@ class OcrGridTest(unittest.TestCase):
         self.assertIn("拆出资金", texts)
         self.assertIn("(二)", texts)
         self.assertNotEqual(texts.index("拆出资金"), texts.index("(二)"))
+
+
+class OcrBoxValidationTest(unittest.TestCase):
+    """A malformed OCR box costs that one item — never the page or the export.
+
+    Regression: a NaN/inf coordinate was copied straight into ``Block`` and the
+    export later died with ``ValueError: cannot convert float NaN to integer``
+    (after the model had already translated the whole document), while a box
+    shaped ``[x0, y0, x1, y1]`` (a VLM backend's format) raised ``TypeError``,
+    which ``_ocr_page_blocks`` swallowed as "OCR failed" — the page's *other*
+    blocks were discarded with it.
+    """
+
+    _GOOD = ([(0.0, 0.0), (80.0, 0.0), (80.0, 10.0), (0.0, 10.0)], "GOOD ONE")
+
+    def test_non_finite_boxes_are_skipped(self):
+        log: list[str] = []
+        items = [
+            self._GOOD,
+            ([(float("nan"), 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], "NAN BOX"),
+            ([(0.0, 0.0), (float("inf"), 0.0), (1.0, 1.0), (0.0, 1.0)], "INF BOX"),
+        ]
+        blocks = pdfio._synthesize_ocr_blocks(items, 0, log.append)
+        self.assertEqual(["GOOD ONE"], [b.text for b in blocks])
+        self.assertTrue(any("非法" in m for m in log), log)
+
+    def test_flat_box_does_not_discard_the_page(self):
+        log: list[str] = []
+        items = [self._GOOD, ([1.0, 1.0, 2.0, 2.0], "FLAT BOX")]
+        blocks = pdfio._synthesize_ocr_blocks(items, 0, log.append)
+        self.assertEqual(["GOOD ONE"], [b.text for b in blocks])
+
+    def test_export_survives_a_nan_box(self):
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((20, 40), "PLACEHOLDER", fontsize=12)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.pdf"
+            out = Path(tmp) / "out.pdf"
+            doc.save(str(src))
+            doc.close()
+
+            def ocr_fn(_i, _p):
+                return [
+                    ([(20.0, 20.0), (200.0, 20.0), (200.0, 40.0), (20.0, 40.0)], "OCR LINE"),
+                    ([(float("nan"), 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], "NAN BOX"),
+                ]
+
+            dt = pdfio.extract_document_text(str(src), ocr=True, ocr_fn=ocr_fn,
+                                             log=lambda _m: None)
+            texts = [b.text for b in dt.pages[0]]
+            self.assertIn("OCR LINE", texts)
+            self.assertNotIn("NAN BOX", texts)
+            # The export used to raise here (NaN → int); it must produce a file.
+            per_page = [[f"T:{b.text}" for b in dt.pages[0]]]
+            pdfio.save_translated_pdf(str(src), dt.pages, per_page, str(out),
+                                      "English", log=lambda _m: None)
+            self.assertTrue(out.exists())
+            check = fitz.open(str(out))
+            try:
+                self.assertIn("OCR LINE", check[0].get_text())
+            finally:
+                check.close()
 
 
 class NumberAtomicityTest(unittest.TestCase):
@@ -1661,6 +1785,30 @@ class NumberAtomicityTest(unittest.TestCase):
                 lines: list[str] = []
                 rest = pdfio._break_word(font, token, 10.0, 6.0, lines)
                 self.assertTrue(lines or rest != token, token)
+
+    def test_amounts_are_never_split_by_the_line_rebalancer(self):
+        # Regression: ``_split_line_half`` checked only ``_is_number_atom``, so the
+        # rebalancer (which forces the translation onto exactly the source line
+        # count) cut a currency/unit amount in half — ``US$1,23`` + ``4,567.89``
+        # reads as two figures, the exact failure the atomicity rule forbids.
+        for line in ("US$1,234,567.89", "1,234.56万元", "RMB12,345,678.90",
+                     "12,345,678.90元"):
+            with self.subTest(line=line):
+                self.assertIsNone(pdfio._split_line_half(line))
+        # A prose line that merely *contains* an amount still splits at its space.
+        self.assertEqual(
+            pdfio._split_line_half("Total liabilities 1,234,567.89元"),
+            ("Total liabilities", "1,234,567.89元"),
+        )
+
+    def test_two_line_cell_keeps_a_currency_amount_whole(self):
+        # The same path end to end: a two-line source cell whose translation is one
+        # long amount must not come back as two half-amounts.
+        font = fitz.Font("cjk")
+        block = pdfio.Block(text="a\nb", page=0, x0=0.0, y0=0.0, x1=90.0, y1=20.0,
+                            size=9.0, in_table=True, single_line=False)
+        lines, _fs = pdfio._fit_block(block, font, "US$1,234,567.89")
+        self.assertEqual(["US$1,234,567.89"], lines)
 
 
 class VerticalLabelTest(unittest.TestCase):
@@ -2117,6 +2265,91 @@ class RotatedPageOcrTest(unittest.TestCase):
             self.assertAlmostEqual(float(expected.y), b.y0, delta=1.0)
         finally:
             doc.close()
+
+
+class RotatedFrameTest(unittest.TestCase):
+    """``_rot_map_rect`` / ``_photo_ocr_blocks`` must agree with the rendered frame.
+
+    ``get_pixmap`` renders the *displayed* (rotated) cropbox; block coordinates are
+    the unrotated cropbox frame.  Two regressions lived here: the map used the
+    mediabox dimensions (wrong whenever a CropBox crops the sheet), and
+    ``_photo_ocr_blocks`` sampled the unrotated box directly on a rotated page —
+    reading white paper under a photo and drawing the cover straight over it.
+    """
+
+    def _text_page(self, rot: int = 0, crop: bool = False):
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=500)
+        page.insert_text((60, 450), "BOTTOM LABEL", fontsize=14)
+        if crop:
+            page.set_cropbox(fitz.Rect(30, 80, 270, 470))
+        if rot:
+            page.set_rotation(rot)
+        return doc, page
+
+    def test_rot_map_matches_the_rendered_ink(self):
+        for rot in (0, 90, 180, 270):
+            for crop in (False, True):
+                with self.subTest(rot=rot, crop=crop):
+                    doc, page = self._text_page(rot, crop)
+                    try:
+                        box = fitz.Rect(page.get_text("dict")["blocks"][0]["bbox"])
+                        mapped = pdfio._rot_map_rect(box, page)
+                        luma = pdfio._pixmap_luma(page.get_pixmap(dpi=72))
+                        ys, xs = (luma < 128).nonzero()
+                        ink = fitz.Rect(xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+                        for got, want in ((mapped.x0, ink.x0), (mapped.y0, ink.y0),
+                                          (mapped.x1, ink.x1), (mapped.y1, ink.y1)):
+                            self.assertAlmostEqual(got, want, delta=8.0)
+                    finally:
+                        doc.close()
+
+    def _photo_page(self, rot: int = 0):
+        doc = fitz.open()
+        page = doc.new_page(width=200, height=400)
+        pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 120, 120))
+        pix.set_rect(pix.irect, (40, 60, 200))
+        page.insert_image(fitz.Rect(0, 0, 100, 200), pixmap=pix)
+        if rot:
+            page.set_rotation(rot)
+        return doc, page
+
+    def test_photo_cover_is_skipped_on_every_rotation(self):
+        for rot in (0, 90, 180, 270):
+            with self.subTest(rot=rot):
+                doc, page = self._photo_page(rot)
+                try:
+                    block = pdfio.Block(text="photo caption", page=0, x0=10.0, y0=10.0,
+                                        x1=90.0, y1=30.0, size=10.0, ocr=True)
+                    luma = pdfio._pixmap_luma(page.get_pixmap(dpi=pdfio._PHOTO_SAMPLE_DPI))
+                    levels = pdfio._page_levels(luma, luma.shape[1] / page.rect.width)
+                    self.assertEqual(
+                        {0}, pdfio._photo_ocr_blocks(page, [block], luma=luma, levels=levels),
+                        "the white cover would be drawn over the photo",
+                    )
+                finally:
+                    doc.close()
+
+    def test_vertical_label_stays_in_its_box_on_a_rotated_page(self):
+        # Regression: the run's on-page clamp used ``page.rect`` (the rotated
+        # view), so on a /Rotate 90 page a label at y=300..390 was pushed up to
+        # y≈160 — 187pt away from the box it labels.
+        font = fitz.Font("cjk")
+        for rot in (0, 90):
+            with self.subTest(rot=rot):
+                doc = fitz.open()
+                page = doc.new_page(width=200, height=400)
+                if rot:
+                    page.set_rotation(rot)
+                block = pdfio.Block(text="", page=0, x0=10.0, y0=300.0,
+                                    x1=18.0, y1=390.0, size=10.0, single_line=True)
+                pdfio._draw_vertical_label(page, font, block, "竖排标签文字")
+                words = page.get_text("words")
+                self.assertTrue(words, "nothing drawn")
+                for w in words:
+                    self.assertGreaterEqual(w[1], block.y0 - 1.0, w)
+                    self.assertLessEqual(w[3], block.y1 + 1.0, w)
+                doc.close()
 
 
 class LineArtPreservationTest(unittest.TestCase):
@@ -2991,6 +3224,65 @@ class TablePageBottomClampTest(unittest.TestCase):
         self.assertEqual(free[0], clamped[0])
         self.assertEqual(free[1], clamped[1])
 
+    def test_export_passes_the_cropbox_height(self):
+        # Regression: the exporter passed ``page.cropbox.y1`` (which includes the
+        # cropbox's origin) while the block boxes are cropbox-*relative*, so a
+        # CropBox that crops a scanned book made the limit too large and the clamp
+        # never fired — the last rows were drawn past the sheet.
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=500)
+        page.insert_text((60, 60), "TABLE CELL TEXT", fontsize=11)
+        page.set_cropbox(fitz.Rect(20, 40, 380, 460))          # height 420, y1 460
+        src = _OUT / "crop_table_src.pdf"
+        doc.save(str(src))
+        doc.close()
+        dt = pdfio.extract_document_text(str(src), log=lambda _m: None)
+        block = dt.pages[0][0]
+        fake_table = {
+            "bbox": fitz.Rect(block.x0, block.y0, block.x1, block.y1),
+            "rows": [[fitz.Rect(block.x0, block.y0, block.x1, block.y1)]],
+            "col_edges": [block.x0, block.x1],
+        }
+        seen: dict = {}
+
+        def fake_layout(tables, mapping, blocks, trans, font, *,
+                        page_height=None, log=None):
+            seen["page_height"] = page_height
+            return {}, {}, [], []
+
+        with mock.patch.object(pdfio, "_extract_tables", return_value=[fake_table]), \
+             mock.patch.object(pdfio, "_map_blocks_to_table_cells",
+                               return_value={0: (0, 0, 0)}), \
+             mock.patch.object(pdfio, "_compute_table_layout", side_effect=fake_layout):
+            pdfio.save_translated_pdf(str(src), dt.pages, [["TRANSLATED"]],
+                                      str(_OUT / "crop_table_out.pdf"), "English",
+                                      log=lambda _m: None)
+        self.assertAlmostEqual(420.0, seen.get("page_height", -1), places=1)
+
+    def test_ocr_grid_redraw_stays_on_the_page(self):
+        # Regression: ``_draw_ocr_grid_page`` grows rows monotonically with no
+        # bottom clamp.  The redraw starts from a *blank* page, so a row pushed
+        # past the edge is lost with no trace.
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        blocks: list[pdfio.Block] = []
+        trans: list[str] = []
+        long = "A very long translated table cell that must wrap over several lines "
+        for r in range(3):
+            for c in range(2):
+                x0 = 20.0 + c * 140.0
+                y0 = 170.0 + r * 8.0
+                blocks.append(pdfio.Block(
+                    text=f"cell {r}{c}", page=0, x0=x0, y0=y0, x1=x0 + 120.0,
+                    y1=y0 + 7.0, size=7.0, ocr=True, in_table=True))
+                trans.append(long * 2)
+        logs: list[str] = []
+        pdfio._draw_ocr_grid_page(page, blocks, trans, fitz.Font("cjk"), logs.append)
+        for blk in page.get_text("dict")["blocks"]:
+            self.assertLessEqual(blk["bbox"][3], 200.0 + 0.5, blk["bbox"])
+        self.assertTrue(any("超出页底" in m for m in logs), logs)
+        doc.close()
+
 
 class BorderlessTableTest(unittest.TestCase):
     """P1-1: a table without ruling lines must still get cell geometry — the
@@ -3193,6 +3485,248 @@ class PureOcrTablePageTest(unittest.TestCase):
     def test_furniture_predicate_rejects_long_text(self):
         self.assertFalse(pdfio._is_page_furniture(
             self._cell(text="1 2 3 4 5 6 7 8 9", ocr=False)))
+
+
+class FigureTextTest(unittest.TestCase):
+    """Text baked into a **raster figure on a page with its own text layer**.
+
+    ``extract_document_text`` only OCR'd pages with no / almost no text layer, so a
+    figure's labels were neither in the text layer nor recognised: a real 5-page
+    paper kept its chart's English title and axis labels in the Chinese output,
+    pixel for pixel.  These tests inject ``ocr_fn`` (the existing seam) so they stay
+    offline and deterministic.
+    """
+
+    #: Box inside the image region of ``_mixed_page`` (the "figure label").
+    _LABEL_BOX = [(70.0, 270.0), (210.0, 270.0), (210.0, 286.0), (70.0, 286.0)]
+
+    @staticmethod
+    def _raster(text: str, *, dark: bool = False) -> bytes:
+        """A PNG panel with ``text`` on it (``dark`` = a photo-like background)."""
+        doc = fitz.open()
+        page = doc.new_page(width=160, height=80)
+        page.draw_rect(fitz.Rect(0, 0, 160, 80), color=None,
+                       fill=(0.05, 0.05, 0.08) if dark else (1, 1, 1))
+        page.insert_text((12, 34), text, fontsize=12,
+                         color=(1, 1, 1) if dark else (0, 0, 0))
+        png = page.get_pixmap(dpi=150).tobytes("png")
+        doc.close()
+        return png
+
+    def _mixed_page(self, path: Path, *, dark: bool = False) -> None:
+        """A page that is *not* sparse (so the whole-page OCR branch stays out)."""
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=460)
+        page.insert_textbox(
+            fitz.Rect(40, 40, 360, 220),
+            " ".join(["Prose line of the source document."] * 20),
+            fontsize=10,
+        )
+        page.insert_image(fitz.Rect(60, 260, 340, 400),
+                          stream=self._raster("CHART LABEL", dark=dark))
+        doc.save(str(path))
+        doc.close()
+
+    def _ocr_fn(self, *extra):
+        def fn(_page_index, _page):
+            return [(self._LABEL_BOX, "CHART LABEL"), *extra]
+        return fn
+
+    def test_figure_text_on_paper_becomes_an_in_image_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mixed.pdf"
+            self._mixed_page(src)
+            outside = ([(40.0, 60.0), (220.0, 60.0), (220.0, 76.0), (40.0, 76.0)],
+                       "OUTSIDE BOX")
+            dt = pdfio.extract_document_text(
+                str(src), ocr=True, ocr_fn=self._ocr_fn(outside),
+                log=lambda _m: None,
+            )
+            texts = [b.text for b in dt.pages[0]]
+            self.assertIn("CHART LABEL", texts)
+            # A box outside every image region must not be adopted: the page's own
+            # text layer is authoritative there.
+            self.assertNotIn("OUTSIDE BOX", texts)
+            figures = [b for b in dt.pages[0] if b.in_image]
+            self.assertEqual(["CHART LABEL"], [b.text for b in figures])
+            self.assertTrue(figures[0].ocr)
+            self.assertEqual(0, figures[0].image_index)
+            # The extraction records the setting: a later "重新导出" compares it
+            # before reusing this document (see TranslateWorker._run_re_export).
+            self.assertIs(True, dt.image_text)
+            # A figure must never be a table cell: the grid reconstruction would
+            # read a chart's numbers as a statement and re-lay it out.
+            self.assertFalse(figures[0].in_table)
+
+    def test_figure_text_on_a_photo_is_left_alone(self):
+        # A photo's pixels are the content: no block, no cover (fail-closed).
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "photo.pdf"
+            self._mixed_page(src, dark=True)
+            logs: list[str] = []
+            dt = pdfio.extract_document_text(
+                str(src), ocr=True, ocr_fn=self._ocr_fn(), log=logs.append,
+            )
+            self.assertEqual([], [b for b in dt.pages[0] if b.in_image])
+            self.assertTrue(any("保留原样" in m for m in logs), logs)
+
+    def test_figure_text_is_not_extracted_without_ocr(self):
+        # ``image_text`` follows ``ocr``: a caller that asked for no OCR must not
+        # get figure blocks either (the review / check scripts rely on this).
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mixed.pdf"
+            self._mixed_page(src)
+            dt = pdfio.extract_document_text(
+                str(src), ocr=False, ocr_fn=self._ocr_fn(), log=lambda _m: None,
+            )
+            self.assertEqual([], [b for b in dt.pages[0] if b.in_image])
+
+    def test_the_option_can_turn_figure_text_off(self):
+        # The GUI checkbox passes image_text=False while OCR itself stays on: the
+        # figure's text must then be left completely alone (pre-v0.5.44 behaviour).
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mixed.pdf"
+            self._mixed_page(src)
+            dt = pdfio.extract_document_text(
+                str(src), ocr=True, ocr_fn=self._ocr_fn(), image_text=False,
+                log=lambda _m: None,
+            )
+            self.assertEqual([], [b for b in dt.pages[0] if b.in_image])
+            self.assertIs(False, dt.image_text)
+            # The semantic (IR-mode) entry point forwards the same flag — the
+            # option has to work on the IR pipeline too, not just plain extraction.
+            st = pdfio.extract_document_structured(
+                str(src), parser="geo", ocr=True, ocr_fn=self._ocr_fn(),
+                image_text=False, log=lambda _m: None,
+            )
+            self.assertEqual([], [b for b in st.pages[0] if b.in_image])
+            self.assertIs(False, st.image_text)
+
+    def test_export_replaces_figure_text_and_keeps_the_figure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mixed.pdf"
+            out = Path(tmp) / "out.pdf"
+            self._mixed_page(src)
+            dt = pdfio.extract_document_text(
+                str(src), ocr=True, ocr_fn=self._ocr_fn(), log=lambda _m: None,
+            )
+            per_page = [[(f"图:{b.text}" if b.in_image else f"T:{b.text}")
+                         for b in dt.pages[0]]]
+            pdfio.save_translated_pdf(str(src), dt.pages, per_page, str(out),
+                                      "Simplified Chinese", log=lambda _m: None)
+
+            def pixels(path, rect):
+                with fitz.open(str(path)) as doc:
+                    pix = doc[0].get_pixmap(clip=fitz.Rect(*rect), dpi=150,
+                                            alpha=False)
+                return pix.samples
+
+            with fitz.open(str(out)) as chk:
+                self.assertEqual(1, len(chk[0].get_image_info()),
+                                 "the figure itself must survive")
+                self.assertIn("图:", chk[0].get_text())
+            label = (70.0, 270.0, 210.0, 286.0)
+            self.assertNotEqual(pixels(src, label), pixels(out, label),
+                                "the figure's baked-in text must be covered")
+            # Far from any text: the picture's own pixels must be untouched (the
+            # scan path's measured ink bands would have painted the chart out).
+            quiet = (300.0, 370.0, 338.0, 398.0)
+            self.assertEqual(pixels(src, quiet), pixels(out, quiet),
+                             "the rest of the figure must be untouched")
+
+
+class FigureTextRoleTest(unittest.TestCase):
+    """A figure's OCR'd text must not inherit the figure region's protected role.
+
+    The semantic layer marks a detected figure as ``role="figure"``, which the IR
+    translator reads as "keep the source" (it exists to protect the *picture*).
+    Claiming the text we recovered from inside that picture handed it the same
+    role, so with the DocLayout backend (real figure regions) a chart's labels
+    came out verbatim English in a Chinese export — 334 Latin chars, 0 CJK —
+    while the geometric backend (no figure region) translated them.
+    """
+
+    _BOX = [(70.0, 270.0), (210.0, 270.0), (210.0, 286.0), (70.0, 286.0)]
+
+    def _mixed(self, path: Path) -> None:
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=460)
+        page.insert_textbox(fitz.Rect(40, 40, 360, 220),
+                            " ".join(["Prose line of the source document."] * 20),
+                            fontsize=10)
+        panel = fitz.open()
+        panel_page = panel.new_page(width=160, height=80)
+        panel_page.draw_rect(fitz.Rect(0, 0, 160, 80), color=None, fill=(1, 1, 1))
+        panel_page.insert_text((12, 34), "CHART LABEL", fontsize=12)
+        png = panel_page.get_pixmap(dpi=150).tobytes("png")
+        panel.close()
+        page.insert_image(fitz.Rect(60, 260, 340, 400), stream=png)
+        doc.save(str(path))
+        doc.close()
+
+    def test_a_figure_region_does_not_claim_the_pictures_own_text(self):
+        import translate_app.ir as ir_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mixed.pdf"
+            self._mixed(src)
+
+            def ocr_fn(_i, _p):
+                return [(self._BOX, "CHART LABEL")]
+
+            dt = pdfio.extract_document_text(str(src), ocr=True, ocr_fn=ocr_fn,
+                                             log=lambda _m: None)
+            figure_idx = [i for i, b in enumerate(dt.pages[0])
+                          if getattr(b, "in_image", False)]
+            self.assertEqual(1, len(figure_idx))
+            flat = figure_idx[0]
+
+            # A semantic backend reports the picture as a figure region covering it.
+            def structure_fn(_page_index, page, blocks):
+                return [{"kind": "figure",
+                         "bbox": list(page.get_image_info()[0]["bbox"]),
+                         "block_indices": [flat]}]
+
+            pdfio.build_structure(str(src), dt, structure_fn, parser="test")
+            structure = dt.page_structure[0]
+            elements = [e for e in structure.elements if e["kind"] == "figure"]
+            self.assertEqual(1, len(elements), structure.elements)
+            self.assertEqual([], elements[0]["block_indices"],
+                             "图内文字块不属于「图片本体」")
+            # …so the IR role stays ordinary text and the block gets translated.
+            self.assertEqual(("text", 0), ir_mod._role_of(flat, structure))
+
+    def test_the_ir_gate_translates_an_in_image_block_anyway(self):
+        # Fail-safe at the decision point: even if a role says "figure", a block
+        # whose text came out of the picture is sent to the translator.
+        import translate_app.ir as ir_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "mixed.pdf"
+            self._mixed(src)
+
+            def ocr_fn(_i, _p):
+                return [(self._BOX, "CHART LABEL")]
+
+            dt = pdfio.extract_document_text(str(src), ocr=True, ocr_fn=ocr_fn,
+                                             log=lambda _m: None)
+            irdoc = ir_mod.build_ir(dt, lang="Simplified Chinese")
+            target = None
+            for ipage in irdoc.pages:
+                for b in ipage.blocks:
+                    if getattr(b.anchor, "in_image", False):
+                        b.role = "figure"        # force the protected role
+                        target = b.text
+            self.assertTrue(target)
+            seen: list[str] = []
+
+            def translate_fn(texts, _lang=None, **_kw):
+                seen.extend(texts)
+                return [f"译:{t}" for t in texts]
+
+            out = ir_mod.translate_ir(irdoc, translate_fn, lang="Simplified Chinese",
+                                      group_prose=False)
+            self.assertIn(target, seen, "图内文字必须进入翻译请求")
 
 
 if __name__ == "__main__":

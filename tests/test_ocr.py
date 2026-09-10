@@ -159,11 +159,18 @@ class NumberNormalizationTest(unittest.TestCase):
         # P1-5: ``_is_numeric_cell`` tests the repaired form too, so a mangled
         # accounting negative keeps its right alignment and its "never send to the
         # model" protection instead of being treated as prose.
+        # v0.5.40: an *ungrouped* figure (``1000``, ``1234.56``, a date-like
+        # ``1960.08``) is a figure too — the old grouped-only pattern rejected it,
+        # and a whole column of such values then failed ``_is_numeric_column`` so
+        # the scanned table was rebuilt as prose.
         for text in ("(3,702.726,474.45)", "(65, 334, 085.99)", "（1,234.56）",
-                     "(1,234.56)", "-60,327,958.12"):
+                     "(1,234.56)", "-60,327,958.12", "1000", "1234.56", "1960.08"):
             with self.subTest(text=text):
                 self.assertTrue(pdfio._is_numeric_cell(text))
-        for text in ("—", "营业收入", "1960.08", "1,234.56万元", "(1,234.56万元)"):
+        # Note / ordinal markers are labels, not figures (a prose page with a
+        # numbered column used to look like a table).
+        for text in ("—", "营业收入", "1,234.56万元", "(1,234.56万元)",
+                     "(1)", "（1）", "(二)", "八)"):
             with self.subTest(text=text):
                 self.assertFalse(pdfio._is_numeric_cell(text))
 
@@ -450,6 +457,27 @@ class OcrExtractionTest(_TempOcrCacheMixin, unittest.TestCase):
         ocr = [blk("some raster text", 80, 90, 200, 110)]
         merged = [b.text for b in pdfio._merge_ocr_blocks(title, ocr)]
         self.assertEqual(["LOGO AND TITLE ART", "some raster text"], merged)
+
+    def test_sparse_merge_drops_ocr_lines_inside_a_merged_text_block(self):
+        # P1-8: the text layer merges a multi-line title into ONE block while OCR
+        # returns one block per line.  Exact text equality missed, so the title was
+        # added a second time (duplicate text in Markdown / plain-text exports and
+        # two overlapping blocks in the PDF).
+        def blk(text, x0, y0, x1, y1, ocr=True):
+            return pdfio.Block(text=text, page=0, x0=x0, y0=y0, x1=x1, y1=y1,
+                               size=12.0, single_line=not ocr, ocr=ocr)
+
+        title = [blk("Annual Report 2025 Mintai Commercial Bank",
+                     72, 70, 300, 120, ocr=False)]
+        ocr = [
+            blk("Annual Report 2025", 74, 72, 250, 90),
+            blk("Mintai Commercial Bank", 74, 95, 300, 115),
+            blk("LOGO TEXT", 80, 210, 260, 240),
+        ]
+        texts = [b.text for b in pdfio._merge_ocr_blocks(title, ocr)]
+        self.assertEqual(1, sum(1 for t in texts if "Annual Report 2025" in t), texts)
+        self.assertNotIn("Mintai Commercial Bank", texts)
+        self.assertIn("LOGO TEXT", texts)
 
     def test_bottom_caption_in_a_tall_box_is_not_a_signature(self):
         # P1-7: the old rule (tall + bottom band + has a letter) dropped a footer

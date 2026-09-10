@@ -203,10 +203,17 @@ def _amounts(text: str) -> tuple[Counter[str], Counter[Decimal]]:
         mult = _unit_multiplier(unit_win)
         currency = bool(_CURRENCY_RE.match(unit_win))
         has_sep = any(ch in ",.%" for ch in tok)
+        # A leading parenthesis is an accounting negative (``（1,234.56）``): the
+        # sign lives outside the token, so without this a lost negative compared
+        # equal to the positive value (and ``%`` was dropped for the same reason —
+        # ``Decimal("92.5%")`` raises and the token got *no* value at all, so a
+        # percentage that changed by 10× was reported as "consistent").
+        paren_neg = m.start() > 0 and t[m.start() - 1] in "(（"
         if not (has_sep or mult != 1 or currency):
             continue                      # bare integer without a unit: not a figure
+        pct = tok.endswith("%")
         canonical: list[str] = []
-        neg = False
+        neg = paren_neg
         for ch in tok:
             if ch.isdigit():
                 canonical.append(ch)
@@ -218,47 +225,47 @@ def _amounts(text: str) -> tuple[Counter[str], Counter[Decimal]]:
                 neg = True
         if canonical:
             roles[("M" if neg else "") + "".join(canonical)] += 1
+        number = tok[:-1] if pct else tok
         try:
-            values[Decimal(tok.replace(",", "")) * mult] += 1
+            value = abs(Decimal(number.replace(",", ""))) * mult
         except InvalidOperation:
             # A separator-swapped token (``3,702.726,474.45`` → ``3702.726474.45``)
             # has no value: it stays unmatched at the value level too, so the swap
             # is still reported (and never silently "explained away").
             continue
+        # ``neg`` already covers the token's own ``-`` *and* an accounting
+        # parenthesis, so apply it once to the absolute value.
+        values[-value if neg else value] += 1
     return roles, values
 
 
 def _numeric_diff(src_text: str, tgt_text: str) -> list[str]:
     """Human-readable differences between the two pages' amounts (empty = clean).
 
-    A token is only reported when it is unmatched **both** by separator pattern
-    and by value: an equivalent value rendered differently (unit conversion,
-    full-width digits, a comma/dot style change) is not a number defect, while a
-    dropped/altered/invented digit, or a separator swap, changes the value or the
-    pattern and is still reported.
+    The comparison is **by value**: ``3.14 亿元`` and ``314 million yuan`` are the
+    same figure, ``1,234.56`` and ``1234.56`` differ only in style, and a
+    full-width ``１，２３４．５６`` is the same number — none of those is a defect.
+    A dropped/altered/invented digit, a lost unit multiplier (``1,234.56 万元`` vs
+    ``1,234.56 yuan``), a lost sign (``（1,234.56）`` vs ``1,234.56``) or a
+    separator swap (which leaves the token unparsable) changes the value and is
+    reported.
+
+    The separator-role view is deliberately *not* a gate any more: the roles of
+    ``1,234.56 万元`` and ``1,234.56 yuan`` are identical (the unit is not part of
+    the token), so the old "roles equal → clean" short-circuit skipped the value
+    check and reported a translation that dropped the 万 multiplier as consistent.
     """
-    src_roles, src_vals = _amounts(src_text)
-    tgt_roles, tgt_vals = _amounts(tgt_text)
-    only_src_roles = src_roles - tgt_roles
-    only_tgt_roles = tgt_roles - src_roles
-    if not only_src_roles and not only_tgt_roles:
-        return []
+    _src_roles, src_vals = _amounts(src_text)
+    _tgt_roles, tgt_vals = _amounts(tgt_text)
     only_src_vals = src_vals - tgt_vals
     only_tgt_vals = tgt_vals - src_vals
     if not only_src_vals and not only_tgt_vals:
         return []                        # same values, different surface form
     diffs: list[str] = []
-    if only_src_vals or only_tgt_vals:
-        for value, n in only_src_vals.most_common():
-            diffs.append(f"原文 {n} 次「{value}」在译文中缺失")
-        for value, n in only_tgt_vals.most_common():
-            diffs.append(f"译文多出 {n} 次「{value}」（不在原文中出现）")
-        return diffs
-    # Values agree but the separator pattern does not: a comma/dot swap.
-    for key, n in only_src_roles.most_common():
-        diffs.append(f"原文 {n} 次「{key}」在译文中缺失")
-    for key, n in only_tgt_roles.most_common():
-        diffs.append(f"译文多出 {n} 次「{key}」（不在原文中出现）")
+    for value, n in only_src_vals.most_common():
+        diffs.append(f"原文 {n} 次「{value}」在译文中缺失")
+    for value, n in only_tgt_vals.most_common():
+        diffs.append(f"译文多出 {n} 次「{value}」（不在原文中出现）")
     return diffs
 
 
@@ -456,6 +463,17 @@ class Checker:
                 "可能漏页。"
             )
 
+    def _check_residual(self, tgt_text: str, where: str) -> None:
+        """Report CJK left in a Western-target translation (needs only text)."""
+        if _has_cjk(self.lang):
+            return
+        residual = _cjk_residual(tgt_text)
+        if residual:
+            self.cjk.append(
+                f"{where}: 残留 {len(residual)} 个中文字符"
+                f"（如 {''.join(residual[:8])}…）：{_snippet(tgt_text)}"
+            )
+
     def _check_page(
         self, src_page: fitz.Page, tgt_page: fitz.Page, i: int, skip_scan: bool
     ) -> str:
@@ -463,7 +481,11 @@ class Checker:
         src_text = src_page.get_text("text") or ""
         tgt_text = tgt_page.get_text("text") or ""
         if skip_scan and _is_scan_like_text(src_text):
-            return "mixed"  # 扫描页（文本层仅页码/无内容）：数字来自 OCR，不能作为基准
+            # 扫描页（文本层仅页码/无内容）：数字来自 OCR / 重排，不能作为基准。
+            # 但「残留中文」只需要译文文本 —— 整页早退曾把它一起跳过（真机样例
+            # 译文第 2 页 750 个残留汉字未被报出、exit 0）。
+            self._check_residual(tgt_text, where)
+            return "mixed"
 
         # 1) 数字一致性：按「值」比较（单位倍率、全角数字、千分位风格差异不算错），
         #    并保留分隔符角色比较以抓千分位/小数点错乱。先归一化中文序数（一、→1.、
@@ -478,13 +500,7 @@ class Checker:
 
         # 2) 残留中文（仅西文目标）。报表/科目号（会商银02表、会企01表-1）按规则保留
         #    不翻译，对其 CJK 不报残留（它们是精确标识，不是漏译）。
-        if not _has_cjk(self.lang):
-            residual = _cjk_residual(tgt_text)
-            if residual:
-                self.cjk.append(
-                    f"{where}: 残留 {len(residual)} 个中文字符"
-                    f"（如 {''.join(residual[:8])}…）：{_snippet(tgt_text)}"
-                )
+        self._check_residual(tgt_text, where)
 
         # 3) 章节编号：序列对比（值）＋ 风格标签（本页）。
         src_sections = _section_numbers(src_text)
