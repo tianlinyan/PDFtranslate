@@ -3092,6 +3092,10 @@ def _covered_ratio(block: Block, cover: Block) -> float:
 #: An OCR block whose own box is covered at least this much by a text-layer block
 #: holding the SAME text is the text layer re-read: a duplicate, dropped.
 _MERGE_DUP_COVER = 0.5
+#: The reverse direction: a text-layer block this well covered by an OCR block of
+#: the *identical* text is the same glyphs re-read in a bigger box (a banner the
+#: OCR box fills).
+_MERGE_DUP_CONTAIN = 0.9
 
 
 def _merge_ocr_blocks(text_blocks: Sequence[Block], ocr_blocks: Sequence[Block]) -> list[Block]:
@@ -3134,10 +3138,25 @@ def _merge_ocr_blocks(text_blocks: Sequence[Block], ocr_blocks: Sequence[Block])
         text = _norm(b.text)
         if not text:
             continue
-        if any(
-            _same_text(text, _norm(t.text)) and _covered_ratio(b, t) >= _MERGE_DUP_COVER
-            for t in text_blocks
-        ):
+        dup = False
+        for t in text_blocks:
+            t_text = _norm(t.text)
+            if not _same_text(text, t_text):
+                continue
+            # The usual case: the OCR re-read the text layer's own glyphs, so its
+            # box sits inside the block.  The reverse also happens — an image the
+            # OCR box *fills* (a banner/ribbon carrying the title) while the text
+            # layer holds only the glyph line: the OCR box is then far wider than
+            # the block, the coverage test above fails, and the same title was
+            # drawn twice (the whole banner in a 40 pt font plus the glyph box),
+            # reported as a 100 % overlap.  Same text AND containment either way
+            # is a duplicate, not extra content.
+            if _covered_ratio(b, t) >= _MERGE_DUP_COVER or (
+                text == t_text and _covered_ratio(t, b) >= _MERGE_DUP_CONTAIN
+            ):
+                dup = True
+                break
+        if dup:
             continue
         kept.append(b)
     if not kept:
@@ -3532,6 +3551,12 @@ def _collect_lines(page_dict: dict) -> list[dict]:
     return out
 
 
+#: Share of the page's text extent an item must span to count as *full width*
+#: (a heading/banner across both columns).  The relative test (1.5 x median
+#: width) alone misfires when many narrow items dominate the median.
+_FULL_WIDTH_SPAN_RATIO = 0.75
+
+
 def _order_generic(
     items: Sequence,
     x0: Callable,
@@ -3560,7 +3585,17 @@ def _order_generic(
     med_w = statistics.median(x1(it) - x0(it) for it in items)
     if med_w <= 0:
         return sorted(items, key=lambda it: (round(y0(it), 1), x0(it)))
-    threshold = 1.5 * med_w
+    span = max(x1(it) for it in items) - min(x0(it) for it in items)
+    # ``width > 1.5 x median`` ALONE misreads ordinary column lines as
+    # full-width whenever the median is dragged down by many narrow items —
+    # a ruled table's cells are ~5-60 pt wide, so on the Evergrowing Bank
+    # sample 38 of 108 lines qualified (every paragraph line of BOTH
+    # columns).  They were then pulled out and re-sorted by y, interleaving
+    # the columns: each paragraph was chopped into fragments, and every
+    # fragment was anchored at its own top, so the (longer) English
+    # translations overprinted each other.  A genuinely full-width item also
+    # spans most of the page's text extent.
+    threshold = max(1.5 * med_w, _FULL_WIDTH_SPAN_RATIO * span)
     full = [it for it in items if (x1(it) - x0(it)) > threshold]
     rest = [it for it in items if (x1(it) - x0(it)) <= threshold]
 
@@ -3611,7 +3646,14 @@ def _order_lines(lines: Sequence[dict]) -> list[dict]:
 
 def _group_lines(ordered: Sequence[dict]) -> list[list[dict]]:
     """Group ordered lines into blocks: split at entries / style changes /
-    paragraph gaps, but keep the lines of a flowing paragraph together."""
+    paragraph gaps, but keep the lines of a flowing paragraph together.
+
+    Grouping is strictly sequential.  An "attach to the most recent group whose
+    x range matches" variant was tried for side-by-side chart labels (their second
+    lines arrive after all the first lines) and reverted: on a two-column paper it
+    merged a column's prose with the figure caption printed in the same x range
+    further down, producing a 273 pt block that swallowed the caption.
+    """
     groups: list[list[dict]] = []
     i = 0
     n = len(ordered)
@@ -3977,6 +4019,258 @@ def _borderless_tables(page) -> list:
     return out
 
 
+#: A ruled table whose body carries no ruling lines of its own: how far below the
+#: detected band the body may continue, and how much of the table's width the rule
+#: that closes it must span.
+_TABLE_BODY_MAX_EXTEND = 900.0
+_TABLE_BODY_RULE_SHARE = 0.8
+#: Fewest rows a synthesised body must have to be a table rather than a stray
+#: line under a header rule.
+_TABLE_BODY_MIN_ROWS = 2
+
+
+class _DetectedRow:
+    """Minimal stand-in for a PyMuPDF ``Table.rows[i]`` (only ``cells``)."""
+
+    __slots__ = ("cells",)
+
+    def __init__(self, cells):
+        self.cells = list(cells)
+
+
+class _DetectedTable:
+    """Minimal stand-in for a PyMuPDF ``Table`` (``bbox`` + ``rows``)."""
+
+    __slots__ = ("bbox", "rows", "borderless")
+
+    def __init__(self, bbox, rows, borderless=False):
+        self.bbox = bbox
+        self.rows = list(rows)
+        self.borderless = bool(borderless)
+
+
+def _body_rules(page, tb: fitz.Rect, *, above: bool = False) -> list[float]:
+    """y of every horizontal rule spanning (almost) all of ``tb``'s width,
+    outside ``tb`` and on the requested side, ascending.
+
+    A rule is usually drawn one segment per column, so the segments at the same
+    y must be merged before measuring the span (a single 31 pt column separator
+    never reaches the 80 % share on its own).  The caller tries the *farthest*
+    rule first: a report can rule every row of an unruled-column body (page 2 of
+    the Evergrowing Bank sample), so the nearest rule is only the first row's
+    edge.  ``find_tables`` may also return a table's last row rather than its
+    header (the same page), so the band is searched on both sides.
+    """
+    segs: list[tuple[float, float, float]] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:  # noqa: BLE001 — detection is best-effort
+        return []
+    for d in drawings:
+        for item in d.get("items", ()):
+            kind = item[0]
+            if kind == "l":
+                p1, p2 = item[1], item[2]
+                if abs(p1.y - p2.y) > 0.5:
+                    continue
+                segs.append(((p1.y + p2.y) / 2.0, min(p1.x, p2.x), max(p1.x, p2.x)))
+            elif kind == "re":
+                r = item[1]
+                if r.height > 3.0:  # a shaded band, not a rule
+                    continue
+                segs.append(((r.y0 + r.y1) / 2.0, r.x0, r.x1))
+    if above:
+        segs = [s for s in segs
+                if tb.y0 - _TABLE_BODY_MAX_EXTEND <= s[0] < tb.y0 - 1.0]
+    else:
+        segs = [s for s in segs
+                if tb.y1 + 1.0 < s[0] <= tb.y1 + _TABLE_BODY_MAX_EXTEND]
+    segs.sort()
+    rules: list[float] = []
+    i = 0
+    while i < len(segs):
+        y = segs[i][0]
+        j = i
+        while j < len(segs) and abs(segs[j][0] - y) <= 1.0:
+            j += 1
+        group = sorted((s[1], s[2]) for s in segs[i:j])
+        covered = 0.0
+        lo, hi = group[0]
+        for a, b in group[1:]:
+            if a <= hi + 0.5:
+                hi = max(hi, b)
+            else:
+                covered += hi - lo
+                lo, hi = a, b
+        covered += hi - lo
+        if (covered >= _TABLE_BODY_RULE_SHARE * tb.width
+                and lo <= tb.x0 + 0.1 * tb.width
+                and hi >= tb.x1 - 0.1 * tb.width):
+            rules.append(y)
+        i = j
+    return rules
+
+
+def _body_text_items(page, tb: fitz.Rect, low: float, high: float) -> list[tuple]:
+    """Text lines with centre inside ``(low, high)`` and ``tb``'s x span."""
+    items: list[tuple] = []
+    try:
+        page_dict = page.get_text("dict")
+    except Exception:  # noqa: BLE001
+        return items
+    for blk in page_dict.get("blocks", ()):
+        if blk.get("type") != 0:
+            continue
+        for line in blk.get("lines", ()):
+            spans = line.get("spans", ())
+            if not spans:
+                continue
+            text = " ".join("".join(s.get("text", "") for s in spans).split())
+            if not text:
+                continue
+            x0 = min(float(s["bbox"][0]) for s in spans)
+            x1 = max(float(s["bbox"][2]) for s in spans)
+            y0 = min(float(s["bbox"][1]) for s in spans)
+            y1 = max(float(s["bbox"][3]) for s in spans)
+            if not (low < (y0 + y1) / 2.0 < high):
+                continue
+            if not (tb.x0 - 2.0 <= (x0 + x1) / 2.0 <= tb.x1 + 2.0):
+                continue
+            items.append((y0, x0, x1, y1, text))
+    items.sort()
+    return items
+
+
+def _line_in_one_column(it: tuple, cols: list[fitz.Rect]) -> bool:
+    """True when the line's x-extent stays inside the column of its centre."""
+    x0, x1 = it[1], it[2]
+    cx = (x0 + x1) / 2.0
+    for col in cols:
+        if col.x0 - 1.0 <= cx <= col.x1 + 1.0:
+            return x0 >= col.x0 - 1.5 and x1 <= col.x1 + 1.5
+    return False
+
+
+def _row_bands(items: list[tuple], cols: list[fitz.Rect], *,
+               downward: bool, bounds: list[float]) -> list[tuple[float, float]] | None:
+    """Row bands ``(top, bottom)`` for a body, or ``None`` when it is prose.
+
+    The body ends where a line stops being confined to a single column: a table
+    cell never crosses a column boundary, a paragraph (or any other full-width
+    text) always does.  Everything from that line on stays ordinary prose.
+
+    ``bounds`` are the rule positions tiling the band (ascending, both ends
+    included) when the source rules every row: those bands ARE the rows, and each
+    one gets the full row height (a cell whose source text wraps over two lines
+    needs it).  Without interior rules the rows are pitched at the midpoints
+    between consecutive line centres — deriving a 9 pt text band instead made
+    every row look too short, so the row-expansion pass pushed the lower rows
+    down and the translations drifted off their source rows.
+    """
+    seq = items if downward else list(reversed(items))
+    kept: list[tuple] = []
+    for it in seq:
+        if not _line_in_one_column(it, cols):
+            break
+        kept.append(it)
+    if len(kept) < _TABLE_BODY_MIN_ROWS:
+        return None
+    if len(bounds) >= 3:
+        bands = [
+            (lo, hi) for lo, hi in zip(bounds, bounds[1:])
+            if any(lo <= (it[0] + it[3]) / 2.0 < hi for it in kept)
+        ]
+        return bands if len(bands) >= _TABLE_BODY_MIN_ROWS else None
+    groups = _cluster_ocr_rows(kept)
+    if len(groups) < _TABLE_BODY_MIN_ROWS:
+        return None
+    centres = [(min(it[0] for it in g) + max(it[3] for it in g)) / 2.0
+               for g in groups]
+    bands = []
+    for i, c in enumerate(centres):
+        top = (centres[i - 1] + c) / 2.0 if i else min(it[0] for it in groups[0])
+        bottom = (c + centres[i + 1]) / 2.0 if i + 1 < len(centres) else max(
+            it[3] for it in groups[-1])
+        bands.append((top, bottom))
+    return bands
+
+
+def _extend_with_body(page, t) -> "_DetectedTable | None":
+    """Add the rows of a table whose body has no ruling lines of its own.
+
+    ``find_tables`` needs ruling *lines* on both axes: a report table often rules
+    only its header band (column separators + a rule under it) and the rows below
+    carry no vertical rules at all, so only the header comes back and every body
+    cell is laid out as ordinary prose — its (longer) translation then wraps down
+    over the row beneath.  The synthesised rows are marked ``borderless``: there
+    is no grid to redraw, only the row-height expansion to run.
+    """
+    try:
+        tb = fitz.Rect(t.bbox)
+        rows = list(getattr(t, "rows", None) or [])
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows:
+        return None
+    cells = getattr(rows[-1], "cells", None) or []
+    cols = [fitz.Rect(c) for c in cells if c]
+    if len(cols) < 2:
+        return None
+    last_h = max(c.y1 for c in cols) - min(c.y0 for c in cols)
+    max_gap = max(2.0 * last_h, 24.0)
+    above = _body_side(page, tb, cols, above=True, max_gap=max_gap)
+    below = _body_side(page, tb, cols, above=False, max_gap=max_gap)
+    if above is None and below is None:
+        return None
+    new_rows: list = []
+    if above is not None:
+        for top, bottom in above:
+            new_rows.append(_DetectedRow([
+                fitz.Rect(c.x0, top, c.x1, bottom) for c in cols
+            ]))
+    new_rows.extend(rows)
+    if below is not None:
+        for top, bottom in below:
+            new_rows.append(_DetectedRow([
+                fitz.Rect(c.x0, top, c.x1, bottom) for c in cols
+            ]))
+    bbox = fitz.Rect(tb.x0, tb.y0, tb.x1, tb.y1)
+    if above:
+        bbox.y0 = min(b.y0 for b in new_rows[0].cells)
+    if below:
+        bbox.y1 = max(b.y1 for b in new_rows[-1].cells)
+    return _DetectedTable(bbox, new_rows, borderless=True)
+
+
+def _body_side(page, tb: fitz.Rect, cols: list[fitz.Rect], *, above: bool,
+               max_gap: float) -> "list[tuple[float, float]] | None":
+    """Rows of the unruled body on one side of ``tb``, with the band's far edge."""
+    rules = _body_rules(page, tb, above=above)
+    # Farthest first: above, that is the smallest y; below, the largest.
+    for rule in (rules if above else list(reversed(rules))):
+        if above:
+            low, high = rule, tb.y0 + 1.0
+        else:
+            low, high = tb.y1 - 1.0, rule
+        items = _body_text_items(page, tb, low, high)
+        if len(items) < _TABLE_BODY_MIN_ROWS:
+            continue
+        near = items[-1] if above else items[0]
+        gap = (tb.y0 - near[3]) if above else (near[0] - tb.y1)
+        if gap > max_gap:
+            continue  # a gap: the next thing over is not this table's body
+        inside = [r for r in rules if low < r < high]
+        if above:
+            bounds = [rule] + inside + [tb.y0]
+        else:
+            bounds = [tb.y1] + inside + [rule]
+        bands = _row_bands(items, cols, downward=not above, bounds=bounds)
+        if bands is None:
+            continue
+        return bands
+    return None
+
+
 def _page_tables(page, log: Callable[[str], None] | None = None) -> tuple[list, bool]:
     """Ruling-line tables on ``page``, else borderless ones.
 
@@ -3989,7 +4283,13 @@ def _page_tables(page, log: Callable[[str], None] | None = None) -> tuple[list, 
         tabs = None
     tables = list(getattr(tabs, "tables", None) or [])
     if tables:
-        return tables, False
+        # ``find_tables`` only sees the *ruled* part of a table: a report often
+        # rules its header band (column separators + a rule under it) and
+        # nothing else, so only the header came back and the body rows were
+        # laid out as ordinary prose — every narrow cell then wrapped its
+        # (longer) translation down over the row below.  Extend such a table
+        # over its unruled body (no grid is redrawn for it).
+        return [(_extend_with_body(page, t) or t) for t in tables], False
     tables = _borderless_tables(page)
     if tables and log:
         log("未检测到框线表格，已改用文本策略识别无框线表格（按单元格对齐，不画表格线）。")
@@ -4358,6 +4658,32 @@ def save_markdown(
 _MARGIN = 42.0
 _FONT_SIZE = 11.0
 
+def _initial_font_scale() -> float:
+    """Translation size factor: ``PDFTRANSLATE_FONT_SCALE``, else 0.9.
+
+    An out-of-range or unparsable value falls back to the default rather than
+    crashing the import (the env knob exists so the factor can be tried without
+    editing code; the GUI still uses the compiled-in default).
+    """
+    raw = os.environ.get("PDFTRANSLATE_FONT_SCALE")
+    if not raw:
+        return 0.9
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.9
+    return value if 0.3 <= value <= 2.0 else 0.9
+
+
+#: Global size factor for every *translated* glyph.  A Latin translation drawn
+#: at the source's own point size reads distinctly larger than the CJK it
+#: replaces (a CJK ideograph fills only part of its em box), so the fitted size
+#: starts at ``scale x`` the source size and the readability floors scale with
+#: it.  It applies to every page kind — text layer, OCR grid, rebuilt vector
+#: table and figure text all fit through :func:`_fit_block` — so one number
+#: tunes the whole product.  1.0 restores the original (unscaled) sizes.
+_TRANSLATION_FONT_SCALE = _initial_font_scale()
+
 #: Largest font size a translation may start at (original headings are capped
 #: here; the shrink loop below keeps every block inside its box).  Raised to 40
 #: so large display headings (cover titles, big chapter heads) are not crushed
@@ -4368,7 +4694,7 @@ _MAX_FONT = 40.0
 #: the rendered text barely legible; when a translation still does not fit its
 #: source box at this size it is drawn slightly past the box (the original text
 #: behind it is redacted) rather than crushed into an unreadable sliver.
-_MIN_READABLE = 7.0
+_MIN_READABLE = 7.0 * _TRANSLATION_FONT_SCALE
 
 #: Smallest size a *table cell* translation may shrink to so it fits on **one
 #: line**.  A cell whose English translation is wider than its column wraps and
@@ -4376,7 +4702,7 @@ _MIN_READABLE = 7.0
 #: table (the reported defect).  A cell is allowed to go a little smaller than
 #: the general ``_MIN_READABLE`` floor because a one-line figure/name in a
 #: reference table is worth the slightly reduced size.
-_MIN_TABLE_READABLE = 6.0
+_MIN_TABLE_READABLE = 6.0 * _TRANSLATION_FONT_SCALE
 
 #: Absolute floor a table cell shrinks to before its single line just overflows
 #: the column instead.  The same 3pt figure the draw loop treats as the
@@ -4384,6 +4710,17 @@ _MIN_TABLE_READABLE = 6.0
 #: is cheaper than splitting a table row — the original scan is also one line
 #: per cell, so a wrapped cell is a visible misalignment, not a readable fix.
 _MIN_TABLE_FLOOR = 3.0
+
+
+def _font_start(block: "Block") -> float:
+    """Font size a translation of ``block`` starts at, before shrinking to fit.
+
+    Never larger than the source's own size, capped at :data:`_MAX_FONT` and
+    scaled by :data:`_TRANSLATION_FONT_SCALE`.  Shared by the export fitter
+    and the deterministic audit so the two never disagree on the size the
+    renderer will use.
+    """
+    return max(5.0, min(block.size, _MAX_FONT) * _TRANSLATION_FONT_SCALE)
 
 
 def _render_note(page: fitz.Page, font, lang: str) -> None:
@@ -4643,7 +4980,7 @@ def _fit_block(block: Block, font, text: str,
     """
     r = fitz.Rect(block.x0, block.y0, block.x1, block.y1)
     max_width = getattr(block, "fit_width", 0.0) or max(1.0, r.width)
-    fs = max(5.0, min(block.size, _MAX_FONT))
+    fs = _font_start(block)
 
     if getattr(block, "in_table", False):
         # The line count of the SOURCE cell (grid cells are one OCR line; a
@@ -4769,7 +5106,7 @@ def _draw_vertical_label(page: fitz.Page, font, block: Block, text: str) -> None
     ``x ∈ [P.x-ascent, P.x+descent]``.
     """
     r = fitz.Rect(block.x0, block.y0, block.x1, block.y1)
-    fs = max(5.0, min(block.size, _MAX_FONT))
+    fs = _font_start(block)
     # Fit the run along the box *height* first — a tall box usually needs no
     # reduction.
     fitted = _fit_one_line(font, text, max(1.0, r.height), fs)
@@ -5301,7 +5638,7 @@ def _extract_tables(page, log: Callable[[str], None] | None = None) -> list[dict
             {round(c.x0, 1) for c in all_cells} | {round(c.x1, 1) for c in all_cells}
         )
         out.append({"bbox": bbox, "rows": rows, "col_edges": col_edges,
-                    "borderless": borderless})
+                    "borderless": borderless or bool(getattr(t, "borderless", False))})
     return out
 
 
@@ -5473,10 +5810,15 @@ def _compute_table_layout(
     *,
     page_height: float | None = None,
     log: Callable[[str], None] | None = None,
+    return_rows: bool = False,
 ):
     """Work out how far every table row must be pushed down so translations fit.
 
-    Returns ``(shifts, new_bottoms, grid, bboxes)``:
+    Returns ``(shifts, new_bottoms, grid, bboxes)`` — plus ``rowinfo`` when
+    ``return_rows`` is set (a 5-tuple), the per-table/per-row geometry *after* the
+    push-down.  ``grid``'s line specs carry no row identity, so a caller that has
+    to place individual rows on their own page (the ``expand_pages`` continuation
+    pages) needs the rows separately.```
 
     * ``shifts``: ``block_index -> dy`` (downward offset for a table cell block).
     * ``new_bottoms``: ``block_index -> new row bottom y`` so the drawing pass can
@@ -5495,7 +5837,7 @@ def _compute_table_layout(
     ``log``.
     """
     if not tables:
-        return {}, {}, [], []
+        return ({}, {}, [], [], []) if return_rows else ({}, {}, [], [])
     # Per table: measure the rows.  ``cum``/``extra`` are filled in *after* the
     # page-bottom clamp below, because the clamp changes every row's extra.
     tinfo: list[dict] = []
@@ -5595,6 +5937,26 @@ def _compute_table_layout(
         for x in t["col_edges"]:
             grid.append(("v", x, new_top0, new_bot_last))
         bboxes.append(fitz.Rect(left, t["bbox"].y0, right, t["bbox"].y1))
+    # Per-row geometry after the push-down (see `return_rows`): `grid`'s line
+    # specs carry no row identity, so a caller that has to place individual rows
+    # on their own page cannot recover "which row is this line" from them.
+    rowinfo: list[list[dict[str, float | bool]]] = []
+    for ti, t in enumerate(tinfo):
+        table_shift = base[("table", ti)]
+        mapped_rows = {key[1] for key in mapping.values() if key[0] == ti}
+        rows_out: list[dict[str, float | bool]] = []
+        for r in range(len(t["orig_top"])):
+            top = t["orig_top"][r] + table_shift + t["cum"][r]
+            rows_out.append({
+                "top": top,
+                "bottom": top + t["needed_h"][r],
+                "orig_top": t["orig_top"][r],
+                "orig_bottom": t["orig_top"][r] + t["orig_h"][r],
+                "mapped": r in mapped_rows,
+            })
+        rowinfo.append(rows_out)
+    if return_rows:
+        return shifts, new_bottoms, grid, bboxes, rowinfo
     return shifts, new_bottoms, grid, bboxes
 
 
@@ -5912,6 +6274,280 @@ def _draw_ai_table(page, rows: Sequence[Sequence[str]], rect, font,
         yy += h
 
 
+# ---------------------------------------------------------------------------
+# 译文扩页（expand_pages）：把源页放不下的内容排到新增的后续页
+#
+# 一页装不下时，现有的两条出路都是「有损」的：压缩表格行高（_compute_table_layout
+# 的页底钳制）或把字号降到可读下限之下。扩页给出第三条路——把放不下的**表格行 /
+# 正文**整块移到后续页，源页上放得下的部分原样不动。
+#
+# 边界：只有矢量/文本层内容能重排。扫描件（位图表格线、印章、手迹）与图内文字钉死在
+# 像素上，_flow_skips 会把它们排除在移动之外；OCR 重绘路径（rebuild_table）仍走原逻辑。
+# ---------------------------------------------------------------------------
+
+#: 续页上正文块之间保留的竖直间距上限（源页间距在跨页处不可用，异常值也可能很大）。
+_FLOW_MAX_GAP = 18.0
+
+#: 表格续页时重复的表头行数上限。多行合并表头很少超过两行；上限同时防止一个
+#: 全文字列的表格把自己的每一行都当成表头反复重画。
+_FLOW_MAX_HEADER_ROWS = 2
+
+
+def _flow_skips(block: Block) -> bool:
+    """True when the draw loop leaves this block to the source page's own pixels.
+
+    Every scanned (``ocr``) block is skipped: its "text" is bitmap pixels with no
+    text layer to re-flow, and the white cover that hides the original ink only
+    runs for blocks that stay on page 1.  Moving one would leave the source ink
+    uncovered *and* duplicate the content on the continuation page.  A diagram
+    node label (``is_chart``) and an ``in_image`` figure label are likewise pinned
+    to the page they came from.
+    """
+    if getattr(block, "ocr", False):
+        return True
+    if block.is_chart or getattr(block, "in_image", False):
+        return True
+    return False
+
+
+def _flow_prose_height(block: Block, font, text: str) -> float:
+    """Natural height of ``text`` in ``block`` at the source size (no shrinking).
+
+    A block moved to a continuation page has no source box to fit into: the box
+    is *made* to the height the translation wants, so the height must be measured
+    against an unconstrained box — ``_fit_block`` then keeps the source size and
+    only wraps.
+    """
+    tall = replace(block, y1=block.y0 + 1_000_000.0, fit_height=0.0)
+    lines, fs = _fit_block(tall, font, text)
+    return _wrapped_height(
+        font, lines, fs,
+        _line_leading(font, in_table=False, n_lines=len(lines),
+                      override=getattr(block, "line_leading", 0.0)),
+    )
+
+
+def _flow_header_rows(ti: int, table: dict, mapping, blocks, trans) -> int:
+    """How many leading rows of table ``ti`` to repeat on a continuation page.
+
+    A repeated header is what makes a continued table readable.  Only *leading*
+    rows whose mapped cells are all non-numeric qualify; a row with no mapped
+    block is treated as data (conservative: never invent a header).
+    """
+    rows = table.get("rows") or []
+    if len(rows) < 2:
+        return 0
+    numeric: dict[int, bool] = {}
+    for bi, key in mapping.items():
+        if key[0] != ti or bi >= len(blocks):
+            continue
+        r = key[1]
+        numeric[r] = numeric.get(r, False) or _is_numeric_cell(str(blocks[bi].text))
+    n = 0
+    while n < len(rows) - 1 and n < _FLOW_MAX_HEADER_ROWS and not numeric.get(n, True):
+        n += 1
+    return n
+
+
+def _flow_elements(m, mapping, shifts, rowinfo, row_cells, layout_blocks, trans,
+                   font) -> list[dict]:
+    """Order a laid-out page into the elements that may move to a new page.
+
+    Two kinds: a table *row* (drawn as a unit, so a row never splits) and a
+    *prose* block.  Each carries the box it currently occupies (``y0``/``y1``,
+    used to decide what no longer fits), the height it needs on a continuation
+    page (``height``) and its original span (``orig_y0``/``orig_y1``, used to
+    keep the source's vertical rhythm when re-flowing).
+    """
+    elements: list[dict] = []
+    for ti, rows in enumerate(rowinfo):
+        for r, info in enumerate(rows):
+            elements.append({
+                "kind": "row", "table": ti, "row": r,
+                "cells": list(row_cells.get((ti, r), [])),
+                "y0": float(info["top"]), "y1": float(info["bottom"]),
+                "height": float(info["bottom"]) - float(info["top"]),
+                "orig_y0": float(info["orig_top"]),
+                "orig_y1": float(info["orig_bottom"]),
+                "order": ti * 100_000 + r,
+            })
+    for j in range(m):
+        if j in mapping:
+            continue
+        b = layout_blocks[j]
+        if _flow_skips(b):
+            continue
+        h = _flow_prose_height(b, font, trans[j])
+        dy = float(shifts.get(j, 0.0))
+        elements.append({
+            "kind": "prose", "j": j,
+            "y0": b.y0 + dy,
+            # A translation that overflows its own source box (drawn past it today)
+            # must count as overflow too, or the very blocks that need the room most
+            # would stay put.
+            "y1": max(b.y1 + dy, b.y0 + dy + h),
+            "height": h,
+            "orig_y0": b.y0, "orig_y1": b.y1,
+            "order": 1_000_000 + j,
+        })
+    elements.sort(key=lambda e: (e["y0"], e["order"]))
+    return elements
+
+
+def _flow_split(elements: list[dict], limit: float) -> tuple[set[int], list[dict]]:
+    """Split into the block indices that flow and the elements that carry them.
+
+    Content is monotonic in ``y`` after the table push-down, so the first element
+    that no longer fits marks the split: everything from there down moves.  When
+    everything fits, both results are empty and the page is exported unchanged.
+    """
+    for idx, el in enumerate(elements):
+        if el["y1"] > limit:
+            break
+    else:
+        return set(), []
+    flow = elements[idx:]
+    ids: set[int] = set()
+    for el in flow:
+        if el["kind"] == "prose":
+            ids.add(el["j"])
+        else:
+            ids.update(el["cells"])
+    return ids, flow
+
+
+def _flow_grid(tables, rowinfo, removed_rows: set[tuple[int, int]]) -> list:
+    """Rebuild the page-1 grid with the rows that moved to a continuation page gone.
+
+    Without this the stale rules of a moved row would stay behind, drawn over the
+    newly freed space.  When nothing moved this reproduces
+    ``_compute_table_layout``'s grid exactly (same boundaries, same order).
+    """
+    grid: list = []
+    for ti, rows in enumerate(rowinfo):
+        if tables[ti].get("borderless"):
+            continue
+        bbox = tables[ti]["bbox"]
+        keep = [r for r in range(len(rows)) if (ti, r) not in removed_rows]
+        if not keep:
+            continue
+        for r in keep:
+            info = rows[r]
+            grid.append(("h", bbox.x0, bbox.x1, float(info["top"])))
+            grid.append(("h", bbox.x0, bbox.x1, float(info["bottom"])))
+        top = float(rows[keep[0]]["top"])
+        bottom = float(rows[keep[-1]]["bottom"])
+        for x in tables[ti]["col_edges"]:
+            grid.append(("v", x, top, bottom))
+    return grid
+
+
+def _flow_draw_row(page, font, table: dict, layout_blocks, trans, cell_ids,
+                   y: float, height: float) -> None:
+    """Draw one table row — its cells and its rules — at ``y`` on a continuation page.
+
+    Every cell of the row gets the FULL row box: on a continuation page the row was
+    sized to the translation, so the box is exactly the room the cell needs, and a
+    single-line cell ends up vertically centred in its row.
+    """
+    for j in cell_ids:
+        if j >= len(trans):
+            # A short ``per_page`` (documented as tolerated) has no translation
+            # for this cell; skip it rather than crash (the source text in the
+            # table bbox is redacted either way).
+            continue
+        b = layout_blocks[j]
+        _draw_translated_block(page, font,
+                               replace(b, y0=y, y1=y + height, fit_height=0.0),
+                               trans[j])
+    if table.get("borderless"):
+        return
+    bbox = table["bbox"]
+    page.draw_line(fitz.Point(bbox.x0, y), fitz.Point(bbox.x1, y),
+                   color=(0, 0, 0), width=0.6)
+    page.draw_line(fitz.Point(bbox.x0, y + height), fitz.Point(bbox.x1, y + height),
+                   color=(0, 0, 0), width=0.6)
+    for x in table["col_edges"]:
+        page.draw_line(fitz.Point(x, y), fitz.Point(x, y + height),
+                       color=(0, 0, 0), width=0.6)
+
+
+def _draw_overflow_pages(out_doc, src_page, flow: list[dict], font, tables,
+                         layout_blocks, trans, rowinfo, row_cells, header_rows,
+                         log: Callable[[str], None] | None, page_no: int) -> int:
+    """Append the continuation pages that carry ``flow``; return how many were made.
+
+    Elements flow top-to-bottom from the top margin on blank pages of the source's
+    size (and /Rotate).  A table that continues repeats its header rows; a row is
+    never split across pages.  There is no page-bottom clamp any more — that is
+    the whole point — so a single row taller than a page overflows rather than
+    being compressed.
+    """
+    if not flow:
+        return 0
+    mb = src_page.mediabox
+    rotation = int(getattr(src_page, "rotation", 0) or 0)
+    limit = float(mb.height) - _MARGIN
+    page = None
+    y = _MARGIN
+    made = 0
+    header_drawn: set[int] = set()
+    prev: dict | None = None
+
+    def start_page() -> None:
+        nonlocal page, y, made, prev
+        page = out_doc.new_page(width=mb.width, height=mb.height)
+        if rotation:
+            page.set_rotation(rotation)
+        y = _MARGIN
+        made += 1
+        header_drawn.clear()
+        prev = None
+
+    def head_height(ti: int, rows: list[int]) -> float:
+        return sum(float(rowinfo[ti][k]["bottom"]) - float(rowinfo[ti][k]["top"])
+                   for k in rows)
+
+    for el in flow:
+        h = float(el["height"])
+        if el["kind"] == "row":
+            ti, r = int(el["table"]), int(el["row"])
+            n_head = int(header_rows.get(ti, 0))
+            heads = (list(range(n_head))
+                     if (r >= n_head and ti not in header_drawn) else [])
+            need_head = head_height(ti, heads)
+            if page is None or (y + need_head + h > limit and y > _MARGIN + 0.01):
+                start_page()
+                heads = list(range(n_head)) if r >= n_head else []
+                need_head = head_height(ti, heads)
+            for k in heads:
+                kh = float(rowinfo[ti][k]["bottom"]) - float(rowinfo[ti][k]["top"])
+                _flow_draw_row(page, font, tables[ti], layout_blocks, trans,
+                               row_cells.get((ti, k), []), y, kh)
+                y += kh
+            header_drawn.add(ti)
+            _flow_draw_row(page, font, tables[ti], layout_blocks, trans,
+                           el["cells"], y, h)
+            y += h
+            prev = el
+        else:
+            gap = 0.0
+            if prev is not None and y > _MARGIN + 0.01:
+                gap = min(_FLOW_MAX_GAP,
+                          max(0.0, float(el["orig_y0"]) - float(prev["orig_y1"])))
+            if page is None or (y + gap + h > limit and y > _MARGIN + 0.01):
+                start_page()
+                gap = 0.0
+            y += gap
+            b = layout_blocks[el["j"]]
+            _draw_translated_block(page, font,
+                                   replace(b, y0=y, y1=y + h), trans[el["j"]])
+            y += h
+            prev = el
+    if log:
+        log(f"第 {page_no} 页译文放不下，已扩展到后续 {made} 页。")
+    return made
+
 def save_translated_pdf(
     src_path: str | Path,
     pages: Sequence[Sequence[Block]],
@@ -5921,9 +6557,10 @@ def save_translated_pdf(
     log: Callable[[str], None] | None = None,
     reflow: bool = False,
     redraw_ocr: bool = False,
+    expand_pages: bool = False,
     table_rebuild_fn: Callable[[int, bytes], Sequence[Sequence[str]] | None] | None = None,
     merge_tool_fn: Callable[[int, bytes, Sequence[Sequence[str]]], list[dict]] | None = None,
-) -> None:
+) -> list[int]:
     """Create a layout-preserving translation PDF.
 
     Every output page keeps the original page (all images, photos, drawings and
@@ -5946,11 +6583,32 @@ def save_translated_pdf(
     provided, an OCR table page is drawn from a model-derived translated 2D grid
     (clean, regular N x M table) instead of the geometric OCR-frame redraw; any
     failure / implausible grid falls back to the geometric redraw.
+
+    With `expand_pages`, content that no longer fits the sheet is not squeezed
+    into it: the table-row push-down is left **unclamped** and the rows / prose
+    that would cross the page bottom move to freshly created continuation pages
+    (same size and `/Rotate`), a continued table repeating its header rows.
+    A translation therefore occupies *more* pages than the source instead of
+    shrinking below the readability floor or losing its last rows off the edge.
+    This only applies to the text-layer in-place path: a scan's raster rules,
+    stamps and handwriting are pinned to their pixels and cannot be re-flowed,
+    so OCR tables (including the `redraw_ocr` rebuild) are untouched.  Scanned
+    blocks in general (any ``ocr`` block) are never moved either, for the same
+    reason.
+
+    Returns the output page index (0-based) where each source page's content
+    begins.  Without expansion this is the identity list ``[0, 1, ...]``; with
+    ``expand_pages`` a source page can occupy several output pages, so a caller
+    (e.g. the preview's source→output mapping) can stay aligned.
     """
     src = fitz.open(str(src_path))
     out_doc = fitz.open()
     try:
         font = _CJK_FONT
+        #: Output page index (0-based) where each source page's content begins.
+        #: With ``expand_pages`` one source page can span several output pages, so
+        #: ``src[i]`` is no longer ``out[i]``; the preview maps with this.
+        page_map: list[int] = []
         # Every source page must appear in the output: a shorter ``per_page`` (the
         # source PDF was edited between extraction and export, or a caller passed a
         # short list) used to truncate the document **silently** — the sibling
@@ -5958,6 +6616,7 @@ def save_translated_pdf(
         # ``group_by_page`` raises on a length mismatch.  A page with no translation
         # is inserted as-is (m == 0 below).
         for i in range(src.page_count):
+            page_map.append(out_doc.page_count)
             blocks = pages[i] if i < len(pages) else []
             trans = per_page[i] if i < len(per_page) else []
             m = min(len(blocks), len(trans))
@@ -6103,10 +6762,26 @@ def save_translated_pdf(
                     for j, b in enumerate(blocks)
                 ]
 
+            # 译文扩页（expand_pages）：不钳制页底，装不下的表格行/正文改由续页
+            # 承载。扫描表格（ocr_table）保持原位几何——位图表格线/签字墨迹不可重排。
+            expand_here = bool(expand_pages) and not ocr_table
+            rowinfo: list[list[dict]] = []
+            row_cells: dict[tuple[int, int], list[int]] = {}
+            header_rows: dict[int, int] = {}
+            flow_ids: set[int] = set()
+            flow_elems: list[dict] = []
             if ocr_table:
                 # 扫描表格保持 OCR 几何：不推挤行高（位图表格线与签字墨迹钉死在像素上），
                 # 靠单元格行带换行 + 缩字兜底。
                 shifts, new_bottoms, grid, bboxes = {}, {}, [], []
+            elif expand_here:
+                # 页底钳制**关闭**：行高按译文自然增长，放不下的行由续页承载。
+                shifts, new_bottoms, grid, bboxes, rowinfo = _compute_table_layout(
+                    tables, mapping, layout_blocks, trans, font,
+                    page_height=None,
+                    log=(lambda m: log(f"  第 {i + 1} 页：{m}")) if log else None,
+                    return_rows=True,
+                )
             else:
                 # ``page_height`` must be the UNROTATED frame the block boxes live
                 # in (a /Rotate page's ``rect.height`` is the page *width*), and the
@@ -6120,6 +6795,25 @@ def save_translated_pdf(
                     page_height=page.cropbox.height,
                     log=(lambda m: log(f"  第 {i + 1} 页：{m}")) if log else None,
                 )
+            if expand_here:
+                # Split the laid-out page at the first element that no longer fits;
+                # everything from there down is re-flowed onto continuation pages,
+                # and page 1 keeps the grid of the rows that stayed.
+                for _j, _key in mapping.items():
+                    row_cells.setdefault((_key[0], _key[1]), []).append(_j)
+                header_rows = {
+                    ti: _flow_header_rows(ti, tables[ti], mapping, layout_blocks, trans)
+                    for ti in range(len(tables))
+                }
+                flow_ids, flow_elems = _flow_split(
+                    _flow_elements(m, mapping, shifts, rowinfo, row_cells,
+                                   layout_blocks, trans, font),
+                    page.cropbox.height - _TABLE_BOTTOM_MARGIN,
+                )
+                if flow_elems:
+                    moved_rows = {(int(e["table"]), int(e["row"]))
+                                  for e in flow_elems if e["kind"] == "row"}
+                    grid = _flow_grid(tables, rowinfo, moved_rows)
 
             # Render the page ONCE and derive everything pixel-based from it: the
             # adaptive luma levels (this page's own contrast), the printed-rule mask
@@ -6225,6 +6919,11 @@ def save_translated_pdf(
             # font size (see ``_draw_translated_block`` for the fitting rules).
             for j in range(m):
                 b = layout_blocks[j]
+                if j in flow_ids:
+                    # Moved to a continuation page (see `_draw_overflow_pages`):
+                    # its source text was redacted above, and drawing it here too
+                    # would duplicate it.
+                    continue
                 if b.is_chart:
                     # A diagram node label keeps its source: the original is
                     # already on the page (nothing was redacted/covered above),
@@ -6370,8 +7069,18 @@ def save_translated_pdf(
                         fitz.Point(x, y0), fitz.Point(x, y1), color=(0, 0, 0), width=0.6
                     )
 
+            # 译文扩页：把源页放不下的内容排到新增的后续页。
+            if flow_elems:
+                _draw_overflow_pages(
+                    out_doc, page, flow_elems, font, tables, layout_blocks, trans,
+                    rowinfo, row_cells, header_rows,
+                    log=(lambda msg: log(f"  {msg}")) if log else None,
+                    page_no=i + 1,
+                )
+
         out_doc.set_metadata({"title": "Translated text", "creator": "PDFtranslate"})
         out_doc.save(str(out_path), garbage=4, deflate=True)
+        return page_map
     finally:
         out_doc.close()
         src.close()

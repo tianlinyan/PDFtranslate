@@ -2189,6 +2189,24 @@ class ParagraphGroupingTest(unittest.TestCase):
         groups = pdfio._group_lines(lines)
         self.assertEqual([2, 1], [len(g) for g in groups])
 
+    def test_narrow_items_do_not_make_a_column_line_full_width(self):
+        # ``width > 1.5 x median`` ALONE classified ordinary column lines as
+        # full-width whenever narrow items dominated the median (a ruled table's
+        # cells are ~5-60 pt wide).  Those lines were then pulled out and
+        # re-sorted by y, so the two columns interleaved and each paragraph was
+        # chopped into fragments that overprinted each other.  The whole left
+        # column must still read before the whole right column.
+        items = [(80.0, 300.0 + 12.0 * i, 100.0, 308.0 + 12.0 * i)
+                 for i in range(10)]                       # narrow table cells
+        items += [(70.0, 200.0, 280.0, 210.0), (70.0, 216.0, 280.0, 226.0)]
+        items += [(620.0, 200.0, 830.0, 210.0), (620.0, 216.0, 830.0, 226.0)]
+        ordered = pdfio._order_generic(
+            items, lambda it: it[0], lambda it: it[2], lambda it: it[1])
+        left = [i for i, it in enumerate(ordered) if it[0] == 70.0]
+        right = [i for i, it in enumerate(ordered) if it[0] == 620.0]
+        self.assertTrue(left and right)
+        self.assertLess(max(left), min(right))
+
     def test_wrapped_paragraph_extracts_as_one_block(self):
         # End-to-end: the same shape on a real PDF must come back as one block, not
         # three (the fragment then got translated alone, losing its context).
@@ -2918,7 +2936,11 @@ class OcrTableRedrawTest(unittest.TestCase):
                      if sp["text"].strip()]
             label_spans = [(sz, bb) for sz, bb, txt in spans if txt in label]
             self.assertEqual(2, len(label_spans), label_spans)      # wrapped to 2 lines
-            self.assertGreaterEqual(min(s[0] for s in label_spans), 5.0,
+            # The old bug drew the label at 4.54pt inside a 12pt band.  The
+            # threshold follows the (scaled) table readability floor instead of a
+            # literal, so it keeps guarding the defect at any font scale.
+            self.assertGreaterEqual(min(s[0] for s in label_spans),
+                                    pdfio._MIN_TABLE_READABLE * 0.9,
                                     "the grown row must not leave the label crushed")
             h_lines = sorted({round(dr["rect"].y0, 1) for dr in page.get_drawings()
                               if dr["rect"].height < 1.0})
@@ -3018,7 +3040,8 @@ class OcrTableRedrawTest(unittest.TestCase):
         doc = fitz.open()
         page = doc.new_page(width=595, height=842)
         font = fitz.Font("cjk")
-        label = 'Net profit from continuing operations (net losses indicated by "-")'
+        label = ('Net profit from continuing operations (net losses indicated '
+                 'by "-") and other comprehensive income after tax')
         rows = [[label, "29"], ["Net profit from discontinued operations", "30"]]
         rect = fitz.Rect(36, 36, 300, 400)
         pdfio._draw_ai_table(page, rows, rect, font)
@@ -3033,13 +3056,55 @@ class OcrTableRedrawTest(unittest.TestCase):
         doc.close()
         # The first column's lines, top to bottom: the label wraps over two lines.
         col = sorted(
-            [(b, size) for b, size, _t in lines if abs(b[0] - 40.0) <= 1.0],
-            key=lambda pair: pair[0][1])
+            [entry for entry in lines if abs(entry[0][0] - 40.0) <= 1.0],
+            key=lambda entry: entry[0][1])
         self.assertGreaterEqual(len(col), 2, lines)
-        (b0, fs0), (b1, _fs1) = col[0], col[1]
+        (b0, fs0, t0), (b1, _fs1, t1) = col[0], col[1]
+        # The first two lines are the label's own wrapped lines, not two rows.
+        wrapped_prefix = " ".join(f"{t0} {t1}".split())
+        self.assertTrue(label.startswith(wrapped_prefix), (t0, t1))
         gap = b1[1] - b0[1]                      # baseline-to-baseline spacing
         self.assertLessEqual(gap, fs0 * 1.1)     # tight (~1.0), not loose 1.35
         self.assertGreaterEqual(gap, fs0 * 0.9)
+
+
+class TranslationFontScaleTest(unittest.TestCase):
+    """A Latin translation at the source's point size reads larger than the CJK it
+    replaces, so every fitted size is scaled (text-layer and OCR pages alike — all
+    paths fit through ``_fit_block``)."""
+
+    def test_start_size_and_floors_track_the_scale(self):
+        b = pdfio.Block(text="x", page=0, x0=0.0, y0=0.0, x1=100.0, y1=12.0,
+                        size=10.0)
+        self.assertAlmostEqual(10.0 * pdfio._TRANSLATION_FONT_SCALE,
+                               pdfio._font_start(b), places=3)
+        self.assertAlmostEqual(7.0 * pdfio._TRANSLATION_FONT_SCALE,
+                               pdfio._MIN_READABLE, places=6)
+        self.assertAlmostEqual(6.0 * pdfio._TRANSLATION_FONT_SCALE,
+                               pdfio._MIN_TABLE_READABLE, places=6)
+
+    def test_translation_is_drawn_below_the_source_size(self):
+        src = _OUT / "font_scale_src.pdf"
+        blank = fitz.open()
+        blank.new_page(width=400, height=300)
+        blank.save(str(src))
+        blank.close()
+        blocks = [pdfio.Block(text="营业收入", page=0, x0=60, y0=100, x1=260,
+                              y1=112, size=10.0)]
+        out = _OUT / "font_scale_out.pdf"
+        pdfio.save_translated_pdf(src, [blocks], [["Operating revenue"]],
+                                  str(out), "English")
+        doc = fitz.open(str(out))
+        try:
+            sizes = [sp["size"] for b in doc[0].get_text("dict")["blocks"]
+                     for ln in b.get("lines", []) for sp in ln["spans"]
+                     if sp["text"].strip()]
+        finally:
+            doc.close()
+        self.assertTrue(sizes)
+        self.assertLess(max(sizes), 10.0)     # never above the source size
+        self.assertAlmostEqual(10.0 * pdfio._TRANSLATION_FONT_SCALE, max(sizes),
+                               places=1)
 
 
 class SymbolCellTest(unittest.TestCase):
@@ -3284,6 +3349,178 @@ class TablePageBottomClampTest(unittest.TestCase):
         doc.close()
 
 
+class ExpandPagesTest(unittest.TestCase):
+    """译文扩页（expand_pages）：源页放不下的表格行改排到后续页并重复表头，
+    而不是压缩行高。默认关闭时导出与改动前逐字一致。"""
+
+    LONG = "Operating revenue from the bank's core lending business for the year"
+
+    @staticmethod
+    def _table_pdf(path, top=120.0, rows=4, height=12.0, pages=1):
+        doc = fitz.open()
+        for _ in range(pages):
+            page = doc.new_page(width=400, height=200)
+            xs = [60.0, 100.0, 140.0]
+            labels = [("项目", "金额"), ("收入", "1,234"),
+                      ("成本", "5,678"), ("利润", "9,012")][:rows]
+            for r, row in enumerate(labels):
+                y0 = top + r * height
+                y1 = y0 + height
+                for c in range(2):
+                    page.draw_rect(fitz.Rect(xs[c], y0, xs[c + 1], y1),
+                                   color=(0, 0, 0), width=0.6)
+                    page.insert_text((xs[c] + 2, y0 + 8), row[c], fontsize=7,
+                                     fontname="china-s")
+        doc.save(str(path))
+        doc.close()
+
+    def _translations(self, rows=4):
+        """Short header, long values — the English needs far more room."""
+        per = ["Item", "Amount"]
+        for i in range(1, rows):
+            per += [self.LONG, f"{i},000"]
+        return per
+
+    def _export(self, src, out, per, **kw):
+        dt = pdfio.extract_document_text(str(src), log=lambda _m: None)
+        logs: list[str] = []
+        pdfio.save_translated_pdf(str(src), dt.pages, [per], str(out), "English",
+                                  log=logs.append, **kw)
+        return logs
+
+    def test_default_export_keeps_one_page_and_clamps(self):
+        # 默认（不勾选）行为不变：行高被钳制在一页内，页数仍与原文一致。
+        src = _OUT / "expand_default_src.pdf"
+        self._table_pdf(src)
+        out = _OUT / "expand_default.pdf"
+        logs = self._export(src, out, self._translations())
+        doc = fitz.open(str(out))
+        try:
+            self.assertEqual(1, doc.page_count)
+        finally:
+            doc.close()
+        self.assertTrue(any("超出页底" in m for m in logs), logs)
+
+    def test_overflow_flows_to_a_continuation_page_with_the_header(self):
+        src = _OUT / "expand_src.pdf"
+        self._table_pdf(src)
+        out = _OUT / "expand_on.pdf"
+        logs = self._export(src, out, self._translations(), expand_pages=True)
+        doc = fitz.open(str(out))
+        try:
+            self.assertEqual(2, doc.page_count)
+            p1 = " ".join(doc[1].get_text().split())
+            # The continuation page repeats the table header and carries the rows
+            # that no longer fitted on page 1.
+            self.assertIn("Item", p1)
+            self.assertIn("Amount", p1)
+            self.assertIn("3,000", p1)
+            self.assertNotIn("1,000", p1)   # row 1 stayed on page 1
+            # …and the grid was redrawn there — not a blank sheet.
+            self.assertGreater(len(doc[1].get_drawings()), 0)
+        finally:
+            doc.close()
+        self.assertTrue(any("已扩展到后续" in m for m in logs), logs)
+
+    def test_content_that_fits_adds_no_pages(self):
+        # 装得下就一页都不加：扩页只在真的溢出时生效。
+        src = _OUT / "expand_fits_src.pdf"
+        self._table_pdf(src, top=40.0)
+        out = _OUT / "expand_fits.pdf"
+        logs = self._export(src, out, self._translations(), expand_pages=True)
+        doc = fitz.open(str(out))
+        try:
+            self.assertEqual(1, doc.page_count)
+        finally:
+            doc.close()
+        self.assertEqual([], logs)
+
+    def test_continuation_page_orders_the_rows_and_stays_on_the_sheet(self):
+        # 续页上表头在最上、数据行按原顺序往下排，且没有内容被排到页外
+        # （扩页的整个意义就是把内容留在纸上，而不是压缩到看不清）。
+        src = _OUT / "expand_order_src.pdf"
+        self._table_pdf(src)
+        out = _OUT / "expand_order.pdf"
+        self._export(src, out, self._translations(), expand_pages=True)
+        doc = fitz.open(str(out))
+        try:
+            page = doc[1]
+            words = page.get_text("words")
+
+            def top_of(token):
+                ys = [w[1] for w in words if token in w[4]]
+                return min(ys) if ys else None
+
+            header = top_of("Item")
+            row2 = top_of("2,000")
+            row3 = top_of("3,000")
+            self.assertIsNotNone(header)
+            self.assertIsNotNone(row2)
+            self.assertIsNotNone(row3)
+            self.assertLess(header, row2)
+            self.assertLess(row2, row3)
+            self.assertLessEqual(max(w[3] for w in words), page.rect.height + 0.5)
+        finally:
+            doc.close()
+
+    def test_expand_pages_never_moves_a_scanned_block(self):
+        # 扫描块的「文字」是位图：搬去续页会让首页原文裸露、续页多出一份译文。
+        # 它必须原样留在首页（白底覆盖 + 画译文），页数不变。
+        src = _OUT / "expand_ocr_src.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=120)
+        page.insert_text((20, 32), "SCAN-ORIGINAL", fontsize=12)
+        doc.save(str(src))
+        doc.close()
+        block = pdfio.Block(text="SCAN-ORIGINAL", page=0, x0=18, y0=20, x1=140,
+                            y1=36, size=12, ocr=True, single_line=True)
+        long = "A very long translation that no longer fits " * 6
+        out = _OUT / "expand_ocr.pdf"
+        pdfio.save_translated_pdf(str(src), [[block]], [[long]], str(out), "English",
+                                  log=lambda _m: None, expand_pages=True)
+        doc = fitz.open(str(out))
+        try:
+            self.assertEqual(1, doc.page_count)
+            text = " ".join(doc[0].get_text().split())
+            self.assertIn("long translation", text)
+        finally:
+            doc.close()
+
+    def test_expand_pages_tolerates_a_short_per_page(self):
+        # save_translated_pdf 明确容忍较短的 per_page（源被改过 / 调用方传短了）。
+        # 扩页搬走的行会引用缺失的译文，不能因此 IndexError。
+        src = _OUT / "expand_short_src.pdf"
+        self._table_pdf(src)
+        dt = pdfio.extract_document_text(str(src), log=lambda _m: None)
+        out = _OUT / "expand_short.pdf"
+        per = [["Item", self.LONG]]       # 只有前两个块有译文
+        pdfio.save_translated_pdf(str(src), dt.pages, per, str(out), "English",
+                                  log=lambda _m: None, expand_pages=True)
+        doc = fitz.open(str(out))
+        try:
+            self.assertGreaterEqual(doc.page_count, 1)
+        finally:
+            doc.close()
+
+    def test_expand_pages_returns_a_source_to_output_page_map(self):
+        # 预览的「译文」侧靠这张映射把源页定位到输出页：扩页后不再一一对应。
+        src = _OUT / "expand_map_src.pdf"
+        self._table_pdf(src, pages=2)
+        dt = pdfio.extract_document_text(str(src), log=lambda _m: None)
+        out = _OUT / "expand_map.pdf"
+        per_page = [self._translations(), []]   # 第 2 页无译文
+        mapping = pdfio.save_translated_pdf(
+            str(src), dt.pages, per_page, str(out), "English",
+            log=lambda _m: None, expand_pages=True)
+        # 第 0 页溢出一页 → 第 1 页从输出第 2 页开始。
+        self.assertEqual([0, 2], list(mapping))
+        doc = fitz.open(str(out))
+        try:
+            self.assertEqual(3, doc.page_count)
+        finally:
+            doc.close()
+
+
 class BorderlessTableTest(unittest.TestCase):
     """P1-1: a table without ruling lines must still get cell geometry — the
     ``text`` fallback is used, with guards so prose pages are not "found"."""
@@ -3354,6 +3591,106 @@ class BorderlessTableTest(unittest.TestCase):
             self.assertEqual([], pdfio._extract_tables(doc[0]))
         finally:
             doc.close()
+
+
+class HeaderOnlyTableBodyTest(unittest.TestCase):
+    """``find_tables`` only sees the *ruled* part of a table.
+
+    A report that rules its header band (column separators + a rule under it) and
+    nothing else came back as a one-row table, so every body row was laid out as
+    ordinary prose and each narrow cell wrapped its (longer) translation down over
+    the row below.  The body must be recovered from the closing rule and the
+    header's own column edges.
+    """
+
+    @staticmethod
+    def _table(path, prose=False):
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        # Header band only: two rules and the column separators.
+        page.draw_line(fitz.Point(60, 90), fitz.Point(500, 90), width=0.5)
+        page.draw_line(fitz.Point(60, 104), fitz.Point(500, 104), width=0.5)
+        for x in (60, 170, 340, 500):   # closed header band, no body rules
+            page.draw_line(fitz.Point(x, 90), fitz.Point(x, 104), width=0.5)
+        # The table's closing rule; the body rows carry no vertical rules.
+        page.draw_line(fitz.Point(60, 190), fitz.Point(500, 190), width=0.75)
+        page.insert_text((70, 100), "序号", fontsize=9, fontname="china-s")
+        page.insert_text((180, 100), "股东名称", fontsize=9, fontname="china-s")
+        page.insert_text((350, 100), "持股数", fontsize=9, fontname="china-s")
+        if prose:
+            page.insert_text((60, 130),
+                             "报告期末，本行股东情况如下，详见附注说明。",
+                             fontsize=9, fontname="china-s")
+        else:
+            for i in range(3):
+                y = 122 + i * 22
+                page.insert_text((70, y), str(i + 1), fontsize=9)
+                page.insert_text((180, y), "股东名称", fontsize=9,
+                                 fontname="china-s")
+                page.insert_text((350, y), "%d,000,000" % (i + 1), fontsize=9)
+        doc.save(str(path))
+        doc.close()
+        return path
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_body_rows_become_table_cells(self):
+        src = self._table(Path(self.tmp.name) / "header_only.pdf")
+        doc = fitz.open(str(src))
+        try:
+            tables = pdfio._extract_tables(doc[0])
+        finally:
+            doc.close()
+        self.assertEqual(1, len(tables))
+        self.assertGreaterEqual(len(tables[0]["rows"]), 4)  # header + 3 rows
+        self.assertTrue(tables[0]["borderless"])
+        dt = pdfio.extract_document_text(str(src), log=lambda _m: None)
+        values = [b for b in dt.pages[0]
+                  if getattr(b, "in_table", False) and "1,000,000" in b.text]
+        self.assertTrue(values, [b.text for b in dt.pages[0]])
+        for b in values:
+            # Widened to the ruled column, not the source glyph box.
+            self.assertGreater(b.x1 - b.x0, 120.0)
+
+    def test_a_full_width_paragraph_ends_the_body(self):
+        src = self._table(Path(self.tmp.name) / "header_only_prose.pdf",
+                          prose=True)
+        doc = fitz.open(str(src))
+        try:
+            tables = pdfio._extract_tables(doc[0])
+        finally:
+            doc.close()
+        self.assertEqual(1, len(tables))
+        self.assertEqual(1, len(tables[0]["rows"]))
+        self.assertFalse(tables[0]["borderless"])
+
+
+class OcrDuplicateContainmentTest(unittest.TestCase):
+    """The figure-text OCR can re-read a text-layer block in a much BIGGER box.
+
+    A banner the OCR box fills while the text layer holds only the glyph line
+    failed the one-directional coverage test, so the same title was drawn twice
+    (the whole banner at 40 pt plus the glyph box) — a 100 % overlap.
+    """
+
+    @staticmethod
+    def _block(text, box, **kw):
+        return pdfio.Block(text=text, page=0, x0=box[0], y0=box[1],
+                           x1=box[2], y1=box[3], **kw)
+
+    def test_ocr_block_containing_the_text_block_is_dropped(self):
+        text = self._block("恒丰银行股份有限公司", (812.9, 208.9, 972.9, 227.2))
+        ocr = self._block("恒丰银行股份有限公司", (688.8, 191.1, 1101.9, 242.2),
+                          ocr=True, in_image=True)
+        self.assertEqual([text], pdfio._merge_ocr_blocks([text], [ocr]))
+
+    def test_a_larger_ocr_block_with_extra_text_is_kept(self):
+        text = self._block("总则", (812.9, 208.9, 860.0, 227.2))
+        ocr = self._block("第一章 总则", (688.8, 191.1, 1101.9, 242.2),
+                          ocr=True)
+        self.assertEqual(2, len(pdfio._merge_ocr_blocks([text], [ocr])))
 
 
 class OcrMixedPageGridTest(unittest.TestCase):

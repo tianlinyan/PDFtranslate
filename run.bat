@@ -6,6 +6,7 @@ set "PDFTRANSLATE_STRUCTURE_PARSER=doclayout"
 set "PDFTRANSLATE_IR_MODE=1"
 set "PDFTRANSLATE_AGENT_TERMS=1"
 set "PDFTRANSLATE_DOCLAYOUT_DEVICE=cpu"
+set "PDFTRANSLATE_FONT_SCALE=1.0"
 rem Prefer the short-path venv (C:\pv, which carries DocLayout-YOLO and inherits the
 rem system site-packages).  Falls back to the system python when it is absent.
 set "PY=python"

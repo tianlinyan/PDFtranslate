@@ -105,6 +105,9 @@ class WorkerSignalTest(_WorkerTestBase):
         self.assertTrue(out.exists())
         self.assertEqual(str(out), worker._last_pdf)
         self.assertEqual("translated_pdf", worker._output_type)
+        # The export reports the source→output page map so the preview stays aligned
+        # (identity here: one page, no expansion).
+        self.assertEqual([0], worker._page_map)
 
     def test_markdown_run_leaves_last_pdf_none(self):
         # A non-PDF output has nothing to render in the preview's "译文" side.
@@ -693,14 +696,14 @@ class RebuildPagesWorkerTest(_WorkerTestBase):
         self._src = build_sample_pdf(self.tmp / "src.pdf", pages=2)
 
     def _worker(self, *, vision: bool = True, rebuild_table: bool = True,
-                reflow: bool = True) -> TranslateWorker:
+                reflow: bool = True, expand_pages: bool = False) -> TranslateWorker:
         model = ModelConfig(
             id="vision", name="vision", type="openai",
             endpoint="http://127.0.0.1:9/v1", model="m", vision=vision)
         return TranslateWorker(
             str(self._src), model, "English", "translated_pdf",
             str(self.tmp / "o.pdf"), agent_mode=False, rebuild_table=rebuild_table,
-            reflow=reflow)
+            reflow=reflow, expand_pages=expand_pages)
 
     def _export_kwargs(self, worker: TranslateWorker) -> dict:
         doc = pdfio.extract_document_text(str(self._src), ocr=False, log=lambda m: None)
@@ -731,6 +734,21 @@ class RebuildPagesWorkerTest(_WorkerTestBase):
         self.assertFalse(kw["redraw_ocr"])
         self.assertIsNone(kw["table_rebuild_fn"])
         self.assertIsNone(kw["merge_tool_fn"])
+
+    def test_expand_pages_reaches_the_exporter_and_is_logged(self):
+        # 勾选框必须真的到达导出器（不到达就是用户看到的「选项失效」），并出现在
+        # 选项日志里，用户才能确认自己勾的值生效了。
+        self.assertTrue(self._export_kwargs(self._worker(expand_pages=True))["expand_pages"])
+        self.assertFalse(self._export_kwargs(self._worker(expand_pages=False))["expand_pages"])
+        self.assertIn("译文扩页=开", self._worker(expand_pages=True)._options_line())
+        self.assertIn("译文扩页=关", self._worker(expand_pages=False)._options_line())
+
+    def test_expand_pages_default_off_and_env_gated(self):
+        # 译文扩页默认关闭：不勾选时导出与改动前一致；环境变量可强制开启。
+        self.assertFalse(self._worker()._expand_pages)
+        self.assertTrue(self._worker(expand_pages=True)._expand_pages)
+        with mock.patch.dict(os.environ, {"PDFTRANSLATE_EXPAND_PAGES": "1"}):
+            self.assertTrue(self._worker()._expand_pages)
 
     def test_options_are_logged_with_their_effective_values(self):
         # The user must be able to verify from the log that the checkbox reached

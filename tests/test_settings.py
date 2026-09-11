@@ -170,6 +170,7 @@ class PrefsTest(unittest.TestCase):
     """
 
     def setUp(self):
+        import os
         import tempfile
         from pathlib import Path
         from unittest import mock
@@ -179,6 +180,13 @@ class PrefsTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.path = Path(self._tmp.name) / "prefs.json"
+        # The suite redirects prefs via PDFTRANSLATE_PREFS_PATH (tests/__init__),
+        # and that override wins over the module constant — so clear it here or
+        # patching APP_PREFS_PATH would be ignored and these tests would share
+        # one global file.
+        env = mock.patch.dict(os.environ, {settings.PREFS_PATH_ENV: ""})
+        env.start()
+        self.addCleanup(env.stop)
         patcher = mock.patch.object(settings, "APP_PREFS_PATH", self.path)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -191,6 +199,42 @@ class PrefsTest(unittest.TestCase):
     def test_corrupt_file_reads_as_empty(self):
         self.path.write_text("{not json", encoding="utf-8")
         self.assertEqual({}, self.settings.load_prefs())
+
+    def test_the_env_var_redirects_the_prefs_file(self):
+        # 与缓存同款的门控：设了 PDFTRANSLATE_PREFS_PATH 就不碰 home 里的 prefs.json。
+        import os
+        from unittest import mock
+
+        other = self.path.parent / "other" / "prefs.json"
+        with mock.patch.dict(os.environ, {self.settings.PREFS_PATH_ENV: str(other)}):
+            self.assertIsNone(self.settings.save_prefs({"image_text": False}))
+            self.assertEqual({"image_text": False}, self.settings.load_prefs())
+        self.assertFalse(self.path.exists(), "默认路径不应被写入")
+        self.assertTrue(other.exists())
+
+    def test_a_blank_env_var_does_not_erase_every_preference(self):
+        # 空值 = 未设置：否则一个空环境变量会让所有偏好静默消失。
+        import os
+        from unittest import mock
+
+        self.settings.save_prefs({"language": "English"})
+        for blank in ("", "   "):
+            with mock.patch.dict(os.environ, {self.settings.PREFS_PATH_ENV: blank}):
+                self.assertEqual(self.settings.APP_PREFS_PATH,
+                                 self.settings.prefs_path())
+                self.assertEqual({"language": "English"},
+                                 self.settings.load_prefs())
+
+    def test_the_override_is_read_on_every_call_not_at_import(self):
+        # 测试在 import 之后才设变量；import 时定死路径的话它们永远重定向不了。
+        import os
+        from unittest import mock
+
+        other = self.path.parent / "late.json"
+        self.assertEqual(self.settings.APP_PREFS_PATH, self.settings.prefs_path())
+        with mock.patch.dict(os.environ, {self.settings.PREFS_PATH_ENV: str(other)}):
+            self.assertEqual(other, self.settings.prefs_path())
+        self.assertEqual(self.settings.APP_PREFS_PATH, self.settings.prefs_path())
 
     def test_failure_returns_a_reason_and_leaves_no_temp_file(self):
         from unittest import mock
@@ -211,3 +255,30 @@ class PrefsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrefsQuarantineTest(unittest.TestCase):
+    """T-1 回归：测试套件必须把 prefs 重定向到临时目录。
+
+    单独成类：本文件的 ``PrefsTest.setUp`` 会清空该环境变量并改补丁，
+    把哨兵放进那个类里等于什么都没测（实测踩过）。
+
+    删掉 tests/__init__ 里的重定向不会报错，只会让「控件默认值」类断言变成
+    只看开发者机器——image_text 就是这样把 test_qt_wiring 跑红的。
+    """
+
+    def test_the_suite_never_touches_the_developer_prefs(self):
+        import tempfile
+        from pathlib import Path
+
+        from translate_app import settings
+
+        path = settings.prefs_path().resolve()
+        dev_dir = (Path.home() / ".pdftranslate").resolve()
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        self.assertFalse(str(path).startswith(str(dev_dir)),
+                         f"prefs 仍在开发者目录下：{path}")
+        self.assertTrue(str(path).startswith(str(temp_root)),
+                        f"prefs 应重定向到临时目录：{path}")
+        self.assertTrue(path.parent.is_dir(), f"重定向目录不存在：{path.parent}")
+

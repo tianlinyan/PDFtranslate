@@ -991,7 +991,7 @@ def _check_layout(state, page=None):
             leading = _pdfio._line_leading(font, in_table=in_table, n_lines=len(lines))
             height = _pdfio._wrapped_height(font, lines, fs, leading)
             box_h = max(0.5, b.y1 - b.y0)
-            start_fs = max(5.0, min(b.size, _pdfio._MAX_FONT))
+            start_fs = _pdfio._font_start(b)
             floor = (_pdfio._MIN_TABLE_FLOOR if in_table
                      else min(start_fs, _pdfio._MIN_READABLE))
             if fs + 1e-9 < floor:

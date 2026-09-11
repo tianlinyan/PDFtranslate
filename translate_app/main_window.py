@@ -220,6 +220,10 @@ class MainWindow(QWidget):
         #: translated output, and ``self._last_output`` may be a .md/.txt.
         self._last_pdf: str | None = None
         self._last_output_type: str = ""
+        #: Source page → output page map for ``_last_pdf``.  ``translated_pdf``
+        #: normally maps page i to output page i, but ``expand_pages`` inserts
+        #: continuation pages, so the preview must use the map the worker reported.
+        self._last_page_map: list[int] | None = None
         #: The last run's final aligned translation (flat index → text) and the source
         #: it came from.  Lets "重新导出" re-write the output with the current chat /
         #: annotation edits without re-translating.
@@ -378,6 +382,20 @@ class MainWindow(QWidget):
         self._image_text_check.setChecked(bool(prefs.get("image_text", True)))
         self._image_text_check.toggled.connect(self._persist_image_text)
 
+        # --- 译文扩页（默认关闭） ---
+        self._expand_pages_check = QCheckBox("译文扩页")
+        self._expand_pages_check.setToolTip(
+            "勾选后，源页放不下的内容不再被压缩：表格行高按译文自然增长，超出页底的"
+            "行与正文改排到**新增的后续页**（表格续页会重复表头行），译文页数可以多于原文。\n"
+            "代价是：源页底部留白（内容已移走），且译文与原文不再逐页对应。\n"
+            "适用范围：只对「仅译文/原位」PDF 的**文本层**内容生效。扫描件（位图表格线、"
+            "印章、手写签字）与图内文字钉死在像素上、不可重排，仍走原逻辑；"
+            "「双语 PDF」保持逐页对照，不受此项影响。\n"
+            "环境变量 PDFTRANSLATE_EXPAND_PAGES=1 可强制开启。"
+        )
+        self._expand_pages_check.setChecked(bool(prefs.get("expand_pages", False)))
+        self._expand_pages_check.toggled.connect(self._persist_expand_pages)
+
         # 选项排成两行、每行两个，用 QGridLayout 对齐两列：左列标签右对齐、勾选框
         # 左对齐，各行的标签/勾选框在同一竖直线上（HBox 拼装会因标签字数不同而左右
         # 错位）。
@@ -388,15 +406,17 @@ class MainWindow(QWidget):
         for row, (lab1, cb1, lab2, cb2) in enumerate((
             ("翻译管线", self._ir_check, "术语注入", self._agent_terms_check),
             ("扫描重建", self._rebuild_table_check, "图内文字", self._image_text_check),
+            ("译文扩页", self._expand_pages_check, None, None),
         )):
             left = QLabel(lab1)
             left.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             opt_grid.addWidget(left, row, 0)
             opt_grid.addWidget(cb1, row, 1)
-            right = QLabel(lab2)
-            right.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            opt_grid.addWidget(right, row, 2)
-            opt_grid.addWidget(cb2, row, 3)
+            if cb2 is not None:
+                right = QLabel(lab2)
+                right.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                opt_grid.addWidget(right, row, 2)
+                opt_grid.addWidget(cb2, row, 3)
         # 第 1、3 列（勾选框列）不参与拉伸，保证两列选项各自成一条竖线。
         opt_grid.setColumnStretch(1, 0)
         opt_grid.setColumnStretch(3, 0)
@@ -821,7 +841,9 @@ class MainWindow(QWidget):
         """
         pdf_path = self._last_pdf
         if pdf_path and Path(pdf_path).exists():
-            out_page = self._translation_output_page(page, self._last_output_type)
+            out_page = self._translation_output_page(
+                page, self._last_output_type, self._last_page_map
+            )
             return self._render_pdf_page_png(pdf_path, out_page)
         worker = self._live_worker()
         if worker is not None:
@@ -887,16 +909,20 @@ class MainWindow(QWidget):
         except Exception:  # noqa: BLE001 — a bad page must not crash the preview
             return None
 
-    def _translation_output_page(self, page: int, kind: str) -> int:
+    def _translation_output_page(self, page: int, kind: str,
+                                 page_map: list[int] | None = None) -> int:
         """Map a source ``page`` to its page index in the exported PDF.
 
         ``translated_pdf`` overlays the translation in place, so the output page
-        index equals the source index.  ``bilingual_pdf`` inserts a mirror
-        translation page after every source page, so source ``i`` lives at output
-        ``2*i + 1``.  Any other kind keeps the index unchanged.
+        index normally equals the source index — except with ``expand_pages``,
+        where ``page_map`` (from the export) gives the real index.  ``bilingual_pdf``
+        inserts a mirror translation page after every source page, so source ``i``
+        lives at output ``2*i + 1``.  Any other kind keeps the index unchanged.
         """
         if kind == "bilingual_pdf":
             return page * 2 + 1
+        if page_map and 0 <= page < len(page_map):
+            return int(page_map[page])
         return page
 
     def _render_pdf_page_png(self, path: str | Path, page: int) -> bytes | None:
@@ -1043,6 +1069,7 @@ class MainWindow(QWidget):
         self._cancelled_by_user = False
         self._errored = False
         self._last_pdf = None   # the previous run's exported PDF no longer applies
+        self._last_page_map = None
         # Clear the log *before* saving prefs so a prefs-save warning is not
         # wiped out.
         self._log.clear()
@@ -1073,6 +1100,7 @@ class MainWindow(QWidget):
             agent_terms=self._agent_terms_check.isChecked(),
             rebuild_table=self._rebuild_table_check.isChecked(),
             image_text=self._image_text_check.isChecked(),
+            expand_pages=self._expand_pages_check.isChecked(),
             overlay=self.doc_ctx.overlay(),
             requirements=[requirement] if requirement else None,
             page_scope=page_scope,
@@ -1135,6 +1163,7 @@ class MainWindow(QWidget):
                     "agent_terms": bool(self._agent_terms_check.isChecked()),
                     "rebuild_table": bool(self._rebuild_table_check.isChecked()),
                     "image_text": bool(self._image_text_check.isChecked()),
+                    "expand_pages": bool(self._expand_pages_check.isChecked()),
                     "last_dir": str(Path(self._source or "").parent),
                 }
             )
@@ -1192,6 +1221,21 @@ class MainWindow(QWidget):
             reason = save_prefs(prefs)
             if reason and hasattr(self, "_log"):
                 self._append_log(f"  警告：用户偏好保存失败（{reason}），图内文字开关不会被记住。")
+        except Exception:
+            pass
+
+    def _persist_expand_pages(self, checked: bool) -> None:
+        """Save the expand-pages checkbox the moment it is toggled.
+
+        Export-only option: it is read when the export runs, so unlike the
+        figure-text switch no re-extraction is needed for a re-export to honour it.
+        """
+        try:
+            prefs = load_prefs()
+            prefs["expand_pages"] = bool(checked)
+            reason = save_prefs(prefs)
+            if reason and hasattr(self, "_log"):
+                self._append_log(f"  警告：用户偏好保存失败（{reason}），译文扩页开关不会被记住。")
         except Exception:
             pass
 
@@ -1259,6 +1303,7 @@ class MainWindow(QWidget):
             # 就是「选项失效」）。表格列宽重排自 v0.5.47 起恒为默认值，无需传参。
             rebuild_table=self._rebuild_table_check.isChecked(),
             image_text=self._image_text_check.isChecked(),
+            expand_pages=self._expand_pages_check.isChecked(),
         ))
 
     def _on_progress(self, done: int, total: int, stage: str) -> None:
@@ -1329,8 +1374,10 @@ class MainWindow(QWidget):
         if worker is not None:
             self._last_pdf = worker_field(worker, "_last_pdf")
             self._last_output_type = worker_field(worker, "_output_type", "")
+            self._last_page_map = worker_field(worker, "_page_map")
         else:
             self._last_pdf = None
+            self._last_page_map = None
         # Gap1: feed the run's result back to the console surface so the user sees a
         # clear completion summary in the sidebar (the console can then follow up).
         report = worker_field(worker, "_report", "")

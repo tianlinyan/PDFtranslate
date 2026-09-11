@@ -18,8 +18,12 @@ from typing import Any
 #: Path to the models.json located next to the package.
 DEFAULT_MODELS_PATH = Path(__file__).resolve().parent.parent / "models.json"
 
-#: Path to the user preferences file.
+#: Path to the user preferences file (the default when nothing overrides it).
 APP_PREFS_PATH = Path.home() / ".pdftranslate" / "prefs.json"
+
+#: Environment variable that redirects the preference file, the same way
+#: ``PDFTRANSLATE_CACHE_DIR`` / ``PDFTRANSLATE_OCR_CACHE_DIR`` redirect the caches.
+PREFS_PATH_ENV = "PDFTRANSLATE_PREFS_PATH"
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -266,11 +270,33 @@ def load_models(path: Path | str = DEFAULT_MODELS_PATH) -> list[ModelConfig]:
 # User preferences
 # ---------------------------------------------------------------------------
 
+def prefs_path() -> Path:
+    """Where preferences are read from / written to.
+
+    ``PDFTRANSLATE_PREFS_PATH`` overrides :data:`APP_PREFS_PATH` (an empty or
+    blank value counts as *unset* — a blank env var must not make every saved
+    preference disappear, cf. the ``${ENV_VAR}`` pitfall in
+    :meth:`ModelConfig.from_dict`).
+
+    The override exists because preferences are read **implicitly** when the
+    main window is built: with no way to redirect the file, a developer's saved
+    settings silently change what a freshly constructed ``MainWindow`` looks
+    like, so a widget-default assertion passes on one machine and fails on
+    another (``image_text`` did exactly that), and a GUI test can overwrite the
+    developer's real preferences while it is at it.
+    """
+    raw = (os.environ.get(PREFS_PATH_ENV) or "").strip()
+    if raw:
+        return Path(raw)
+    return APP_PREFS_PATH
+
+
 def load_prefs() -> dict[str, Any]:
     """Load the persisted user preferences (empty dict if none are saved)."""
+    path = prefs_path()
     try:
-        if APP_PREFS_PATH.exists():
-            with APP_PREFS_PATH.open("r", encoding="utf-8") as fh:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fh:
                 return dict(json.load(fh))
     except Exception:
         pass
@@ -286,11 +312,12 @@ def save_prefs(prefs: dict[str, Any]) -> str | None:
     translation/OCR caches: the GUI hard-exits on window close, and a plain
     overwrite could leave a truncated ``prefs.json``.
     """
-    tmp = APP_PREFS_PATH.with_name(f"{APP_PREFS_PATH.name}.{os.getpid()}.tmp")
+    path = prefs_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        APP_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), "utf-8")
-        os.replace(tmp, APP_PREFS_PATH)
+        os.replace(tmp, path)
         return None
     except Exception as exc:  # noqa: BLE001 — prefs are best-effort
         try:

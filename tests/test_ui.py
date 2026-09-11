@@ -77,6 +77,14 @@ class TranslationOutputPageTest(unittest.TestCase):
         # translated_pdf overlays the translation in place → same page index.
         self.assertEqual(3, MainWindow._translation_output_page(None, 3, "translated_pdf"))
 
+    def test_inplace_pdf_uses_the_reported_page_map(self):
+        # expand_pages 后源页 i 不再等于输出页 i：预览必须用导出返回的映射，
+        # 越界的映射则退回原页号。
+        self.assertEqual(2, MainWindow._translation_output_page(
+            None, 1, "translated_pdf", [0, 2, 3]))
+        self.assertEqual(5, MainWindow._translation_output_page(
+            None, 5, "translated_pdf", [0, 2, 3]))
+
     def test_bilingual_pdf_mirrors_to_2i_plus_1(self):
         # bilingual inserts a translation page after every source page.
         self.assertEqual(1, MainWindow._translation_output_page(None, 0, "bilingual_pdf"))

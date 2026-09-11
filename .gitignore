@@ -24,6 +24,10 @@ _baseline_clean.txt
 # 大体积示例 / 生成的译文 PDF（测试运行时会自行生成样本，无需入库）
 *.pdf
 
+# 本机工具状态（含凭据）与临时草稿目录，绝不入库
+.pi/
+.review_tmp/
+
 # IDE 与系统
 .idea/
 .vscode/

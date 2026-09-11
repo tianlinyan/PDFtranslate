@@ -108,7 +108,7 @@ def measure_layout(blocks: Sequence, translated_texts: Sequence[str], *,
         leading = pdfio._line_leading(font, in_table=in_table, n_lines=len(lines))
         height = pdfio._wrapped_height(font, lines, fs, leading)
         box_h = max(0.5, b.y1 - b.y0)
-        start_fs = max(5.0, min(b.size, pdfio._MAX_FONT))
+        start_fs = pdfio._font_start(b)
         floor = pdfio._MIN_TABLE_FLOOR if in_table else min(start_fs, pdfio._MIN_READABLE)
 
         if fs < 4:

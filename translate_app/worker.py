@@ -85,6 +85,7 @@ class TranslateWorker(QObject):
         reflow: bool = True,
         rebuild_table: bool = False,
         image_text: bool | None = None,
+        expand_pages: bool = False,
         policy_fn=None,
     ):
         super().__init__()
@@ -137,6 +138,10 @@ class TranslateWorker(QObject):
         #: window's "译文" side renders from THIS after the run — the exported
         #: translation — while a live run shows the in-progress translation (below).
         self._last_pdf: str | None = None
+        #: Source page → output page map of the last export (set for the in-place
+        #: PDF type; ``None`` when it does not apply).  With ``expand_pages`` an
+        #: output page no longer equals its source index, so the preview needs it.
+        self._page_map: list[int] | None = None
         # ``preview_handler`` (e.g. ``preview.PreviewBridge.get_region``) is the
         # worker↔GUI channel the v0.3.0 agent uses to show a page and receive a
         # user-framed region back (see ``agent.run_page_visual``).
@@ -181,6 +186,12 @@ class TranslateWorker(QObject):
         #: 单元格），失败回退几何重绘。
         self._rebuild_table = bool(rebuild_table) or (
             os.environ.get("PDFTRANSLATE_REBUILD_TABLE") == "1")
+        #: 译文扩页（expand_pages，默认关闭）：源页放不下的表格行/正文排到新增的
+        #: 后续页，而不是压缩行高或缩到可读下限之下。只对「仅译文/原位」PDF 的
+        #: 文本层内容生效——扫描件位图与图内文字不可重排。环境变量
+        #: PDFTRANSLATE_EXPAND_PAGES=1 可强制开启（与其它导出旋钮同款，供排查用）。
+        self._expand_pages = bool(expand_pages) or (
+            os.environ.get("PDFTRANSLATE_EXPAND_PAGES") == "1")
         # Cancellation flag.  An ``Event`` (not a bare bool) because it is
         # written from the GUI thread (``cancel``) and read from the worker
         # thread: the Event gives explicit, memory-model-safe signalling
@@ -212,7 +223,8 @@ class TranslateWorker(QObject):
         """
         return (
             f"导出选项：OCR表格重建={'开' if self._rebuild_table else '关'}，"
-            f"表格列宽重排={'开' if self._reflow else '关'}"
+            f"表格列宽重排={'开' if self._reflow else '关'}，"
+            f"译文扩页={'开' if self._expand_pages else '关'}"
             f"{'（AI 重建表：模型支持视觉）' if self._rebuild_table and getattr(self._model, 'vision', False) else ''}。"
         )
 
@@ -783,7 +795,12 @@ class TranslateWorker(QObject):
                 f"为避免覆盖源文件，改存为：{out}"
             )
         kind = self._output_type
+        self._page_map = None
         if kind == "bilingual_pdf":
+            # 双语产物是「源页 + 镜像译文页」逐页对照，扩页会打破配对
+            # （检查脚本也按 src[i] ↔ tgt[2i+1] 配对），因此不适用。
+            if self._expand_pages:
+                self.log.emit("  提示：双语产物保持逐页对照，「译文扩页」不适用。")
             pdfio.save_interleaved_pdf(
                 self._source, per_page, out, self._lang, doc.pages
             )
@@ -804,10 +821,11 @@ class TranslateWorker(QObject):
                                                    client=client)
                 merge_fn = make_merge_tool_fn(self._model, self.log.emit, client=client)
             try:
-                pdfio.save_translated_pdf(
+                self._page_map = pdfio.save_translated_pdf(
                     self._source, doc.pages, per_page, out, self._lang,
                     log=self.log.emit, reflow=self._reflow,
                     redraw_ocr=self._rebuild_table,
+                    expand_pages=self._expand_pages,
                     table_rebuild_fn=rebuild_fn,
                     merge_tool_fn=merge_fn,
                 )
