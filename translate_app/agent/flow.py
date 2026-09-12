@@ -773,6 +773,12 @@ _UNIT_EN_RE = re.compile(
 _UNIT_EN_POWER = {"thousand": 3, "million": 6, "billion": 9, "trillion": 12}
 _UNIT_CN_RE = re.compile(r"^\s*(万亿|亿|万)\s*")
 _UNIT_CN_POWER = {"万亿": 12, "亿": 8, "万": 4}
+#: A currency right after a value makes even a *bare* integer a figure (``5 元``,
+#: ``5 yuan``); without one, a lone ``4`` is a section marker / year / "Tier 1"
+#: (see the bare-integer rule in ``_number_signature``).  Mirrors
+#: ``check_translation._CURRENCY_RE`` so both implementations judge alike.
+_CURRENCY_RE = re.compile(
+    r"^\s*(?:yuan|rmb|cny|usd|eur|hkd|jpy|dollars?|元|美元|港元|人民币)")
 #: Latin words used by the residual-prose detector (a code like ``GB/T 33436-2016``
 #: is not prose, an untranslated sentence is).
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]+(?:[’'-][A-Za-z]+)*")
@@ -792,7 +798,7 @@ def _unit_multiplier(window: str) -> Decimal:
     return Decimal(1)
 
 
-def _number_signature(text: Any) -> "Counter[Decimal]":
+def _number_signature(text: Any, *, figures_only: bool = False) -> "Counter[Decimal]":
     """The multiset of *values* (not token strings) that ``text`` contains.
 
     Full-width glyphs, Unicode minus and hyphen-separated runs (``2023-12-31``)
@@ -807,7 +813,9 @@ def _number_signature(text: Any) -> "Counter[Decimal]":
     # from the day/year ("December 31, 2023" == "2023年12月31日"), so no space
     # normalization may merge them.
     t = _MONTH_RE.sub(lambda m: _MONTH_NUM[m.group(0)], t)
-    t = t.replace(",", "").replace("，", "")
+    # Commas are **not** stripped here: a token that carries one is a *figure*, and
+    # the bare-integer rule below has to be able to see it.  ``Decimal`` gets the
+    # stripped form per token instead.
     # Only the sign-adjacent space is an artifact: "− 7,326.50" keeps its sign
     # while "3.14 亿元" / "314 million yuan" keep the space the unit matcher
     # needs to attach the multiplier to the right value.
@@ -821,15 +829,35 @@ def _number_signature(text: Any) -> "Counter[Decimal]":
         tok = m.group(0)
         if tok in ("", "-", "+", "."):
             continue
-        try:
-            v = Decimal(tok)
-        except InvalidOperation:
-            continue
         # The unit that belongs to THIS value sits between the token and the next
         # number (a unit cannot skip over another figure).
         unit_win = (t[m.end():spans[i + 1].start()] if i + 1 < len(spans)
                     else t[m.end():m.end() + 16])
-        out[v * _unit_multiplier(unit_win)] += 1
+        mult = _unit_multiplier(unit_win)
+        # A separator must sit **between digits**: the comma in "December 31, 2025" is
+        # punctuation, not a thousands separator (reading it as one made every English
+        # date an "extra" number against the CJK date it came from).
+        has_sep = bool(re.search(r"\d[.,]\d", tok))
+        # A *figure* carries a separator, a percent sign, a unit multiplier or a
+        # currency; a bare integer is a section / ordinal marker, a year or a
+        # "Tier 1"-style qualifier.
+        is_figure = (has_sep or t[m.end():m.end() + 1] == "%" or mult != 1
+                     or bool(_CURRENCY_RE.match(unit_win)))
+        if figures_only and not is_figure:
+            # Only the translation's **extra** direction asks for this: a correct
+            # translation legitimately *introduces* bare integers the source wrote as
+            # CJK numerals or as a word (「（四）」 → "(4)", 「一级资本」 → "Tier 1
+            # capital").  Counting those made the gate reject correct translations on
+            # a real annual report (7 false findings on one page — and the same check
+            # gates both the review loop and the per-page batch path, v0.6.9).  The
+            # ``missing`` direction keeps the full signatures, so a dropped or altered
+            # source value — including a date digit — is still reported.
+            continue
+        try:
+            v = Decimal(tok.replace(",", ""))
+        except InvalidOperation:
+            continue
+        out[v * mult] += 1
     return out
 
 
@@ -957,7 +985,11 @@ def _check_numbers(state, page=None):
         src = _number_signature(str(b.text))
         trans = _number_signature(t)
         missing = list((src - trans).elements())
-        extra = list((trans - src).elements())
+        # ``extra`` compares *figures* on both sides (see ``figures_only``): the
+        # translation may introduce small integers that the source never had as
+        # digits, and reporting those was a false positive on every sectioned report.
+        extra = list((_number_signature(t, figures_only=True)
+                      - _number_signature(str(b.text), figures_only=True)).elements())
         if missing or extra:
             out.append({"index": idx, "source": str(b.text), "translation": t,
                         "missing": missing, "extra": extra})

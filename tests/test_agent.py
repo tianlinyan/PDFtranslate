@@ -1036,6 +1036,67 @@ class PageExecutorsTest(unittest.TestCase):
         s.out_doc = {0: {"text": "As of May 2023 revenue was 31 million yuan"}}
         self.assertTrue(tools["check_numbers"](0)["numbers"])
 
+    def test_check_numbers_ignores_cjk_section_markers(self):
+        # 真机发现（v0.6.9）：源文的「（四）」被译成 "(4)" 后，检查把 4 当成「译文多出来的
+        # 数字」，于是一份完全正确的译文被判 needs-fix——真机 28 页年报的一页上刷出 7 条
+        # 假 numbers，而且同一个检查既是复核门也是 M2 批量页的门。
+        # 「裸整数」= 没有分隔符 / 百分号 / 单位倍率 / 货币的整数，通常是序号、年份或
+        # "Tier 1" 这类词，不是会被误读千分位的小数——check_translation.py 的 _amounts
+        # 从 v0.5.x 起就是这个判据，两处现在一致。
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("（四）市场风险。止损限额2.17%，外汇敞口头寸比例0.18%。",
+                                page=0, x0=0, y0=0, x1=100, y1=10)]],
+            blocks=["（四）市场风险。止损限额2.17%，外汇敞口头寸比例0.18%。"],
+            block_pages=[0])
+        tools = agent.make_page_executors(s, _dummy_model())
+        s.out_doc = {0: {"text": "(4) Market Risk. The stop-loss limit was 2.17% and the "
+                               "foreign exchange open position ratio was 0.18%."}}
+        self.assertEqual([], tools["check_numbers"](0)["numbers"])
+        # 真数字被改（2.17 → 2.71）仍然必须报出来。
+        s.out_doc = {0: {"text": "(4) Market Risk. The stop-loss limit was 2.71% and the "
+                               "foreign exchange open position ratio was 0.18%."}}
+        self.assertTrue(tools["check_numbers"](0)["numbers"])
+
+    def test_check_numbers_tolerates_a_digit_introduced_for_a_word(self):
+        # 容忍是**单向**的：译文把源文写作汉字的量词/序号写成阿拉伯数字（「一级资本」→
+        # "Tier 1 capital"）不算「多出来的数字」——否则每份分节报告都会被刷屏。
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("利率风险敏感度（一级资本）10.04%", page=0,
+                                x0=0, y0=0, x1=100, y1=10)]],
+            blocks=["利率风险敏感度（一级资本）10.04%"], block_pages=[0])
+        tools = agent.make_page_executors(s, _dummy_model())
+        s.out_doc = {0: {"text": "Interest rate risk sensitivity (Tier 1 capital) "
+                               "was 10.04%"}}
+        self.assertEqual([], tools["check_numbers"](0)["numbers"])
+
+    def test_check_numbers_still_flags_a_dropped_bare_number(self):
+        # 容差只在 extra 方向：源文里真实存在的裸整数被丢掉／改掉，仍然必须报
+        # （日期里的日/月数字就靠这条）。
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("本行共 5 项业务", page=0, x0=0, y0=0, x1=100, y1=10)]],
+            blocks=["本行共 5 项业务"], block_pages=[0])
+        tools = agent.make_page_executors(s, _dummy_model())
+        s.out_doc = {0: {"text": "The bank has these business lines."}}
+        self.assertTrue(tools["check_numbers"](0)["numbers"],
+                        "源文的裸整数被丢掉仍然要报")
+        s.out_doc = {0: {"text": "The bank has 5 business lines."}}
+        self.assertEqual([], tools["check_numbers"](0)["numbers"])
+
+    def test_check_numbers_still_flags_a_bare_amount_with_currency(self):
+        # 带货币的裸整数仍然是金额：「5 元」→ "50 yuan" 必须报。
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("净利润 5 元", page=0, x0=0, y0=0, x1=100, y1=10)]],
+            blocks=["净利润 5 元"], block_pages=[0])
+        tools = agent.make_page_executors(s, _dummy_model())
+        s.out_doc = {0: {"text": "Net profit was 5 yuan"}}
+        self.assertEqual([], tools["check_numbers"](0)["numbers"])
+        s.out_doc = {0: {"text": "Net profit was 50 yuan"}}
+        self.assertTrue(tools["check_numbers"](0)["numbers"])
+
     def test_check_numbers_accepts_month_abbreviations(self):
         # 正确的英文日期缩写（Jan/Dec）曾经被报「missing 1 / missing 12」：月份数字
         # 随全名一起消失，模型无论怎么正确翻译都过不了复核门（三轮后报「仍有问题」）。
