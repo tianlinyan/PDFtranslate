@@ -396,31 +396,27 @@ class MainWindow(QWidget):
         self._expand_pages_check.setChecked(bool(prefs.get("expand_pages", False)))
         self._expand_pages_check.toggled.connect(self._persist_expand_pages)
 
-        # 选项排成两行、每行两个，用 QGridLayout 对齐两列：左列标签右对齐、勾选框
-        # 左对齐，各行的标签/勾选框在同一竖直线上（HBox 拼装会因标签字数不同而左右
-        # 错位）。
-        opt_grid = QGridLayout()
+        # 选项排成**两行三列**。v0.6.14 起不再给每项加分类标签（「翻译管线」「术语
+        # 注入」…）：勾选框自带说明（「IR 文档级管线」「文档级术语」…），标签只是把同一件
+        # 事说两遍，还占掉半行宽度。用 QGridLayout 而不是 HBox 拼装——各行/各列要在同一
+        # 竖直线上，按文字长度自然排会左右参差。
+        self._option_grid = opt_grid = QGridLayout()   # 测试断言 2×3 用
         opt_grid.setContentsMargins(0, 0, 0, 0)
         opt_grid.setHorizontalSpacing(16)
         opt_grid.setVerticalSpacing(4)
-        for row, (lab1, cb1, lab2, cb2) in enumerate((
-            ("翻译管线", self._ir_check, "术语注入", self._agent_terms_check),
-            ("扫描重建", self._rebuild_table_check, "图内文字", self._image_text_check),
-            ("译文扩页", self._expand_pages_check, None, None),
+        for i, cb in enumerate((
+            self._ir_check,            # 文档级管线（IR）
+            self._agent_terms_check,   # 全文术语统一
+            self._rebuild_table_check,  # 扫描表格 → 矢量表格
+            self._image_text_check,    # 图内文字
+            self._expand_pages_check,  # 放不下就扩页
         )):
-            left = QLabel(lab1)
-            left.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            opt_grid.addWidget(left, row, 0)
-            opt_grid.addWidget(cb1, row, 1)
-            if cb2 is not None:
-                right = QLabel(lab2)
-                right.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                opt_grid.addWidget(right, row, 2)
-                opt_grid.addWidget(cb2, row, 3)
-        # 第 1、3 列（勾选框列）不参与拉伸，保证两列选项各自成一条竖线。
-        opt_grid.setColumnStretch(1, 0)
-        opt_grid.setColumnStretch(3, 0)
-        opt_grid.setColumnStretch(4, 1)
+            opt_grid.addWidget(cb, i // 3, i % 3,
+                              Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        # 三列不参与拉伸（各自按内容取宽，不裁剪长标签），末列之后的空列吸收余量。
+        for col in range(3):
+            opt_grid.setColumnStretch(col, 0)
+        opt_grid.setColumnStretch(3, 1)
         form.addRow(opt_grid)
 
         # --- 智能编排 + 扫描页识别：已交由 AI 自动处理，不再提供开关 ---

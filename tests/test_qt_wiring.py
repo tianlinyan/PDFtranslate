@@ -330,6 +330,40 @@ class ReExportForwardsExportFlagsTest(unittest.TestCase):
             self.assertTrue(seen, "设置不一致时必须重新提取，而不是复用旧文档")
 
 
+class OptionsGridLayoutTest(unittest.TestCase):
+    """v0.6.14：选项区删掉每项前面的分类标签，5 个勾选框排成两行三列。
+
+    标签（「翻译管线」「术语注入」…）只是把勾选框文字换个说法重复一遍，还占掉半行
+    宽度、把 5 个选项挤成 3 行；删掉后按 2×3 排。勾选框自带说明文字，悬停提示照旧。
+    """
+
+    def test_five_checkboxes_in_two_rows_of_three_without_labels(self):
+        from PyQt6.QtWidgets import QCheckBox
+
+        _app()
+        win = MainWindow()
+        try:
+            grid = win._option_grid
+            boxes = (win._ir_check, win._agent_terms_check,
+                     win._rebuild_table_check, win._image_text_check,
+                     win._expand_pages_check)
+            self.assertEqual(len(boxes), grid.count(),
+                             "网格里只能有勾选框：分类标签必须已删除")
+            spots = []
+            for cb in boxes:
+                index = grid.indexOf(cb)
+                self.assertGreaterEqual(index, 0, f"{cb.text()} 不在选项网格里")
+                self.assertIsInstance(grid.itemAt(index).widget(), QCheckBox)
+                row, col, row_span, col_span = grid.getItemPosition(index)
+                self.assertEqual((1, 1), (row_span, col_span))
+                spots.append((row, col))
+            # 顺序不变：管线 → 术语 → 扫描重建（第一行）→ 图内文字 → 扩页（第二行）。
+            self.assertEqual([(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)], spots)
+        finally:
+            win._chat_thread.quit()
+            win._chat_thread.wait(2000)
+
+
 class StartButtonAlwaysStartsTest(unittest.TestCase):
     """v0.5.31: 「开始翻译」＝全新翻译，且 AI 没启动时按钮自己启动。
 
