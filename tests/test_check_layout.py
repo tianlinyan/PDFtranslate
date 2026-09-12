@@ -110,22 +110,90 @@ class RuleCrossingTest(unittest.TestCase):
         self.assertEqual([], check_layout.find_rule_crossings(
             spans, rules, scale=1.0))
 
+    def test_a_glyph_stroke_inside_the_run_is_not_a_crossing(self):
+        # v0.6.13 真机：「二、公司组织架构图」的译文折成两行，第二行被报 12% 压线，
+        # 而那条「线」是「司」的横笔（≈11pt，正好够 _RULE_MIN_RUN_PT=10pt），
+        # 整段落在译文 x 范围内 —— 源文墨迹豁免也救不了（该「线」本身就是墨）。
+        import numpy as np
+
+        rules = np.zeros((100, 100), dtype=bool)
+        rules[40:42, 25:55] = True      # 只存在于字形内部的「线」
+        spans = [_span("Chart", (10, 32, 60, 52))]
+        self.assertEqual([], check_layout.find_rule_crossings(
+            spans, rules, scale=1.0))
+
+    def test_a_rule_that_continues_past_the_run_is_a_crossing(self):
+        # 印刷表格线横跨单元格，必然越过它穿过的文字。
+        import numpy as np
+
+        rules = np.zeros((100, 100), dtype=bool)
+        rules[40:42, 25:] = True        # 延伸到字形右侧（直到页边）
+        spans = [_span("Chart", (10, 32, 60, 52))]
+        self.assertEqual(1, len(check_layout.find_rule_crossings(
+            spans, rules, scale=1.0)))
+
     def test_no_mask_is_not_an_error(self):
         self.assertEqual([], check_layout.find_rule_crossings(
             [_span("x", (0, 0, 10, 10))], None, scale=1.0))
 
 
 class SmallTextTest(unittest.TestCase):
-    def test_grades_table_floor_and_body_floor(self):
-        spans = [
-            _span("tiny", (0, 0, 10, 10), size=2.5),
-            _span("cell", (0, 20, 10, 30), size=6.2),
-            _span("body", (0, 40, 10, 50), size=9.0),
-        ]
-        found = check_layout.find_too_small(spans, 6.0, 7.0)
-        self.assertEqual(2, len(found))
-        self.assertTrue(any("低于最小可读字号" in m for m in found))
-        self.assertTrue(any("低于正文下限" in m for m in found))
+    """字号判据按**该块自己的**下限（与 flow._check_layout / 导出器同口径）。"""
+
+    def _block(self, text, y0, size, **kw):
+        return pdfio.Block(text=text, page=0, x0=0, y0=y0, x1=100, y1=y0 + 10,
+                           size=size, **kw)
+
+    def test_a_table_cell_is_graded_by_the_table_floor_not_the_prose_floor(self):
+        # v0.6.13 真机：一份 5 页扫描密集报表上刷出 331 条假「字号」——格内文字按 3pt
+        # 下限画（导出器有意为之），这里却拿 6.3pt 正文下限量。
+        cell = self._block("net profit", 0, 9.0, in_table=True)
+        span = _span("net profit", (0, 0, 100, 10), size=5.2)
+        self.assertEqual([], check_layout.find_too_small([span], [cell]))
+
+    def test_a_prose_span_below_its_own_blocks_floor_is_reported(self):
+        body = self._block("body", 0, 11.0)
+        span = _span("body", (0, 0, 100, 10), size=5.0)
+        found = check_layout.find_too_small([span], [body])
+        self.assertEqual(1, len(found), found)
+        self.assertIn("低于可读下限", found[0])
+        self.assertIn("源文字号 11.0pt", found[0])
+
+    def test_a_small_source_block_is_not_flagged(self):
+        # 源文自己就是 5pt 的脚注：`_font_start` 就是 5pt，画成 5pt 是合法的——
+        # 该页正文下限是 min(5.0, 6.3)=5.0，而不是 6.3。（导出器不会给这个块画 4.5pt，
+        # 所以 4.5pt 仍会被报出来。）
+        foot = self._block("footnote", 0, 5.0)
+        legal = _span("footnote", (0, 0, 100, 10), size=5.0)
+        shrunk = _span("footnote", (0, 20, 100, 30), size=4.5)
+        self.assertEqual([], check_layout.find_too_small([legal], [foot]))
+        self.assertEqual(1, len(check_layout.find_too_small([shrunk], [foot])))
+
+    def test_an_unattributed_span_is_not_graded_against_a_prose_floor(self):
+        # 对应不到原文块的译文（扫描/图表页）不比正文下限——CLI 无从知道原文多大；
+        # 但低于 3pt 这个「任何合法路径都不会到」的绝对下限仍要报。
+        stamp = pdfio.Block(text="stamp", page=0, x0=500, y0=500, x1=520, y1=512,
+                            size=11.0)
+        cell = _span("5pt cell", (0, 0, 40, 8), size=5.0)
+        tiny = _span("2pt cell", (0, 20, 40, 28), size=2.5)
+        found = check_layout.find_too_small([cell, tiny], [stamp])
+        self.assertEqual(1, len(found), found)
+        self.assertIn("2.5pt", found[0])
+        self.assertIn("无对应源块", found[0])
+
+    def test_a_page_without_a_text_layer_only_reports_the_universal_floor(self):
+        found = check_layout.find_too_small(
+            [_span("cell", (0, 0, 40, 8), size=4.9),
+             _span("tiny", (0, 20, 40, 28), size=2.0)], None)
+        self.assertEqual(1, len(found), found)
+        self.assertIn("无对应源块", found[0])
+        self.assertIn("3.0pt", found[0])
+
+    def test_attribution_prefers_the_block_that_contains_the_span(self):
+        a = self._block("a", 0, 10.0)
+        b = self._block("b", 20, 10.0)
+        pairs = check_layout.attribute_spans([_span("b", (0, 20, 100, 30))], [a, b])
+        self.assertIs(b, pairs[0][1])
 
     def test_the_body_floor_follows_the_source_pages_own_text_size(self):
         # 源码本身就是 5pt 的脚注，按 5pt 画出来是合法的：正文下限取该页源文块的
@@ -199,6 +267,35 @@ class EndToEndTest(unittest.TestCase):
         self.assertTrue(report.rule, "rule crossing not detected")
         self.assertTrue(report.off_page, "off-page text not detected")
         self.assertTrue(report.structural())
+
+    def test_scanned_page_spans_are_summarised_not_graded(self):
+        # v0.6.13：一页没有文本层时，CLI 无从知道原文用了多大字号（扫描密集报表的
+        # 格内文字本来就是 ~5pt），所以不逐条判字号，只汇总一行提示；同一份产物里
+        # 有文本层的页仍照常判。
+        src = _OUT / "scan_src.pdf"
+        tgt = _OUT / "scan_tgt.pdf"
+        doc = fitz.open()
+        doc.new_page(width=300, height=200).insert_text((20, 40), "Amount unit",
+                                                        fontsize=10)
+        doc.new_page(width=300, height=200)          # 无文本层（扫描页）
+        doc.save(str(src))
+        doc.close()
+        doc = fitz.open()
+        doc.new_page(width=300, height=200).insert_text((20, 40), "Amount unit",
+                                                        fontsize=10)
+        scan = doc.new_page(width=300, height=200)
+        for i in range(4):
+            scan.insert_text((20, 40 + 12 * i), f"CELL {i}", fontsize=5)
+        doc.save(str(tgt))
+        doc.close()
+        report = check_layout.check_document(src, tgt)
+        self.assertEqual([], report.small, report.small)
+        self.assertEqual([], report.structural(), report.structural())
+        self.assertEqual(1, len(report.small_no_source))
+        page, count, smallest = report.small_no_source[0]
+        self.assertEqual(2, page)
+        self.assertEqual(4, count)
+        self.assertAlmostEqual(5.0, smallest, places=2)
 
     def test_missing_translation_is_reported_for_text_layer_sources(self):
         src = _OUT / "missing_src.pdf"

@@ -9,6 +9,47 @@
 * **体例**：每条按「版本 → 症状/动机 → 根因 → 修法 → 验证（回归测试 / 真机复测）」组织。
 * **历史断层**：v0.5.0 之后直接跳到 v0.5.19——v0.5.1–v0.5.18 的条目在本仓库中不存在（无记录，非漏写）。
 
+## v0.6.13
+
+**修复 `check_layout.py` 在扫描件上的两类假阳性：字号按「块自己的下限」判，压线的线必须延伸到字形之外**（真机端到端发现）。
+
+**症状**（真实 GUI 路径导出的 5 页扫描年报）：`check_layout.py` 报 **331 条 `[字号]`**（5.0–6.3pt，全部写成
+「低于正文下限 6.3pt」）+ **1 条 `[压线]`**，结论 `exit 1`——唯一那条真问题被 331 行噪声埋掉，验收脚本没法用。
+
+**根因 ①／字号**：`find_too_small` 拿**整页正文下限**（6.3pt）去量每一段译文，而导出器的下限是**逐块的**
+（`flow._check_layout` 同一口径）：表格单元 3pt（`_MIN_TABLE_FLOOR`），其它 `min(原字号×0.9, 6.3pt)`。
+扫描密集报表的格内文字按 ~5pt 画是设计如此（`_MIN_TABLE_READABLE`/`_MIN_TABLE_FLOOR`），于是 328 段合法小字
+被报成缺陷——其中 3 段在**有文本层**的页上本来能对上源块（`in_table=True`），另外 325 段在第 4、5 页：
+这两页只有 1 个 11pt 的文本层碎片（扫描页），CLI 根本无从知道原文用了多大字号。
+
+**根因 ②／压线**：『二、公司组织架构图』的译文折成两行，第二行 `Chart`（90.0–105.5pt）被判 12% 压线——
+而那段「线」是**「司」的横笔**：12pt 汉字的横笔 ≈11pt，正好够上 `pdfio._page_rule_mask` 的游程判据
+（`_RULE_MIN_RUN_PT`=10pt），且整段（90.2–101.3pt）落在译文 x 范围内。源文墨迹豁免也救不了它：
+那条「线」本身就是豁免要测的墨。
+
+**修法（只改 `check_layout.py`）**：
+① **字号按块判**：新增 `attribute_spans`（复用 `find_missing` 的 `_covers`/`_credit_key` 归属仲裁），
+   把每段译文配到它所属的源块，再用 `_block_floor`（＝导出器的规则）判；**归不上源块的不比正文下限**
+   ——CLI 无从知道原文多大（扫描/图表页），只保留 3pt 这个「任何合法路径都到不了」的绝对下限，
+   其余偏小文字按页**汇总成一行提示**（`LayoutReport.small_no_source`，不进结论）。真的跑到别处去的块
+   由「漏画」检查兜底（同一套松紧度），不会因为这里不判就消失。`find_too_small` 保留原语义（多一个可选
+   `blocks`），另拆出 `grade_attributed(pairs)` 供调用方复用同一份归属结果（每页只算一次 `_covers`）。
+② **压线要求线延伸到字形之外**（`_rule_reaches_beyond`，`_RULE_EXTEND_PT`=3pt）：印刷表格线横跨单元格，
+   必然越过它穿过的文字；汉字的横笔止于字形内部。只在该带**自己的行**里找，且只看字形两侧 3pt 内。
+
+**真机复测**（同一份产物、同一份原文）：`[字号] 331 + [压线] 1 → exit 1` 变成 `[字号] 0 + [压线] 0
+→ 一行提示（第 1、4、5 页另有 328 段译文无法对应到原文块…）→ exit 0`；同一份产物上「重叠/出页/漏画」
+仍为 0，`check_translation.py` 仍 exit 0——不是把检查放宽到假绿，而是把判据换成导出器真正用的那一条。
+
+**回归**（`tests/test_check_layout.py` 27 → 35）：`test_a_table_cell_is_graded_by_the_table_floor_not_the_prose_floor`、
+`test_a_prose_span_below_its_own_blocks_floor_is_reported`、`test_a_small_source_block_is_not_flagged`、
+`test_an_unattributed_span_is_not_graded_against_a_prose_floor`、`test_a_page_without_a_text_layer_only_reports_the_universal_floor`、
+`test_attribution_prefers_the_block_that_contains_the_span`、`test_scanned_page_spans_are_summarised_not_graded`（端到端）、
+`test_a_glyph_stroke_inside_the_run_is_not_a_crossing`、`test_a_rule_that_continues_past_the_run_is_a_crossing`。
+全量 **946 → 954 全绿**。
+
+---
+
 ## v0.6.12
 
 **修复 agent 在「并行 tool_call」上的饥饿：把被丢弃的调用回灌给模型 + 同调用重复早停**（真机端到端发现）。

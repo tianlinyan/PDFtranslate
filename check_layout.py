@@ -15,12 +15,20 @@
 2. **超出页面**：字形带越过页面左/右/下边界（页外字形会被裁掉，等于丢内容）。
    判界用**未旋转帧**（`get_text` 的坐标就是那一帧），旋转页不会再把页内的
    文字误判成出页。
-3. **压线**：字形带落在**源页印刷表格线**上的比例 > 5%。表格线来自自适应掩膜
-   （``pdfio._page_rule_mask``），所以扫描件/文本层件一视同仁；采样前把字形带
-   映射到渲染帧，旋转页同样有效。
-4. **字号过小**：低于 ``pdfio._MIN_READABLE``（正文可读下限）。表格单元允许到
-   ``pdfio._MIN_TABLE_READABLE``——扫描密集报表里那 3–5pt 的格子属于物理极限，
-   这里只报出来供人工判断，不算致命。
+3. **压线**：字形带落在**源页印刷表格线**上的比例 > 5%，**且该线要延伸到字形带
+   之外**。表格线来自自适应掩膜（``pdfio._page_rule_mask``），所以扫描件/文本层件
+   一视同仁；采样前把字形带映射到渲染帧，旋转页同样有效。延伸判据是必需的：12pt
+   汉字的横笔就有 ≈11pt 长，正好够上掩膜的「游程」判据——真机把『二、公司组织架构图』
+   的第二行译文判成 12% 压线，而那段「线」是 90.2–101.3pt、整段落在 90.0–105.5pt
+   的译文里（「司」的横笔），源文墨迹豁免也救不了它（那条「线」本身就是豁免要测的
+   墨）。印刷表格线横跨单元格，必然越过它穿过的文字。
+4. **字号过小**：低于**该块自己的**可读下限——与导出器 / ``flow._check_layout`` 同口径：
+   表格单元 ``pdfio._MIN_TABLE_FLOOR``(3pt)，其它 ``min(pdfio._font_start(块),
+   pdfio._MIN_READABLE)``（源文本身就是 5pt 的脚注，按 5pt 画出来是合法的）。
+   **源页没有文本层时**（扫描密集报表）无从知道原文用了多大字号——那些 3–5pt 的格内
+   文字是 OCR 行高与表格格的物理极限，导出器本来就这么画——该页只报 < 3pt 的文字，
+   其余偏小文字**汇总成一行提示**（此前拿 6.3pt 正文下限去量 5 页扫描件，刷出 331 条
+   假「字号」，把唯一一条真问题埋了）。
 5. **漏画**（仅源页有文本层时）：源页有文字的块，译文里没有对应位置的文字。
    判据是「有译文字形带落在这个块里（或落在它被表格下推后的位置附近）」——
    按**整块面积**要求 10% 会把长段落永远误报（短译文只盖住一行）。
@@ -58,6 +66,13 @@ _RULE_BAND_INSET = 0.20
 #: rule runs through the source's own text too (dotted statement lines do) — the
 #: translation being crossed is faithful, not a defect.
 _SOURCE_INK_SHARE = 0.04
+#: How far (pt) a printed rule must reach **outside** the glyph run to count as crossing
+#: it.  A printed table rule spans its cell, so it continues past the text it crosses;
+#: a CJK glyph stroke stops inside the run — and a 12 pt glyph's horizontal stroke
+#: (≈11 pt) already satisfies ``pdfio._RULE_MIN_RUN_PT`` (10 pt), which is how a real
+#: 「压线」 came out of 「二、公司组织架构图」's wrapped second line (see
+#: ``_rule_reaches_beyond``).
+_RULE_EXTEND_PT = 3.0
 #: Share of a *span's own* glyph band that must fall inside the source block's box
 #: for the span to count as that block's translation.  (The old rule asked for
 #: ``_COVER_SHARE`` of the whole *block* area from a single span: a correctly
@@ -92,6 +107,11 @@ class LayoutReport:
     off_page: list[str] = field(default_factory=list)
     rule: list[str] = field(default_factory=list)
     small: list[str] = field(default_factory=list)
+    #: ``(1-based page, count, smallest size)`` for pages whose source has **no text
+    #: layer**: what size the source used there is unknowable without OCR, so their
+    #: small spans are summarised (one note) instead of individually graded.  A note
+    #: never changes the verdict — a limitation stated honestly is not a defect.
+    small_no_source: list[tuple[int, int, float]] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
     pages_issue: list[str] = field(default_factory=list)
     scanned_pages: list[int] = field(default_factory=list)
@@ -176,6 +196,39 @@ def find_off_page(spans: Sequence[Span], page_rect: fitz.Rect,
     return out
 
 
+def _rule_reaches_beyond(rules, py0: int, py1: int, px0: int, px1: int,
+                         extend_px: int) -> bool:
+    """True when a rule in the band's *row* reaches **outside** the glyph run.
+
+    A printed table rule spans its cell, so it continues left of / right of the text it
+    crosses; a CJK glyph stroke stops inside the run.  Measured false positive:
+    「二、公司组织架构图」's translation wrapped to two lines and the second line
+    ("Chart", 90.0–105.5 pt) sat on a run of 90.2–101.3 pt — 司's horizontal stroke,
+    ≈11 pt long, enough for ``pdfio._RULE_MIN_RUN_PT`` (10 pt).  The source-ink excuse
+    cannot help there: the stroke *is* the ink that excuse measures.
+
+    Only the band's own rows are searched (a rule elsewhere cannot condemn this span),
+    and only ``extend_px`` beyond either edge — the same stroke that crosses the text is
+    the one that continues past it.
+    """
+    height, width = rules.shape
+    y0, y1 = max(0, py0), min(height, py1)
+    if y1 <= y0 or width <= 0 or extend_px <= 0:
+        return False
+    lo = max(0, px0 - extend_px)
+    hi = min(width, px1 + extend_px + 1)
+    x0, x1 = px0 - lo, px1 - lo
+    for r in range(y0, y1):
+        row = rules[r, lo:hi]
+        if not row[x0:x1].any():
+            continue                   # this row does not cross the run at all
+        left = row[max(0, x0 - extend_px):x0]
+        right = row[x1 + 1:min(row.size, x1 + 1 + extend_px)]
+        if (left.size and left.any()) or (right.size and right.any()):
+            return True
+    return False
+
+
 def find_rule_crossings(spans: Sequence[Span], rules, scale: float,
                         share: float = _RULE_SHARE,
                         inset: float = _RULE_BAND_INSET,
@@ -186,6 +239,10 @@ def find_rule_crossings(spans: Sequence[Span], rules, scale: float,
     that already ran through the source's own text (dotted statement lines do) is
     *not* reported: the translation is faithful there.  Only a rule that crosses a
     translation where the source had no text is a defect.
+
+    The rule must also reach beyond the glyph run (:func:`_rule_reaches_beyond`):
+    a CJK stroke long enough to look like a rule sits *inside* the text, while a
+    printed table line continues past it.
     """
     if rules is None:
         return []
@@ -206,6 +263,9 @@ def find_rule_crossings(spans: Sequence[Span], rules, scale: float,
         got = float(rules[py0:py1, px0:px1].mean())
         if got <= share:
             continue
+        if not _rule_reaches_beyond(rules, py0, py1, px0, px1,
+                                   max(1, int(round(_RULE_EXTEND_PT * scale)))):
+            continue               # a glyph stroke, not a printed rule
         if ink is not None and float(ink[py0:py1, px0:px1].mean()) >= _SOURCE_INK_SHARE:
             continue                   # the source text was crossed there too
         out.append(f"第 {s.page + 1} 页：{got:.0%} 压在表格线上 —— "
@@ -227,23 +287,101 @@ def _body_floor_for(blocks) -> float:
     return min(floors) if floors else pdfio._MIN_READABLE
 
 
-def find_too_small(spans: Sequence[Span], in_table_floor: float,
-                   body_floor: float) -> list[str]:
-    """Spans below the readable floor.
+def _block_floor(block) -> float:
+    """The readability floor the **exporter** uses for one source block.
 
-    ``in_table_floor`` is the exporter's **absolute** floor (``_MIN_TABLE_FLOOR``: a
-    pathological cell may legitimately reach 3 pt) and ``body_floor`` comes from the
-    *source page's* own text size (see :func:`_body_floor_for`) — the same way
-    ``flow._check_layout`` and ``eval`` judge a block.
+    Identical to ``flow._check_layout``: a table cell may legitimately reach
+    ``_MIN_TABLE_FLOOR`` (3 pt — a dense scanned statement's cells are at the physical
+    limit of the medium), anything else ``min(_font_start(block), _MIN_READABLE)``, so a
+    5 pt footnote drawn at 5 pt is faithful rather than too small.
+    """
+    if getattr(block, "in_table", False):
+        return pdfio._MIN_TABLE_FLOOR
+    return min(pdfio._font_start(block), pdfio._MIN_READABLE)
+
+
+def find_too_small(spans: Sequence[Span], blocks=None) -> list[str]:
+    """Spans below the readable floor **of the block they belong to**.
+
+    ``blocks`` are the page's *source* blocks (its text layer).  Grading every span with
+    the page's prose floor reported 331 legitimately small spans on a real 5-page scan:
+    a table cell drawn at 5.2 pt is what the exporter deliberately does
+    (``_MIN_TABLE_FLOOR``), and ``flow._check_layout`` grades each block with its *own*
+    floor.  So a span is graded against the block it belongs to (see :func:`_covers`).
+
+    A span that belongs to **no** source block is not graded against a prose floor at
+    all — the CLI cannot know what the source used there (an OCR'd statement's rows are
+    drawn at ~5 pt by design, and on a partly-OCR'd page the fragment in the text layer
+    is unrelated to the dense block of cells).  Only the universal limit applies:
+    ``blocks is None`` (no text layer) or an unattributable span is reported below
+    ``_MIN_TABLE_FLOOR``, which nothing legitimate reaches — not even an OCR-synthesised
+    block (never under 5 pt, i.e. ≥4.5 pt once scaled).  The unattributable mass is the
+    caller's summary note (``LayoutReport.small_no_source``), and a source block whose
+    translation really went astray is reported by :func:`find_missing` instead.
+    """
+def attribute_spans(spans: Sequence[Span], blocks) -> list[tuple[Span, object | None]]:
+    """Pair every span with the source block it belongs to (``None`` = unattributable).
+
+    One attribution rule for the module: the same :func:`_covers` / :func:`_credit_key`
+    arbitration :func:`find_missing` uses, so a span cannot answer for a neighbour's
+    block here either.  ``blocks`` may be ``None`` (the page has no text layer) — then
+    nothing is attributable.
+    """
+    boxes: list[tuple[object, fitz.Rect]] = []
+    for block in blocks or []:
+        if not str(getattr(block, "text", "")).strip():
+            continue
+        box = fitz.Rect(block.x0, block.y0, block.x1, block.y1)
+        if not box.is_empty:
+            boxes.append((block, box))
+    pairs: list[tuple[Span, object | None]] = []
+    for s in spans:
+        cands = [i for i, (_b, box) in enumerate(boxes) if _covers(box, s)]
+        pairs.append((s, boxes[min(cands, key=lambda i:
+                                  _credit_key(boxes[i][1], s, i))][0] if cands else None))
+    return pairs
+
+
+def find_too_small(spans: Sequence[Span], blocks=None) -> list[str]:
+    """Spans below the readable floor **of the block they belong to**.
+
+    ``blocks`` are the page's *source* blocks (its text layer).  Grading every span with
+    the page's prose floor reported 331 legitimately small spans on a real 5-page scan:
+    a table cell drawn at 5.2 pt is what the exporter deliberately does
+    (``_MIN_TABLE_FLOOR``), and ``flow._check_layout`` grades each block with its *own*
+    floor.  So a span is graded against the block it belongs to (see
+    :func:`attribute_spans`).
+
+    A span belonging to **no** source block is not graded against a prose floor at all —
+    the CLI cannot know what size the source used there (an OCR'd statement's rows are
+    drawn at ~5 pt by design, and on a partly-OCR'd page the fragment in the text layer
+    is unrelated to the dense block of cells).  Only the universal limit applies:
+    ``_MIN_TABLE_FLOOR``, which nothing legitimate reaches — not even an OCR-synthesised
+    block (never under 5 pt, i.e. ≥4.5 pt once scaled).  The unattributable mass is the
+    caller's summary note (``LayoutReport.small_no_source``); a source block whose
+    translation really went astray is reported by :func:`find_missing` instead.
+    """
+    return grade_attributed(attribute_spans(spans, blocks))
+
+
+def grade_attributed(pairs) -> list[str]:
+    """The ``find_too_small`` findings for already-attributed ``(span, block)`` pairs.
+
+    Split out because the caller needs the attribution itself (to summarise the
+    spans that could not be attributed) — attributing twice per output page would
+    double the ``_covers`` work on every scanned page.
     """
     out: list[str] = []
-    for s in spans:
-        if s.size < in_table_floor - 0.01:
-            out.append(f"第 {s.page + 1} 页：{s.size:.1f}pt（低于最小可读字号 "
-                       f"{in_table_floor}pt）—— 「{_clip(s.text)}」")
-        elif s.size < body_floor - 0.01:
-            out.append(f"第 {s.page + 1} 页：{s.size:.1f}pt（低于正文下限 "
-                       f"{body_floor:.1f}pt）—— 「{_clip(s.text)}」")
+    for s, block in pairs:
+        if block is None:
+            floor, why = pdfio._MIN_TABLE_FLOOR, "无对应源块"
+        else:
+            floor = _block_floor(block)
+            why = ("表格单元" if getattr(block, "in_table", False)
+                   else f"源文字号 {float(getattr(block, 'size', 0.0)):.1f}pt")
+        if s.size < floor - 0.01:
+            out.append(f"第 {s.page + 1} 页：{s.size:.1f}pt（低于可读下限 "
+                       f"{floor:.1f}pt，{why}）—— 「{_clip(s.text)}」")
     return out
 
 
@@ -441,7 +579,11 @@ def check_document(source: Path, target: Path,
             # legitimately lives on a continuation page, so comparing the source with
             # one output page would report the moved blocks as missing.
             page_spans: list = []
-            body_floor = _body_floor_for(text_layers.get(i))
+            # ``None`` = this page has no text layer (a scan): its blocks are OCR'd
+            # at export time, so the CLI has nothing to grade the spans against.
+            src_blocks = text_layers.get(i) or None
+            body_floor = _body_floor_for(src_blocks)
+            unattributed: list = []
             for ti in tis:
                 visited.add(ti)
                 page = tgt[ti]
@@ -451,8 +593,9 @@ def check_document(source: Path, target: Path,
                 sizes.extend(s.size for s in spans)
                 report.overlap += find_overlaps(spans)
                 report.off_page += find_off_page(spans, frame_rect(page))
-                report.small += find_too_small(
-                    spans, pdfio._MIN_TABLE_FLOOR, body_floor)
+                pairs = attribute_spans(spans, src_blocks)
+                report.small += grade_attributed(pairs)
+                unattributed.extend(s for s, b in pairs if b is None)
                 if (abs(src_frame.width - frame_rect(page).width) > 1.0
                         or abs(src_frame.height - frame_rect(page).height) > 1.0):
                     report.pages_issue.append(
@@ -473,6 +616,15 @@ def check_document(source: Path, target: Path,
                                 for s in spans]
                     report.rule += find_rule_crossings(rendered, rules, scale,
                                                        ink=ink)
+            if unattributed:
+                # Spans the CLI cannot tie to a source block: say *what* was seen
+                # instead of grading it.  Grading these against the 6.3 pt prose floor
+                # produced 331 findings on a real 5-page scan (a dense statement's rows
+                # are drawn at ~5 pt by design), which buried the one real problem.
+                below = [s for s in unattributed if s.size < body_floor - 0.01]
+                if below:
+                    report.small_no_source.append(
+                        (i + 1, len(below), min(s.size for s in below)))
             # The missing check needs no pixels (it compares text spans), so it
             # runs even when the page could not be sampled — an unsampled page
             # used to skip it silently.
@@ -506,8 +658,11 @@ def check_document(source: Path, target: Path,
                 sizes.extend(s.size for s in spans)
                 report.overlap += find_overlaps(spans)
                 report.off_page += find_off_page(spans, frame_rect(page))
-                report.small += find_too_small(
-                    spans, pdfio._MIN_TABLE_FLOOR, pdfio._MIN_READABLE)
+                report.small += find_too_small(spans, None)
+                below = [s for s in spans if s.size < pdfio._MIN_READABLE - 0.01]
+                if below:
+                    report.small_no_source.append(
+                        (t + 1, len(below), min(s.size for s in below)))
             if extra:
                 report.pages_issue.append(
                     f"译文多出 {len(extra)} 页没有对应原文（第 "
@@ -655,6 +810,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if report.scanned_pages:
         print(f"[提示] 第 {report.scanned_pages} 页源页无文本层，"
               f"跳过「漏画」检查（需 OCR）。")
+    if report.small_no_source:
+        pages_txt = "、".join(str(p) for p, _c, _s in report.small_no_source)
+        total = sum(c for _p, c, _s in report.small_no_source)
+        smallest = min(s for _p, _c, s in report.small_no_source)
+        print(f"[提示] 第 {pages_txt} 页：另有 {total} 段译文无法对应到原文块"
+              f"（该页无文本层，或为扫描/图表页），其字号由 OCR 行高与表格格决定，"
+              f"未与原文比对（最小 {smallest:.1f}pt）。")
     for msg in report.notes:
         print(f"[提示] {msg}")
 
