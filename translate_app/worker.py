@@ -789,6 +789,33 @@ class TranslateWorker(QObject):
                 return png
         return self._render_source_page(int(page))
 
+    def _translate_page_batch(self, state, page: int, model, *, log=None, cancel=None):
+        """One deterministic batch pass over one page (v0.6.7 M2 ``batch`` strategy).
+
+        Reuses the very tool the per-page agent calls (``translate_blocks``), so a
+        batch page gets exactly the translations the agent would have produced — only
+        without the decide loop.  ``DocumentSession`` still runs the deterministic
+        audit gate afterwards and falls back to the agent when it is not clean.
+        """
+        from .agent import flow as flow_mod
+
+        executors = flow_mod.make_page_executors(
+            state, model, log=self.log.emit,
+            cancel=self._cancelled.is_set,
+            render_handler=self.render_page_for_agent,
+        )
+        # A kept block must stay verbatim.  The agent may override a keep when the
+        # user asks for it, but a deterministic pass has no such judgement, so it
+        # gets an explicit index list — the tool's ``page`` default would pick every
+        # translatable block, keeps included.
+        pages = list(getattr(getattr(state, "src_doc", None), "pages", None) or [])
+        if not (0 <= int(page) < len(pages)):
+            return {"ok": False, "error": f"bad page {page}"}
+        base = sum(len(p) for p in pages[:int(page)])
+        indices = [base + i for i, b in enumerate(pages[int(page)])
+                   if not getattr(b, "keep_original", False)]
+        return executors["translate_blocks"](page=page, indices=indices)
+
     def _run_agent(self, doc: pdfio.DocumentText, keep_original: set[int]):
         """v0.3.0: drive translation through the AI-orchestration loop per page.
 
@@ -823,6 +850,7 @@ class TranslateWorker(QObject):
                 interpret=agent_mod.make_llm_interpret(self._model, log=self.log.emit),
                 infer_terms=self._agent_terms,
                 plan=self._document_plan,
+                translate_batch=self._translate_page_batch,
                 scope=self._page_scope,
                 max_steps_per_page=32,
             ).run()

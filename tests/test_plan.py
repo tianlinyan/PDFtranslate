@@ -7,10 +7,14 @@ already exist.
 """
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from translate_app import agent, pdfio
+from translate_app import worker as worker_module
+from translate_app.agent import flow as flow_mod
 from translate_app.agent import plan as plan_mod
 from translate_app.agent.flow import DocumentSession
+from translate_app.agent.state import PageTriage
 
 
 def _model():
@@ -78,6 +82,19 @@ class ValidatePlanTest(unittest.TestCase):
         self.assertEqual("", plan.source)
         self.assertIn("无有效内容", plan_mod.plan_summary(plan))
 
+    def test_page_strategies_are_bound_to_the_document(self):
+        # M2: only a *normal* page may be marked ``batch`` — a scan/chart/uncertain
+        # page needs the visual loop.  Unknown values, unknown page numbers and
+        # out-of-range indices are dropped and reported.
+        plan = plan_mod.validate_plan(
+            {"page_strategy": {"0": "batch", "1": "batch", "2": "agent",
+                               "9": "batch", "x": "batch", "0b": "skip"}},
+            n_blocks=4, source_text="", n_pages=3,
+            kinds=["normal", "scan", "normal"])
+        self.assertEqual({0: "batch", 2: "agent"}, plan.page_strategy)
+        dropped = [d for d in plan.dropped if "page_strategy" in d]
+        self.assertEqual(4, len(dropped), plan.dropped)
+        self.assertTrue(any("scan" in d for d in dropped), dropped)
     def test_document_summary_is_bounded_and_lists_special_pages_first(self):
         doc = _doc(_page("正文一"), _page("正文二"), _page("扫描内容"))
         info = SimpleNamespace(language="zh", text_pages=2, scan_pages=1,
@@ -179,6 +196,102 @@ class PlanChannelTest(unittest.TestCase):
         self.assertIsNone(state.plan)
         self.assertFalse(any("文档级方案" in m for m in logs), logs)
 
+
+class BatchPageStrategyTest(unittest.TestCase):
+    """M2: a ``batch`` page skips the decide loop only when the audit gate is clean.
+
+    The saving is the per-page agent loop (a handful of model rounds); the invariant
+    is unchanged — a page still has to pass the deterministic audit, and anything
+    else falls back to the agent pass, so ``batch`` can never be worse, only cheaper.
+    """
+
+    def _session(self, *, plan_strategy, audit_clean=True, batch_error=None):
+        doc = _doc(_page("总资产", "营业收入"), _page("注释一"), _page("注释二"))
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        state.out_doc = {}
+        for i in range(3):
+            state.triage[i] = PageTriage(page=i, kind="normal")
+        state.plan = plan_mod.TranslationPlan(page_strategy=dict(plan_strategy),
+                                              source="llm")
+        calls = {"batch": [], "agent": [], "audit": []}
+
+        def batch(st, page, model, *, log=None, cancel=None):
+            calls["batch"].append(page)
+            if batch_error is not None:
+                raise batch_error
+            offset = sum(len(pg) for pg in doc.pages[:page])
+            for i, b in enumerate(doc.pages[page]):
+                st.out_doc[offset + i] = {"text": "TR:" + str(b.text)}
+
+        def agent_pass(st, page, model, **kw):
+            calls["agent"].append(page)
+            return st
+
+        def audit(page=None, checks=None):
+            calls["audit"].append(page)
+            return {"clean": audit_clean,
+                    "issues": [] if audit_clean else [{"check": "residual"}]}
+
+        session = DocumentSession(
+            state, doc, model=object(), log=lambda _m: None,
+            translate_page=agent_pass, translate_batch=batch, audit=audit)
+        return state, session, calls
+
+    def test_a_batch_page_skips_the_agent_loop(self):
+        state, session, calls = self._session(plan_strategy={0: "batch"})
+        session._translate_one_normal(0)
+        self.assertEqual([0], calls["batch"])
+        self.assertEqual([], calls["agent"], "审计干净时不该再跑逐页 agent")
+        self.assertEqual([0], calls["audit"])
+        self.assertEqual("done", state.page(0).status)
+
+    def test_a_dirty_audit_falls_back_to_the_agent(self):
+        state, session, calls = self._session(plan_strategy={0: "batch"},
+                                              audit_clean=False)
+        session._translate_one_normal(0)
+        self.assertEqual([0], calls["batch"])
+        self.assertEqual([0], calls["agent"], "审计不通过必须回到逐页 agent")
+        self.assertEqual("done", state.page(0).status)
+
+    def test_a_batch_failure_falls_back_to_the_agent(self):
+        state, session, calls = self._session(plan_strategy={0: "batch"},
+                                              batch_error=RuntimeError("boom"))
+        session._translate_one_normal(0)
+        self.assertEqual([0], calls["batch"])
+        self.assertEqual([0], calls["agent"])
+
+    def test_without_a_strategy_nothing_changes(self):
+        state, session, calls = self._session(plan_strategy={})
+        session._translate_one_normal(0)
+        self.assertEqual([], calls["batch"])
+        self.assertEqual([0], calls["agent"])
+        self.assertEqual([], calls["audit"], "没有 batch 页就不该多跑审计")
+
+class BatchPageWiringTest(unittest.TestCase):
+    """The worker's deterministic batch pass must never rewrite a kept block."""
+
+    def test_kept_blocks_are_excluded_from_the_batch_pass(self):
+        doc = _doc(_page("总资产", "营业收入"), _page("注释一"), _page("注释二"))
+        doc.pages[0][1].keep_original = True          # e.g. the plan or page scope kept it
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        seen: dict = {}
+
+        def fake_make(_state, _model, **_kw):
+            def translate_blocks(page, indices=None, target_lang=None):
+                seen["page"] = page
+                seen["indices"] = list(indices or [])
+                return {"ok": True}
+
+            return {"translate_blocks": translate_blocks}
+
+        worker = worker_module.TranslateWorker(
+            "a.pdf", object(), "English", "plain_text", "out.txt")
+        with mock.patch.object(flow_mod, "make_page_executors", fake_make):
+            worker._translate_page_batch(state, 0, object())
+        self.assertEqual(0, seen["page"])
+        self.assertEqual([0], seen["indices"], "被保留的块不得进入批量翻译")
 
 if __name__ == "__main__":
     unittest.main()

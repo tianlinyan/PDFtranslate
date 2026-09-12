@@ -11,6 +11,38 @@
 
 ---
 
+## v0.6.7
+
+**文档级翻译方案 M2：按页选「批量」还是「逐页 agent」，且批量页仍过审计门**——
+设计见 `docs/0.6.6-文档级翻译方案设计.md`（§5.4 / §9）。
+
+**动机**：M1 只能决定「翻译成什么样」，不能决定「怎么翻」。而整篇最贵的一环是逐页 agent 循环
+（每页若干轮模型调用）；一篇纯文本年报的绝大多数页其实一次批量翻译就够了。
+
+**做法**：`TranslationPlan` 增加 `page_strategy`（`{页号: "batch" | "agent"}`）。
+`DocumentSession._translate_one_normal` 对 `batch` 页先走一次**确定性批量翻译**
+（`worker._translate_page_batch` → 复用 agent 本来就会调用的那个 `translate_blocks` 工具，所以译文
+与 agent 自己翻的完全一致，只是省掉了 decide 循环），随即跑**确定性审计门** `audit_page`：
+
+* 审计 `clean` → 该页直接 `done`，省掉整页的逐页 agent 循环（M2 的全部收益）；
+* 审计不干净 / 批量抛异常 / 一个译文都没产生 → **回退到逐页 agent**（与今天完全一样的路径）。
+
+所以「批量」永远不会比今天更差，只会更便宜；「每页必须过审计门」这条质量不变量没有被绕过。
+
+**约束（都在 `plan.validate_plan` 里强制）**：① 只对 **normal 页**接受 `batch`——扫描/图表/待确认
+页需要视觉循环，写了也丢弃并进 `plan.dropped`；② 页号必须界内、取值必须在枚举里；③ **被保留的块
+永不进入批量翻译**（agent 可以在用户要求时覆盖一个 keep，确定性批量路径没有这个判断力，所以
+`_translate_page_batch` 显式排除 `keep_original` 的块，而不是走工具的「整页默认」）；④ 批量页的
+「是否有译文」判据同样排除保留块（`_page_translation_counts(..., include_kept=False)`），否则整页
+保留会被误判成「没翻译」。
+
+**开关**：仍由 `PDFTRANSLATE_PLAN=1` 一起控制（默认关）。
+
+**回归**：`tests/test_plan.py` 新增 6 例（策略只认 normal 页 / 越界与未知值丢弃；批量页跳过 agent
+循环；审计不干净回退 agent；批量失败回退 agent；没有策略时行为不变；保留块不进批量）。
+全量 **926 → 932 全绿**。
+
+---
 ## v0.6.6
 
 **文档级翻译方案 M1（`TranslationPlan`，默认关闭的试验特性）**——设计见

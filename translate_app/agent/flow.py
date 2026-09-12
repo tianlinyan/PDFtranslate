@@ -292,7 +292,8 @@ def _render_source_page(src_path, page_index: int, dpi: int = 150) -> bytes:
         doc.close()
 
 
-def _page_translation_counts(state: WorkflowState, page_index: int) -> tuple[int, int]:
+def _page_translation_counts(state: WorkflowState, page_index: int, *,
+                             include_kept: bool = True) -> tuple[int, int]:
     """Return ``(translatable, translated)`` for one page.
 
     ``translatable`` counts the page's blocks that *should* be translated (contain
@@ -301,7 +302,13 @@ def _page_translation_counts(state: WorkflowState, page_index: int) -> tuple[int
     ``translatable > 0`` but ``translated == 0`` is the "the AI answered with prose
     / never called a translate tool" case — it must not be recorded ``STATUS_DONE``
     (that is a fail-open: the export would carry the untranslated source).
+
+    ``include_kept=False`` drops the blocks marked ``keep_original`` (the plan's or
+    the content policy's defaults): the deterministic batch path (M2) never
+    translates those, so counting them as "still pending" made an all-kept page
+    look like a failure.
     """
+    
     doc = getattr(state, "src_doc", None)
     pages = getattr(doc, "pages", None) if doc is not None else None
     if not pages or not (0 <= page_index < len(pages)):
@@ -316,6 +323,8 @@ def _page_translation_counts(state: WorkflowState, page_index: int) -> tuple[int
     for i, b in enumerate(page):
         text = str(getattr(b, "text", ""))
         if not _needs(text) or _pdfio._is_numeric_cell(text):
+            continue
+        if not include_kept and getattr(b, "keep_original", False):
             continue
         translatable += 1
         entry = out.get(offset + i)
@@ -1742,6 +1751,7 @@ class DocumentSession:
         infer_terms: bool = False,
         plan: bool = False,
         plan_llm: Callable[..., dict] | None = None,
+        translate_batch: Callable[..., Any] | None = None,
         include_kept: bool = False,
         scope: list[int] | None = None,
         max_steps_per_page: int = 24,
@@ -1775,6 +1785,10 @@ class DocumentSession:
         #: injectable callback (tests); ``None`` builds the real one lazily.
         self.plan_enabled = bool(plan)
         self.plan_llm = plan_llm
+        #: v0.6.7 M2: one deterministic batch pass over one page, injected by the
+        #: worker.  ``None`` = no batch path, so a ``batch`` page falls back to the
+        #: normal agent loop (the feature can never be half-wired).
+        self.translate_batch = translate_batch
         #: M4 (U1 knob): when True the AI self-check also reviews pages the user chose to
         #: keep/skip (default False — those carry the source verbatim, so re-checking them
         #: would wrongly try to translate the intentionally-kept original).
@@ -1960,7 +1974,9 @@ class DocumentSession:
                  lang=self.state.lang)
         plan = plan_mod.validate_plan(
             raw, n_blocks=len(self.doc.blocks),
-            source_text="\n".join(str(t) for t in self.doc.blocks))
+            source_text="\n".join(str(t) for t in self.doc.blocks),
+            n_pages=n_pages,
+            kinds=list(getattr(self.state.doc_info, "kinds", None) or []))
         if not plan.has_content():
             self.log("  文档级方案：未生成（无有效内容）。")
             return
@@ -2018,10 +2034,60 @@ class DocumentSession:
                 raise FlowCancelled()
         return run_agent
 
+    def _page_is_batch(self, i: int) -> bool:
+        """True when the plan picked the cheap batch pass for page ``i`` (M2)."""
+        if self.translate_batch is None:
+            return False
+        plan = self.state.plan
+        return bool(plan is not None and plan.page_strategy.get(i) == "batch")
+
+    def _batch_one_normal(self, i: int) -> bool:
+        """One deterministic batch pass + the audit gate.  ``True`` = done and clean.
+
+        The batch pass reuses the very tool the per-page agent would call, so the
+        translations are the ones the agent would have produced — only the decide loop
+        is skipped.  Every other outcome (an exception, no translation at all, or an
+        audit that is not ``clean``) returns False and the caller falls back to the
+        normal agent pass, so a ``batch`` page can never be *worse* than today, only
+        cheaper.
+        """
+        try:
+            self.translate_batch(self.state, i, self.model,
+                                 log=self.log, cancel=self.cancel)
+        except _tr.TranslationCancelled:
+            raise
+        except FlowCancelled:
+            raise _tr.TranslationCancelled()
+        except Exception as exc:               # noqa: BLE001 — fall back to the agent
+            self.log(f"  第 {i + 1} 页批量翻译失败：{type(exc).__name__}: {exc}"
+                     f"（改用逐页 agent）。")
+            return False
+        translatable, translated = _page_translation_counts(self.state, i,
+                                                             include_kept=False)
+        if translatable > 0 and translated == 0:
+            self.log(f"  第 {i + 1} 页批量翻译未产生任何译文（改用逐页 agent）。")
+            return False
+        audit = self.audit(i) or {}
+        if audit.get("clean") is True:
+            self.log(f"  第 {i + 1} 页批量翻译，确定性审计通过（省去逐页 agent 循环）。")
+            return True
+        issues = audit.get("issues") or []
+        self.log(f"  第 {i + 1} 页批量翻译后审计有 {len(issues)} 处问题，改用逐页 agent。")
+        return False
+
     def _translate_one_normal(self, i: int) -> None:
-        """Translate one ``normal`` page (fail-closed to its source on error)."""
+        """Translate one ``normal`` page (fail-closed to its source on error).
+
+        A page the document-level plan marked ``batch`` (M2) first takes one
+        deterministic batch pass plus the audit gate; the per-page decide loop is
+        skipped only when that gate is clean, so the quality bar is unchanged and
+        the saving is real (a normal page costs a handful of model rounds today).
+        """
         ps = self.state.page(i)
         ps.status = STATUS_IN_PROGRESS
+        if self._page_is_batch(i) and self._batch_one_normal(i):
+            ps.status = STATUS_DONE
+            return
         try:
             rs = run_flow(STANDARD_FLOWS["translate_page"],
                           run_agent=self._page_agent(i), cancel=self.cancel,

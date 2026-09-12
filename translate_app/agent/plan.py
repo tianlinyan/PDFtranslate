@@ -6,7 +6,11 @@ cannot express but that must stay consistent across the whole document:
 * extra / overriding **terminology** (``glossary``);
 * the document's **conventions** — register, forms of address, units, numbering, how
   personal names are written (``style``);
-* which of the ambiguous blocks **keep their source** (``keep``).
+* which of the ambiguous blocks **keep their source** (``keep``);
+* which **normal** pages may take the cheap deterministic batch pass instead of the
+  per-page agent loop (``page_strategy``, M2) — every such page still has to pass
+  the deterministic audit gate afterwards, and falls back to the agent when it does
+  not.
 
 Everything a deterministic tool already knows (page count, page kinds, language, block
 count) stays in :func:`pdfio.get_doc_info` — a plan never re-derives a fact.
@@ -39,6 +43,9 @@ _PLAN_BLOCKS_PER_PAGE = 3
 _PLAN_INPUT_BUDGET = 8000
 #: Caps that keep a malformed or hostile reply from bloating the run.
 _PLAN_MAX_GLOSSARY = 40
+#: Accepted ``page_strategy`` values (M2).  ``agent`` is the default behaviour,
+#: ``batch`` is the one that actually saves calls; anything else is dropped.
+_PAGE_STRATEGIES = ("agent", "batch")
 _PLAN_MAX_KEEP = 200
 _PLAN_MAX_STYLE = 300
 _PLAN_MAX_TERM = 80
@@ -65,11 +72,14 @@ class TranslationPlan:
 
     def has_content(self) -> bool:
         """True when at least one channel would actually change the run."""
-        return bool(self.glossary or self.style or self.keep)
+        return bool(self.glossary or self.style or self.keep or self.page_strategy)
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"glossary": dict(self.glossary), "style": self.style,
                                "keep": sorted(self.keep), "notes": self.notes}
+        if self.page_strategy:
+            out["page_strategy"] = {str(p): v for p, v in sorted(
+                self.page_strategy.items())}
         if self.dropped:
             out["dropped"] = list(self.dropped)
         return out
@@ -137,7 +147,8 @@ def document_summary(doc, doc_info, triage=None, *, terms=(), requirements=(),
     return text
 
 
-def validate_plan(raw: dict | None, *, n_blocks: int, source_text: str = "") -> TranslationPlan:
+def validate_plan(raw: dict | None, *, n_blocks: int, source_text: str = "",
+                  n_pages: int = 0, kinds=None) -> TranslationPlan:
     """Bind a model reply to the document; drop (and report) everything unusable."""
     plan = TranslationPlan()
     data = raw if isinstance(raw, dict) else {}
@@ -190,7 +201,32 @@ def validate_plan(raw: dict | None, *, n_blocks: int, source_text: str = "") -> 
             plan.keep.add(i)
     elif keep is not None:
         plan.dropped.append("keep(不是数组)")
-
+    strategy = data.get("page_strategy")
+    if isinstance(strategy, dict):
+        kind_list = list(kinds or [])
+        for raw_p, raw_v in strategy.items():
+            value = str(raw_v).strip().lower()
+            try:
+                p = int(raw_p)
+            except (TypeError, ValueError):
+                plan.dropped.append(f"page_strategy:{raw_p!r}(不是页号)")
+                continue
+            if not (0 <= p < int(n_pages)):
+                plan.dropped.append(f"page_strategy:{p}(越界)")
+                continue
+            if value not in _PAGE_STRATEGIES:
+                plan.dropped.append(f"page_strategy:{p}={raw_v!r}(未知策略)")
+                continue
+            kind = kind_list[p] if p < len(kind_list) else "normal"
+            if value == "batch" and kind != "normal":
+                # A scan / chart / uncertain page needs the visual loop: a batch
+                # pass cannot look at the page, and the pixels of a scan are not a
+                # text decision.
+                plan.dropped.append(f"page_strategy:{p}=batch({kind} 页不支持)")
+                continue
+            plan.page_strategy[p] = value
+    elif strategy is not None:
+        plan.dropped.append("page_strategy(不是对象)")
     notes = data.get("notes")
     if notes:
         plan.notes = re.sub(r"\s+", " ", str(notes)).strip()[:200]
@@ -253,6 +289,9 @@ def plan_summary(plan: TranslationPlan) -> str:
         parts.append(f"约定 {len(plan.style)} 字")
     if plan.keep:
         parts.append(f"保留 {len(plan.keep)} 块")
+    batch = [p for p, v in plan.page_strategy.items() if v == "batch"]
+    if batch:
+        parts.append(f"批量页 {len(batch)} 页")
     body = "、".join(parts) or "无有效内容"
     drop = f"（已丢弃 {len(plan.dropped)} 条无法校验的项）" if plan.dropped else ""
     return f"文档级方案：{body}{drop}。"
