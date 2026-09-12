@@ -355,8 +355,8 @@ class MainWindow(QWidget):
         # 不缩，表格总宽不变。只影响「仅译文/原位」PDF 的文本层（矢量线）表格；
         # 扫描件位图表格线与双语 PDF 不受影响。需要排查时可设 PDFTRANSLATE_REFLOW=0。
 
-        # --- 扫描表格重绘为矢量表格（默认关闭） ---
-        self._rebuild_table_check = QCheckBox("OCR表格重建为矢量表格")
+        # --- OCR 表格重建＝扫描表格重绘为矢量表格（默认关闭） ---
+        self._rebuild_table_check = QCheckBox("OCR表格重建")
         self._rebuild_table_check.setToolTip(
             "勾选后，扫描（OCR）表格页会被**重绘为一张干净的矢量表格**：新建空白页，"
             "按 OCR 块聚类出的行列画网格线，行高按译文扩展，再填入译文——扫描底图、"
@@ -1409,7 +1409,7 @@ class MainWindow(QWidget):
             last_translated=self._last_translated,
             last_doc=self._last_doc,
             # 导出选项必须与「开始翻译」一致：旧实现只传 ocr/agent_mode，导致勾选了
-            # 「OCR表格重建为矢量表格」后点「重新导出」仍旧输出扫描表格（用户看到的
+            # 「OCR表格重建」后点「重新导出」仍旧输出扫描表格（用户看到的
             # 就是「选项失效」）。表格列宽重排自 v0.5.47 起恒为默认值，无需传参。
             rebuild_table=self._rebuild_table_check.isChecked(),
             image_text=self._image_text_check.isChecked(),

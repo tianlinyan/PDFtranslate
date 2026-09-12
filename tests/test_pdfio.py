@@ -13,7 +13,9 @@ from translate_app import pdfio
 from tests._helpers import (
     build_sample_pdf,
     build_two_column_pdf,
+    build_two_column_pdf_with_author_line,
     build_two_column_pdf_with_heading,
+    build_two_column_pdf_with_running_head,
     build_list_table_pdf,
 )
 
@@ -698,6 +700,51 @@ class PdfioTest(unittest.TestCase):
             [texts[i] for i in right_idx],
             ["Right column first line.", "Right column second line."],
         )
+
+    def test_running_head_does_not_merge_columns(self):
+        # Regression: a *centred running head* that is wider than a column yet
+        # below the full-width threshold used to join the left column and drag
+        # its right edge past the right column's left edge.  Every line of the
+        # right column then "overlapped" the left column and the two were
+        # interleaved by y into one single-line block per line.  Measured on a
+        # real ICML paper: a 279 pt running head on a 488 pt text span collapsed
+        # pages 1-13 (89% of all extracted blocks came out single-line).
+        src = _OUT / "two_col_running_head.pdf"
+        build_two_column_pdf_with_running_head(src)
+        doc = pdfio.extract_document_text(src)
+        texts = doc.blocks
+        self.assertEqual(texts[0], "ANNUAL REPORT OF THE BANK RUNNING HEAD")
+        left = [i for i, t in enumerate(texts) if t.startswith("Left column")]
+        right = [i for i, t in enumerate(texts) if t.startswith("Right column")]
+        self.assertTrue(left and right)
+        # Each column stays ONE paragraph block ...
+        self.assertEqual(len(doc.pages[0]), 3)
+        self.assertEqual(len(left), 1)
+        self.assertEqual(len(right), 1)
+        self.assertFalse(doc.pages[0][1].single_line)
+        self.assertFalse(doc.pages[0][2].single_line)
+        # ... and the whole left column still precedes the whole right column.
+        self.assertLess(max(left), min(right))
+
+    def test_author_line_does_not_merge_columns(self):
+        # Same failure mode as the running head, reached from the other side:
+        # the wide line starts *inside* the left column's x range (an author
+        # list indented from the column's left edge), so it joins that column
+        # first and only then drags its right edge across the gutter.
+        src = _OUT / "two_col_author_line.pdf"
+        build_two_column_pdf_with_author_line(src)
+        doc = pdfio.extract_document_text(src)
+        texts = doc.blocks
+        self.assertEqual(texts[0], "A. Author * 1 B. Author * 2 C. Author * 3")
+        left = [i for i, t in enumerate(texts) if t.startswith("Left column")]
+        right = [i for i, t in enumerate(texts) if t.startswith("Right column")]
+        self.assertTrue(left and right)
+        self.assertEqual(len(doc.pages[0]), 3)
+        self.assertEqual(len(left), 1)
+        self.assertEqual(len(right), 1)
+        self.assertFalse(doc.pages[0][1].single_line)
+        self.assertFalse(doc.pages[0][2].single_line)
+        self.assertLess(max(left), min(right))
 
     def test_list_and_table_entries_are_not_collapsed(self):
         # Regression: PyMuPDF merges a close-spaced list / table into one block,
@@ -1765,6 +1812,43 @@ class NumberAtomicityTest(unittest.TestCase):
         lines = pdfio._wrap(font, "10 000", 585.0, 11.0)
         self.assertEqual(["10 000"], lines)
 
+    def test_number_keeps_its_unit_when_prose_wraps(self):
+        # Real wrap on a Chinese cleaning-instruction line: "40" ended one line
+        # and "%蒸馏水" began the next, which reads as a different value.  Sweep
+        # the width so the greedy cut lands in many places, including right
+        # after the figure.
+        font = fitz.Font("cjk")
+        text = "一种好的清洁液是异丙醇与蒸馏水的混合液，比例为60%异丙醇和40%蒸馏水。"
+        for width in range(60, 220, 3):
+            lines = pdfio._wrap(font, text, float(width), 11.0)
+            with self.subTest(width=width):
+                self.assertEqual("".join(lines), text)
+                for a, b in zip(lines, lines[1:]):
+                    self.assertFalse(
+                        a[-1:].isdigit() and b[:1] in pdfio._NUMBER_UNIT_CHARS,
+                        f"figure torn from its unit at width {width}: {a!r} / {b!r}",
+                    )
+                self.assertTrue(any("40%" in ln for ln in lines))
+
+    def test_number_is_not_split_in_two_inside_prose(self):
+        # Same rule for the digits themselves: an amount inside CJK prose must
+        # not be cut as "1,2" / "34.56".
+        font = fitz.Font("cjk")
+        text = "本期营业支出合计为1,234,567.89元，较上年同期有所下降。"
+        for width in range(60, 240, 3):
+            lines = pdfio._wrap(font, text, float(width), 11.0)
+            with self.subTest(width=width):
+                self.assertEqual("".join(lines), text)
+                for a, b in zip(lines, lines[1:]):
+                    self.assertFalse(
+                        a[-1:].isdigit() and b[:1].isdigit(),
+                        f"number split at width {width}: {a!r} / {b!r}",
+                    )
+                    self.assertFalse(
+                        a[-1:] in ",." and a[-2:-1].isdigit() and b[:1].isdigit(),
+                        f"decimal split at width {width}: {a!r} / {b!r}",
+                    )
+
     def test_break_latin_word_minimum_two_char_pieces(self):
         # The org chart shards (``P- ar- ty a- n- d ...``) came from one-char
         # pieces; a piece must carry at least two characters or the rest is
@@ -2197,6 +2281,50 @@ class ParagraphGroupingTest(unittest.TestCase):
         groups = pdfio._group_lines(lines)
         self.assertEqual(1, len(groups), [len(g) for g in groups])
         self.assertEqual(3, len(groups[0]))
+
+    def test_end_of_line_hyphen_is_undone(self):
+        # A LaTeX/InDesign source hyphenates across lines ("genera-" / "tion").
+        # Joining the lines with a plain space left "genera- tion" in the block
+        # text, so the translation reproduced the hyphen inside a word: a real
+        # 25-page paper's Chinese output carried 61 of them ("微调至接- 近零").
+        joined = pdfio._join_group_text(
+            [{"text": "where a substantial geometric genera-"},
+             {"text": "tion of the feature space is observed."}]
+        )
+        self.assertEqual(
+            "where a substantial geometric generation of the feature space is observed.",
+            joined,
+        )
+        # A hyphen that ends a genuine compound is kept: the next line starts
+        # with a capital, so it is not a mid-word break.
+        self.assertEqual(
+            "we use Late- Stage LoRA here",
+            pdfio._join_group_text(
+                [{"text": "we use Late-"}, {"text": "Stage LoRA here"}]),
+        )
+        # Ordinary lines keep the single-space join.
+        self.assertEqual(
+            "first line second line",
+            pdfio._join_group_text([{"text": "first line"}, {"text": "second line"}]),
+        )
+
+    def test_hyphen_undone_end_to_end(self):
+        # The same rule through the real extractor: a tightly-leaded hyphenated
+        # paragraph must reach the model as one un-hyphenated block text.
+        src = _OUT / "hyphenated.pdf"
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((60, 100), "where a substantial geometric genera-", fontsize=10)
+        page.insert_text((60, 112), "tion of the feature space is observed, and the", fontsize=10)
+        page.insert_text((60, 124), "model keeps Late-", fontsize=10)
+        page.insert_text((60, 136), "Stage LoRA enabled.", fontsize=10)
+        doc.save(str(src))
+        doc.close()
+        dt = pdfio.extract_document_text(src, ocr=False, log=lambda _m: None)
+        text = " | ".join(dt.blocks)
+        self.assertIn("generation of the feature space", text)
+        self.assertNotIn("genera-", text)
+        self.assertIn("Late- Stage LoRA", text)
 
     def test_staggered_column_transition_still_breaks(self):
         # The rule's real job: a two-column page whose right column starts BELOW the

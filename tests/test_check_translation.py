@@ -13,10 +13,13 @@ from pathlib import Path
 import pymupdf as fitz
 
 from check_translation import (
+    Checker,
     _cjk_residual,
+    _entity_names,
     _is_scan_like_text,
     _normalize_cjk_ordinals,
     _numeric_diff,
+    _scanned_sign_diff,
     _section_numbers,
     _cn_to_int,
     main,
@@ -423,6 +426,168 @@ class BilingualPairingTest(unittest.TestCase):
         checker = run_checks(src, out, lang="English")
         self.assertTrue(checker.numeric_ok(), checker.numeric)
         self.assertTrue(checker.all_clear(), checker.numeric + checker.cjk)
+
+
+class ScannedSignFallbackTest(unittest.TestCase):
+    """S1: a page with no source text layer still gets its figures' SIGNS checked.
+
+    Measured on a real annual report: the cash-flow statement on page 27 came out
+    of the OCR/redraw path with -5,138,116,000.00 rendered as 5,138,116,000.00,
+    and the checker reported the document clean because a scan page has no text
+    layer to compare against.  The comparison is per figure by *count*: that
+    magnitude appears twice on the page (consolidated and parent-company
+    columns) and only one of them lost its minus.
+    """
+
+    def test_lost_minus_is_reported(self):
+        fatal, advisory = _scanned_sign_diff(
+            "3 4,044,199,001.20 -5,138,116,000.00\n2 -5,138,116,000.00",
+            "3 4,044,199,001.20 5,138,116,000.00\n2 -5,138,116,000.00",
+        )
+        self.assertEqual(1, len(fatal), fatal)
+        self.assertEqual([], advisory, advisory)
+        self.assertIn("513811600000", fatal[0])
+        self.assertIn("2 次负数", fatal[0])
+        self.assertIn("1 次", fatal[0])
+
+    def test_matching_signs_are_clean(self):
+        self.assertEqual(
+            ([], []),
+            _scanned_sign_diff("合计 -5,138,116,000.00", "Total -5,138,116,000.00"),
+        )
+
+    def test_ocr_dropped_minus_is_only_advisory(self):
+        # 200/300 dpi OCR reads -5,138,116,000.00 without the dash (measured), so
+        # this direction cannot be a verdict — it is reported for a human.
+        fatal, advisory = _scanned_sign_diff(
+            "Customer deposits 5,138,116,000.00",
+            "Customer deposits -5,138,116,000.00",
+        )
+        self.assertEqual([], fatal)
+        self.assertEqual(1, len(advisory), advisory)
+        self.assertIn("OCR 可能漏读", advisory[0])
+
+    def test_separator_confusion_does_not_matter(self):
+        # A 400 dpi OCR pass reads 5,138.116,000.00 for 5,138,116,000.00: the
+        # sign check keys on the digits, so that is the same figure.
+        self.assertEqual(
+            ([], []),
+            _scanned_sign_diff("合计 -5,138.116,000.00", "Total -5,138,116,000.00"),
+        )
+
+    def test_accounting_parenthesis_counts_as_negative(self):
+        fatal, _advisory = _scanned_sign_diff(
+            "（5,138,116,000.00）", "5,138,116,000.00",
+        )
+        self.assertEqual(1, len(fatal), fatal)
+
+    def test_small_values_are_ignored(self):
+        # A page number or a percentage flipping sign is format noise, not a
+        # figure a reader acts on.
+        self.assertEqual(([], []), _scanned_sign_diff("第 -3 页", "Page 3"))
+
+
+class EntityNameTest(unittest.TestCase):
+    """S2: company / bank names are inventoried, and a high-confidence mismatch
+    with the document's dominant name is reported."""
+
+    def test_names_are_extracted_without_the_legal_tail(self):
+        names = _entity_names(
+            "Prepared by: Zhejiang Mintai Commercial Bank Co., Ltd. "
+            "and Huishang Bank Form 03"
+        )
+        self.assertIn("Zhejiang Mintai Commercial Bank", names)
+        self.assertIn("Huishang Bank", names)
+
+    def test_bare_head_noun_is_not_a_name(self):
+        # "the Bank" is prose, not an entity: without this rule every occurrence
+        # of the word Bank (hundreds in an annual report) became an "entity".
+        self.assertEqual({}, dict(_entity_names("In this section, the Bank is described.")))
+        self.assertEqual({}, dict(_entity_names("The Company implemented the plan.")))
+
+    def test_bank_of_x_inversion_is_matched(self):
+        self.assertIn("Bank of China", _entity_names("served at Bank of China"))
+
+    def test_glossary_mapping_is_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "glossary.json").write_text(
+                '{"浙江民泰商业银行": "Zhejiang Mintai Commercial Bank"}',
+                encoding="utf-8",
+            )
+            checker = Checker(lang="English")
+            checker._src_text = ["编制单位：浙江民泰商业银行"]
+            checker._tgt_text = ["Prepared by: Xinjiang Minquan Commercial Bank"]
+            checker._check_glossary(root / "src.pdf")
+            self.assertEqual(1, len(checker.terms), checker.terms)
+            self.assertIn("Zhejiang Mintai Commercial Bank", checker.terms[0])
+            checker._tgt_text = ["Prepared by: Zhejiang Mintai Commercial Bank"]
+            checker.terms = []
+            checker._check_glossary(root / "src.pdf")
+            self.assertEqual([], checker.terms)
+
+
+class EntityConsistencyTest(unittest.TestCase):
+    """The source-anchored rule: a page whose SOURCE names the document's own
+    company must name it in the translation too.
+
+    Comparing target names with each other does not work — a bank's annual report
+    legitimately names dozens of peers and subsidiaries (measured: 62 distinct
+    names, 20 of which "matched" the dominant on >= 2 words).
+    """
+
+    @staticmethod
+    def _checker(pages: list[tuple[str, str]]) -> Checker:
+        checker = Checker(lang="English")
+        for i, (src, tgt) in enumerate(pages):
+            checker._src_text.append(src)
+            checker._tgt_text.append(tgt)
+            checker._note_entities(tgt, i)
+        checker._summarise_entities()
+        return checker
+
+    def test_a_different_bank_on_the_company_page_is_flagged(self):
+        checker = self._checker([
+            ("编制单位：浙江民泰商业银行股份有限公司",
+             "Prepared by: Zhejiang Mintai Commercial Bank Co., Ltd."),
+            ("编制单位：浙江民泰商业银行股份有限公司",
+             "Prepared by: Xinjiang Minquan Commercial Bank Co., Ltd."),
+            ("本行服务小微", "The Bank serves small businesses."),
+        ])
+        self.assertEqual(1, len(checker.entities), checker.entities)
+        self.assertIn("第 2 页", checker.entities[0])
+        self.assertIn("Xinjiang Minquan Commercial Bank", checker.entities[0])
+        self.assertFalse(checker.all_clear())
+
+    def test_peer_banks_in_a_cv_are_not_flagged(self):
+        # A director's CV legitimately lists other banks — as long as the page
+        # still names the document's own company.
+        checker = self._checker([
+            ("恒丰银行股份有限公司", "Hengfeng Bank Co., Ltd."),
+            ("曾任中国银行…后加入恒丰银行",
+             "previously at Bank of China ... joined Hengfeng Bank"),
+        ])
+        self.assertEqual([], checker.entities, checker.entities)
+
+    def test_subsidiaries_are_not_flagged(self):
+        # The report's own village banks share the brand token: the dominant name
+        # is a superset/subset match and must not be reported.
+        checker = self._checker([
+            ("浙江民泰商业银行", "Zhejiang Mintai Commercial Bank Co., Ltd."),
+            ("浙江民泰商业银行发起设立民泰村镇银行",
+             "Zhejiang Mintai Commercial Bank sponsors Jiangsu Hanjiang "
+             "Mintai Village Bank and Fujian Zhangping Mintai Village Bank"),
+        ])
+        self.assertEqual([], checker.entities, checker.entities)
+
+    def test_inventory_is_reported_but_never_fails_the_run(self):
+        checker = self._checker([
+            ("恒丰银行", "Hengfeng Bank"),
+            ("恒丰银行", "Hengfeng Bank and Bank of China"),
+        ])
+        self.assertTrue(checker.entity_report)
+        self.assertTrue(any("Hengfeng Bank" in line for line in checker.entity_report))
+        self.assertEqual([], checker.entities)
 
 
 if __name__ == "__main__":

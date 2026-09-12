@@ -3568,6 +3568,13 @@ def _collect_lines(page_dict: dict) -> list[dict]:
 #: width) alone misfires when many narrow items dominate the median.
 _FULL_WIDTH_SPAN_RATIO = 0.75
 
+#: How far an item's LEFT edge may sit from its column's left edge and still be
+#: allowed to push that column's right edge outward.  Beyond this the item is
+#: treated as *shifted* — a centred running head or a wide author list — and
+#: joins the column for reading order only, without widening it.  Widening is
+#: what collapses a two-column page (see :func:`_order_generic`).
+_COLUMN_ALIGN_TOL_RATIO = 0.06
+
 
 def _order_generic(
     items: Sequence,
@@ -3590,6 +3597,12 @@ def _order_generic(
     full-width item is wider than 1.5× the median item width, so on a
     single-column page (all items about equally wide) nothing is ever
     misclassified and the plain top-to-bottom order is kept.
+
+    An item that is *wider than a column but not full width* — a centred running
+    head, a wide author list, a banner — must not widen a column either: it
+    joins the column so it still reads in place, but only an item that is
+    left-aligned with that column (within `_COLUMN_ALIGN_TOL_RATIO` of the
+    column's left edge) may push the column's right edge outward.
     """
     if len(items) < 2:
         return list(items)
@@ -3617,15 +3630,29 @@ def _order_generic(
     xsorted = sorted(rest, key=lambda it: x0(it))
     columns: list = []
     col_max_x1: list[float] = []
+    col_min_x0: list[float] = []
+    align_tol = max(12.0, _COLUMN_ALIGN_TOL_RATIO * span)
     for it in xsorted:
         for c in range(len(columns)):
             if x0(it) < col_max_x1[c] - 2.0:
                 columns[c].append(it)
-                col_max_x1[c] = max(col_max_x1[c], x1(it))
+                col_min_x0[c] = min(col_min_x0[c], x0(it))
+                # Only an item LEFT-ALIGNED with this column may push its right
+                # edge outward.  A centred running head or a wide author list
+                # starts well right of the column's left edge; letting it widen
+                # the column dragged that edge past the next column's left edge,
+                # so every line of the next column "overlapped" this one and the
+                # two columns collapsed into a single column interleaved by y.
+                # Measured on a real ICML paper: a 279 pt running head and a
+                # 358 pt author line — neither above the full-width threshold —
+                # collapsed pages 1-13 (89% of all blocks came out single-line).
+                if x0(it) - col_min_x0[c] <= align_tol:
+                    col_max_x1[c] = max(col_max_x1[c], x1(it))
                 break
         else:
             columns.append([it])
             col_max_x1.append(x1(it))
+            col_min_x0.append(x0(it))
 
     if len(columns) <= 1:
         # Single-column page (or no non-full-width items): plain reading order,
@@ -4396,6 +4423,26 @@ def _table_cell_key(ln: dict) -> tuple:
     return (round(ln["y0"], 0), ln["x0"])
 
 
+def _join_group_text(group: Sequence[dict]) -> str:
+    """Join a block's lines, undoing an end-of-line hyphen.
+
+    A source that hyphenates across lines (LaTeX/InDesign: "genera-" /
+    "tion") produced a block text of "genera- tion", so the translation
+    reproduced the hyphen inside a word - a real 25-page paper's Chinese output
+    carried 61 of them ("微调至接-" / "近零", "效果显-" / "著").  The hyphen is
+    dropped only when the next line continues with a lowercase letter, so a
+    genuine compound split across lines ("Late-" / "Stage") keeps it.
+    """
+    parts: list[str] = []
+    for ln in group:
+        text = ln["text"]
+        if parts and parts[-1].endswith("-") and text[:1].islower():
+            parts[-1] = parts[-1][:-1] + text
+        else:
+            parts.append(text)
+    return " ".join(parts)
+
+
 def _group_to_block(
     group: Sequence[dict], spans, page_x0: float, page_x1: float, page_index: int
 ) -> Block | None:
@@ -4406,7 +4453,7 @@ def _group_to_block(
     y0 = min(ln["y0"] for ln in group)
     x1 = max(ln["x1"] for ln in group)
     y1 = max(ln["y1"] for ln in group)
-    text = " ".join(ln["text"] for ln in group)
+    text = _join_group_text(group)
     if not text.strip() or _is_pure_symbol(text):
         return None
     meta = _block_meta(fitz.Rect(x0, y0, x1, y1), spans, page_x0, page_x1, n_lines=len(group))
@@ -5331,6 +5378,45 @@ def _is_amount_atom(text: str) -> bool:
     return bool(_AMOUNT_ATOM_RE.match(text))
 
 
+#: Characters that must not be torn away from the figure in front of them.
+#: Breaking ``…和40`` / ``%蒸馏水`` or ``1000`` / ``码`` reads as a *different
+#: value*, which is the failure the amount-atomicity rule exists to prevent — but
+#: that rule only covers a token that is nothing but an amount, so a figure
+#: inside a longer space-less run (CJK prose) still reached the character
+#: breaker.  The first character of a multi-character unit (``万元``) is taken
+#: along too; the rest of the unit stays on the line by the same rule.
+_NUMBER_UNIT_CHARS = "%％‰°℃万亿元年月日时天周倍码米克吨斤度岁股户家人个张笔次"
+
+#: A figure inside a longer run: digits with separators, optionally signed.
+_INNER_NUMBER_RE = re.compile(r"[+-]?\d[\d,．.]*\d|[+-]?\d")
+
+
+def _cut_outside_number(word: str, k: int) -> int:
+    """Move a character-break index ``k`` out of the figure it lands in.
+
+    ``_break_word`` breaks a space-less run (CJK has no spaces, so a whole
+    paragraph is one "word") by glyph.  The greedy cut landed between a figure
+    and its unit — ``…比例为60%异丙醇和40`` / ``%蒸馏水`` — and inside figures —
+    ``1,2`` / ``34.56``.  The cut is moved to the start of the figure (the whole
+    figure moves to the next line) or, when the figure starts the line, past its
+    trailing unit characters.
+    """
+    if k <= 0 or k >= len(word):
+        return k
+    for m in _INNER_NUMBER_RE.finditer(word):
+        s, end = m.span()
+        if s < k < end:
+            # Inside the digits / separators: move the whole figure across.
+            return s if s > 0 else end
+        if k == end:
+            # Right after the figure: keep its unit glued to it.
+            while end < len(word) and word[end] in _NUMBER_UNIT_CHARS:
+                end += 1
+            if end != k:
+                return end
+    return k
+
+
 def _color_tuple(color: int) -> tuple[float, float, float]:
     """Convert a 24-bit color int (PyMuPDF span ``color``) to a float RGB triple."""
     return (
@@ -5420,9 +5506,10 @@ def _break_word(font, word: str, width: float, fontsize: float, lines: list[str]
         # taken, so the loop makes progress even when a single character
         # already exceeds ``width`` (a very narrow box) — that character is
         # emitted alone, exactly as the old binary search did.
+        k = _cut_outside_number(word, k)
         lines.append(word[:k])
         word = word[k:]
-        remaining -= acc
+        remaining = font.text_length(word, fontsize=fontsize)
     return word
 
 
@@ -5467,8 +5554,11 @@ def _break_latin_word(font, word: str, width: float, fontsize: float, lines: lis
             # A cut like ``tiv-`` + ``e`` leaves a lone trailing letter; take
             # one char less so the tail is ``ve``.
             take = max(2, len(word) - 2)
-        lines.append(word[:take] + "-")
-        word = word[take:]
+        # Never cut a figure away from its unit — and a boundary kept whole is
+        # not a hyphenation, so it is not marked with one either.
+        moved = _cut_outside_number(word, take)
+        lines.append(word[:moved] + ("" if moved != take else "-"))
+        word = word[moved:]
     return word
 
 

@@ -225,7 +225,7 @@ class PreviewSendRegionTest(unittest.TestCase):
 class ReExportForwardsExportFlagsTest(unittest.TestCase):
     """v0.5.25: 「重新导出」 must honor the export knobs, like 「开始翻译」.
 
-    It used to pass only ``ocr``/``agent_mode``, so with 「OCR表格重建为矢量表格」 ticked
+    It used to pass only ``ocr``/``agent_mode``, so with 「OCR表格重建」 ticked
     the re-export silently wrote the same scanned tables again — the option looked
     broken.  (「表格列宽重排」自 v0.5.47 起恒为默认值，不再是界面旋钮。)
     """

@@ -137,6 +137,73 @@ def build_two_column_pdf_with_heading(path: str | Path) -> Path:
     return path
 
 
+def _build_two_column_pdf_with_wide_line(
+    path: str | Path,
+    wide_line: str,
+    wide_size: float,
+    wide_x: float,
+) -> Path:
+    """Two tightly-leaded column paragraphs plus one wide line above them.
+
+    `wide_line` is deliberately wider than a column yet **narrower than the
+    full-width threshold** (`max(1.5 x median width, 0.75 x span)`) — exactly
+    the shape that used to collapse the page: it joined the left column and
+    dragged that column's right edge past the right column's left edge, so every
+    right-column line "overlapped" the left column and the two were interleaved
+    by y into one block per line.
+    """
+    path = Path(path)
+    doc = fitz.open()
+    page = doc.new_page()  # A4: 595 x 842
+    page.insert_text((wide_x, 50), wide_line, fontsize=wide_size)
+    # Tight 12 pt leading on 10 pt type keeps each column ONE paragraph (the
+    # grouping rule only breaks above 1.1 x size), so a collapsed page shows up
+    # as a run of single-line blocks instead of two paragraph blocks.
+    for i, text in enumerate(
+        (
+            "Left column first line of a single paragraph,",
+            "left column second line of the same paragraph,",
+            "left column third line of the same paragraph.",
+        )
+    ):
+        page.insert_text((60, 100 + 12 * i), text, fontsize=10)
+    for i, text in enumerate(
+        (
+            "Right column first line of a single paragraph,",
+            "right column second line of the same paragraph,",
+            "right column third line of the same paragraph.",
+        )
+    ):
+        page.insert_text((315, 100 + 12 * i), text, fontsize=10)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def build_two_column_pdf_with_running_head(path: str | Path) -> Path:
+    """Two columns under a *centred running head* that is not full width.
+
+    Regression fixture (ICML-style paper): the running head covers ~0.6 of the
+    page's text span, so it is neither a full-width heading nor a column line.
+    It must not merge the two columns.
+    """
+    return _build_two_column_pdf_with_wide_line(
+        path, "ANNUAL REPORT OF THE BANK RUNNING HEAD", 12, 150
+    )
+
+
+def build_two_column_pdf_with_author_line(path: str | Path) -> Path:
+    """Two columns under a wide *author line* that is not full width.
+
+    Regression fixture (ICML-style paper): the author list spans both columns
+    ("Meimingwei Li * 1 Yuanhao Ding * 2 ..." on the real page) yet stays below
+    the full-width threshold.  It must not merge the two columns.
+    """
+    return _build_two_column_pdf_with_wide_line(
+        path, "A. Author * 1 B. Author * 2 C. Author * 3", 12, 118
+    )
+
+
 def build_list_table_pdf(path: str | Path) -> Path:
     """Create a PDF with a close-spaced numbered list and ``Label:`` table rows.
 
