@@ -282,6 +282,34 @@ def page_task(page_index: int, lang: str, kind: str | None = None) -> str:
     )
 
 
+def document_plan_task(summary: str, terms=(), requirements=(), lang: str = "") -> str:
+    """The one document-level pass: terminology + conventions + which blocks keep source.
+
+    ``summary`` is the bounded digest (:func:`agent.plan.document_summary`), ``terms``
+    the deterministic candidate list and ``requirements`` the user's own words.  The
+    reply contract is strict JSON; :func:`agent.plan.validate_plan` decides what of it
+    is actually used, so this prompt may ask for more than it gets.
+    """
+    term_line = "、".join(str(t) for t in terms) if terms else "（无候选术语）"
+    req_line = "；".join(str(r) for r in requirements) if requirements else "（无）"
+    return f"""你是 PDF 翻译流水线的**文档级方案**判定器。目标语言：{lang or '（未指定）'}。
+在逐页翻译开始之前，对整篇文档做**一次**判断，只输出一个 JSON 对象（不要解释、不要 markdown 围栏、不要多余字段）：
+{{"glossary": {{"源词": "目标词"}}, "style": "……", "keep": [0, 3], "notes": "……"}}
+
+规则：
+1. **glossary**：只收录下面「候选术语」里出现过的词（{term_line}），键必须与原文完全一致。没有把握就**不要写**——写错会把整篇的译名锁死。
+2. **style**：用一句中文说明本篇的文体与约定（称谓、单位与金额写法、编号风格、人名写法等），不超过 300 字。它会被逐页翻译遵循。
+3. **keep**：要**保留原文**的文本块扁平索引。数字/金额/公式块本就不翻译，不必列出；没有明确理由就不要写（保留得越多，译文越不完整）。
+4. **notes**：给用户看的一句话说明。
+
+拿不准的字段就留空（{{}} / 空串 / 空数组）。这不是「必须给答案」的问题——给错的代价比留空大得多。
+
+【用户要求】{req_line}
+
+【文档概况】
+{summary}"""
+
+
 def content_policy_task(entries, lang: str, requirement: str = "") -> str:
     """Ask the model which of the listed blocks must keep their source text.
 

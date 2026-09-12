@@ -11,6 +11,49 @@
 
 ---
 
+## v0.6.6
+
+**文档级翻译方案 M1（`TranslationPlan`，默认关闭的试验特性）**——设计见
+`docs/0.6.6-文档级翻译方案设计.md`。
+
+**动机**：逐页判定的内容策略（`policy.candidates` 每页 ≤6 个候选）会让同一类页「这页保留、
+那页翻译」；文体/称谓/单位与编号风格只写在通用提示词里、每页自由发挥；而整篇最贵的一环
+（逐页 agent 调用）在开工前没有任何全局判断。
+
+**做法**：在 `DocumentSession._preprocess` 末尾（紧挨 `_inject_terminology`）加一次**文档级**
+模型调用（`agent/plan.py` 的 `make_llm_plan` + `prompts.document_plan_task`），产出：
+
+* `glossary`：在 `infer_terms` 候选之上覆盖/补充的术语 → 写 `state.user_decisions
+["terminology"]`（引擎的 `extra_glossary` 通道；术语内容已计入缓存键，所以换术语会换缓存名）；
+* `style`：一句「本篇的文体与约定」→ 追加进 `state.requirements`（`FlowAgent.observe()` 每轮
+  都会打印，模型立刻看得到）；
+* `keep`：要保留原文的块索引 → 写 `Block.keep_original`（引擎 / IR / 审计 / 导出四个消费者
+  共用的通道）。
+
+**硬约束**（全部在 `agent/plan.validate_plan` 里强制，且**不新增任何执行路径**）：
+① **以文档为准**——glossary 的键必须真的出现在原文里（否则是幻觉：丢弃并在 `plan.dropped`
+里回报）、`keep` 索引必须界内、`style` 超长截断；被丢弃的项必须能被看见，不能变成
+「看起来照做了」；② **只增不减**——`keep` 只写 True、永不清除，所以方案既不能放宽
+`page_scope`，也不能推翻内容策略；③ **fail-open**——无可用模型 / 请求失败 / JSON 坏 / 校验后
+为空 → `state.plan` 保持 `None`，行为与不开启时**完全一致**（只多一行日志）；④ **输入有界**——
+给模型的不是全文，而是 `get_doc_info` 的统计 + 术语候选 + 每页最多 3 段文字片段 + 用户要求
+（≤8000 字符，超出截断，扫描/图表/待确认页排前面）；⑤ **文档太小不跑**（`PLAN_MIN_PAGES`：
+少于 3 页时跳过——省的还没有花的多）。
+
+**开关**：默认**关**。`PDFTRANSLATE_PLAN=1` 强制开启（与 `PDFTRANSLATE_IR_MODE` /
+`PDFTRANSLATE_STRUCTURE_MODE` 同款 opt-in）；运行选项日志新增「文档级方案=开/关」。
+
+**边界（M1 有意不做）**：方案在 **agent 编排路径**上生效；IR 与确定性回退路径还没有等价的
+消费点，开启时会明确记一行「仅 AI 编排（agent）路径支持，本路径已跳过」，**不静默忽略**。
+`page_strategy`（按页选批量 / 逐页）留到 M2——它需要给 `DocumentSession` 注入批量通道，并先
+定死「批量产物如何过 `audit_page` 复核门」。
+
+**回归**：`tests/test_plan.py` 12 例（validate 丢弃幻觉术语 / 越界与畸形索引 / 超长 style；
+摘要有界且特殊页在前；请求失败与坏 JSON 都退化成无方案；三条通道各自落地；方案只能增加保留；
+关闭时不发请求且不写日志）+ `test_worker` 接线 2 例（开关确实传进 `DocumentSession`；
+批量路径确实记「已跳过」并显示「文档级方案=开」）。全量 **912 → 926 全绿**。
+
+---
 ## v0.6.5
 
 **按 `docs/代码审查-v0.6.4-2.md` §9 的顺序修复审查发现**（用例 **877 → 907 全绿**，离线）。

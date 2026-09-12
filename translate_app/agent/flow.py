@@ -1740,6 +1740,8 @@ class DocumentSession:
         audit: Callable[..., dict[str, Any]] | None = None,
         interpret: Callable[[str, str], str] | None = None,
         infer_terms: bool = False,
+        plan: bool = False,
+        plan_llm: Callable[..., dict] | None = None,
         include_kept: bool = False,
         scope: list[int] | None = None,
         max_steps_per_page: int = 24,
@@ -1768,6 +1770,11 @@ class DocumentSession:
         #: per-page block translation (which reads that dict as ``extra_glossary``)
         #: stays terminology-consistent across pages.
         self.infer_terms = infer_terms
+        #: v0.6.6 M1: produce a document-level plan in ``_preprocess`` (opt-in;
+        #: see ``docs/0.6.6-文档级翻译方案设计.md``).  ``plan_llm`` is the
+        #: injectable callback (tests); ``None`` builds the real one lazily.
+        self.plan_enabled = bool(plan)
+        self.plan_llm = plan_llm
         #: M4 (U1 knob): when True the AI self-check also reviews pages the user chose to
         #: keep/skip (default False — those carry the source verbatim, so re-checking them
         #: would wrongly try to translate the intentionally-kept original).
@@ -1847,6 +1854,8 @@ class DocumentSession:
         self.progress(0, d.pages, "预处理")
         if self.infer_terms:
             self._inject_terminology()
+        if self.plan_enabled:
+            self._build_plan()
 
     def _mark_kept_diagrams(self) -> None:
         """Default content policy: a chart page's diagram labels keep the source.
@@ -1908,6 +1917,79 @@ class DocumentSession:
         if glossary:
             self.state.user_decisions.setdefault("terminology", {}).update(glossary)
             self.log(f"  已注入 {len(glossary)} 条文档级术语（跨页一致）。")
+
+    def _plan_terms(self) -> list[str]:
+        """The deterministic term candidates a plan may pin (never invented here)."""
+        try:
+            from .. import ir as ir_mod
+
+            return list(ir_mod.infer_terms(
+                ir_mod.build_ir(self.doc, lang=self.state.lang)))
+        except Exception:                      # noqa: BLE001 — terminology is advisory
+            return []
+
+    def _build_plan(self) -> None:
+        """One document-level pass: terminology + conventions + which blocks keep source.
+
+        Fail-open by construction: no model / a bad reply / nothing that validates
+        leaves ``state.plan`` as ``None``, and the run behaves exactly as if the
+        feature were off.  The plan is consumed only through the three channels that
+        already exist (``user_decisions["terminology"]``, ``state.requirements``,
+        ``Block.keep_original``) — there is no new execution path, so "the plan was
+        followed" is guaranteed by the existing invariants instead of new plumbing.
+        """
+        from . import plan as plan_mod
+
+        if self.doc is None or self.state.doc_info is None:
+            return
+        n_pages = len(getattr(self.doc, "pages", None) or ())
+        if n_pages < plan_mod.PLAN_MIN_PAGES:
+            self.log(f"  文档级方案：文档过小（<{plan_mod.PLAN_MIN_PAGES} 页），跳过。")
+            return
+        fn = self.plan_llm
+        if fn is None:
+            fn = plan_mod.make_llm_plan(self.model, log=self.log)
+        if fn is None:
+            self.log("  文档级方案：无可用模型，跳过。")
+            return
+        terms = self._plan_terms()
+        summary = plan_mod.document_summary(
+            self.doc, self.state.doc_info, self.state.triage,
+            terms=terms, requirements=self.state.requirements)
+        raw = fn(summary, terms=terms, requirements=list(self.state.requirements),
+                 lang=self.state.lang)
+        plan = plan_mod.validate_plan(
+            raw, n_blocks=len(self.doc.blocks),
+            source_text="\n".join(str(t) for t in self.doc.blocks))
+        if not plan.has_content():
+            self.log("  文档级方案：未生成（无有效内容）。")
+            return
+        self._apply_plan(plan)
+        self.state.plan = plan
+        self.log("  " + plan_mod.plan_summary(plan))
+
+    def _apply_plan(self, plan) -> None:
+        """Write a validated plan into the three channels that already exist.
+
+        ``keep`` only ever *adds* the flag, so a plan can never release a block the page
+        scope or the content policy kept — a plan must not be able to widen a range the
+        user asked for (see the page-scope lesson in docs/代码审查-v0.6.5.md).
+        """
+        if plan.glossary:
+            self.state.user_decisions.setdefault("terminology", {}).update(plan.glossary)
+        for line in plan.style_lines():
+            if line not in self.state.requirements:
+                self.state.requirements.append(line)
+        if not plan.keep:
+            return
+        flat = [b for pg in (getattr(self.doc, "pages", None) or []) for b in pg]
+        kept = 0
+        for i in sorted(plan.keep):
+            if 0 <= i < len(flat) and not getattr(flat[i], "keep_original", False):
+                flat[i].keep_original = True
+                kept += 1
+        if kept:
+            self.log(f"  文档级方案：{kept} 个块保留原文。")
 
     def _page_agent(self, page: int):
         """Bind one page's agent channel (``translate_page``) for a flow's AgentStep.

@@ -86,6 +86,7 @@ class TranslateWorker(QObject):
         rebuild_table: bool = False,
         image_text: bool | None = None,
         expand_pages: bool = False,
+        document_plan: bool = False,
         policy_fn=None,
     ):
         super().__init__()
@@ -175,6 +176,12 @@ class TranslateWorker(QObject):
         #: ``PDFTRANSLATE_AGENT_TERMS=0`` forces it off (higher priority).
         self._agent_terms = bool(agent_terms) and (
             os.environ.get("PDFTRANSLATE_AGENT_TERMS", "1") != "0")
+        #: v0.6.6 M1 document-level plan（默认**关**，试验特性）：在逐页翻译前
+        #: 用**一次**模型调用定下术语/文体约定/保留块，见
+        #: ``docs/0.6.6-文档级翻译方案设计.md``。开关：prefs/构造参数，或
+        #: ``PDFTRANSLATE_PLAN=1`` 强制开启（与其它 opt-in 旋钮同款）。
+        self._document_plan = bool(document_plan) or (
+            os.environ.get("PDFTRANSLATE_PLAN") == "1")
         #: C-⑥ reflow（保守层）：文本层表格列宽按译文重分配（数字列不缩）。
         #: 默认开启（v0.5.47 起界面复选框已移除）；PDFTRANSLATE_REFLOW=0 可强制关闭
         #: （与 PDFTRANSLATE_AGENT_TERMS 同款，供排查用）。
@@ -228,7 +235,8 @@ class TranslateWorker(QObject):
             f"图内文字={'跟随OCR' if self._image_text is None else ('开' if self._image_text else '关')}，"
             f"OCR={'开' if self._ocr else '关'}，"
             f"IR管线={'开' if self._ir_mode else '关'}，"
-            f"术语抽取={'开' if self._agent_terms else '关'}"
+            f"术语抽取={'开' if self._agent_terms else '关'}，"
+            f"文档级方案={'开' if self._document_plan else '关'}"
             f"{'（AI 重建表：模型支持视觉）' if self._rebuild_table and getattr(self._model, 'vision', False) else ''}。"
         )
 
@@ -283,6 +291,14 @@ class TranslateWorker(QObject):
             # pipeline, the audit and the exporter all read.
             if self._page_scope:
                 keep_original = self._mark_page_scope(doc)
+            if self._document_plan and (
+                    self._ir_mode
+                    or not (self._agent_mode and getattr(self._model, "vision", False))):
+                # M1 builds the plan inside ``DocumentSession._preprocess`` (the
+                # agent path) and applies it through three channels that already
+                # exist.  The batch paths have no equivalent consumer yet: say so
+                # rather than silently ignoring a switch the user turned on.
+                self.log.emit("  文档级方案：仅 AI 编排（agent）路径支持，本路径已跳过。")
 
             translate_started = time.monotonic()
             if self._ir_mode:
@@ -806,6 +822,7 @@ class TranslateWorker(QObject):
                 render_handler=self.render_page_for_agent,
                 interpret=agent_mod.make_llm_interpret(self._model, log=self.log.emit),
                 infer_terms=self._agent_terms,
+                plan=self._document_plan,
                 scope=self._page_scope,
                 max_steps_per_page=32,
             ).run()

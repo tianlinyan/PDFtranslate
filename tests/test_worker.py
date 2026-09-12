@@ -955,5 +955,46 @@ class WorkerFieldLifetimeTest(_WorkerTestBase):
         self.assertEqual("translated_pdf", worker_field(worker, "_output_type", ""))
 
 
+
+class DocumentPlanWiringTest(_WorkerTestBase):
+    """v0.6.6 M1: the document-plan knob must reach the pipeline — and say so when
+    the current path cannot consume it (a switch that silently does nothing is the
+    failure mode this whole feature is designed around).
+    """
+
+    def test_the_knob_reaches_the_agent_session(self):
+        src = build_sample_pdf(self.tmp / "plan.pdf", pages=1)
+        model = self._model("http://127.0.0.1:9/v1")
+        model.vision = True                     # agent path
+        seen: dict = {}
+
+        class _FakeSession:
+            def __init__(self, *_a, **kw):
+                seen.update(kw)
+
+            def run(self):
+                return None
+
+        worker = TranslateWorker(
+            str(src), model, "Chinese", "plain_text", str(self.tmp / "o.txt"),
+            document_plan=True)
+        with mock.patch.object(agent_module, "DocumentSession", _FakeSession):
+            self._run(worker)
+        self.assertTrue(seen.get("plan"), "开关没有传进 DocumentSession")
+
+    def test_the_batch_path_says_the_plan_was_skipped(self):
+        src = build_sample_pdf(self.tmp / "plan2.pdf", pages=1)
+        out = self.tmp / "out.txt"
+        with MockServer() as server:
+            worker = TranslateWorker(str(src), self._model(server.endpoint),
+                                     "Chinese", "plain_text", str(out),
+                                     document_plan=True)   # model has no vision
+            logs: list[str] = []
+            worker.log.connect(logs.append)
+            events = self._run(worker)
+        self.assertEqual(["finished", "stopped"], events)
+        self.assertTrue(any("文档级方案=开" in m for m in logs), logs)
+        self.assertTrue(any("文档级方案" in m and "已跳过" in m for m in logs), logs)
+
 if __name__ == "__main__":
     unittest.main()

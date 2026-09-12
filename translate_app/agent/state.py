@@ -186,6 +186,9 @@ class WorkflowState:
     current_page: int = 0                            # preview navigation pointer
     summary: str = ""                                # pipeline summary
     review_mode: str = ""                            # M4: "ai" | "user"
+    #: v0.6.6 M1: the validated document-level plan, or ``None`` when the feature is
+    #: off / nothing usable came back (see ``agent/plan.py``).
+    plan: Any = None
 
     def page(self, index: int) -> PageState:
         """The ``PageState`` for ``index``, created on first access."""
