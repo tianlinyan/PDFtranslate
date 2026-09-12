@@ -214,17 +214,21 @@ class TranslateWorker(QObject):
 
     @pyqtSlot()
     def _options_line(self) -> str:
-        """One log line naming the *effective* export options of this run.
+        """One log line naming the *effective* options of this run.
 
-        The 「OCR表格重建为矢量表格」 checkbox is read when the run starts; without
-        this line a user who toggled it could not tell whether the worker actually
-        received the new value (the earlier "option has no effect" reports were both
-        about the option not reaching / not being honoured somewhere).
+        Every knob that changes the product belongs here: they are read when the run
+        starts, and without this line a user who toggled one cannot tell whether the
+        worker received the new value (the earlier "option has no effect" reports were
+        both about an option not reaching — or not being honoured by — the pipeline).
         """
         return (
-            f"导出选项：OCR表格重建={'开' if self._rebuild_table else '关'}，"
+            f"运行选项：OCR表格重建={'开' if self._rebuild_table else '关'}，"
             f"表格列宽重排={'开' if self._reflow else '关'}，"
-            f"译文扩页={'开' if self._expand_pages else '关'}"
+            f"译文扩页={'开' if self._expand_pages else '关'}，"
+            f"图内文字={'跟随OCR' if self._image_text is None else ('开' if self._image_text else '关')}，"
+            f"OCR={'开' if self._ocr else '关'}，"
+            f"IR管线={'开' if self._ir_mode else '关'}，"
+            f"术语抽取={'开' if self._agent_terms else '关'}"
             f"{'（AI 重建表：模型支持视觉）' if self._rebuild_table and getattr(self._model, 'vision', False) else ''}。"
         )
 
@@ -270,6 +274,15 @@ class TranslateWorker(QObject):
             # them from the AI content policy (``_content_policy``) instead, so this
             # starts empty and is filled below.
             keep_original: set[int] = set()
+            # "只翻第 N 页" must hold on **every** path.  Only the agent path has a
+            # per-page loop (``DocumentSession(scope=…)``), so the IR pipeline and the
+            # deterministic fallback used to translate the whole document while the
+            # GUI had already told the user "AI 理解为只翻第 N 页" (measured: with
+            # ``page_scope=[1]`` both pages came out translated).  Marking the other
+            # pages' blocks ``keep_original`` is the one channel the engine, the IR
+            # pipeline, the audit and the exporter all read.
+            if self._page_scope:
+                keep_original = self._mark_page_scope(doc)
 
             translate_started = time.monotonic()
             if self._ir_mode:
@@ -294,7 +307,11 @@ class TranslateWorker(QObject):
                 # scanned seal / stamp / handwriting block, which no deterministic rule
                 # can tell apart from printed text.  Its keeps come back on the blocks.
                 self._content_policy(doc, engine)
-                keep_original = {i for i, b in enumerate(doc.blocks)
+                # The blocks are ``doc.pages`` (``doc.blocks`` holds the *texts*), so a
+                # comprehension over ``doc.blocks`` silently produced an empty set and
+                # every keep (content policy, page scope) was still sent to the model.
+                flat_blocks = [blk for page_blocks in doc.pages for blk in page_blocks]
+                keep_original = {i for i, b in enumerate(flat_blocks)
                                  if getattr(b, "keep_original", False)}
                 result = engine.translate_blocks(
                     doc.blocks,
@@ -494,6 +511,19 @@ class TranslateWorker(QObject):
         # reachable from the answer at all.  Keeps land on the blocks; releases come
         # back as a set for ``translate_ir``.
         released = self._content_policy(doc, engine)
+        if self._page_scope:
+            # ``ir._keeps_source`` lets a *release* win over ``keep_original`` (the
+            # policy's "translate this figure" answer), so an out-of-scope block the
+            # model released would sneak back into the translation and break the page
+            # scope the user asked for.  Drop those releases.
+            scope = {int(p) for p in self._page_scope}
+            out_of_scope = {i for i, p in enumerate(doc.block_pages)
+                            if int(p) not in scope}
+            dropped = released & out_of_scope
+            if dropped:
+                released = released - dropped
+                self.log.emit(
+                    f"  页范围：忽略 {len(dropped)} 个范围外块的内容策略放行（保持原文）。")
         translate_fn = ir_mod.make_ir_translate_fn(
             engine, doc_path=Path(self._source), log=lambda m: self.log.emit(m),
             cancel=lambda: self._cancelled.is_set(),
@@ -516,6 +546,35 @@ class TranslateWorker(QObject):
         result = TranslationResult(blocks=src_texts, translated=out_texts)
         result.errors = list(translate_fn.last_errors)
         return result
+
+    def _mark_page_scope(self, doc: "pdfio.DocumentText") -> set[int]:
+        """Keep the source text of every block outside ``page_scope``; return them.
+
+        The scope is the user's "只翻第 N 页" request (resolved by the chat/agent and
+        already reported to the user), so the paths without a per-page loop have to
+        honour it here instead of translating the whole document.  ``keep_original``
+        is the channel the translation engine, ``ir._keeps_source``, the audit and
+        the exporter all share, so one write covers every path.
+
+        A scope that matches no page of the document is reported loudly: "translated
+        nothing" must never look like "done".
+        """
+        scope = {int(p) for p in (self._page_scope or [])}
+        flat = [b for page_blocks in doc.pages for b in page_blocks]
+        kept: set[int] = set()
+        for i, page in enumerate(doc.block_pages):
+            if int(page) in scope or i >= len(flat):
+                continue
+            flat[i].keep_original = True
+            kept.add(i)
+        listed = "、".join(str(p + 1) for p in sorted(scope))
+        if scope and not any(0 <= p < doc.page_count for p in scope):
+            self.log.emit(
+                f"  警告：页范围（第 {listed} 页）超出文档范围（共 {doc.page_count} 页），"
+                f"本次不会翻译任何内容。")
+        elif kept:
+            self.log.emit(f"  页范围：只翻第 {listed} 页，其余 {len(kept)} 个文本块保留原文。")
+        return kept
 
     def add_user_requirement(self, text: str) -> None:
         """Inject a sidebar free-text message into the running AI agent.

@@ -94,6 +94,34 @@ class TranslationOutputPageTest(unittest.TestCase):
         self.assertEqual(2, MainWindow._translation_output_page(None, 2, "markdown"))
 
 
+class PreviewOutputPagingTest(unittest.TestCase):
+    """扩页产物的续页必须能在预览里翻到。
+
+    以源页号为单位翻页时，源页 i 的续页 i+1… 在「译文」侧没有任何入口：实测源 1 页
+    → 产物 2 页，窗口只给「第 1/1 页」，被搬走的表格行永远看不到。现在扩页产物改成
+    按**输出页**翻页，并把输出页反查回源页写进标题。
+    """
+
+    def test_only_an_expanded_inplace_product_uses_output_pages(self):
+        self.assertFalse(MainWindow._uses_output_paging("translated_pdf", None))
+        self.assertFalse(MainWindow._uses_output_paging("translated_pdf", [0, 1]))
+        self.assertFalse(MainWindow._uses_output_paging("bilingual_pdf", [0, 2]))
+        self.assertFalse(MainWindow._uses_output_paging("markdown", [0, 2]))
+        self.assertTrue(MainWindow._uses_output_paging("translated_pdf", [0, 2]))
+
+    def test_an_output_page_maps_back_to_its_source_page(self):
+        page_map = [0, 2, 4]
+        self.assertEqual(0, MainWindow._source_page_for_output(0, page_map, 6))
+        self.assertEqual(0, MainWindow._source_page_for_output(1, page_map, 6))
+        self.assertEqual(1, MainWindow._source_page_for_output(2, page_map, 6))
+        self.assertEqual(2, MainWindow._source_page_for_output(5, page_map, 6))
+        # 映射不全（越界）时夹到最后一页，绝不抛错
+        self.assertEqual(2, MainWindow._source_page_for_output(9, page_map, 6))
+
+    def test_without_a_map_the_page_number_is_the_source_page(self):
+        self.assertEqual(3, MainWindow._source_page_for_output(3, None, 10))
+
+
 class ExportOverwriteTest(unittest.TestCase):
     """v0.5.24: exports overwrite the target file instead of making ``(n)`` copies.
 

@@ -138,6 +138,33 @@ class ChatSession:
     def _new_client(self):
         return OpenAI(**self.model.client_kwargs())
 
+    #: How many messages the console keeps in memory.  ``_CHAT_HISTORY_CAP`` is the
+    #: API *window*; a few times that is plenty of context to keep around.
+    _HISTORY_KEEP = _CHAT_HISTORY_CAP * 4
+
+    def _prune_history(self) -> None:
+        """Bound the in-memory history and drop stale image payloads.
+
+        The history lives for the whole session while only the last
+        ``_CHAT_HISTORY_CAP`` messages can ever be sent again, and every preview
+        screenshot stays in it as base64 (40 turns with images held ~100 MB of pixels
+        that were no longer reachable).  Old messages are dropped, and image parts left
+        outside the send window are stripped.
+        """
+        if len(self.history) > self._HISTORY_KEEP:
+            del self.history[:len(self.history) - self._HISTORY_KEEP]
+        keep_from = max(0, len(self.history) - _CHAT_HISTORY_CAP)
+        for i, msg in enumerate(self.history):
+            if i >= keep_from:
+                break
+            content = msg.get("content")
+            if isinstance(content, list):
+                msg["content"] = [
+                    part for part in content
+                    if not (isinstance(part, dict)
+                            and part.get("type") == "image_url")
+                ]
+
     def refresh_client(self) -> None:
         """Close the current client and mint a fresh one.
 
@@ -389,6 +416,7 @@ class ChatSession:
         system_prompt = prompts.chat_system_prompt()
         if tools:
             system_prompt += prompts.chat_tool_hint()
+        self._prune_history()
         messages = [{"role": "system", "content": system_prompt}] + self._window_history()
         kwargs: dict[str, Any] = {
             "model": self.model.model,

@@ -1036,6 +1036,37 @@ class PageExecutorsTest(unittest.TestCase):
         s.out_doc = {0: {"text": "As of May 2023 revenue was 31 million yuan"}}
         self.assertTrue(tools["check_numbers"](0)["numbers"])
 
+    def test_check_numbers_accepts_month_abbreviations(self):
+        # 正确的英文日期缩写（Jan/Dec）曾经被报「missing 1 / missing 12」：月份数字
+        # 随全名一起消失，模型无论怎么正确翻译都过不了复核门（三轮后报「仍有问题」）。
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("报告期：2025 年 1 月 1 日至 2025 年 12 月 31 日",
+                                page=0, x0=0, y0=0, x1=100, y1=10)]],
+            blocks=["报告期：2025 年 1 月 1 日至 2025 年 12 月 31 日"],
+            block_pages=[0])
+        tools = agent.make_page_executors(s, _dummy_model())
+        s.out_doc = {0: {"text": "Reporting period: Jan 1, 2025 to Dec 31, 2025"}}
+        self.assertEqual([], tools["check_numbers"](0)["numbers"])
+        # 月份写错（Jan→Feb）仍然要报。
+        s.out_doc = {0: {"text": "Reporting period: Feb 1, 2025 to Dec 31, 2025"}}
+        self.assertTrue(tools["check_numbers"](0)["numbers"])
+
+    def test_check_residual_ignores_a_lone_unit_glyph(self):
+        # 西文目标里跟着数字的**单个**单位汉字（元/万元）不是「残留中文」：它是正确
+        # 译文的货币名，此前被报成 residual_cjk → 复核循环反复重译一个本来就对的块。
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("总资产 1,234 元", page=0, x0=0, y0=0, x1=100, y1=10),
+                    pdfio.Block("总资产", page=0, x0=0, y0=20, x1=100, y1=30)]],
+            blocks=["总资产 1,234 元", "总资产"], block_pages=[0])
+        s.out_doc = {0: {"text": "Total assets 1,234 元"},
+                     1: {"text": "Total assets 总资产"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        res = tools["check_residual"](0)["residual"]
+        self.assertEqual([1], [r["index"] for r in res],
+                         "只有成句/成词的中文才算残留")
+
     def test_check_residual_ignores_cjk_translation_for_cjk_target(self):
         # Regression (fix 1): the residual check scanned the language NAME for CJK
         # glyphs, so the default Chinese target ("Simplified Chinese" is ASCII) was

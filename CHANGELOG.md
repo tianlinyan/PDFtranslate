@@ -11,6 +11,140 @@
 
 ---
 
+## v0.6.5
+
+**按 `docs/代码审查-v0.6.4-2.md` §9 的顺序修复审查发现**（用例 **877 → 907 全绿**，离线）。
+本轮把「审查结论」逐条落成代码 + 回归测试；每条后面括注对应的审查编号。
+
+### A. 先修：用户可见的静默丢失
+
+① **保留块不再吞掉用户/AI 的编辑（P1-4）**：`keep_original` 是**默认**不是锁——导出器
+此前无条件 `continue`，于是侧栏/标注写入的译文被丢弃，而日志照旧报「已应用 N 处编辑」。
+现在跳过条件是 `keep_original and trans == 原文`；写了真译文就照画（扫描块同时补白底）。
+回归：`KeptOcrPixelsTest::test_an_edited_kept_ocr_block_is_drawn`、
+`test_an_untranslated_kept_ocr_block_keeps_its_pixels`、
+`OverlayApplyTest::test_re_export_applies_an_edit_to_a_kept_block`。
+② **文本层保留块原样保留**：红action 与绘制同样只跳过「未改动」的保留块（`keep_original`
+文本块不再被擦掉后换字体重画），`_flow_skips` 也不再把它搬到续页。
+③ **`page_scope` 每条路径都生效（P1-5）**：只有 agent 路径有逐页循环，IR / 确定性回退
+此前把整篇都翻了，而界面已告诉用户「AI 理解为只翻第 N 页」。现在提取后把范围外的块标
+`keep_original`（引擎/IR/审计/导出共用的唯一通道），并忽略这些块的内容策略「放行」；
+顺带修掉 `worker.py` 里 `for i, b in enumerate(doc.blocks)`（`doc.blocks` 是**文本**列表，
+该推导式恒为空集，内容策略的保留从未传给引擎）。回归：`PageScopeTest`。
+④ **越界页范围不再报「翻译完成」（P2-10）**：`DocumentSession._preprocess` 把范围与页数
+求交，交集为空时 summary 以「未执行翻译：页范围…超出文档范围」开头；worker 侧同样记警告。
+回归：`DocumentSessionTest::test_an_out_of_range_scope_is_not_reported_as_done`。
+
+### B. 扩页（`译文扩页`）三条 P1
+
+① **不可搬移块不再被推出页面（P1-1）**：表格下推把 `ocr`/`in_image` 块当散文推下去，
+而 `_flow_skips` 又保证它们永不进 flow——两条改动的交集让译文与白底一起落到页面外
+（实测块 `dy=66.2` → 绘制框 y 238..256，页高 200；扫描带暗像素 434→0、可提取词 5→4，
+**且无任何日志**）。现在「表格下方存在不可搬移块」的页面保持页底钳制并记一行日志；
+覆盖矩形也随 `draw_b` 平移（此前按未平移的原始框测量，白底会擦在译文的旧位置）。
+回归：`ExpandPagesTest::test_a_block_below_a_grown_table_never_leaves_the_page`。
+② **超长正文按行跨页（P1-2）**：元素此前是不可分单元，高于一页的部分永久落在纸外
+（实测开扩页 630→481 词，−24%，比不开还差）。续页现在把正文**按行**分段续排（表格行
+仍不拆），实测 1824/1824 字全在纸上、每页 `ymax ≤ 页高`。
+回归：`test_an_oversized_paragraph_continues_onto_the_next_page`。
+③ **旋转页不扩页（P1-3）**：`find_tables` 在旋转显示帧给出几何、块坐标与拆分上限在未
+旋转帧，扩页把错位放大成「首页空白 + 续页重复」（实测 `/Rotate 90` 1 页 → 4 页）。
+现在旋转页明确保持页底钳制并记日志（`/Rotate 0` 行为不变）。
+回归：`test_expand_pages_on_a_rotated_page_does_not_inflate_the_document`。
+④ **续页继承裁剪帧（P2-7）**：续页改用源页 cropbox 尺寸建页（块坐标是 cropbox 相对帧），
+裁剪页的续页不再比源页可见区更大。回归：`test_a_continuation_page_keeps_the_source_crop_frame`。
+
+### C. 预览与导出（P1-8 / P1-9 / P2-2）
+
+① **换源文件丢掉上次导出状态（P1-8）**：`set_source_path` 现在清空 `_last_pdf`/页映射/
+译文/对齐文档，预览不会再把**上一份文档**的产物当成新文档的译文（实测逐字节相同）。
+回归：`SourceSwitchInvalidatesExportTest`。
+② **txt/md 原子写（P1-9）**：`save_plain_text`/`save_markdown` 改走临时文件 + `os.replace`
+（关窗 `os._exit` 时半截文件会毁掉上一份可用产物）。回归：`AtomicTextExportTest`。
+③ **续页可预览（P2-2）**：扩页产物的「译文」侧改按**输出页**翻页（源页 → 输出页映射反查
+写进标题「续页归属原文第 N 页」），否则被搬走的行永远看不到。
+回归：`PreviewOutputPagingTest`。
+
+### D. 校验链路（P2-1）
+
+导出器把「源页 → 首个输出页」映射写进 PDF 的 **XMP**（`pdftranslate:pageMap`；
+PyMuPDF 的 `set_metadata` 拒绝未知 Info 键）。`check_translation.py` /
+`check_layout.py` 优先按它配对：扩页产物此前退化成按页序配对（`check_translation`
+报满屏假「数字不一致」`exit 1`；`check_layout` 还因「页数恰好 2×」误判成双语交错），
+现在按映射把一页源文的所有续页一起比对，扩页页跳过几何「漏画」检查并**明确提示**，
+无映射而页数更多时给出「配对可能错位」的页数告警（不再静默错配）。
+回归：`ExpandedProductPairingTest`（两个脚本各一例 + 改错数字仍能报出）。
+
+### E. 审计与流程（P2-3 / P2-9）
+
+① **审计门两个固定假阳性（P2-3）**：月份缩写（`Jan 1, 2025`）此前被 `check_numbers`
+报 `missing=[1,12]`——模型无论怎么正确翻译都过不了复核门；西文目标下跟数字的**单个**
+单位汉字（`1,234 元`）被报 `residual_cjk`。现在 `_MONTH_RE` 认缩写，`_has_cjk` 要求
+≥2 个连续汉字或非单位字。回归：`test_check_numbers_accepts_month_abbreviations`、
+`test_check_residual_ignores_a_lone_unit_glyph`。
+② **越界页审计不再假绿（P3-4）**：`audit_page(s, 99)` 此前 `clean=True`（所有检查走了
+空块表），现在报 `unknown_page` 并 `clean=False`。
+③ **计划的失败/丢弃不再被吞（P2-9）**：`_validate_plan` 把无法识别的任务记进
+`Plan.dropped` 并在 `note`/日志里说明；`run_plan` 不再吞 `TranslationCancelled`；
+「有 `error` 没有 `ok`」的步骤算失败（`read_page(page=99)` 的「页号越界」此前算成功）；
+`compile_plan(available=…)` 让对话侧在编译期就丢掉自己跑不了的任务而不是中途失败。
+回归：`PlanDropReportingTest`。
+
+### F. 表格与提取（P1-6 / P1-7 / P2-4 / P2-5）
+
+① **有框线的表不再被当成无框线表（P1-6）**：`_extend_with_body` 把整表标 `borderless`
+→ 行高下推但表格线既不擦也不重画（实测 19/102 行压线）；它还会把**相邻的另一张表**当成
+自己的「无框线表体」吸收（两张表报同样的行与 bbox）。现在只对真正来自 `find_tables` 的
+行出网格（`ruled_rows`）、只红action 有线的部分（`ruled_bbox`），并按同页其它表的边界
+截断表体搜索（实测 0/102）。回归：`TableRulesAfterPushDownTest`。
+② **列宽重排不再产出反框（P1-7）**：`_rebalance_table_columns` 可把窄列压到 2×pad 以下
+（实测 width=−0.48pt）→ `_fit_block` 把宽度钳成 1pt → 逐字换行并越出表格右边界。现在
+每个弹性列有可用下限，`col_boxes` 兜底 `x1 ≥ x0+1`。回归：同一测试类。
+③ **合并 OCR 块保持列序（P2-4）**：`_merge_ocr_blocks` 用 (y,x) 重排整页，把两栏页按行
+交错（`1.L 5.R 2.L …`），翻译顺序 / Markdown / 【上下文参考】都拿到另一栏；改用共享的
+列感知 `_order_generic`。回归：`test_merged_order_keeps_the_column_reading_order`。
+④ **双语译文页也长高表格行（P2-5）**：行高机制此前只接在原位导出上，镜像页照抄源几何、
+长译文压住下一行；现在共用 `_compute_table_layout` + `_shifted_block` + `_draw_grid`。
+回归：`BilingualTableExpansionTest`。
+
+### G. 其余修复与口径
+
+* `resume=False` 只表示「不读磁盘缓存」，不再连带关掉**写盘**（`PDFTRANSLATE_CACHE_DIR`
+  已设时仍落盘）；eval/verify/agent 术语抽取不再静默失去缓存。回归：`test_resume_false_still_persists_the_fresh_results`。
+* `OCR缓存版本 9 → 10`：缓存字段含块**顺序**，阅读序判据变了必须换版本。
+* `_image_text_blocks` 不再吞掉 `TranslationCancelled`（同一 OCR 缝的整页路径是显式上抛）。
+* 侧栏 `add_message`/`add_notice` 转义 HTML：含 `<` 的文本此前被当标签吃掉（`<table>`
+  之后整段消失）。回归：`SidebarEscapingTest`。
+* 运行选项日志补齐 `图内文字/OCR/IR管线/术语抽取`；运行中再次请求「开始翻译」会记一行
+  日志，且对话工具如实回报「已有翻译在运行中」，不再谎报「已触发」。
+* 对白历史有界：超出保留量的旧消息被丢弃、窗口外的旧截图（base64）被剥离。
+* `save_translated_pdf` 对 NaN/inf/空框的块跳过并记日志（此前会从导出中途抛
+  `ValueError`，整轮白翻）；`check_translation.py --skip` 非法值改为用法错 **exit 2**。
+* CLI `check_layout.py` 的「字号过小」改用**源页自身**的正文下限（与 `flow._check_layout`、
+  `eval` 同口径：合法的小字号脚注不再误报），硬下限对齐导出器的 `_MIN_TABLE_FLOOR`。
+* 计划分发：`_dispatch_plan_task` 对校验器接受的原子名回退到完整工具表（不再「未知原子工具」）。
+* 文档口径：`unique_path` 的 docstring 说明导出**有意覆盖**（仅源文件本身受保护）。
+
+### H. 代码审查（第三轮）两条 P1 修复
+
+① **表格内的保留块不再被擦掉（P1-1）**：`keep_original` 的语义是「不红action、不重画」，
+但表格那一遍红action 按整张表 bbox 擦（为了擦掉旧表格线），于是**表内的文本层保留块被擦掉
+却没人补画**——而 v0.6.5 新增的 `page_scope` 把范围外整页的块（含表格单元格）都标成
+`keep_original`，所以「只翻第 N 页」会删掉其余页所有表格的文字。现在导出器先用
+`_erased_by_table_redaction()` 判断「这个保留块会不会被表格红action 覆盖」：会，就按普通块
+处理（整框红action + 用 `trans[j]`（=原文）重画回来，避免跨表边界时半个字框被擦）；不会，
+才保持「原样不动」。双语的**空白镜像页**（纯文字页，没有源图可留）也不再跳过保留块——那张页
+没有源副本，跳过等于留白。回归：`KeptBlockInsideATableTest` 4 例（原位 / 整页保留 / 双语
+镜像页 / 空白镜像页）。
+② **`_extend_with_body` 向上扩表体时不再画错表格线（P1-2）**：有框线的行改用**区间**
+`ruled_span=(start, end)` 记录（原来记的是「前 N 行」的计数），`_compute_table_layout` /
+`_flow_grid` / 续页 `_flow_draw_row` 都按区间出线。此前表体在**上**时，真表格带被红action
+擦掉却不重画（表格线整条消失），同时在合成出来的散文行上凭空画出表格线。回归：
+`TableRulesAfterPushDownTest::test_a_table_body_above_the_ruled_band_keeps_the_rules`。
+**已知未修（登记）**：`settings.load_prefs` 对损坏 JSON 仍静默返回空偏好（P3-12，低危）。
+
+---
+
 ## v0.6.4
 
 > 注：本版开发过程中曾以 0.6.3 为工作版本号，发布时统一为 0.6.4——v0.6.3 未单独发版，

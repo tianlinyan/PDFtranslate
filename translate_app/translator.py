@@ -753,6 +753,10 @@ class TranslationEngine:
         with the input block order.  ``keep_original`` is a set of block indices
         that must be left verbatim (e.g. a personal-name column); those blocks
         are never sent to the model and always export as the source text.
+
+        ``resume=False`` means "ignore what is already on disk" — it does **not**
+        disable writing: with persistence enabled (``PDFTRANSLATE_CACHE_DIR``) the
+        fresh results are still cached, so a later resumed run can reuse them.
         """
         log = log or (lambda _msg: None)
         cancel = cancel or (lambda: False)
@@ -786,19 +790,22 @@ class TranslationEngine:
         # to disk beyond the final output.
         cache: dict[str, str] = {}
         cache_path: Path | None = None
-        if resume and doc_path is not None and _cache_persist_enabled():
-            # An absent glossary keeps the hash empty, so the cache key is the
-            # same as before the glossary feature existed (only the version tag
-            # differs); a glossary's content is part of the key.
+        if doc_path is not None and _cache_persist_enabled():
+            # ``resume=False`` means "do not REUSE what is on disk", not "do not
+            # write": the two used to be one gate, so every caller that asked for a
+            # fresh run (eval_ir / verify_* / the agent's terminology pass) silently
+            # disabled persistence altogether — a successful fresh run left nothing
+            # to reuse, with no hint in the log.
             glossary_hash = (
                 hashlib.sha1(
                     json.dumps(glossary, ensure_ascii=False, sort_keys=True).encode("utf-8")
                 ).hexdigest()[:16]
                 if glossary else ""
             )
-            cache = load_translation_cache(
-                doc_path, target_language, self.model.id, glossary_hash
-            )
+            if resume:
+                cache = load_translation_cache(
+                    doc_path, target_language, self.model.id, glossary_hash
+                )
             cache_path = _cache_dir() / _cache_key(
                 doc_path, target_language, self.model.id, glossary_hash
             )

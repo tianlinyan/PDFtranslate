@@ -201,9 +201,13 @@ class SidebarChat(QWidget):
     # -- messages ------------------------------------------------------------
     def add_message(self, role: str, text: str) -> None:
         tag = "AI" if role == "ai" else "我"
-        html = f'<p><b style="color:{"#2b6cb0" if role == "ai" else "#805ad5"}">{tag}:</b> ' \
-               f'{str(text)}</p>'
-        self._log.append(html)
+        color = "#2b6cb0" if role == "ai" else "#805ad5"
+        # The log is a rich-text widget: anything the user or the model writes must be
+        # escaped (the streaming bubble always did).  Un-escaped text silently lost the
+        # rest of the message — a user writing "把 <b>公司名</b> 改成 Bank" rendered as
+        # "把 公司名 改成 Bank", and a "<table>" threw the remainder away entirely.
+        body = html.escape(str(text)).replace("\n", "<br>")
+        self._log.append(f'<p><b style="color:{color}">{tag}:</b> {body}</p>')
         # Keep the newest chat line visible.
         self._log.moveCursor(QTextCursor.MoveOperation.End)
         self._log.ensureCursorVisible()
@@ -252,7 +256,8 @@ class SidebarChat(QWidget):
 
     def add_notice(self, text: str) -> None:
         """A muted system line (not a user/AI bubble), e.g. "已复制图片"."""
-        self._log.append(f'<p style="color:#718096"><i>{str(text)}</i></p>')
+        body = html.escape(str(text)).replace("\n", "<br>")
+        self._log.append(f'<p style="color:#718096"><i>{body}</i></p>')
         self._log.moveCursor(QTextCursor.MoveOperation.End)
         self._log.ensureCursorVisible()
 

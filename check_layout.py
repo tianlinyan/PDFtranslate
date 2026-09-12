@@ -95,9 +95,14 @@ class LayoutReport:
     missing: list[str] = field(default_factory=list)
     pages_issue: list[str] = field(default_factory=list)
     scanned_pages: list[int] = field(default_factory=list)
+    #: Informational lines (what was checked / skipped and why).  They must not change
+    #: the verdict: a limitation stated honestly is not a defect.
+    notes: list[str] = field(default_factory=list)
     span_count: int = 0
     size_median: float = 0.0
     interleaved: bool = False
+    #: The source→output page map read from the target (empty = none recorded).
+    page_map: list[int] = field(default_factory=list)
 
     def structural(self) -> list[str]:
         """Findings that mean content is wrong (exit 1), not just cosmetic."""
@@ -208,17 +213,37 @@ def find_rule_crossings(spans: Sequence[Span], rules, scale: float,
     return out
 
 
+def _body_floor_for(blocks) -> float:
+    """The smallest body font size the *source* page legitimately uses.
+
+    A 5 pt footnote drawn at 5 pt is not a defect: the exporter scales its start size
+    from ``pdfio._font_start`` and ``flow._check_layout`` judges each block against
+    ``min(_font_start(block), _MIN_READABLE)``.  Comparing every span with the absolute
+    6.3 pt body floor reported legal small text as too small (the agent's own audit
+    reported 0 issues for the same document).
+    """
+    floors = [min(pdfio._font_start(b), pdfio._MIN_READABLE)
+              for b in blocks or [] if not getattr(b, "in_table", False)]
+    return min(floors) if floors else pdfio._MIN_READABLE
+
+
 def find_too_small(spans: Sequence[Span], in_table_floor: float,
                    body_floor: float) -> list[str]:
-    """Spans below the readable floor (table cells may go down to their floor)."""
+    """Spans below the readable floor.
+
+    ``in_table_floor`` is the exporter's **absolute** floor (``_MIN_TABLE_FLOOR``: a
+    pathological cell may legitimately reach 3 pt) and ``body_floor`` comes from the
+    *source page's* own text size (see :func:`_body_floor_for`) — the same way
+    ``flow._check_layout`` and ``eval`` judge a block.
+    """
     out: list[str] = []
     for s in spans:
         if s.size < in_table_floor - 0.01:
-            out.append(f"第 {s.page + 1} 页：{s.size:.1f}pt（低于表格下限 "
+            out.append(f"第 {s.page + 1} 页：{s.size:.1f}pt（低于最小可读字号 "
                        f"{in_table_floor}pt）—— 「{_clip(s.text)}」")
         elif s.size < body_floor - 0.01:
             out.append(f"第 {s.page + 1} 页：{s.size:.1f}pt（低于正文下限 "
-                       f"{body_floor}pt）—— 「{_clip(s.text)}」")
+                       f"{body_floor:.1f}pt）—— 「{_clip(s.text)}」")
     return out
 
 
@@ -360,6 +385,25 @@ def check_document(source: Path, target: Path,
     try:
         report.pages = tgt.page_count
         report.interleaved = src.page_count > 0 and tgt.page_count == 2 * src.page_count
+        # An expanded product ("译文扩页") lets one source page occupy several output
+        # pages; the exporter records the source→output map in the PDF's XMP
+        # (``pdfio.document_page_map``).  Without it, ``tgt[i]`` pairs a source page
+        # with the *continuation* of an earlier one, so every page after the first
+        # expansion is compared with the wrong translation.
+        page_map = pdfio.document_page_map(tgt)
+        if page_map is None and not report.interleaved \
+                and tgt.page_count > src.page_count:
+            report.pages_issue.append(
+                f"译文 {tgt.page_count} 页多于原文 {src.page_count} 页，"
+                "且文件内没有扩页映射（XMP pageMap）——按页序配对可能错位，"
+                "「漏画」等结论仅供参考；请用「译文扩页」导出的原始产物重跑。")
+        ranges = (pdfio.mapped_page_ranges(page_map, src.page_count, tgt.page_count)
+                  if page_map is not None else None)
+        if ranges is not None:
+            report.page_map = list(page_map)
+            report.notes.append(
+                f"检测到扩页产物：按文件内记录的页映射配对（源页 → 首个输出页 "
+                f"{','.join(str(t + 1) for t in page_map)}）。")
         if tgt.page_count < src.page_count:
             report.pages_issue.append(
                 f"译文 {tgt.page_count} 页少于原文 {src.page_count} 页")
@@ -378,49 +422,73 @@ def check_document(source: Path, target: Path,
         for i in range(src.page_count):
             if pages and (i + 1) not in pages:
                 continue
-            ti = 2 * i + 1 if report.interleaved else i
-            if ti >= tgt.page_count:
+            if ranges is not None:
+                tis = [t for t in ranges[i] if t < tgt.page_count]
+            else:
+                ti = 2 * i + 1 if report.interleaved else i
+                tis = [ti] if ti < tgt.page_count else []
+            if not tis:
                 continue
-            visited.add(ti)
-            page = tgt[ti]
             src_page = src[i]
-            spans = collect_spans(page, i)
-            report.span_count += len(spans)
-            sizes.extend(s.size for s in spans)
-            report.overlap += find_overlaps(spans)
-            report.off_page += find_off_page(spans, frame_rect(page))
-            report.small += find_too_small(
-                spans, pdfio._MIN_TABLE_READABLE, pdfio._MIN_READABLE)
             src_frame = frame_rect(src_page)
-            if (abs(src_frame.width - frame_rect(page).width) > 1.0
-                    or abs(src_frame.height - frame_rect(page).height) > 1.0):
-                report.pages_issue.append(
-                    f"第 {i + 1} 页尺寸不一致：源 {_fmt(src_frame)} "
-                    f"译文 {_fmt(frame_rect(page))}")
             try:
                 luma = pdfio._pixmap_luma(src_page.get_pixmap(dpi=dpi))
             except Exception:              # noqa: BLE001 — sampling is best-effort
                 luma = None
-            if luma is not None:
-                scale = luma.shape[1] / max(1e-6, float(src_page.rect.width))
-                levels = pdfio._page_levels(luma, scale)
-                rules = pdfio._page_rule_mask(luma, levels, scale)
-                ink = None
-                if levels is not None and rules is not None:
-                    bg, _span, offsets = levels
-                    # Source *text* ink only: the rule pixels themselves are dark
-                    # too and must not excuse a crossing.
-                    ink = (luma < bg - offsets[1]) & ~rules
-                rendered = [Span(s.text, s.size, to_render_frame(s.rect, src_page), s.page)
-                            for s in spans]
-                report.rule += find_rule_crossings(rendered, rules, scale, ink=ink)
+            # Every output page belonging to this source page is measured on its own
+            # (collisions / off-page / sizes are page-local), while the source
+            # comparison below sees the *union*: with expansion part of the page
+            # legitimately lives on a continuation page, so comparing the source with
+            # one output page would report the moved blocks as missing.
+            page_spans: list = []
+            body_floor = _body_floor_for(text_layers.get(i))
+            for ti in tis:
+                visited.add(ti)
+                page = tgt[ti]
+                spans = collect_spans(page, i)
+                page_spans.extend(spans)
+                report.span_count += len(spans)
+                sizes.extend(s.size for s in spans)
+                report.overlap += find_overlaps(spans)
+                report.off_page += find_off_page(spans, frame_rect(page))
+                report.small += find_too_small(
+                    spans, pdfio._MIN_TABLE_FLOOR, body_floor)
+                if (abs(src_frame.width - frame_rect(page).width) > 1.0
+                        or abs(src_frame.height - frame_rect(page).height) > 1.0):
+                    report.pages_issue.append(
+                        f"第 {i + 1} 页尺寸不一致：源 {_fmt(src_frame)} "
+                        f"译文 {_fmt(frame_rect(page))}")
+                if luma is not None:
+                    scale = luma.shape[1] / max(1e-6, float(src_page.rect.width))
+                    levels = pdfio._page_levels(luma, scale)
+                    rules = pdfio._page_rule_mask(luma, levels, scale)
+                    ink = None
+                    if levels is not None and rules is not None:
+                        bg, _span, offsets = levels
+                        # Source *text* ink only: the rule pixels themselves are dark
+                        # too and must not excuse a crossing.
+                        ink = (luma < bg - offsets[1]) & ~rules
+                    rendered = [Span(s.text, s.size,
+                                     to_render_frame(s.rect, src_page), s.page)
+                                for s in spans]
+                    report.rule += find_rule_crossings(rendered, rules, scale,
+                                                       ink=ink)
             # The missing check needs no pixels (it compares text spans), so it
             # runs even when the page could not be sampled — an unsampled page
             # used to skip it silently.
-            if not text_layer_known:
+            if len(tis) > 1:
+                # An expanded source page: blocks that did not fit were moved to
+                # continuation pages, so their *coordinates* no longer match the source
+                # geometry the missing check compares against.  Reporting them as
+                # "漏画" would be a false positive on every expanded page; say the
+                # check was skipped instead.
+                report.notes.append(
+                    f"第 {i + 1} 页为扩页页（输出第 {tis[0] + 1}–{tis[-1] + 1} 页）："
+                    "搬到续页的块坐标已改变，该页跳过「漏画」检查。")
+            elif not text_layer_known:
                 pass               # already reported as a pages_issue above
             elif text_layers.get(i):
-                report.missing += find_missing(text_layers[i], spans)
+                report.missing += find_missing(text_layers[i], page_spans)
             else:
                 report.scanned_pages.append(i + 1)
         if not report.interleaved and not pages:
@@ -439,7 +507,7 @@ def check_document(source: Path, target: Path,
                 report.overlap += find_overlaps(spans)
                 report.off_page += find_off_page(spans, frame_rect(page))
                 report.small += find_too_small(
-                    spans, pdfio._MIN_TABLE_READABLE, pdfio._MIN_READABLE)
+                    spans, pdfio._MIN_TABLE_FLOOR, pdfio._MIN_READABLE)
             if extra:
                 report.pages_issue.append(
                     f"译文多出 {len(extra)} 页没有对应原文（第 "
@@ -565,7 +633,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"原文：{files[0]}")
     print(f"译文：{files[1]}")
     print(f"页数：{report.pages}，文字块 {report.span_count} 段")
-    if report.interleaved:
+    if report.interleaved and not report.page_map:
         print("（双语交错产物：按「源页 i ↔ 译文页 2i+1」配对检查）")
     print()
 
@@ -587,6 +655,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if report.scanned_pages:
         print(f"[提示] 第 {report.scanned_pages} 页源页无文本层，"
               f"跳过「漏画」检查（需 OCR）。")
+    for msg in report.notes:
+        print(f"[提示] {msg}")
 
     print()
     if report.structural():

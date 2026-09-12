@@ -712,8 +712,26 @@ def make_source_tools(state: WorkflowState, *, src_path=None) -> dict[str, Calla
             "get_structure": get_structure, "get_table": get_table}
 
 
+#: Ideographs that legitimately survive as a *unit* after a figure (``1,234 元``,
+#: ``5 万元``, ``第 8 月``): a **single** isolated one of them is not "残留中文" — the
+#: number carries the meaning.  Requiring two consecutive ideographs (or any
+#: non-unit one) keeps real residue (``总资产``, ``人民币``) reportable while stopping
+#: the false positive that made the self-check loop retranslate an already-correct
+#: block on every attempt.
+_CJK_UNIT_MARKS = frozenset("元圆角分万亿年月日号个")
+
+
 def _has_cjk(text: Any) -> bool:
-    return any("\u4e00" <= ch <= "\u9fff" for ch in str(text))
+    """True when ``text`` still holds a meaningful amount of untranslated Chinese."""
+    run = 0
+    for ch in str(text):
+        if "\u4e00" <= ch <= "\u9fff":
+            run += 1
+            if run > 1 or ch not in _CJK_UNIT_MARKS:
+                return True
+        else:
+            run = 0
+    return False
 
 
 #: Full-width digit / decimal-separator rune → ASCII (accounts for OCR/PDF runs that
@@ -725,12 +743,19 @@ _UNICODE_MINUS = str.maketrans("−–—", "---")
 _NUM_TOKEN_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 #: Month names in date runs map to their number (``December 31, 2023`` must compare
 #: equal to ``2023年12月31日``).  Capitalized only — "may be" must stay prose, never
-#: become the digit 5.
+#: become the digit 5.  The three-letter abbreviations count too: a correct English
+#: export writes ``Jan 1, 2025`` and used to be reported as "missing 1" / "missing 12"
+#: (the month number vanished with the full name), so the retranslate loop could never
+#: reach "clean" no matter how right the translation was.
 _MONTH_RE = re.compile(
-    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\b")
+    r"\b(January|February|March|April|May|June|July|August|September|October|"
+    r"November|December|Sept|Sep|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Oct|Nov|Dec)\b")
 _MONTH_NUM = {"January": "1", "February": "2", "March": "3", "April": "4",
               "May": "5", "June": "6", "July": "7", "August": "8",
-              "September": "9", "October": "10", "November": "11", "December": "12"}
+              "September": "9", "October": "10", "November": "11", "December": "12",
+              "Jan": "1", "Feb": "2", "Mar": "3", "Apr": "4", "Jun": "6",
+              "Jul": "7", "Aug": "8", "Sept": "9", "Sep": "9", "Oct": "10",
+              "Nov": "11", "Dec": "12"}
 #: Unit multipliers that legitimately change a value's appearance: 万/亿 in a CJK
 #: source, and thousand/million/billion/trillion (with ten/hundred prefixes) in a
 #: Latin translation — ``3.14 亿元`` and ``314 million yuan`` are the same value.
@@ -846,6 +871,15 @@ def _audit_blocks(state, page):
         return [], 0
     offset = sum(len(pg) for pg in src.pages[:page])
     return src.pages[page], offset
+
+
+def _page_in_range(state, page) -> bool:
+    """True when ``page`` is a real page of the session's source document."""
+    pages = getattr(getattr(state, "src_doc", None), "pages", None) or []
+    try:
+        return 0 <= int(page) < len(pages)
+    except (TypeError, ValueError):
+        return False
 
 
 def _audit_read(state, idx):
@@ -1070,6 +1104,16 @@ def audit_page(state, page=None, checks=None) -> dict[str, Any]:
     names = list(dict.fromkeys(n for n in canonical if n in _AUDIT_CHECKS))
     all_issues: list[dict] = []
     per_check: dict[str, Any] = {}
+    if page is not None and not _page_in_range(state, page):
+        # An out-of-range page audited "clean": every check walked an empty block
+        # list, so the gate said "复核通过" for a page that does not exist (measured:
+        # ``audit_page(s, 99)`` → ``clean=True``).  Report it and fail closed.
+        all_issues.append({
+            "check": "unknown_page", "page": page,
+            "detail": f"第 {int(page) + 1} 页不在文档范围内（共 "
+                      f"{len(getattr(state.src_doc, 'pages', []) or [])} 页），"
+                      f"该页未做任何检查。",
+        })
     if unknown:
         all_issues.append({
             "check": "unknown_checks", "unknown": unknown,
@@ -1730,6 +1774,9 @@ class DocumentSession:
         self.include_kept = include_kept
         #: U1 scope: translate / negotiate only these 0-based pages (None = all).
         self.scope = scope
+        #: Set by ``_preprocess`` when the scope matches no page of the document, so
+        #: the completion report cannot call "translated nothing" a success.
+        self.scope_mismatch: str | None = None
         self.max_steps_per_page = max_steps_per_page
 
     #: phase-name → phase constant, used to set ``state.phase`` as the plan advances.
@@ -1782,6 +1829,20 @@ class DocumentSession:
             f"扫描 {d.scan_pages} 页，图表 {d.chart_pages} 页，表格 {d.table_pages} 页，"
             f"待确认 {d.uncertain_pages} 页。"
         )
+        if self.scope is not None:
+            # A page scope that matches nothing (the user asked for 「第 10 页」 in a
+            # 2-page document) used to run the phases over an empty set and then report
+            # "翻译完成：共处理 0 页" — a success report for doing nothing.  Clamp it
+            # here so the report says what actually happened.
+            wanted = sorted({int(p) for p in self.scope})
+            valid = {p for p in wanted if 0 <= p < d.pages}
+            if not valid:
+                listed = "、".join(str(p + 1) for p in wanted)
+                self.scope_mismatch = (
+                    f"页范围（第 {listed} 页）超出文档范围（共 {d.pages} 页），"
+                    "未翻译任何内容")
+                self.log(f"  警告：{self.scope_mismatch}。")
+            self.scope = valid
         self._mark_kept_diagrams()
         self.progress(0, d.pages, "预处理")
         if self.infer_terms:
@@ -2071,6 +2132,10 @@ class DocumentSession:
             if isinstance(e, dict) and str(e.get("text", "")).strip()
         )
         parts = [f"翻译完成：共处理 {len(pages)} 页，翻译 {translated} 块。"]
+        if self.scope_mismatch:
+            # "Nothing was translated" must not read as "done": the user asked for a
+            # page range the document does not have.
+            parts.insert(0, f"未执行翻译：{self.scope_mismatch}。")
         if done:
             parts.append(f"完成页 {len(done)} 页（{done}）。")
         if need:

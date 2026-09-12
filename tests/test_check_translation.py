@@ -305,6 +305,75 @@ class CheckerTest(unittest.TestCase):
         self.assertFalse(_is_scan_like_text("Total assets"))
 
 
+class ExpandedProductPairingTest(unittest.TestCase):
+    """扩页产物（``译文扩页``）必须按导出器记录的页映射配对。
+
+    导出器把「源页 → 首个输出页」映射写进 PDF 的 XMP；脚本此前只认「页数恰好 2×」
+    的双语交错规则，扩页产物于是退化成按页序配对——源第 2 页被拿去和第 1 页的
+    **续页**比对，报出满屏假「数字不一致」（exit 1），真问题反而被淹没。
+    """
+
+    LONG = "Operating revenue from the bank's core lending business for the year"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def _export(self, *, wrong_number: bool = False) -> tuple[Path, Path]:
+        from translate_app import pdfio
+
+        src = self.tmp / "src.pdf"
+        out = self.tmp / "out.pdf"
+        doc = fitz.open()
+        for _ in range(2):
+            page = doc.new_page(width=400, height=200)
+            xs = [60.0, 100.0, 140.0]
+            rows = [("项目", "金额"), ("收入", "1,234"), ("成本", "5,678"),
+                    ("利润", "9,012")]
+            for r, (label, value) in enumerate(rows):
+                y0 = 120.0 + r * 12.0
+                for c, text in enumerate((label, value)):
+                    page.draw_rect(fitz.Rect(xs[c], y0, xs[c + 1], y0 + 12.0),
+                                   color=(0, 0, 0), width=0.6)
+                    page.insert_text((xs[c] + 2, y0 + 8), text, fontsize=7,
+                                     fontname="china-s")
+        doc.save(str(src))
+        doc.close()
+
+        dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        per_page = []
+        for blocks in dt.pages:
+            per = []
+            for b in blocks:
+                if b.text == "项目":
+                    per.append("Item")
+                elif b.text == "金额":
+                    per.append("Amount")
+                elif b.text in ("收入", "成本", "利润"):
+                    per.append(self.LONG + " " + b.text)
+                else:
+                    per.append("9,999" if wrong_number else b.text)
+            per_page.append(per)
+        mapping = pdfio.save_translated_pdf(
+            str(src), dt.pages, per_page, str(out), "English",
+            log=lambda _m: None, expand_pages=True)
+        self.assertNotEqual([0, 1], list(mapping), "本用例必须真的扩页")
+        return src, out
+
+    def test_an_expanded_product_is_paired_by_its_page_map(self):
+        src, out = self._export()
+        checker = run_checks(src, out, lang="English")
+        self.assertTrue(checker.numeric_ok(), checker.numeric)
+
+    def test_a_wrong_number_in_an_expanded_product_is_still_reported(self):
+        # 配对修好之后，检查能力不能被顺手关掉。
+        src, out = self._export(wrong_number=True)
+        checker = run_checks(src, out, lang="English")
+        self.assertFalse(checker.numeric_ok(),
+                         "扩页产物里的错数字仍必须报出")
+
+
 class BilingualPairingTest(unittest.TestCase):
     """A bilingual target pairs source page i with translation page 2i+1 (P0).
 

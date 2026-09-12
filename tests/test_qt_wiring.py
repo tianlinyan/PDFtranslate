@@ -113,6 +113,55 @@ class CancelWiringTest(unittest.TestCase):
             thread.wait(2000)
 
 
+class SidebarEscapingTest(unittest.TestCase):
+    """侧栏是富文本控件：用户/模型的文本必须原样显示。
+
+    非流式气泡直接拼 HTML，含 ``<`` 的文本被当成标签吃掉，``<table>`` 之后的整段
+    直接消失（流式气泡一直是转义的）。
+    """
+
+    def test_markup_in_a_message_is_shown_verbatim(self):
+        _app()
+        sidebar = SidebarChat()
+        sidebar.add_message("ai", "把 <b>公司名</b> 改成 Bank，注意 x < y")
+        text = sidebar._log.toPlainText()
+        self.assertIn("<b>公司名</b>", text)
+        self.assertIn("x < y", text)
+        sidebar.add_notice("<table> 之后的内容也必须保留")
+        self.assertIn("<table> 之后的内容也必须保留", sidebar._log.toPlainText())
+
+
+class SourceSwitchInvalidatesExportTest(unittest.TestCase):
+    """换源文件必须丢掉上一份文档的导出状态。
+
+    否则预览的「译文」侧会拿旧文档的导出 PDF 渲染（实测与新源页号错位、逐字节等于
+    旧产物），「重新导出」也会把旧译文写到新源文件旁边。
+    """
+
+    def test_switching_the_source_drops_the_previous_export(self):
+        _app()
+        win = MainWindow()
+        try:
+            win._last_pdf = "old.pdf"
+            win._last_output_type = "translated_pdf"
+            win._last_page_map = [0]
+            win._last_translated = ["previous"]
+            win._last_translated_source = "a.pdf"
+            win._last_doc = object()
+            win.set_source_path("b.pdf")
+
+            self.assertIsNone(win._last_pdf)
+            self.assertIsNone(win._last_page_map)
+            self.assertIsNone(win._last_translated)
+            self.assertIsNone(win._last_doc)
+            self.assertEqual("", win._last_output_type)
+            self.assertFalse(win._re_export_btn.isEnabled(),
+                             "换源后不能再用旧译文重新导出")
+        finally:
+            win._chat_thread.quit()
+            win._chat_thread.wait(2000)
+
+
 class NoModelMessageTest(unittest.TestCase):
     """F14: no usable model must answer the user, not swallow the message."""
 

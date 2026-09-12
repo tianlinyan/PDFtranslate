@@ -166,6 +166,44 @@ class BuildFlowTest(unittest.TestCase):
             agent.build_flow(agent.FlowSpec(base="nope"))
 
 
+class PlanDropReportingTest(unittest.TestCase):
+    """AI 自由分解（Path B）：被丢弃的任务必须回报，失败步骤不能被当成功。"""
+
+    def test_an_unknown_task_is_dropped_but_reported(self):
+        plan = uf._validate_plan({"tasks": [{"name": "read_page"},
+                                            {"name": "check_everything"}],
+                                  "note": "先读再查"})
+        self.assertEqual(["read_page"], [t.name for t in plan.tasks])
+        self.assertEqual(["check_everything"], plan.dropped)
+        res = uf.run_plan(plan, dispatch=lambda t: {"ok": True})
+        self.assertTrue(res["ok"])
+        self.assertEqual(["check_everything"], res["dropped"])
+        self.assertIn("check_everything", res["note"])
+
+    def test_a_step_with_an_error_but_no_ok_flag_fails_the_plan(self):
+        # 旧判据是 out.get("ok", True)：`read_page(page=99)` 的「页号越界」没有 ok 字段，
+        # 于是被判成功，计划继续往下跑。
+        plan = uf.Plan(tasks=[uf.Task(tier="atomic", name="read_page",
+                                      params={"page": 99})])
+        res = uf.run_plan(plan, dispatch=lambda t: {"error": "页号越界或无文档。"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(1, res["executed"])
+
+    def test_a_control_signal_is_not_swallowed(self):
+        from translate_app.control import ControlSignal
+
+        class _Boom(ControlSignal):
+            pass
+
+        plan = uf.Plan(tasks=[uf.Task(tier="atomic", name="read_page", params={})])
+
+        def _raise(_task):
+            raise _Boom()
+
+        with self.assertRaises(_Boom):
+            uf.run_plan(plan, dispatch=_raise)
+
+
 class ToolBindingConsistencyTest(unittest.TestCase):
     def test_standard_flows_reference_only_bound_or_deterministic_tools(self):
         # The "先绑定后暴露" gate: every flow's ToolStep tools must be in the bound

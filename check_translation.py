@@ -20,6 +20,9 @@
 4. **页数合理性**：译文页数不应少于原文；少了即告警。**双语（交错）产物
    按「源页 i ↔ 译文页 2i+1」配对**检查（页数为 2×原文时），不再把原文页当
    译文页比对——那会让真正的译文页从不被检查（错误的数字也判「体检通过」）。
+   **扩页（``译文扩页``）产物**按导出器写进 PDF（XMP ``pageMap``）的「源页 →
+   首个输出页」映射，把一页源文的所有续页一起比对；没有映射而页数又多于原文
+   时明确告警「配对可能错位」，不静默错配。
 
 退出码：0 = 全部通过；1 = 数字不一致（或 ``--strict`` 下任意告警）；
 2 = 用法错误。
@@ -35,6 +38,12 @@ from pathlib import Path
 from typing import Sequence
 
 import pymupdf as fitz
+
+# Let the script run from the repo root without installing anything (same trick as
+# ``check_layout.py``): ``translate_app`` is a sibling package.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from translate_app import pdfio  # noqa: E402
 
 #: A numeric token: digits with grouped separators / a percentage sign.  The
 #: token must END in a digit (or %) so a trailing sentence period (``2025.``)
@@ -455,16 +464,38 @@ class Checker:
                 # issue at all).
                 interleaved = (src.page_count > 0
                                and tgt.page_count == 2 * src.page_count)
+                # 扩页产物：一页源文可能占多个输出页，页序不再一一对应。导出器把
+                # 「源页 → 首个输出页」映射写进 PDF 的 XMP（pdfio.document_page_map），
+                # 这里优先用它；否则整篇错位配对（实测把源第 2 页配到第 1 页的续页，
+                # 报出满屏假「数字不一致」）。
+                page_map = pdfio.document_page_map(tgt)
+                if page_map is None and not interleaved \
+                        and tgt.page_count > src.page_count:
+                    self.pages.append(
+                        f"译文页数（{tgt.page_count}）多于原文（{src.page_count}）"
+                        "且文件里没有扩页映射（XMP pageMap）——按页序配对可能错位，"
+                        "结论仅供参考；请用「译文扩页」导出的原始产物重跑。"
+                    )
                 n = (src.page_count if interleaved
                      else min(src.page_count, tgt.page_count))
                 tgt_styles: list[str] = []
+                ranges = (pdfio.mapped_page_ranges(page_map, src.page_count,
+                                                   tgt.page_count)
+                          if page_map is not None else None)
                 for i in range(n):
                     if i + 1 in self.skip:
                         continue
-                    ti = 2 * i + 1 if interleaved else i
-                    if ti >= tgt.page_count:
+                    if ranges is not None:
+                        tis = [t for t in ranges[i] if t < tgt.page_count]
+                    else:
+                        ti = 2 * i + 1 if interleaved else i
+                        tis = [ti] if ti < tgt.page_count else []
+                    if not tis:
                         continue
-                    style = self._check_page(src[i], tgt[ti], i, skip_scan)
+                    # 一页源文的续页一起参与比对：被搬到续页的表格行只在那里出现，
+                    # 只比首个输出页会把它们误报成「缺失」。
+                    tgt_text = "\n".join((tgt[t].get_text("text") or "") for t in tis)
+                    style = self._check_page(src[i], tgt_text, i, skip_scan)
                     if style and style != "mixed":
                         tgt_styles.append(style)
                 if len(set(tgt_styles)) > 1:
@@ -498,11 +529,10 @@ class Checker:
             )
 
     def _check_page(
-        self, src_page: fitz.Page, tgt_page: fitz.Page, i: int, skip_scan: bool
+        self, src_page: fitz.Page, tgt_text: str, i: int, skip_scan: bool
     ) -> str:
         where = f"第 {i + 1} 页"
         src_text = src_page.get_text("text") or ""
-        tgt_text = tgt_page.get_text("text") or ""
         if skip_scan and _is_scan_like_text(src_text):
             # 扫描页（文本层仅页码/无内容）：数字来自 OCR / 重排，不能作为基准。
             # 但「残留中文」只需要译文文本 —— 整页早退曾把它一起跳过（真机样例
@@ -550,23 +580,30 @@ def run_checks(
     return checker
 
 
-def _parse_page_spec(text: str) -> set[int]:
+def _parse_page_spec(text: str) -> set[int] | None:
+    """Parse ``"24-27,30"`` into ``{24,...,27,30}``; ``None`` = a usage error.
+
+    A bad value used to raise ``SystemExit("字符串")``, whose exit code is **1** —
+    the same code as "数字不一致" — while the script's own docs (and
+    ``check_layout.py``) reserve 2 for usage errors.  An empty / inverted range
+    (``5-1``) also silently skipped nothing, so a typo looked like a clean run.
+    """
     pages: set[int] = set()
     for part in text.split(","):
         part = part.strip()
         if not part:
             continue
-        if "-" in part:
-            lo_s, hi_s = part.split("-", 1)
-            try:
-                pages.update(range(int(lo_s), int(hi_s) + 1))
-            except ValueError:
-                raise SystemExit(f"无法解析页数范围：{part}")
-        else:
-            try:
+        try:
+            if "-" in part:
+                lo_s, hi_s = part.split("-", 1)
+                lo, hi = int(lo_s), int(hi_s)
+                if hi < lo:
+                    return None
+                pages.update(range(lo, hi + 1))
+            else:
                 pages.add(int(part))
-            except ValueError:
-                raise SystemExit(f"无法解析页数：{part}")
+        except ValueError:
+            return None
     return pages
 
 
@@ -599,6 +636,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     skip = _parse_page_spec(skip_text) if skip_text else set()
+    if skip is None:
+        print(f"--skip 参数无法解析：{skip_text!r}（示例：--skip 24-27,30）",
+              file=sys.stderr)
+        return 2
     checker = run_checks(Path(files[0]), Path(files[1]), lang=lang, skip=skip)
 
     print(f"原文：{files[0]}")

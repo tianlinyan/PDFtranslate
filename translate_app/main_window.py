@@ -516,7 +516,7 @@ class MainWindow(QWidget):
             log=self._chat_log.log.emit,
             show_preview=self.preview_bridge.showPreview.emit,
             re_export=self.preview_bridge.reExportRequested.emit,
-            start_translate=self.preview_bridge.translateRequested.emit,
+            start_translate=self._chat_start_translate,
             set_setting=self.preview_bridge.setSettingRequested.emit,
         )
         self._chat_worker.moveToThread(self._chat_thread)
@@ -569,11 +569,33 @@ class MainWindow(QWidget):
     # Public helpers
     # ------------------------------------------------------------------
     def set_source_path(self, path: str) -> None:
-        """Set the source PDF (e.g. from the command line)."""
+        """Set the source PDF (e.g. from the command line or the file browser)."""
         self._source = path
         self._src_edit.setText(path)
+        # The previous run's export belongs to the *old* file: keeping it would make
+        # the preview's "译文" side render the old document's pages (measured: the
+        # byte-identical PNG of the old product, labelled with the new page number),
+        # and "重新导出" would rewrite the old translation next to the new source.
+        self._invalidate_previous_run()
         # Point the chat's document context at the new file (keeps any prefs lang/ocr).
         self._refresh_doc_ctx(path)
+
+    def _invalidate_previous_run(self) -> None:
+        """Drop everything that belonged to the previous source / run.
+
+        Called when the source changes (and at the start of a new run): the exported
+        PDF, its page map, the committed translation and the aligned document are all
+        keyed to one source file, so a stale copy is not "the last run" any more.
+        """
+        self._last_pdf = None
+        self._last_output_type = ""
+        self._last_page_map = None
+        self._last_translated = None
+        self._last_translated_source = None
+        self._last_doc = None
+        self.doc_ctx.set_last_translated(None)
+        if hasattr(self, "_re_export_btn"):
+            self._re_export_btn.setEnabled(False)
 
     def current_source(self) -> str | None:
         return self._source
@@ -725,7 +747,7 @@ class MainWindow(QWidget):
             # source page — and then it must be labelled 原文, not 译文.
             png = self._render_translation_preview(page)
             if not png:
-                png = self._render_source_preview(page)
+                png = self._render_source_preview(self._source_page_for_preview(page))
                 self._append_log("  [预览] 该页暂无译文可显示，已回退到原文页。")
             else:
                 shown_what = "translation"
@@ -746,9 +768,10 @@ class MainWindow(QWidget):
         # "下一页" keeps showing what is really on screen (not a mislabeled side).
         self._preview_current_page = page
         self._preview_current_what = shown_what
-        win.set_page_info(page, self._page_count())
+        win.set_page_info(page, self._preview_page_count(shown_what))
         prefix = "预览（译文）" if shown_what == "translation" else "预览（原文）"
-        win.setWindowTitle(f"{prefix} · 第 {page + 1} 页")
+        win.setWindowTitle(f"{prefix} · 第 {page + 1} 页"
+                           f"{self._preview_page_suffix(page, shown_what)}")
         # A fresh popup resets size/zoom and re-docks the window; an in-place refresh
         # (prev/next/jump inside the window) keeps the user's resized window, zoomed
         # view and where they parked it.
@@ -771,6 +794,73 @@ class MainWindow(QWidget):
                 doc.close()
         except Exception:  # noqa: BLE001
             return 1
+
+    # -- preview page numbering (source pages vs the exported PDF's pages) ----
+
+    @staticmethod
+    def _uses_output_paging(kind: str, page_map: list[int] | None) -> bool:
+        """True when the 「译文」side must navigate the *exported PDF's* pages.
+
+        An expanded in-place product no longer has one output page per source page:
+        the overflow lives on continuation pages that a source-page-numbered preview
+        can never reach (measured: a 1-page source exported to 2 pages, the window
+        offered 「第 1/1 页」 only — the very page the option produced was invisible).
+        Every other product keeps source-page navigation.
+        """
+        if kind != "translated_pdf" or not page_map:
+            return False
+        return list(page_map) != list(range(len(page_map)))
+
+    def _output_page_count(self) -> int:
+        """Page count of the last exported PDF (0 when there is none)."""
+        import pymupdf as fitz
+
+        if not self._last_pdf:
+            return 0
+        try:
+            doc = fitz.open(str(self._last_pdf))
+            try:
+                return doc.page_count
+            finally:
+                doc.close()
+        except Exception:  # noqa: BLE001
+            return 0
+
+    @staticmethod
+    def _source_page_for_output(page: int, page_map: list[int] | None,
+                                output_pages: int) -> int:
+        """Inverse of ``_last_page_map``: which source page an output page came from."""
+        if not page_map:
+            return page
+        out = int(page)
+        for i, start in enumerate(page_map):
+            end = page_map[i + 1] if i + 1 < len(page_map) else output_pages
+            if int(start) <= out < int(end):
+                return i
+        return max(0, min(out, len(page_map) - 1))
+
+    def _source_page_for_preview(self, page: int) -> int:
+        """The source page a preview page number refers to (fallback rendering)."""
+        if self._uses_output_paging(self._last_output_type, self._last_page_map):
+            return self._source_page_for_output(page, self._last_page_map,
+                                                self._output_page_count())
+        return page
+
+    def _preview_page_count(self, what: str) -> int:
+        """How many pages the preview's navigation may visit on this side."""
+        if what == "translation" and self._uses_output_paging(
+                self._last_output_type, self._last_page_map):
+            return self._output_page_count() or self._page_count()
+        return self._page_count()
+
+    def _preview_page_suffix(self, page: int, what: str) -> str:
+        """Title suffix tying an output page back to its source page."""
+        if what == "translation" and self._uses_output_paging(
+                self._last_output_type, self._last_page_map):
+            src = self._source_page_for_output(page, self._last_page_map,
+                                               self._output_page_count())
+            return f"（续页归属原文第 {src + 1} 页）"
+        return ""
 
     def _on_preview_page_changed(self, page: int) -> None:
         """A navigation request from the preview window (prev/next/jump)."""
@@ -841,9 +931,15 @@ class MainWindow(QWidget):
         """
         pdf_path = self._last_pdf
         if pdf_path and Path(pdf_path).exists():
-            out_page = self._translation_output_page(
-                page, self._last_output_type, self._last_page_map
-            )
+            if self._uses_output_paging(self._last_output_type, self._last_page_map):
+                # The preview navigates the exported PDF's own pages here, so the
+                # continuation pages carrying the overflow are reachable and the
+                # numbering matches the file the user opens.
+                out_page = page
+            else:
+                out_page = self._translation_output_page(
+                    page, self._last_output_type, self._last_page_map
+                )
             return self._render_pdf_page_png(pdf_path, out_page)
         worker = self._live_worker()
         if worker is not None:
@@ -969,6 +1065,20 @@ class MainWindow(QWidget):
                 return m
         return self.models[0] if self.models else None
 
+    def _chat_start_translate(self, requirement: str = "",
+                              page_scope: list[int] | None = None) -> dict:
+        """The chat's "开始翻译" entry: emit the request, but answer honestly.
+
+        ``translateRequested`` is a signal, so the tool could not learn whether the run
+        actually started and reported "已触发开始翻译" even while a run was already going
+        (the GUI just returned).  Check the one condition that makes ``_start`` a no-op
+        and say so; the emit itself is thread-safe (queued to this (GUI) thread).
+        """
+        if self._thread is not None:
+            return {"ok": False, "error": "已有翻译在运行中（可先点「取消」再重新开始）。"}
+        self.preview_bridge.translateRequested.emit(requirement, page_scope)
+        return {"ok": True, "message": "已触发开始翻译（按当前设置后台执行）。"}
+
     def _refresh_chat_settings(self) -> None:
         """Keep the AI ``get_settings`` snapshot current (source/lang/format/model)."""
         if not self._settings_ready:
@@ -1043,6 +1153,10 @@ class MainWindow(QWidget):
         """
         requirement = str(requirement or "").strip()
         if self._thread is not None:
+            # A run is already going: say so instead of a silent no-op.  The chat tool
+            # used to answer "已触发开始翻译" while nothing happened.
+            self._append_log("  已有翻译在运行中，本次「开始翻译」请求已忽略"
+                             "（可先点「取消」再重新开始）。")
             return
         if not self._source or not Path(self._source).exists():
             QMessageBox.information(self, "翻译", "请先选择一个 PDF 源文件。")

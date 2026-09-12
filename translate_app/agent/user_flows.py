@@ -35,6 +35,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Callable
 
+from ..control import ControlSignal
 from .flow_steps import (
     Flow, STANDARD_FLOWS, ForEachPage, ToolStep, run_flow,
     registered_flow_tiers,
@@ -591,9 +592,18 @@ class Plan:
 
     tasks: list[Task] = field(default_factory=list)
     note: str = ""
+    #: Task names the model invented and the registry does not know.  They are
+    #: dropped (the registry is authoritative), but the caller must be able to say
+    #: so: a plan of three tasks that ran two reported plain success, so the user
+    #: believed the dropped step ("彻底检查") had happened.
+    dropped: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"tasks": [t.to_dict() for t in self.tasks], "note": self.note}
+        out: dict[str, Any] = {"tasks": [t.to_dict() for t in self.tasks],
+                               "note": self.note}
+        if self.dropped:
+            out["dropped"] = list(self.dropped)
+        return out
 
 
 def _parse_plan_json(text: str) -> dict:
@@ -608,36 +618,46 @@ def _parse_plan_json(text: str) -> dict:
         return {}
 
 
-def _validate_plan(data: dict | None) -> Plan:
+def _validate_plan(data: dict | None, available: set[str] | None = None) -> Plan:
     """Validate an AI plan into a :class:`Plan`, dropping unknown/malformed tasks.
 
     The registry is authoritative: a task's ``tier`` is taken from the known tool /
     flow (whatever the model said is advisory), and a name that is neither a known
-    atomic tool nor a registered flow is dropped.  A plan with zero surviving tasks is
-    returned as-is so the caller can fall back to Path A.
+    atomic tool nor a registered flow is dropped **and reported** in ``Plan.dropped``
+    (a plan of three steps that ran two must not read as "done").
+
+    ``available`` (optional) narrows the accepted names to what the caller can run: the
+    chat dispatcher supports a subset of the catalog, and a name it cannot run used to
+    be accepted here and then fail the whole plan at that step.
     """
     data = data or {}
     tiers = registered_flow_tiers()
     atomic = atomic_tool_names()
     raw_tasks = data.get("tasks")
     tasks: list[Task] = []
+    dropped: list[str] = []
     if isinstance(raw_tasks, list):
         for raw in raw_tasks:
             if not isinstance(raw, dict):
                 continue
             name = str(raw.get("name") or "")
             params = dict(raw.get("params")) if isinstance(raw.get("params"), dict) else {}
+            if available is not None and name not in available:
+                dropped.append(name or "(未命名)")
+                continue
             if name in tiers:
                 tier = tiers[name]                 # flow -> its real tier
             elif name in atomic:
                 tier = TIER_ATOMIC                 # a single atomic tool
             else:
-                continue                           # unknown name -> drop
+                dropped.append(name or "(未命名)")   # unknown name -> drop, but report
+                continue
             tasks.append(Task(tier=tier, name=name, params=params))
-    return Plan(tasks=tasks, note=str(data.get("note", "")))
+    return Plan(tasks=tasks, note=str(data.get("note", "")), dropped=dropped)
 
 
-def compile_plan(req: str, *, llm: Callable[[str], dict] | None = None) -> Plan:
+def compile_plan(req: str, *, llm: Callable[[str], dict] | None = None,
+                 available: set[str] | None = None) -> Plan:
     """Decompose a requirement into a :class:`Plan` of ordered, mixed-tier tasks.
 
     This is the **free-composition** (Path B) entry.  It deliberately does NOT degrade
@@ -654,7 +674,7 @@ def compile_plan(req: str, *, llm: Callable[[str], dict] | None = None) -> Plan:
         data = llm(r) or {}
     except Exception:  # noqa: BLE001 — a bad/failing model reply -> empty plan (refuse)
         data = {}
-    return _validate_plan(data)
+    return _validate_plan(data, available=available)
 
 
 def run_plan(plan: Plan, *, dispatch: Callable[[Task], dict],
@@ -669,6 +689,10 @@ def run_plan(plan: Plan, *, dispatch: Callable[[Task], dict],
     """
     results: list[dict[str, Any]] = []
     executed = 0
+    note = plan.note
+    if plan.dropped:
+        extra = f"已忽略无法识别的任务：{'、'.join(plan.dropped)}"
+        note = f"{note}；{extra}" if note else extra
     for task in plan.tasks:
         if cancel is not None and cancel():
             return {"ok": False, "error": "已取消", "executed": executed, "results": results}
@@ -677,18 +701,29 @@ def run_plan(plan: Plan, *, dispatch: Callable[[Task], dict],
             log(f"  计划执行：{label} {task.params}")
         try:
             out = dict(dispatch(task) or {})
+        except ControlSignal:
+            # A cancellation is a control signal, not a failed task: swallowing it
+            # turned "user pressed 取消" into `ok=False, error="TranslationCancelled"`
+            # and the plan looked like a normal failure (flow_steps re-raises; this
+            # path did not).
+            raise
         except Exception as exc:  # noqa: BLE001 — fail-closed per task
             if log:
                 log(f"  计划任务失败：{label} {type(exc).__name__}: {exc}")
             out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         executed += 1
-        ok = bool(out.get("ok", True))
+        # A step that reports an ``error`` without an explicit ``ok`` failed: the old
+        # default (``True``) let `read_page(page=99)`'s "页号越界" count as success and
+        # the plan kept going as if it had read the page.
+        ok = bool(out.get("ok", not out.get("error")))
         results.append({"tier": task.tier, "name": task.name, "params": dict(task.params),
                         "ok": ok, **out})
         if not ok:
             return {"ok": False, "executed": executed, "results": results,
+                    "dropped": list(plan.dropped), "note": note,
                     "error": f"任务 {task.name} 失败：{out.get('error', '')}"}
-    return {"ok": True, "executed": executed, "results": results}
+    return {"ok": True, "executed": executed, "results": results,
+            "dropped": list(plan.dropped), "note": note}
 
 
 #: Prompt that asks the model to decompose a requirement into an ordered task plan

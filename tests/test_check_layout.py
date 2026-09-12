@@ -124,8 +124,22 @@ class SmallTextTest(unittest.TestCase):
         ]
         found = check_layout.find_too_small(spans, 6.0, 7.0)
         self.assertEqual(2, len(found))
-        self.assertTrue(any("低于表格下限" in m for m in found))
+        self.assertTrue(any("低于最小可读字号" in m for m in found))
         self.assertTrue(any("低于正文下限" in m for m in found))
+
+    def test_the_body_floor_follows_the_source_pages_own_text_size(self):
+        # 源码本身就是 5pt 的脚注，按 5pt 画出来是合法的：正文下限取该页源文块的
+        # ``min(_font_start, _MIN_READABLE)``，与 flow._check_layout / eval 同口径。
+        small = pdfio.Block(text="footnote", page=0, x0=0, y0=0, x1=100, y1=10,
+                            size=5.0)
+        body = pdfio.Block(text="body", page=0, x0=0, y0=20, x1=100, y1=40,
+                           size=11.0)
+        self.assertEqual(5.0, check_layout._body_floor_for([small]))
+        self.assertEqual(pdfio._MIN_READABLE,
+                         check_layout._body_floor_for([body]))
+        self.assertEqual(pdfio._MIN_READABLE, check_layout._body_floor_for([]))
+        # 该页的下限是「页内最小者」：5pt 脚注页不会把它抬到 6.3pt
+        self.assertEqual(5.0, check_layout._body_floor_for([small, body]))
 
 
 class MissingTest(unittest.TestCase):
@@ -367,6 +381,127 @@ class RealExportTest(unittest.TestCase):
         self.assertEqual(2, check_layout.main([str(src) + ".nope", str(out)]))
         self.assertEqual(2, check_layout.main([str(src) + ".nope", str(out),
                                               "--page", "1"]))
+
+class ExpandedProductPairingTest(unittest.TestCase):
+    """扩页产物按文件内的页映射配对，且该页不再报假「漏画」。
+
+    扩页后一页源文占多个输出页；此前脚本按页序配对（页数恰好 2× 时还会误判成
+    「双语交错」），把源第 2 页配到第 1 页的续页上。
+    """
+
+    LONG = "Operating revenue from the bank's core lending business for the year"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def _export(self) -> tuple[Path, Path]:
+        src = self.tmp / "src.pdf"
+        out = self.tmp / "out.pdf"
+        doc = fitz.open()
+        for _ in range(2):
+            page = doc.new_page(width=400, height=200)
+            xs = [60.0, 100.0, 140.0]
+            for r, (label, value) in enumerate([("项目", "金额"), ("收入", "1,234"),
+                                                ("成本", "5,678"), ("利润", "9,012")]):
+                y0 = 120.0 + r * 12.0
+                for c, text in enumerate((label, value)):
+                    page.draw_rect(fitz.Rect(xs[c], y0, xs[c + 1], y0 + 12.0),
+                                   color=(0, 0, 0), width=0.6)
+                    page.insert_text((xs[c] + 2, y0 + 8), text, fontsize=7,
+                                     fontname="china-s")
+        doc.save(str(src))
+        doc.close()
+
+        dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        per_page = []
+        for blocks in dt.pages:
+            per_page.append([
+                "Item" if b.text == "项目" else
+                "Amount" if b.text == "金额" else
+                self.LONG if b.text in ("收入", "成本", "利润") else b.text
+                for b in blocks
+            ])
+        mapping = pdfio.save_translated_pdf(
+            str(src), dt.pages, per_page, str(out), "English",
+            log=lambda _m: None, expand_pages=True)
+        self.assertNotEqual([0, 1], list(mapping), "本用例必须真的扩页")
+        return src, out
+
+    def test_the_page_map_is_used_and_missing_is_skipped(self):
+        src, out = self._export()
+        report = check_layout.check_document(src, out)
+        self.assertTrue(report.page_map, "必须读到导出器写入的页映射")
+        self.assertEqual([], report.pages_issue, report.pages_issue)
+        self.assertEqual([], report.missing,
+                         "扩页页不得把搬到续页的块报成漏画")
+        self.assertTrue(any("扩页" in n for n in report.notes), report.notes)
+
+
+class BilingualTableExpansionTest(unittest.TestCase):
+    """双语产物的**译文页**也必须按译文长高表格行。
+
+    行高机制此前只接在原位导出上：镜像页照抄源几何，长单元格译文直接压住下一行
+    （实测同一份产物原位导出干净、双语版 94% 重叠）。
+    """
+
+    LONG = ("Number and name of the shareholder as recorded in the register of "
+            "members of the Company as at the end of the reporting period, "
+            "together with the number of shares held and the number of shares "
+            "pledged, if any, during the reporting period. " * 3)
+
+    def test_the_mirror_page_expands_the_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            src = tmp / "src.pdf"
+            out = tmp / "bi.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=560, height=300)
+            xs = [60.0, 170.0, 340.0, 500.0]
+            for r in range(4):
+                y = 90.0 + r * 22.0
+                page.draw_line(fitz.Point(xs[0], y), fitz.Point(xs[-1], y), width=0.5)
+            for x in xs:
+                page.draw_line(fitz.Point(x, 90.0), fitz.Point(x, 156.0), width=0.5)
+            for i in range(3):
+                y = 108.0 + i * 22.0
+                page.insert_text((70, y), str(i + 1), fontsize=9)
+                page.insert_text((180, y), "股东名称", fontsize=9, fontname="china-s")
+                page.insert_text((350, y), f"{i + 1},000,000", fontsize=9)
+            doc.save(str(src))
+            doc.close()
+
+            dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+            trans = [self.LONG if not pdfio._is_numeric_cell(b.text) else b.text
+                     for b in dt.pages[0]]
+            pdfio.save_interleaved_pdf(str(src), [trans], str(out), "English",
+                                       pages=dt.pages)
+
+            def cell_top(path: Path, page_no: int, token: str) -> float | None:
+                doc = fitz.open(str(path))
+                try:
+                    page = doc[page_no]
+                    ys = [line["bbox"][1]
+                          for blk in page.get_text("dict")["blocks"]
+                          for line in blk.get("lines", [])
+                          if any(token in span["text"] for span in line["spans"])]
+                    return min(ys) if ys else None
+                finally:
+                    doc.close()
+
+            src1 = cell_top(src, 0, "1,000,000")
+            src2 = cell_top(src, 0, "2,000,000")
+            out1 = cell_top(out, 1, "1,000,000")
+            out2 = cell_top(out, 1, "2,000,000")
+            for v in (src1, src2, out1, out2):
+                self.assertIsNotNone(v, "定位不到行首单元格")
+            # 第一行还在原处，第二行被长译文推下去（源行距 22pt）。
+            self.assertAlmostEqual(src1, out1, delta=2.0)
+            self.assertGreater(out2 - out1, 30.0,
+                               f"镜像页的行高没有跟着译文长高：{out1} → {out2}")
+            self.assertAlmostEqual(src2 - src1, 22.0, delta=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

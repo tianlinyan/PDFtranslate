@@ -103,7 +103,8 @@ def candidates(doc, *, max_per_page: int = _MAX_PER_PAGE,
             in_image = bool(getattr(b, "in_image", False))
             if role == "figure" and not in_image:
                 kind, default_keep = "figure", True
-            elif bool(getattr(b, "ocr", False)) and not getattr(b, "keep_original", False):
+            elif (bool(getattr(b, "ocr", False)) and not in_image
+                  and not getattr(b, "keep_original", False)):
                 kind, default_keep = "ocr", False
             else:
                 continue

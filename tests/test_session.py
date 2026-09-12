@@ -124,6 +124,20 @@ class DocumentSessionTest(unittest.TestCase):
                                   cancel=cancel)
         return state, session
 
+    def test_an_out_of_range_scope_is_not_reported_as_done(self):
+        # 用户说「只翻第 10 页」而文档只有 2 页：范围求交后为空，此前照常报
+        # 「翻译完成：共处理 0 页」——把「什么都没做」说成成功。
+        doc = _small_special_doc()
+        state = agent.WorkflowState(src_path="a.pdf", lang="English")
+        state.src_doc = doc
+        session = DocumentSession(state, doc, model=object(), log=lambda m: None,
+                                  translate_page=lambda st, page, model, **kw: st,
+                                  scope=[9])
+        session.run()
+        self.assertIn("未执行翻译", state.summary)
+        self.assertIn("超出文档范围", state.summary)
+        self.assertEqual(set(), set(session.scope))
+
     def test_infer_terms_injects_glossary_into_user_decisions(self):
         # C-⑥: when ``infer_terms=True`` the preprocess extracts + translates
         # document-level terms once and writes them into the ``terminology`` channel

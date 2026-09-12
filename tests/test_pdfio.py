@@ -52,6 +52,23 @@ def _text_lines(page):
     return out
 
 
+def build_ruled_table_pdf(path, *, rows: int = 3, cols: int = 3):
+    """A page carrying one fully ruled text-layer table (``rows`` x ``cols``)."""
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    xs = [72.0 + 148.0 * c for c in range(cols + 1)]
+    ys = [100.0 + 50.0 * r for r in range(rows + 1)]
+    for y in ys:
+        page.draw_line(fitz.Point(xs[0], y), fitz.Point(xs[-1], y), width=0.8)
+    for x in xs:
+        page.draw_line(fitz.Point(x, ys[0]), fitz.Point(x, ys[-1]), width=0.8)
+    for r in range(rows):
+        for c in range(cols):
+            page.insert_text((xs[c] + 6, ys[r] + 20), f"Cell{r}{c}", fontsize=11)
+    doc.save(str(path))
+    doc.close()
+    return Path(path)
+
 def setUpModule():  # noqa: N802
     _OUT.mkdir(exist_ok=True)
 
@@ -3521,6 +3538,329 @@ class ExpandPagesTest(unittest.TestCase):
             doc.close()
 
 
+    def test_an_oversized_paragraph_continues_onto_the_next_page(self):
+        # 一个高于一页的正文块必须**按行**跨页续排：把元素当成不可分单元时，
+        # 超出页底的部分永久落在纸外——实测开扩页比不开丢得更多（630→481 词），
+        # 与「扩页是为了不丢内容」正相反。
+        src = _OUT / "expand_paragraph_src.pdf"
+        out = _OUT / "expand_paragraph.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        page.insert_text((40, 62), "正文", fontsize=9, fontname="china-s")
+        doc.save(str(src))
+        doc.close()
+
+        text = ("Operating revenue from the bank's core lending business "
+                "for the year ended 31 December " * 24).strip()
+        blocks = [pdfio.Block("正文", 0, 40, 55, 360, 70, size=9)]
+        logs: list[str] = []
+        pdfio.save_translated_pdf(str(src), [blocks], [[text]], str(out),
+                                  "English", log=logs.append, expand_pages=True)
+        expected = len("".join(text.split()))
+        with fitz.open(str(out)) as o:
+            self.assertGreater(o.page_count, 1, "高于一页的段落必须续页")
+            extracted = 0
+            for p in o:
+                words = p.get_text("words")
+                extracted += len("".join(w[4] for w in words))
+                self.assertLessEqual(max((w[3] for w in words), default=0.0),
+                                     p.rect.height + 0.5,
+                                     "续页正文不得画到页外")
+            # 连字符换行只会**多**出字符，所以「≥ 期望值」等价于「一字未丢」。
+            self.assertGreaterEqual(extracted, expected,
+                                    f"译文丢了字符：{extracted} < {expected}")
+        self.assertTrue(any("已扩展到后续" in m for m in logs), logs)
+
+    def test_a_block_below_a_grown_table_never_leaves_the_page(self):
+        # 表格下方的 OCR 块：像素不可搬移（_flow_skips 拒绝搬走），因此它的
+        # 下推必须被钳制。此前「关钳制 + 不搬走」两条交集让译文被画到页外：
+        # 扫描原文被白底擦掉、译文看不见，且没有任何日志。
+        src = _OUT / "expand_fixed_src.pdf"
+        out = _OUT / "expand_fixed.pdf"
+        _OUT.mkdir(parents=True, exist_ok=True)
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        xs = [60.0, 100.0, 140.0]
+        for r, (label, value) in enumerate([("项目", "金额"), ("收入", "1,234"),
+                                            ("成本", "5,678")]):
+            y0 = 30.0 + r * 12.0
+            for c, text in enumerate((label, value)):
+                page.draw_rect(fitz.Rect(xs[c], y0, xs[c + 1], y0 + 12.0),
+                               color=(0, 0, 0), width=0.6)
+                page.insert_text((xs[c] + 2, y0 + 8), text, fontsize=7,
+                                 fontname="china-s")
+        doc.save(str(src))
+        doc.close()
+
+        cells = pdfio.Block("项目", 0, 62, 31, 98, 39, size=7, in_table=True)
+        scanned = pdfio.Block("扫描页脚", 0, 60, 178, 260, 190, size=8,
+                              ocr=True, single_line=True)
+        long = "Operating revenue from the bank's core lending business for the year"
+        footnote = "Unit: RMB ten thousand yuan"
+        blocks = [cells, scanned]
+        logs: list[str] = []
+        pdfio.save_translated_pdf(str(src), [blocks], [[long, footnote]], str(out),
+                                  "English", log=logs.append, expand_pages=True)
+        with fitz.open(str(out)) as o:
+            self.assertEqual(1, o.page_count,
+                             "不可搬移块所在页不得扩页（必须保持页底钳制）")
+            text = o[0].get_text()
+            self.assertIn("Operating", text, "表格块的译文必须留在纸上")
+            self.assertIn("Unit: RMB ten thousand yuan", text,
+                          "扫描块的译文必须留在纸上（此前被推出页面）")
+            words = o[0].get_text("words")
+            self.assertLessEqual(max((w[3] for w in words), default=0.0),
+                                 o[0].rect.height + 0.5)
+        self.assertTrue(any("不可搬移" in m for m in logs), logs)
+
+    def test_expand_pages_on_a_rotated_page_does_not_inflate_the_document(self):
+        # /Rotate 页上 find_tables 的几何在旋转显示帧、块坐标在未旋转帧，拆分
+        # 判定因此无意义：实测 1 页 → 4 页（首页空白、续页重复同一批行）。
+        # 现在旋转页明确不扩页（保持页底钳制）并记一行日志。
+        src = _OUT / "expand_rot_src.pdf"
+        out = _OUT / "expand_rot.pdf"
+        _OUT.mkdir(parents=True, exist_ok=True)
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=200)
+        xs = [60.0, 100.0, 140.0]
+        for r, (label, value) in enumerate([("项目", "金额"), ("收入", "1,234"),
+                                            ("成本", "5,678"), ("利润", "9,012")]):
+            y0 = 30.0 + r * 12.0
+            for c, text in enumerate((label, value)):
+                page.draw_rect(fitz.Rect(xs[c], y0, xs[c + 1], y0 + 12.0),
+                               color=(0, 0, 0), width=0.6)
+                page.insert_text((xs[c] + 2, y0 + 8), text, fontsize=7,
+                                 fontname="china-s")
+        page.set_rotation(90)
+        doc.save(str(src))
+        doc.close()
+
+        dt = pdfio.extract_document_text(str(src), log=lambda _m: None)
+        per = [self.LONG if not b.text.replace(",", "").isdigit() else b.text
+               for b in dt.pages[0]]
+        logs: list[str] = []
+        mapping = pdfio.save_translated_pdf(str(src), dt.pages, [per], str(out),
+                                            "English", log=logs.append,
+                                            expand_pages=True)
+        self.assertEqual([0], list(mapping))
+        with fitz.open(str(out)) as o:
+            self.assertLessEqual(o.page_count, 2,
+                                 "旋转页不得因扩页而膨胀")
+        self.assertTrue(any("旋转页" in m for m in logs), logs)
+
+
+class AtomicTextExportTest(unittest.TestCase):
+    """``.txt`` / ``.md`` 导出必须原子：导出直接覆盖目标文件，而关窗会 ``os._exit``。
+
+    就地写一半被打断会留下 0 字节/半截文件——上一份可用产物被毁掉，且译文本只存在
+    内存里（事后只能整篇重译）。PDF 侧因为 ``fitz.save`` 写新文件而天然原子。
+    """
+
+    def test_a_failed_write_keeps_the_previous_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.txt"
+            out.write_text("OLD", encoding="utf-8")
+            real = Path.write_text
+
+            def half_written(self, data, *args, **kwargs):
+                real(self, "HALF", *args, **kwargs)   # 半截内容进临时文件
+                raise OSError("boom")
+
+            with mock.patch.object(Path, "write_text", half_written):
+                with self.assertRaises(OSError):
+                    pdfio.save_plain_text([["NEW"]], out)
+            self.assertEqual("OLD", out.read_text("utf-8"),
+                             "失败时不得动到已有产物")
+            self.assertEqual([], list(Path(tmp).glob("*.tmp")),
+                             "临时文件必须清理")
+
+    def test_markdown_is_replaced_through_a_temporary_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out.md"
+            out.write_text("OLD", encoding="utf-8")
+            pdfio.save_markdown([["Hello"]], ["你好"], [0], out, "English")
+            text = out.read_text("utf-8")
+            self.assertIn("Hello", text)
+            self.assertIn("你好", text)
+            self.assertEqual([], list(Path(tmp).glob("*.tmp")))
+
+
+class TableRulesAfterPushDownTest(unittest.TestCase):
+    """表格行高被下推后，**原有**的表格线必须跟着走（擦掉＋重画），且不得凭空加线。
+
+    两个 v0.6.4 缺陷：
+    * ``_extend_with_body`` 把「有框线、只是表体无线」的表整张标成 ``borderless``
+      → 行高下推但表格线既不擦也不重画，译文压在留在原位的旧线上（实测 19/102）；
+    * 列宽重排可把窄列压到 2×``_TABLE_CELL_PAD`` 以下 → 反框（width<0）→ 单元格逐字
+      换行并越出表格右边界。
+    """
+
+    LONG = ("The consolidated and the parent company financial statements of the "
+            "Group for the year ended 31 December 2025 prepared in accordance "
+            "with the International Financial Reporting Standards")
+
+    def _crossings(self, path: Path) -> tuple[int, int]:
+        """(跨线的文本行数, 文本行总数)。"""
+        doc = fitz.open(str(path))
+        try:
+            page = doc[0]
+            rules = self._h_rules(path)
+            boxes = [line["bbox"] for blk in page.get_text("dict")["blocks"]
+                     for line in blk.get("lines", [])]
+            cross = sum(1 for bb in boxes
+                        if any(bb[1] < ry < bb[3] for ry in rules))
+            return cross, len(boxes)
+        finally:
+            doc.close()
+
+    def test_a_stacked_ruled_table_keeps_its_rules_aligned(self):
+        src = _OUT / "pushdown_src.pdf"
+        out = _OUT / "pushdown.pdf"
+        _OUT.mkdir(parents=True, exist_ok=True)
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        xs = [60.0, 170.0, 340.0, 500.0]
+        for base in (90.0, 178.0):          # 两张上下相邻、各自全框线的表
+            for r in range(4):
+                y0 = base + r * 22.0
+                page.draw_line(fitz.Point(xs[0], y0), fitz.Point(xs[-1], y0),
+                               width=0.5)
+            for c in range(3):
+                page.draw_line(fitz.Point(xs[c], base), fitz.Point(xs[c], base + 66),
+                               width=0.5)
+                for r in range(3):
+                    page.insert_text((xs[c] + 4, base + 15 + r * 22),
+                                     f"L{r}{c}", fontsize=9)
+        doc.save(str(src))
+        doc.close()
+
+        dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        per = [[self.LONG for _ in dt.pages[0]]]
+        pdfio.save_translated_pdf(str(src), dt.pages, per, str(out), "English",
+                                  log=lambda _m: None, reflow=True)
+        h_rules = self._h_rules(out)
+        # 行高被下推后，表格线必须跟着走：除了表顶（不再移动的那条），输出里的横线
+        # 不得停留在源文件的旧行位置——旧线留在原地正是「译文压线」的根因。
+        self.assertEqual({90.0}, set(h_rules) & set(self.STACKED_RULES), h_rules)
+
+    #: 上面那张测试页所有横线的原始 y（表顶 90 与第二张表的顶 178 之外都会下移）。
+    STACKED_RULES = {90.0, 112.0, 134.0, 156.0, 178.0, 200.0, 222.0, 244.0}
+
+    def test_a_table_body_above_the_ruled_band_keeps_the_rules(self):
+        # ``_extend_with_body`` can find the unruled body *above* the band
+        # ``find_tables`` really saw (a report's total band sits at the bottom).
+        # Reading the ruled rows as "the FIRST N rows" then drew the grid over the
+        # synthesised prose and left the real band redacted-but-never-redrawn: its
+        # rules vanished and lines the source never had appeared.  The ruled rows
+        # are a *range* (v0.6.5 review P1-2).
+        src = _OUT / "above_src.pdf"
+        out = _OUT / "above.pdf"
+        _OUT.mkdir(parents=True, exist_ok=True)
+        xs = [72.0, 220.0, 380.0, 520.0]
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        # A full-width rule above, then column-confined prose (the unruled body).
+        page.draw_line(fitz.Point(xs[0], 150), fitz.Point(xs[-1], 150), width=0.8)
+        body = (("Delta", "Echo", "Foxtrot"), ("Golf", "Hotel", "India"),
+                ("Juliet", "Kilo", "Lima"))
+        for r, row in enumerate(body):
+            for c, text in enumerate(row):
+                page.insert_text((xs[c] + 6, 155 + r * 30 + 12), text, fontsize=11)
+        # … and the fully ruled band find_tables really sees, at the bottom.
+        for y in (250.0, 300.0):
+            page.draw_line(fitz.Point(xs[0], y), fitz.Point(xs[-1], y), width=0.8)
+        for x in xs:
+            page.draw_line(fitz.Point(x, 250.0), fitz.Point(x, 300.0), width=0.8)
+        for c, text in enumerate(("Alpha", "Bravo", "Charlie")):
+            page.insert_text((xs[c] + 6, 270), text, fontsize=11)
+        doc.save(str(src))
+        doc.close()
+
+        dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        per = [["T:" + b.text for b in dt.pages[0]]]   # short: no push-down
+        pdfio.save_translated_pdf(str(src), dt.pages, per, str(out), "English",
+                                  log=lambda _m: None)
+        rules = set(self._h_rules(out))
+        self.assertEqual({150.0, 250.0, 300.0}, rules,
+                         "the ruled band's own rules must be redrawn where they"
+                         " were, and no rule invented over the synthesised prose")
+
+    def _h_rules(self, path: Path) -> list[float]:
+        doc = fitz.open(str(path))
+        try:
+            return sorted({
+                round(it[1].y, 1)
+                for dr in doc[0].get_drawings()
+                for it in dr.get("items", ())
+                if it[0] == "l" and abs(it[1].y - it[2].y) < 0.5
+            })
+        finally:
+            doc.close()
+
+    def test_a_narrow_column_is_never_squeezed_to_a_reverse_box(self):
+        src = _OUT / "reflow_src.pdf"
+        out = _OUT / "reflow.pdf"
+        _OUT.mkdir(parents=True, exist_ok=True)
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        xs = [60.0, 170.0, 500.0, 545.0]
+        top, bot = 90.0, 200.0
+        for y in (top, top + 36, top + 72, bot):
+            page.draw_line(fitz.Point(xs[0], y), fitz.Point(xs[-1], y), width=0.5)
+        for x in xs:
+            page.draw_line(fitz.Point(x, top), fitz.Point(x, bot), width=0.5)
+        for i, y in enumerate((110.0, 146.0, 182.0)):
+            page.insert_text((70, y), f"附注项目{i + 1}", fontsize=9,
+                             fontname="china-s")
+            page.insert_text((180, y), f"{i + 1},234,567.89", fontsize=9)
+            page.insert_text((505, y), "(二)" if i == 0 else "—", fontsize=9,
+                             fontname="china-s")
+        doc.save(str(src))
+        doc.close()
+
+        dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        trans = []
+        for b in dt.pages[0]:
+            if pdfio._is_numeric_cell(b.text):
+                trans.append(b.text)
+            elif b.text.startswith("附注"):
+                trans.append(self.LONG)
+            else:
+                trans.append(b.text)
+        pdfio.save_translated_pdf(str(src), dt.pages, [trans], str(out), "English",
+                                  log=lambda _m: None, reflow=True)
+        with fitz.open(str(out)) as o:
+            words = o[0].get_text("words")
+        over = [w for w in words if w[2] > 545.0 + 1.0]
+        self.assertEqual([], [w[4] for w in over],
+                         "窄列被压成反框后译文越出了表格右边界")
+
+
+    def test_a_continuation_page_keeps_the_source_crop_frame(self):
+        # 块坐标是 cropbox 相对帧：续页若只按 mediabox 建页，裁剪页的续页会比源页
+        # 「可见区」更大（实测源可见 200pt、续页 300pt），内容偏移也对不上。
+        src = _OUT / "expand_crop_src.pdf"
+        out = _OUT / "expand_crop.pdf"
+        _OUT.mkdir(parents=True, exist_ok=True)
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((40, 60), "正文", fontsize=9, fontname="china-s")
+        page.set_cropbox(fitz.Rect(0, 50, 400, 250))      # 可见区 400×200
+        doc.save(str(src))
+        doc.close()
+
+        text = ("Operating revenue from the bank's core lending business for the "
+                "year ended 31 December " * 30).strip()
+        blocks = [pdfio.Block("正文", 0, 40, 55, 360, 70, size=9)]
+        pdfio.save_translated_pdf(str(src), [blocks], [[text]], str(out), "English",
+                                  log=lambda _m: None, expand_pages=True)
+        with fitz.open(str(out)) as o:
+            self.assertGreater(o.page_count, 1, "本用例必须真的扩页")
+            for p in o:
+                self.assertAlmostEqual(400.0, p.cropbox.width, delta=0.5)
+                self.assertAlmostEqual(200.0, p.cropbox.height, delta=0.5)
+
+
 class BorderlessTableTest(unittest.TestCase):
     """P1-1: a table without ruling lines must still get cell geometry — the
     ``text`` fallback is used, with guards so prose pages are not "found"."""
@@ -4243,6 +4583,63 @@ class KeptOcrPixelsTest(unittest.TestCase):
                 self.assertIn("标题", o[0].get_text(),
                               "the heading is text and must still be exported")
 
+    def test_an_edited_kept_ocr_block_is_drawn(self):
+        # ``keep_original`` is a *default*, not a lock: an edit made through the
+        # chat overlay (or by the AI) must reach the output.  The exporter used to
+        # skip every kept OCR block unconditionally, so the new translation vanished
+        # while the log still claimed "已应用 N 处编辑" — a silent content loss.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "kept_edited.pdf"
+            out = Path(tmp) / "out.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=200)
+            # A black marker behind the block: covering it proves the cover ran.
+            page.draw_rect(fitz.Rect(40, 55, 200, 90), color=None, fill=(0, 0, 0))
+            doc.save(str(src))
+            doc.close()
+
+            blocks = [pdfio.Block("印章", 0, 50, 60, 120, 80, size=10, ocr=True,
+                                  single_line=True, keep_original=True)]
+            pdfio.save_translated_pdf(str(src), [blocks], [["SEAL-TRANSLATED"]],
+                                      str(out), "English", log=lambda _m: None)
+            with fitz.open(str(out)) as o:
+                self.assertIn("SEAL-TRANSLATED", o[0].get_text(),
+                              "an edited kept block must be exported")
+                # The block's own box was covered (white) …
+                pix = o[0].get_pixmap(clip=fitz.Rect(52, 61, 118, 64), dpi=72,
+                                      alpha=False)
+                self.assertGreater(min(pix.samples), 200,
+                                   "the covered source pixels must be white")
+                # … while the marker outside the block is untouched.
+                outside = o[0].get_pixmap(clip=fitz.Rect(150, 60, 190, 80),
+                                          dpi=72, alpha=False)
+                self.assertEqual(0, min(outside.samples),
+                                 "the cover must not eat the surrounding image")
+
+    def test_an_untranslated_kept_ocr_block_keeps_its_pixels(self):
+        # The other direction (the signature / seal default): text identical to the
+        # source means "nothing was translated", so the pixels stay verbatim.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "kept_plain.pdf"
+            out = Path(tmp) / "out.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=200)
+            page.draw_rect(fitz.Rect(40, 55, 200, 90), color=None, fill=(0, 0, 0))
+            doc.save(str(src))
+            doc.close()
+
+            blocks = [pdfio.Block("印章", 0, 50, 60, 120, 80, size=10, ocr=True,
+                                  single_line=True, keep_original=True)]
+            pdfio.save_translated_pdf(str(src), [blocks], [["印章"]],
+                                      str(out), "English", log=lambda _m: None)
+            with fitz.open(str(out)) as o:
+                pix = o[0].get_pixmap(clip=fitz.Rect(60, 65, 110, 75), dpi=72,
+                                      alpha=False)
+                self.assertEqual(0, min(pix.samples),
+                                 "an untranslated kept block must not be covered")
+                self.assertNotIn("印章", o[0].get_text(),
+                                 "and must not be redrawn as text")
+
     def test_a_translated_chart_label_overrides_the_default(self):
         # The keep rule is a *default*, not a lock: a block the AI actually
         # translated is drawn, so the AI decides per block what to translate.
@@ -4270,6 +4667,93 @@ class KeptOcrPixelsTest(unittest.TestCase):
                 self.assertNotIn("节点1", text, "kept labels stay pixels")
                 self.assertNotIn("节点2", text, "kept labels stay pixels")
 
+
+class KeptBlockInsideATableTest(unittest.TestCase):
+    """A ``keep_original`` block inside a table must not be erased by the export.
+
+    The table pass redacts the whole table bbox — it has to, to drop the stale rules
+    before they are redrawn at the new row positions — so once the exporter also
+    stopped *drawing* kept blocks, a kept cell was erased with nothing drawn back.
+    ``page_scope`` makes that a routine path: every block outside the requested pages
+    is marked ``keep_original`` (v0.6.5 review P1-1).
+    """
+
+    @staticmethod
+    def _kept_page(tmp: str, *needles: str):
+        """Extract a ruled-table page and keep every block whose text matches."""
+        src = build_ruled_table_pdf(Path(tmp) / "table.pdf")
+        dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+        blocks = dt.pages[0]
+        for b in blocks:
+            b.keep_original = any(n in b.text for n in needles)
+        per = [[b.text if getattr(b, "keep_original", False) else "TR:" + b.text
+                for b in blocks]]
+        return src, dt, per
+
+    def test_a_kept_table_cell_keeps_its_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dt, per = self._kept_page(tmp, "Cell11")
+            out = Path(tmp) / "out.pdf"
+            pdfio.save_translated_pdf(str(src), dt.pages, per, str(out), "English",
+                                      log=lambda _m: None)
+            with fitz.open(str(out)) as o:
+                text = o[0].get_text()
+            self.assertIn("Cell11", text,
+                          "a kept table cell must survive the table redaction")
+            self.assertNotIn("TR:Cell11", text)
+            self.assertIn("TR:Cell00", text, "its neighbours still translate")
+
+    def test_a_page_kept_whole_keeps_all_of_its_table_text(self):
+        # The page-scope shape: every block of an out-of-scope page is kept, so a
+        # whole table must come out verbatim instead of blank.
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dt, per = self._kept_page(tmp, "Cell")
+            out = Path(tmp) / "out.pdf"
+            pdfio.save_translated_pdf(str(src), dt.pages, per, str(out), "English",
+                                      log=lambda _m: None)
+            with fitz.open(str(out)) as o:
+                text = o[0].get_text()
+            missing = [b.text for b in dt.pages[0] if b.text and b.text not in text]
+            self.assertEqual([], missing, "no cell text may be lost")
+
+    def test_a_kept_table_cell_keeps_its_text_on_the_mirror_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dt, per = self._kept_page(tmp, "Cell11")
+            out = Path(tmp) / "bi.pdf"
+            pdfio.save_interleaved_pdf(str(src), per, str(out), "English",
+                                       pages=dt.pages)
+            with fitz.open(str(out)) as o:
+                text = o[1].get_text()
+            self.assertIn("Cell11", text,
+                          "a kept cell must survive the mirror page's table pass")
+            self.assertNotIn("TR:Cell11", text)
+
+    def test_a_kept_block_stays_on_a_blank_mirror_page(self):
+        # A text-only page makes a *blank* mirror page: there is no source copy to
+        # preserve, so a kept block must still be drawn (its translation IS the
+        # source text) — skipping it left the bilingual product with an empty page.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "plain.pdf"
+            out = Path(tmp) / "bi.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=595, height=842)
+            page.insert_text(fitz.Point(72, 100), "Kept paragraph text.", fontsize=12)
+            page.insert_text(fitz.Point(72, 140), "Translated paragraph text.",
+                             fontsize=12)
+            doc.save(str(src))
+            doc.close()
+            dt = pdfio.extract_document_text(str(src), ocr=False, log=lambda _m: None)
+            blocks = dt.pages[0]
+            for b in blocks:
+                b.keep_original = "Kept" in b.text
+            per = [[b.text if getattr(b, "keep_original", False) else "TR:" + b.text
+                    for b in blocks]]
+            pdfio.save_interleaved_pdf(str(src), per, str(out), "English",
+                                       pages=dt.pages)
+            with fitz.open(str(out)) as o:
+                text = o[1].get_text()
+            self.assertIn("Kept paragraph text.", text)
+            self.assertIn("TR:Translated paragraph text.", text)
 
 if __name__ == "__main__":
     unittest.main()

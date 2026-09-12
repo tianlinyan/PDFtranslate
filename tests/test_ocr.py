@@ -458,6 +458,21 @@ class OcrExtractionTest(_TempOcrCacheMixin, unittest.TestCase):
         merged = [b.text for b in pdfio._merge_ocr_blocks(title, ocr)]
         self.assertEqual(["LOGO AND TITLE ART", "some raster text"], merged)
 
+    def test_merged_order_keeps_the_column_reading_order(self):
+        # 合并 OCR 块时用 (y, x) 重排整页会把两栏页按行交错（1.L 5.R 2.L 6.R …）：
+        # 翻译顺序、Markdown/纯文本导出与批次的【上下文参考】都会拿到另一栏的内容。
+        def blk(text, x0, y0, ocr=False):
+            return pdfio.Block(text=text, page=0, x0=x0, y0=y0, x1=x0 + 120.0,
+                               y1=y0 + 12.0, size=9.0, single_line=True, ocr=ocr)
+
+        left = [blk(f"{i + 1}. Left item {i + 1}", 60, 90 + i * 20) for i in range(4)]
+        right = [blk(f"{i + 5}. Right item {i + 1}", 320, 90 + i * 20) for i in range(4)]
+        merged = [b.text for b in pdfio._merge_ocr_blocks(left + right, [])]
+        self.assertEqual(
+            ["1. Left item 1", "2. Left item 2", "3. Left item 3", "4. Left item 4",
+             "5. Right item 1", "6. Right item 2", "7. Right item 3", "8. Right item 4"],
+            merged)
+
     def test_sparse_merge_drops_ocr_lines_inside_a_merged_text_block(self):
         # P1-8: the text layer merges a multi-line title into ONE block while OCR
         # returns one block per line.  Exact text equality missed, so the title was

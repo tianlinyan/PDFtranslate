@@ -18,6 +18,8 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
+import fitz
+
 from translate_app import agent as agent_module
 from translate_app import pdfio
 from translate_app import worker as worker_module
@@ -385,6 +387,38 @@ class WorkerAgentPreviewTest(_WorkerTestBase):
         self.assertEqual(b"\x89PNG", png[:4])
 
 
+class PageScopeTest(_WorkerTestBase):
+    """"只翻第 N 页" 必须在**每条**路径上都生效（IR / 确定性回退 / agent）。
+
+    只有 agent 路径有逐页循环，另外两条此前把整篇都翻了，而界面已经告诉用户
+    「AI 理解为只翻第 N 页」——日志与行为不一致。
+    """
+
+    def _run_scope(self, ir_mode: bool):
+        src = build_sample_pdf(self.tmp / f"scope_{ir_mode}.pdf", pages=2)
+        out = self.tmp / f"scope_{ir_mode}.txt"
+        with MockServer() as server:
+            worker = TranslateWorker(
+                str(src), self._model(server.endpoint), "Chinese", "plain_text",
+                str(out), page_scope=[1], ir_mode=ir_mode,
+            )
+            logs: list[str] = []
+            worker.log.connect(logs.append)
+            events = self._run(worker)
+        self.assertEqual(["finished", "stopped"], events)
+        return out.read_text("utf-8"), logs
+
+    def test_every_path_honours_the_page_scope(self):
+        for ir_mode in (True, False):
+            with self.subTest(ir_mode=ir_mode):
+                text, logs = self._run_scope(ir_mode)
+                page1, _, page2 = text.partition("===== Page 2 =====")
+                self.assertNotIn("MOCK:", page1,
+                                 "范围外的第 1 页必须保留原文")
+                self.assertIn("MOCK:", page2, "范围内的第 2 页必须翻译")
+                self.assertTrue(any("页范围" in m for m in logs), logs)
+
+
 class OverlayApplyTest(_WorkerTestBase):
     """The protected chat/manual overlay always wins over what the run produced."""
 
@@ -464,6 +498,38 @@ class OverlayApplyTest(_WorkerTestBase):
         text = out.read_text("utf-8")
         self.assertIn("重新导出的编辑", text)
         self.assertIn("已应用 1 处", "\n".join(logs))
+
+    def test_re_export_applies_an_edit_to_a_kept_block(self):
+        # A kept block (content policy / chart default: ``keep_original``) must not
+        # swallow an edit made through the chat overlay.  The exporter used to skip
+        # every kept OCR block unconditionally, so the edit was silently dropped
+        # while the log still reported "已应用 1 处编辑".
+        src = self.tmp / "kept.pdf"
+        out = self.tmp / "kept_out.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 100), "SEAL", fontsize=20)
+        doc.save(str(src))
+        doc.close()
+
+        blk = pdfio.Block("SEAL", page=0, x0=40, y0=80, x1=140, y1=110, size=20,
+                          ocr=True, keep_original=True)
+        last_doc = pdfio.DocumentText(pages=[[blk]], blocks=["SEAL"],
+                                      block_pages=[0])
+        worker = TranslateWorker(
+            str(src), self._model("http://127.0.0.1:9/v1"), "Chinese",
+            "translated_pdf", str(out),
+            re_export=True, last_translated=["SEAL"], last_doc=last_doc,
+            overlay={0: {"text": "SEAL-TRANSLATED"}},
+        )
+        logs: list[str] = []
+        worker.log.connect(logs.append)
+        events = self._run(worker)
+        self.assertEqual(["finished", "stopped"], events)
+        self.assertIn("已应用 1 处", "\n".join(logs))
+        with fitz.open(str(out)) as o:
+            self.assertIn("SEAL-TRANSLATED", o[0].get_text(),
+                          "the overlay edit must reach the exported PDF")
 
     def test_re_export_with_no_last_translation_errors(self):
         # Re-export needs a previous committed translation; otherwise it must report

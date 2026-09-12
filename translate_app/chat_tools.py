@@ -560,9 +560,13 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             except Exception:  # noqa: BLE001 — bad parse degrades to whole document
                 page_scope = None
         try:
-            start_translate(str(requirement or ""), page_scope)
+            started = start_translate(str(requirement or ""), page_scope)
         except Exception as exc:  # noqa: BLE001 — fail-closed
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        if isinstance(started, dict) and started:
+            # The GUI can refuse (a run is already going): report *its* answer instead
+            # of a blanket "已触发" that contradicted the log.
+            return {"scope": page_scope, **started}
         return {"ok": True, "message": "已触发开始翻译（按当前设置后台执行；完成会在主窗口日志/进度提示）。"}
 
     def set_setting_tool(key: str, value: str):
@@ -661,8 +665,7 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
     #: Atomic chat tools a Path-B plan may call directly (read / write / verify /
     #: settings / re-export).  Deliberately excludes the orchestration tools
     #: (``run_translate`` / ``run_flow`` / ``run_plan``) so a plan never recurses.
-    _ATOMIC: dict[str, Callable] = {
-        "get_doc_info": get_doc_info,
+    _ATOMIC: dict[str, Callable] = {        "get_doc_info": get_doc_info,
         "get_settings": get_settings,
         "classify_page": classify_page,
         "get_structure": get_structure,
@@ -678,6 +681,23 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         "set_setting": set_setting_tool,
         "re_export": _re_export,
     }
+
+    #: Filled at the end of this factory with the *complete* chat tool table, so the
+    #: plan dispatcher can fall back to it: ``user_flows._validate_plan`` accepts every
+    #: registered atomic tool, and rejecting an accepted name here failed entire plans.
+    _all_tools: dict[str, Callable] = {}
+
+    #: What a Path-B plan may ask this dispatcher to run.  Passed to ``compile_plan``
+    #: so a name the chat cannot execute is *dropped and reported at compile time*
+    #: instead of failing the plan halfway through.  ``run_flow`` / ``run_plan`` stay
+    #: in the set on purpose: the dispatcher rejects them with an explicit
+    #: "不能嵌套调用" error (an invalid plan must fail, not lose a step silently).
+    _PLAN_FLOWS = {
+        "translate_page", "translate_normal", "special_pages", "special_page",
+        "translate_doc", "preprocess", "export", "self_check_page", "ai_self_check",
+    }
+    _PLAN_AVAILABLE = (set(_ATOMIC) | _PLAN_FLOWS
+                       | {"run_translate", "run_flow", "run_plan"})
 
     def _validated_scope(scope):
         """Normalise a plan/flow ``scope`` coming from the model's JSON.
@@ -720,15 +740,25 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
                 if err:
                     return {"ok": False, "base": "run_translate", "error": err}
                 try:
-                    start_translate(params.get("requirement", ""), scope)
+                    started = start_translate(params.get("requirement", ""), scope)
                 except Exception as exc:  # noqa: BLE001 — fail-closed
                     return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                if isinstance(started, dict) and started:
+                    return {"base": "run_translate", "scope": scope, **started}
                 return {"ok": True, "base": "run_translate", "scope": scope,
                         "message": "已触发翻译（后台执行）。"}
             if task.name in ("run_flow", "run_plan"):
                 return {"ok": False,
                         "error": f"{task.name} 不能在计划内嵌套调用（计划本身就是这一层）。"}
             fn = _ATOMIC.get(task.name)
+            if fn is None:
+                # The plan validator accepts *every* registered atomic tool
+                # (``atomic_tool_names()``), so a name it accepted must not be
+                # rejected here as "未知原子工具" and fail the whole plan.  Fall back
+                # to the chat tool table itself; only the orchestration tools stay
+                # off-limits (checked just above, so a plan cannot recurse).
+                fallback = _all_tools.get(task.name) if _all_tools else None
+                fn = fallback if callable(fallback) else None
             if fn is None:
                 return {"ok": False, "error": f"未知原子工具：{task.name}"}
             try:
@@ -794,7 +824,8 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             return {"ok": False,
                     "error": "run_plan（AI 自由组合）需要模型在线；当前没有可用模型，无法自由分解。"
                              "请先在主窗口选择并配置模型（models.json）。"}
-        plan = _agent.compile_plan(str(requirement or ""), llm=plan_llm)
+        plan = _agent.compile_plan(str(requirement or ""), llm=plan_llm,
+                                   available=_PLAN_AVAILABLE)
         if not plan.tasks:
             return {"ok": False,
                     "error": "无法把该要求分解成任何可执行任务（可换个说法，或改用 run_flow/run_translate）。"}
@@ -809,10 +840,17 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
             if isinstance(img, (bytes, bytearray)) and img:
                 res["image"] = bytes(img)
                 break
-        res["note"] = plan.note
+        # ``run_plan`` already folded the plan's note (and any dropped task names) into
+        # its result; only fill the note in if it produced none.
+        res.setdefault("note", plan.note)
+        if plan.dropped:
+            res.setdefault("dropped", list(plan.dropped))
+            if log:
+                log(f"  [计划] 忽略 {len(plan.dropped)} 个未注册任务："
+                    f"{'、'.join(plan.dropped)}")
         return res
 
-    return {
+    tools: dict[str, Callable] = {
         "get_doc_info": get_doc_info,
         "get_settings": get_settings,
         "classify_page": classify_page,
@@ -832,3 +870,5 @@ def make_chat_tools(ctx, *, show_preview: Callable[[int, str], None] | None = No
         "run_translate": run_translate,
         "set_setting": set_setting_tool,
     }
+    _all_tools.update(tools)
+    return tools

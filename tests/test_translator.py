@@ -199,6 +199,20 @@ class TranslatorTest(unittest.TestCase):
     def test_cache_dir_env_override_is_used(self):
         self.assertEqual(self.cache_dir, _cache_dir())
 
+    def test_resume_false_still_persists_the_fresh_results(self):
+        # ``resume=False``（eval/verify/agent 术语抽取都用它）此前把**写盘**也一起关掉
+        # 了：一次成功的新翻译什么都没留下，下次 resume 又要重翻，且日志毫无提示。
+        # 「忽略磁盘上已有的」与「不要写盘」必须是两件事。
+        with MockServer() as server:
+            engine = self._engine(server)
+            res = engine.translate_blocks(["Hello world."], "Chinese",
+                                          doc_path=Path("_fake.pdf"), resume=False)
+            self.assertEqual([], res.errors, res.errors)
+        files = list(self.cache_dir.glob("trans_v*.json"))
+        self.assertEqual(1, len(files), files)
+        entries = json.loads(files[0].read_text("utf-8"))
+        self.assertEqual(1, len(entries), entries)
+
     def test_retry_backoff_is_interruptible(self):
         # Every other test injects ``retry_delays=(0, 0)``, so ``_sleep_interruptible``
         # returned before its loop and the "cancel during backoff" path was never
