@@ -1072,15 +1072,25 @@ def _check_layout(state, page=None):
             if fs + 1e-9 < floor:
                 issues.append({"index": idx, "kind": "too_small",
                                "detail": f"译文字号 {fs:.2f}pt 低于可读下限 {floor:.2f}pt"})
-            if height > box_h + 2.0:
-                issues.append({"index": idx, "kind": "overflow",
-                               "detail": f"译文高度 {height:.1f}pt 超过自身框 {box_h:.1f}pt"})
             below = [nb for nb in blocks
                      if nb is not b and nb.y0 >= b.y1 - 0.5
                      and nb.x0 < b.x1 and nb.x1 > b.x0]
-            if below:
-                gap = min(nb.y0 for nb in below) - b.y1
-                if height > box_h + gap + 2.0:
+            gap = (min(nb.y0 for nb in below) - b.y1) if below else None
+            if height > box_h + 2.0:
+                # A prose block's box is the source *glyph* box, one line tall; a
+                # translation that wraps to two lines is expected to eat the leading
+                # below it.  Whether that is a defect depends on what is actually
+                # there: measured on a real annual report, 29 of 30 blocks reported
+                # as "overflow" had 9–198pt of free space under them (nothing was
+                # pressed into), so the finding was a false positive that made the
+                # review loop "fix" correct translations and made the batch path fall
+                # back to the agent for nothing.  Report only what collides (or, with
+                # no block below to absorb it, may run off the page).
+                if gap is None:
+                    issues.append({"index": idx, "kind": "overflow",
+                                   "detail": f"译文高度 {height:.1f}pt 超过自身框 "
+                                             f"{box_h:.1f}pt（该块下方没有其它块）"})
+                elif height > box_h + gap + 2.0:
                     issues.append({"index": idx, "kind": "crowding",
                                    "detail": f"译文高 {height:.1f}pt 会压入下一块（剩余 {gap:.1f}pt）"})
         offset += len(blocks)

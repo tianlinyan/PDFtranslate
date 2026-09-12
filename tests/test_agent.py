@@ -1200,6 +1200,42 @@ class PageExecutorsTest(unittest.TestCase):
         self.assertEqual([], res["empty_cells"])
         self.assertEqual([], res["empty_text"])
 
+    def test_check_layout_ignores_a_wrap_absorbed_by_the_leading(self):
+        # 真机年报的形状：正文块的框是**源文字形框**（一行高 ~11.7pt），英文译文换到第二
+        # 行——下方有 ~9pt 行距时只是「吃掉行距」，并没有压到任何东西。真机 30 条 overflow
+        # 里 29 条属于这种（下方 9–198pt 空闲）；把它报成缺陷会让复核循环去「修」本来就对
+        # 的译文，也让批量路径白白回退 agent（v0.6.11）。
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("本行净利润稳步增长，资产质量保持良好", page=0,
+                                x0=0, y0=0, x1=120, y1=11.7, size=10.6),
+                    pdfio.Block("下一段", page=0, x0=0, y0=20.7, x1=120, y1=32.4,
+                                size=10.6)]],
+            blocks=["本行净利润稳步增长，资产质量保持良好", "下一段"],
+            block_pages=[0, 0])
+        s.out_doc = {0: {"text": "Net profit grew steadily and asset quality stayed sound"},
+                     1: {"text": "Next paragraph"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        kinds = {i["kind"] for i in tools["check_layout"](0)["issues"] if i["index"] == 0}
+        self.assertNotIn("crowding", kinds)
+        self.assertNotIn("overflow", kinds, "行距能吸收的换行不是缺陷")
+
+    def test_check_layout_reports_a_wrap_that_collides(self):
+        # 同一个块，但下一段只隔 0.5pt：这时换行第二行真的会压上去，必须报 crowding。
+        s = agent.WorkflowState("a.pdf", "English")
+        s.src_doc = pdfio.DocumentText(
+            pages=[[pdfio.Block("本行净利润稳步增长，资产质量保持良好", page=0,
+                                x0=0, y0=0, x1=120, y1=11.7, size=10.6),
+                    pdfio.Block("下一段", page=0, x0=0, y0=12.2, x1=120, y1=23.9,
+                                size=10.6)]],
+            blocks=["本行净利润稳步增长，资产质量保持良好", "下一段"],
+            block_pages=[0, 0])
+        s.out_doc = {0: {"text": "Net profit grew steadily and asset quality stayed sound"},
+                     1: {"text": "Next paragraph"}}
+        tools = agent.make_page_executors(s, _dummy_model())
+        kinds = {i["kind"] for i in tools["check_layout"](0)["issues"] if i["index"] == 0}
+        self.assertIn("crowding", kinds)
+
     def test_check_layout_flags_overflowing_prose_block(self):
         # A much-longer prose translation that cannot fit its box is flagged (fs hit
         # the readable floor and still overflows) — the exporter draws it past the box.
