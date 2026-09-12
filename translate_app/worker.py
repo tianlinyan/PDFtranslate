@@ -87,6 +87,7 @@ class TranslateWorker(QObject):
         image_text: bool | None = None,
         expand_pages: bool = False,
         document_plan: bool = False,
+        batch_first: bool = True,
         policy_fn=None,
     ):
         super().__init__()
@@ -182,6 +183,13 @@ class TranslateWorker(QObject):
         #: ``PDFTRANSLATE_PLAN=1`` 强制开启（与其它 opt-in 旋钮同款）。
         self._document_plan = bool(document_plan) or (
             os.environ.get("PDFTRANSLATE_PLAN") == "1")
+        #: v0.6.10 批量优先：每个 normal 页先走一次确定性批量翻译，再过分级审计门——
+        #: 只有 agent 真能修的问题（漏译/残留/数字/表格）才回退逐页 agent；`layout`
+        #: （译文超框）是导出侧问题，实测回退 agent 零改善，因此只记录不回退。
+        #: 真机 28 页年报：整篇 22 个请求 vs 全 agent 外推 125 个。默认**开**，
+        #: ``PDFTRANSLATE_BATCH_FIRST=0`` 关闭（与其它 opt-out 旋钮同款）。
+        self._batch_first = bool(batch_first) and (
+            os.environ.get("PDFTRANSLATE_BATCH_FIRST", "1") != "0")
         #: C-⑥ reflow（保守层）：文本层表格列宽按译文重分配（数字列不缩）。
         #: 默认开启（v0.5.47 起界面复选框已移除）；PDFTRANSLATE_REFLOW=0 可强制关闭
         #: （与 PDFTRANSLATE_AGENT_TERMS 同款，供排查用）。
@@ -236,7 +244,8 @@ class TranslateWorker(QObject):
             f"OCR={'开' if self._ocr else '关'}，"
             f"IR管线={'开' if self._ir_mode else '关'}，"
             f"术语抽取={'开' if self._agent_terms else '关'}，"
-            f"文档级方案={'开' if self._document_plan else '关'}"
+            f"文档级方案={'开' if self._document_plan else '关'}，"
+            f"批量优先={'开' if self._batch_first else '关'}"
             f"{'（AI 重建表：模型支持视觉）' if self._rebuild_table and getattr(self._model, 'vision', False) else ''}。"
         )
 
@@ -851,6 +860,7 @@ class TranslateWorker(QObject):
                 infer_terms=self._agent_terms,
                 plan=self._document_plan,
                 translate_batch=self._translate_page_batch,
+                batch_first=self._batch_first,
                 scope=self._page_scope,
                 max_steps_per_page=32,
             ).run()

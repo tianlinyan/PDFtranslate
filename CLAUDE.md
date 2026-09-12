@@ -68,7 +68,7 @@ main.py → MainWindow (PyQt6)
 质量不变量没有被绕过。两条约束：① 只对 **normal 页**接受 `batch`（扫描/图表/待确认页需要视觉循环，写了也丢弃并进
 `plan.dropped`）；② **保留块永不进入批量翻译**——agent 可以在用户要求时覆盖一个 keep，确定性路径没有这个判断力，
 所以 `_translate_page_batch` 显式排除 `keep_original` 的块，并且批量页的「有没有译文」判据用 `include_kept=False`。
-回归 `tests/test_plan.py` 6 例（批量跳过 agent / 审计不干净回退 / 批量失败回退 / 无策略不变 / 策略只认 normal 页 / 保留块不进批量）。
+回归 `tests/test_plan.py` 6 例（批量跳过 agent / 审计不干净回退 / 批量失败回退 / 无策略不变 / 策略只认 normal 页 / 保留块不进批量）。**v0.6.10：批量优先成为默认策略 + 回退门收窄**——`DocumentSession(batch_first=…)`（worker 默认开，`PDFTRANSLATE_BATCH_FIRST=0` 关）让**每个 normal 页**先走批量，不再依赖那次计划调用；`plan.page_strategy` 变成逐页**覆盖**（`batch` 走批量、`agent` 显式退出）。回退门只对 **agent 真能修**的 finding 生效（`missing`/`residual`/`numbers`/`table`）；**只有 `layout`（译文超框）时不回退**——真机实测 agent 每页 5 个请求却零改善（8/1/4 条 layout 前后相同），超框是导出侧问题，改为把「排版提示：N 处译文超出自身框」记进该页 `issues` 并算完成。真机 28 页年报：整篇批量 **22 个请求 / 5.3 分钟** vs 全 agent 外推 **125 个请求 / ~14 分钟**。选项日志新增「批量优先=开/关」。
 
 ### translate_app/translator.py
 - 翻译协议：每个批次以编号块发送 `[[1]] 文本 … [[k]] 文本`；模型必须回显 `[[n]] 译文`（一个块可跨多行，`_MULTI_BLOCK_RE` 折叠内部换行）。编号**仅在批次内局部使用**（1..k，而非全局索引），因为已缓存的块会被跳过。`_parse_response` **要么返回恰好 k 条译文，要么抛 `ValueError`**：有 `[[n]]` 标记时编号必须完整无缺、不越界；完全没有 `[[n]]` 标记时只接受「行数 == 块数」的回复（单块批次例外：整段回复折叠为该块译文）。**空译文同样被拒**（编号块无内容、或整段空白回复折叠成 `""`）——空串会被判成功、写进缓存并让该块在每次导出里变空白，且被永久复用。**绝不用原文填补缺口**——那会被判为成功并写入缓存，模型的一句拒答就能永久污染该块。**改协议前先看 `tests/_helpers.py` 的 mock**（按 `\n\n` 分块解析 user 消息）。

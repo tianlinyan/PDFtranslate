@@ -981,6 +981,8 @@ class DocumentPlanWiringTest(_WorkerTestBase):
         with mock.patch.object(agent_module, "DocumentSession", _FakeSession):
             self._run(worker)
         self.assertTrue(seen.get("plan"), "开关没有传进 DocumentSession")
+        self.assertTrue(seen.get("batch_first"),
+                        "批量优先默认应传进 DocumentSession（v0.6.10）")
 
     def test_the_batch_path_says_the_plan_was_skipped(self):
         src = build_sample_pdf(self.tmp / "plan2.pdf", pages=1)
@@ -994,6 +996,7 @@ class DocumentPlanWiringTest(_WorkerTestBase):
             events = self._run(worker)
         self.assertEqual(["finished", "stopped"], events)
         self.assertTrue(any("文档级方案=开" in m for m in logs), logs)
+        self.assertTrue(any("批量优先=开" in m for m in logs), logs)
         self.assertTrue(any("文档级方案" in m and "已跳过" in m for m in logs), logs)
 
 if __name__ == "__main__":

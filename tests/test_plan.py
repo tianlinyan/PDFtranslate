@@ -224,16 +224,20 @@ class BatchPageStrategyTest(unittest.TestCase):
     else falls back to the agent pass, so ``batch`` can never be worse, only cheaper.
     """
 
-    def _session(self, *, plan_strategy, audit_clean=True, batch_error=None):
+    def _session(self, *, plan_strategy, audit_clean=True, audit_issues=None,
+                 batch_error=None, batch_first=None, plan=True):
         doc = _doc(_page("总资产", "营业收入"), _page("注释一"), _page("注释二"))
         state = agent.WorkflowState(src_path="a.pdf", lang="English")
         state.src_doc = doc
         state.out_doc = {}
         for i in range(3):
             state.triage[i] = PageTriage(page=i, kind="normal")
-        state.plan = plan_mod.TranslationPlan(page_strategy=dict(plan_strategy),
-                                              source="llm")
+        if plan:
+            state.plan = plan_mod.TranslationPlan(page_strategy=dict(plan_strategy),
+                                                  source="llm")
         calls = {"batch": [], "agent": [], "audit": []}
+        issues = [] if audit_clean else list(
+            audit_issues if audit_issues is not None else [{"check": "residual"}])
 
         def batch(st, page, model, *, log=None, cancel=None):
             calls["batch"].append(page)
@@ -249,13 +253,49 @@ class BatchPageStrategyTest(unittest.TestCase):
 
         def audit(page=None, checks=None):
             calls["audit"].append(page)
-            return {"clean": audit_clean,
-                    "issues": [] if audit_clean else [{"check": "residual"}]}
+            return {"clean": audit_clean, "issues": issues}
 
+        extra = {} if batch_first is None else {"batch_first": batch_first}
         session = DocumentSession(
             state, doc, model=object(), log=lambda _m: None,
-            translate_page=agent_pass, translate_batch=batch, audit=audit)
+            translate_page=agent_pass, translate_batch=batch, audit=audit, **extra)
         return state, session, calls
+
+    def test_a_layout_only_audit_does_not_fall_back_to_the_agent(self):
+        # 真机实测：批量译文超框（layout）时回退逐页 agent 是纯浪费——agent 跑 5 个请求、
+        # 审计结果一模一样（8/1/4 条 layout 前后相同）。超框是导出侧问题，不是文本能修的，
+        # 所以只把提示记在页上，页面照常算完成。
+        state, session, calls = self._session(
+            plan_strategy={0: "batch"}, audit_clean=False,
+            audit_issues=[{"check": "layout"}, {"check": "layout"}])
+        session._translate_one_normal(0)
+        self.assertEqual([0], calls["batch"])
+        self.assertEqual([], calls["agent"], "layout 类问题不该回退 agent")
+        self.assertEqual("done", state.page(0).status)
+        self.assertTrue(any("排版提示" in i for i in state.page(0).issues),
+                        state.page(0).issues)
+
+    def test_an_actionable_finding_still_falls_back(self):
+        state, session, calls = self._session(
+            plan_strategy={0: "batch"}, audit_clean=False,
+            audit_issues=[{"check": "numbers"}, {"check": "layout"}])
+        session._translate_one_normal(0)
+        self.assertEqual([0], calls["agent"], "可修问题必须回退 agent")
+
+    def test_batch_first_covers_pages_without_a_plan(self):
+        # 批量优先是**策略**，不依赖那次计划调用：没有 plan 时每个 normal 页也先走批量。
+        state, session, calls = self._session(plan_strategy={}, plan=False,
+                                              batch_first=True)
+        session._translate_one_normal(0)
+        self.assertEqual([0], calls["batch"])
+        self.assertEqual("done", state.page(0).status)
+
+    def test_a_plan_can_opt_a_page_out_of_batch_first(self):
+        state, session, calls = self._session(
+            plan_strategy={0: "agent"}, batch_first=True)
+        session._translate_one_normal(0)
+        self.assertEqual([], calls["batch"], "plan 显式指定 agent 时不走批量")
+        self.assertEqual([0], calls["agent"])
 
     def test_a_batch_page_skips_the_agent_loop(self):
         state, session, calls = self._session(plan_strategy={0: "batch"})

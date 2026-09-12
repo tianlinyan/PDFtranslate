@@ -1784,6 +1784,7 @@ class DocumentSession:
         plan: bool = False,
         plan_llm: Callable[..., dict] | None = None,
         translate_batch: Callable[..., Any] | None = None,
+        batch_first: bool = False,
         include_kept: bool = False,
         scope: list[int] | None = None,
         max_steps_per_page: int = 24,
@@ -1821,6 +1822,10 @@ class DocumentSession:
         #: worker.  ``None`` = no batch path, so a ``batch`` page falls back to the
         #: normal agent loop (the feature can never be half-wired).
         self.translate_batch = translate_batch
+        #: v0.6.10: every normal page tries the batch pass first (the audit gate plus
+        #: the narrowed fallback keep the quality bar).  The worker turns it on by
+        #: default; a direct caller must ask for it.
+        self.batch_first = bool(batch_first)
         #: M4 (U1 knob): when True the AI self-check also reviews pages the user chose to
         #: keep/skip (default False — those carry the source verbatim, so re-checking them
         #: would wrongly try to translate the intentionally-kept original).
@@ -2067,11 +2072,26 @@ class DocumentSession:
         return run_agent
 
     def _page_is_batch(self, i: int) -> bool:
-        """True when the plan picked the cheap batch pass for page ``i`` (M2)."""
+        """True when page ``i`` should take the cheap batch pass first.
+
+        Two sources, in this order: the document-level plan's explicit choice for the
+        page, then the ``batch_first`` policy.  The policy makes **every** normal page
+        try the batch pass first (measured on a real 28-page annual report: 22 requests
+        for the whole document instead of 125, with the audit gate unchanged), because
+        the gate — plus the narrowed fallback in :meth:`_batch_one_normal` — is what
+        protects quality, not the per-page decide loop.  A page the plan marks
+        ``agent`` explicitly opts out.
+        """
         if self.translate_batch is None:
             return False
         plan = self.state.plan
-        return bool(plan is not None and plan.page_strategy.get(i) == "batch")
+        if plan is not None:
+            choice = plan.page_strategy.get(i)
+            if choice == "agent":
+                return False
+            if choice == "batch":
+                return True
+        return bool(self.batch_first)
 
     def _batch_one_normal(self, i: int) -> bool:
         """One deterministic batch pass + the audit gate.  ``True`` = done and clean.
@@ -2100,12 +2120,28 @@ class DocumentSession:
             self.log(f"  第 {i + 1} 页批量翻译未产生任何译文（改用逐页 agent）。")
             return False
         audit = self.audit(i) or {}
+        issues = list(audit.get("issues") or [])
         if audit.get("clean") is True:
             self.log(f"  第 {i + 1} 页批量翻译，确定性审计通过（省去逐页 agent 循环）。")
             return True
-        issues = audit.get("issues") or []
-        self.log(f"  第 {i + 1} 页批量翻译后审计有 {len(issues)} 处问题，改用逐页 agent。")
-        return False
+        # Only the findings the agent can actually act on justify the decide loop.
+        # ``layout`` cannot: measured on a real annual report the agent spent 5 requests
+        # per page and the page came back exactly as dirty (8/1/4 layout findings before
+        # and after) — the overflow is a *layout/export* problem (a one-line CJK box
+        # whose English needs two lines), not something a text edit fixes.  Those
+        # findings are recorded on the page so the completion report still surfaces
+        # them, and the page counts as done.
+        actionable = [it for it in issues if str(it.get("check")) != "layout"]
+        if actionable:
+            self.log(f"  第 {i + 1} 页批量翻译后审计有 {len(actionable)} 处可修问题，"
+                     f"改用逐页 agent。")
+            return False
+        layout_n = len(issues)
+        self.state.page(i).issues.append(
+            f"排版提示：{layout_n} 处译文超出自身框（导出侧问题，未回退逐页 agent）")
+        self.log(f"  第 {i + 1} 页批量翻译：审计只有 {layout_n} 处排版提示（译文超框），"
+                 f"不回退逐页 agent。")
+        return True
 
     def _translate_one_normal(self, i: int) -> None:
         """Translate one ``normal`` page (fail-closed to its source on error).
