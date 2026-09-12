@@ -373,6 +373,56 @@ class _FakeClient:
 class LlmDecideAndPageLoopTest(unittest.TestCase):
     """P3: real-LLM ``decide`` (vision + tools + result feedback) and the page loop."""
 
+    def test_a_repeated_identical_call_ends_the_loop_early(self):
+        # 真机发现（v0.6.12）：275 块的 OCR 页上模型连续调用 read_page 30 次、一次
+        # translate_blocks 都没调，步数用尽、整页零译文。同一「工具+参数」重复
+        # _MAX_REPEAT_CALLS 次即判定卡住并早停（结果 fail-closed 保留原文，但不再白烧
+        # 剩下的轮次）。
+        s = agent.WorkflowState("a.pdf", "English")
+        calls: list = []
+        logs: list[str] = []
+        tools = {"read_page": lambda **kw: (calls.append(kw), {"ok": True})[1]}
+        decide = lambda obs, state, last: agent.flow.Decision(
+            action="call", tool="read_page", arguments={"page": 0})
+        loop = agent.flow.FlowAgent(s, tools, decide, log=logs.append, max_steps=30)
+        loop.run(max_rounds=30)
+        self.assertEqual(agent.flow._MAX_REPEAT_CALLS + 1, len(calls),
+                         "重复到上限就应停，而不是烧完 30 轮")
+        self.assertTrue(any("卡住" in m for m in logs), logs)
+
+    def test_the_repeat_is_visible_in_the_observation(self):
+        # 观察里必须出现「同一调用已连续 N 次」，否则模型无从知道它在原地打转。
+        s = agent.WorkflowState("a.pdf", "English")
+        tools = {"read_page": lambda **kw: {"ok": True}}
+        decide = lambda obs, state, last: agent.flow.Decision(
+            action="call", tool="read_page", arguments={"page": 0})
+        loop = agent.flow.FlowAgent(s, tools, decide, log=lambda _m: None, max_steps=9)
+        loop.run(max_rounds=9)
+        obs = loop.observe()
+        self.assertIn("repeat=", obs, obs)
+
+    def test_a_dropped_parallel_call_is_reported_to_the_model(self):
+        # 模型并行请求多个 tool_call 时只执行第一个——但必须**告诉它**：真机上模型每轮都
+        # 计划 read_page + translate_blocks，第二个永远不执行且它一无所知，于是无限重规划。
+        seen: list = []
+        tc1 = _FakeToolCall("read_page", '{"page": 0}')
+        tc2 = _FakeToolCall("translate_blocks", '{"page": 0}')
+        tc2.id = "call_2"
+        queue = [
+            _FakeResp(_FakeMsg(content="", tool_calls=[tc1, tc2])),
+            _FakeResp(_FakeMsg(content="done")),
+        ]
+        decide = agent.make_llm_decide(_vision_model(), task="t",
+                                       client=_FakeClient(queue, seen))
+        s = agent.WorkflowState("a.pdf", "English")
+        s.page(0)
+        d1 = decide("obs1", s)
+        self.assertEqual("read_page", d1.tool)
+        decide("obs2", s, agent.flow.AgentResult(ok=True, op_tool="read_page"))
+        sent = json.dumps(seen[1]["messages"], ensure_ascii=False)
+        self.assertIn("只能包含", sent)
+        self.assertIn("translate_blocks", sent, "被丢弃的调用必须告诉模型")
+
     def test_make_llm_decide_parses_tool_call_then_done(self):
         seen: list = []
         queue = [

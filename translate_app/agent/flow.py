@@ -59,6 +59,15 @@ class Decision:
     summary: str = ""
 
 
+#: How many times the SAME tool+arguments may repeat before the loop gives up.
+#: A real run called ``read_page`` 30 times on a 275-block page (its parallel
+#: ``translate_blocks`` call was dropped every round — see ``make_llm_decide``) and
+#: burned the whole step budget without translating anything; three repeats is
+#: already "stuck", and stopping early keeps the result honest (fail-closed to the
+#: source) while saving the remaining rounds.
+_MAX_REPEAT_CALLS = 3
+
+
 @dataclass
 class AgentResult:
     """The structured outcome of one tool call (the "read result" step)."""
@@ -92,6 +101,10 @@ class FlowAgent:
         if max_steps is not None:
             state.budget.max_steps = max_steps
         self.last_result: AgentResult | None = None
+        #: Repeat guard: the signature of the last tool call (``tool|args``) and how
+        #: many times in a row it has been chosen again.
+        self._last_signature: str = ""
+        self._repeat_count: int = 0
         #: Optional worker↔GUI channel: ``answer_handler(question, options, target)``
         #: blocks until the user answers; the answer is stored and the loop resumes.
         self.answer_handler = answer_handler
@@ -123,6 +136,16 @@ class FlowAgent:
             if r.error:
                 line += f" error={r.error}"
             lines.append(line)
+        if self._repeat_count >= 1:
+            # Tell the controller it is re-issuing the same call.  Without this the
+            # model never learns that its *other* tool calls were dropped, so it
+            # re-plans the same batch and the page is never translated (measured: 30
+            # identical ``read_page`` rounds on a 275-block OCR page, zero output).
+            tool = self._last_signature.split("|", 1)[0]
+            lines.append(
+                f"repeat={self._repeat_count}（同一调用 {tool} 已连续 "
+                f"{self._repeat_count + 1} 次，结果不会变：请改用别的工具——例如直接 "
+                f"translate_blocks(page=页码) 一次翻译本页——或结束本页）")
         return "\n".join(lines)
 
     def _call(self, name: str, args: dict) -> AgentResult:
@@ -157,6 +180,12 @@ class FlowAgent:
         obs = self.observe()
         dec = self.decide(obs, self.state, self.last_result)
         if dec.action == "call":
+            sig = f"{dec.tool}|{json.dumps(dec.arguments, sort_keys=True, default=str)}"
+            if sig == self._last_signature:
+                self._repeat_count += 1
+            else:
+                self._last_signature = sig
+                self._repeat_count = 0
             # Surface the tool call as soon as it starts (so blocking tools like a
             # slow local request are visible) and report the elapsed time on done.
             self.log(f"  工具开始：{dec.tool}")
@@ -197,6 +226,11 @@ class FlowAgent:
                 break   # a user cancellation stops the loop; the caller raises
             dec = self.step()
             i += 1
+            if self._repeat_count >= _MAX_REPEAT_CALLS:
+                stuck = self._last_signature.split("|", 1)[0]
+                self.log(f"  同一工具连续调用 {self._repeat_count + 1} 次（{stuck}），"
+                         f"判定为卡住，本页结束（未完成的块保留原文）。")
+                break
             if dec.action == "done":
                 break
             if dec.action == "ask" and self.answer_handler is None:
@@ -432,9 +466,13 @@ def make_llm_decide(model, *, task: str, image_provider=None,
     sent_image = False
     pending_assistant: dict | None = None
     pending_call_id: str = ""
+    #: A note fed back with the NEXT observation (see the dropped-parallel-calls
+    #: branch below): the model has no other way to learn that its extra calls were
+    #: not executed.
+    pending_note: str = ""
 
     def _decision(obs: str, state: WorkflowState, last_result: AgentResult | None = None) -> Decision:
-        nonlocal sent_image, pending_assistant, pending_call_id
+        nonlocal sent_image, pending_assistant, pending_call_id, pending_note
         if pending_assistant is not None:
             messages.append(pending_assistant)
             pending_assistant = None
@@ -448,6 +486,11 @@ def make_llm_decide(model, *, task: str, image_provider=None,
                          "error": last_result.error},
                         ensure_ascii=False, default=str),
                 })
+        if pending_note:
+            # The controller is told *why* its plan shrank; without this it re-sends
+            # the same batch every round (see the branch below).
+            obs = f"{pending_note}\n{obs}"
+            pending_note = ""
         # Build the user observation: text + (on the first call) the source page
         # image, and re-inject a *user-framed region* as a new visual observation
         # (so a "send this area to the AI" truly reaches the model as an image).
@@ -543,11 +586,19 @@ def make_llm_decide(model, *, task: str, image_provider=None,
         if not tcs:
             return Decision(action="done", summary=str(getattr(msg, "content", "") or ""))
         tc = tcs[0]
-        if len(tcs) > 1 and log:
-            # Only one tool call is executed per step; say which ones were dropped
-            # instead of silently discarding the model's parallel calls.
-            log("  decide 返回多个 tool_calls，本轮只执行第一个："
-                + ", ".join(str(getattr(t.function, "name", "?")) for t in tcs))
+        if len(tcs) > 1:
+            # Only one tool call is executed per step (the message history carries one
+            # result per round).  Telling the *model* matters as much as the log: a
+            # real run planned ``read_page`` + ``translate_blocks`` every round, only
+            # the first ever ran, and the page was left untranslated after 30 rounds.
+            names = [str(getattr(t.function, "name", "?")) for t in tcs]
+            pending_note = (
+                f"注意：本协议的每条消息只能包含**一个** tool_call。你上一轮同时请求了 "
+                f"{len(tcs)} 个（{', '.join(names)}），系统只执行了第一个"
+                f"（{names[0]}），未执行：{', '.join(names[1:])}。"
+                f"请在下一条消息里只发一个工具调用；需要多个动作就分成多轮。")
+            if log:
+                log("  decide 返回多个 tool_calls，本轮只执行第一个：" + ", ".join(names))
         try:
             args = json.loads(tc.function.arguments) if tc.function.arguments else {}
             if not isinstance(args, dict):
