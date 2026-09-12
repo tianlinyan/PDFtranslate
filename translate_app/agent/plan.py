@@ -52,6 +52,13 @@ _PLAN_MAX_TERM = 80
 _PLAN_MAX_TARGET = 120
 #: Below this many pages a document-level pass costs more than it can save.
 PLAN_MIN_PAGES = 3
+#: Reply budget for the one plan call.  Measured on a real local reasoning model
+#: (qwen3.8-27b, ``reasoning_effort=low``): its thinking is billed against the same
+#: budget and grows with the document — a 5-page sample needed ~1064 tokens, while a
+#: 28-page report and a 51-page report both hit a 3072 cap and truncated the JSON,
+#: which makes every plan degrade to "no plan" (a silent no-op feature).  The prompt
+#: also bounds the answer (see ``document_plan_task``); this is the safety net.
+_PLAN_MAX_TOKENS = 8192
 
 
 @dataclass
@@ -259,7 +266,7 @@ def make_llm_plan(model, client: Any = None,
             kwargs: dict[str, Any] = {
                 "model": model.model,
                 "temperature": 0.0,
-                "max_tokens": 1024,
+                "max_tokens": _PLAN_MAX_TOKENS,
                 "messages": [{
                     "role": "user",
                     "content": prompts.document_plan_task(
@@ -270,7 +277,14 @@ def make_llm_plan(model, client: Any = None,
             if body:
                 kwargs["extra_body"] = body
             resp = client.chat.completions.create(**kwargs)
-            text = (getattr(resp.choices[0].message, "content", "") or "").strip()
+            choice = resp.choices[0]
+            text = (getattr(choice.message, "content", "") or "").strip()
+            if str(getattr(choice, "finish_reason", "") or "") == "length" and log:
+                # A truncated reply is a *budget* failure, not "the model chose to
+                # say nothing": say which one it was, or the log implies the feature
+                # ran and had nothing to do.
+                log(f"  文档级方案：回复被 max_tokens（{_PLAN_MAX_TOKENS}）截断，"
+                    f"本次不生成（可减少页数或提高该值）。")
             return parse_plan_json(text)
         except Exception as exc:   # noqa: BLE001 — fail-open to "no plan"
             if log:

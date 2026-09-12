@@ -128,6 +128,25 @@ class MakeLlmPlanTest(unittest.TestCase):
         self.assertEqual({"glossary": {"总资产": "Total assets"}},
                          fn("概况", lang="English"))
 
+    def test_a_truncated_reply_is_reported_and_yields_no_plan(self):
+        # Real-machine finding (v0.6.8): a reasoning model bills its thinking against
+        # the same max_tokens budget, so too small a cap truncated the JSON and every
+        # plan silently degraded to "no plan" — a no-op feature.  A truncated reply
+        # must be named as such in the log, never read as "the model had nothing to say".
+        def create(**_kw):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="length",
+                message=SimpleNamespace(content='{"glossary": {"总资产": "Total'))])
+
+        client = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)))
+        logs: list[str] = []
+        fn = plan_mod.make_llm_plan(_model(), client=client, log=logs.append)
+        self.assertEqual({}, fn("概况", lang="English"))
+        self.assertTrue(any("截断" in m for m in logs), logs)
+        self.assertGreaterEqual(plan_mod._PLAN_MAX_TOKENS, 2048,
+                                "推理模型的思考也算在 max_tokens 里，预算必须留够")
+
     def test_no_client_means_no_plan_callback(self):
         class _NoKwargs:
             pass
